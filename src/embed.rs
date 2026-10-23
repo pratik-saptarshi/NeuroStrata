@@ -9,6 +9,35 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// An HTTP failure from the embedding endpoint, carrying the status so the
+/// retry loop can recognise it.
+///
+/// Formatting the status into an `anyhow!` string used to erase the type: the
+/// resulting error chain held no `StatusCode`, so the downcast in
+/// `embed_with_retry` never matched and the 429/5xx probe was dead code.
+#[derive(Debug)]
+struct EmbedApiStatus {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for EmbedApiStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "embedding API error {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for EmbedApiStatus {}
+
+/// Whether this failure is worth a second attempt. Kept separate from the loop
+/// so the classification can be tested without a server.
+fn should_retry(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<EmbedApiStatus>()
+        .map(|e| e.status == reqwest::StatusCode::TOO_MANY_REQUESTS || e.status.is_server_error())
+        .unwrap_or(false)
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
     pub model_name: String,
@@ -239,11 +268,9 @@ impl RemoteEmbedder {
                     if attempts >= 2 {
                         return Err(e);
                     }
-                    if let Some(status) = e.downcast_ref::<reqwest::StatusCode>() {
-                        if *status == 429 || status.is_server_error() {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
+                    if should_retry(&e) {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
                     return Err(e);
                 }
@@ -267,7 +294,7 @@ impl RemoteEmbedder {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("API error {}: {}", status, body));
+            return Err(anyhow::Error::new(EmbedApiStatus { status, body }));
         }
 
         let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
@@ -371,5 +398,42 @@ mod tests {
         // This tests the factory logic
         let embedder = build_embedder();
         assert!(embedder.is_ok());
+    }
+
+    /// The retry used to probe `downcast_ref::<StatusCode>()` on a string that
+    /// held no status, so a 429 never retried. The status has to survive the
+    /// conversion into an error.
+    #[test]
+    fn api_status_survives_the_anyhow_chain() {
+        let error = anyhow::Error::new(EmbedApiStatus {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: "slow down".to_string(),
+        });
+
+        let recovered = error
+            .downcast_ref::<EmbedApiStatus>()
+            .expect("the status must be recoverable, or the retry never fires");
+        assert_eq!(recovered.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.to_string().contains("slow down"));
+    }
+
+    #[test]
+    fn rate_limits_and_server_errors_are_retried() {
+        let status = |code: u16| {
+            anyhow::Error::new(EmbedApiStatus {
+                status: reqwest::StatusCode::from_u16(code).expect("valid status"),
+                body: String::new(),
+            })
+        };
+
+        assert!(should_retry(&status(429)), "429 is a rate limit");
+        assert!(should_retry(&status(500)), "5xx is transient");
+        assert!(should_retry(&status(503)), "5xx is transient");
+        assert!(!should_retry(&status(400)), "a bad request will not improve");
+        assert!(!should_retry(&status(401)), "a bad key will not improve");
+        assert!(
+            !should_retry(&anyhow::anyhow!("connection reset")),
+            "an untyped error must not be retried as if it were a rate limit"
+        );
     }
 }
