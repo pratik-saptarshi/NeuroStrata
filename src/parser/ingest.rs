@@ -487,25 +487,28 @@ async fn run_consumer(
                         agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                     };
 
-                    match embedder.embed(&summary).await {
-                        Ok(embedding) => {
-                            if let Err(e) = vector_store
-                                .upsert(namespace, &id, embedding, payload)
-                                .await
-                            {
-                                eprintln!(
-                                    "Failed to store symbol {} from {}: {}",
-                                    symbol.name, path_display, e
-                                );
-                            } else {
-                                symbols_stored += 1;
-                            }
-                        }
-                        Err(e) => eprintln!(
-                            "Failed to embed symbol {} from {}: {}",
-                            symbol.name, path_display, e
-                        ),
-                    }
+                    let embedding = embedder.embed(&summary).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "could not embed {} from {}: {}. The namespace was cleared before this walk, so its index is now incomplete -- fix the embedder and ingest again.",
+                            symbol.name,
+                            path_display,
+                            e
+                        )
+                    })?;
+
+                    vector_store
+                        .upsert(namespace, &id, embedding, payload)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "could not store {} from {}: {}. The namespace was cleared before this walk, so its index is now incomplete -- ingest again once the store is healthy.",
+                                symbol.name,
+                                path_display,
+                                e
+                            )
+                        })?;
+
+                    symbols_stored += 1;
                 }
 
                 if symbols_stored > 0 {
@@ -867,6 +870,20 @@ mod tests {
         }
     }
 
+    /// Stands in for a remote embedder that is down or rate-limited.
+    struct FailingEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FailingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Err(anyhow::anyhow!("embedder unavailable"))
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
     #[tokio::test]
     async fn a_missing_root_is_refused_before_anything_is_cleared() {
         let db = std::env::temp_dir().join(format!("ns-missing-root-{}", uuid::Uuid::new_v4()));
@@ -955,6 +972,46 @@ mod tests {
         assert!(sym_entry.is_some(), "symbol node was stored");
 
         // Clean up.
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Ingestion clears the namespace before it walks. If every symbol then
+    /// fails to embed, reporting success hands back an emptied graph with no
+    /// indication anything went wrong -- so a failure has to fail the walk.
+    #[tokio::test]
+    async fn a_failed_embed_fails_the_walk_instead_of_reporting_success() {
+        let tmp = std::env::temp_dir().join(format!("ns-embed-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write test file");
+
+        let db = std::env::temp_dir().join(format!("ns-embed-fail-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("fail-ns").await.expect("create the schema");
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(FailingEmbedder),
+            store.clone(),
+            "fail-ns",
+            None,
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "an embed that fails for every symbol must fail the ingest, not be logged and skipped"
+        );
+        let message = format!("{}", outcome.expect_err("ingest failed"));
+        assert!(
+            message.contains("hello.rs"),
+            "the error should name the file being embedded: {message}"
+        );
+
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
