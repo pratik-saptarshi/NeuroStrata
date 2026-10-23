@@ -484,6 +484,7 @@ mod tests {
             db_path: PathBuf::from("test.db"),
             deduplication: DeduplicationConfig::default(),
             project_contexts: HashMap::new(),
+            store: StoreConfig::default(),
             extra: HashMap::new(),
         };
 

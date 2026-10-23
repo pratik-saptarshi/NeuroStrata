@@ -83,12 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn observation_jsonl_append_write_atomic() {
+    #[tokio::test]
+    async fn observation_jsonl_append_write_atomic() {
         // Append-only atomicity: two records must land on separate lines even if
         // we close and reopen before the second flush completes.
         let tmpdir = std::env::temp_dir().join("ns_learn_test");
         std::fs::create_dir_all(&tmpdir).unwrap();
-        let rec = LearningRecorder::open(tmpdir.clone(), None).unwrap();
+        let rec = LearningRecorder::open(tmpdir.clone(), None).await.unwrap();
         let v1 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-1".into(),
@@ -110,12 +111,12 @@ mod tests {
             shadow_model_version: None,
             decision: crate::judgment::DedupDecision::Allowed,
         };
-        rec.record_observation(&v1).unwrap();
+        rec.record_observation(&v1).await.unwrap();
         // Reopen separately to ensure append semantics, no pre-existing data
         // from previous test runs.
         let tmpdir2 = std::env::temp_dir().join("ns_learn_test_2");
         std::fs::create_dir_all(&tmpdir2).unwrap();
-        let rec2 = LearningRecorder::open(tmpdir2, None).unwrap();
+        let rec2 = LearningRecorder::open(tmpdir2, None).await.unwrap();
         let v2 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-2".into(),
@@ -137,7 +138,7 @@ mod tests {
             shadow_model_version: None,
             decision: crate::judgment::DedupDecision::BlockedExact,
         };
-        rec2.record_observation(&v2).unwrap();
+        rec2.record_observation(&v2).await.unwrap();
         assert!(true);
         let _ = tmpdir;
         let _ = tmpdir2;
