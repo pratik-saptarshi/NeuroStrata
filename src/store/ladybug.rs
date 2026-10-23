@@ -570,6 +570,23 @@ impl StoreLimits {
     /// 8 GiB of address space: far below the engine's 8 TB default, and far
     /// above anything this tool has produced.
     pub const DEFAULT_MAX_DB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+    fn validate(self) -> Result<()> {
+        if self.buffer_pool_bytes == 0 || self.max_db_bytes == 0 {
+            anyhow::bail!(
+                "store byte limits must be positive; zero selects an unbounded engine default"
+            );
+        }
+        if self.buffer_pool_bytes == u32::MAX as u64 || self.max_db_bytes == u32::MAX as u64 {
+            anyhow::bail!(
+                "store byte limits cannot use the engine's u32::MAX automatic-size sentinel"
+            );
+        }
+        if self.buffer_pool_bytes > self.max_db_bytes {
+            anyhow::bail!("the buffer-pool ceiling cannot exceed the database-size ceiling");
+        }
+        Ok(())
+    }
 }
 
 impl Default for StoreLimits {
@@ -581,55 +598,108 @@ impl Default for StoreLimits {
     }
 }
 
-/// Where the embedding width a database was created with is recorded.
+/// Width and, for newly marked databases, model identity used to create a DB.
 ///
 /// The `Memory` table stores `embedding FLOAT[N]`, sized from the embedder at
-/// creation time, and the schema records N nowhere. Re-opening a 768-wide store
-/// under a 384-wide embedder resizes nothing: writes and searches fail later, or
-/// -- for a same-width model swap -- quietly compare vectors from two different
-/// spaces. A sidecar next to the database makes the mismatch immediate and
-/// explicit instead.
-fn width_marker_path(db_path: &Path) -> PathBuf {
+/// creation time. The fixed width can be read from the catalog, but the schema
+/// does not record which model produced each vector. A sidecar records both for
+/// new stores; a legacy store without identity adopts its current model with a
+/// visible warning, then blocks subsequent identity changes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EmbeddingMarker {
+    version: u8,
+    dimensions: usize,
+    #[serde(default)]
+    embedder_id: Option<String>,
+}
+pub(crate) fn width_marker_path(db_path: &Path) -> PathBuf {
     let mut marker = db_path.as_os_str().to_os_string();
     marker.push(".embedding");
     PathBuf::from(marker)
 }
 
-/// Refuse to open a store whose recorded width differs from `dimensions`.
-///
-/// A missing marker means the database predates this check (or is new); it is
-/// written by `write_width_marker` on the first successful open, so an old store
-/// adopts its current width rather than being rejected outright.
-fn check_width_marker(db_path: &Path, dimensions: usize) -> Result<()> {
+/// Read the marker; legacy numeric markers remain readable for an explicit,
+/// warned identity adoption.
+fn read_width_marker(db_path: &Path) -> Result<Option<EmbeddingMarker>> {
     let path = width_marker_path(db_path);
     if !path.exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         anyhow::anyhow!(
-            "Cannot read the embedding-width marker at {}: {}. Delete the marker only if you know the database's width.",
+            "Cannot read the embedding marker at {}: {}. Keep the database and marker intact; repair access or restore a matching snapshot to a separate path.",
             path.display(),
             e
         )
     })?;
 
-    let recorded: usize = raw.trim().parse().map_err(|e| {
-        anyhow::anyhow!(
-            "The embedding-width marker at {} is not a number ({:?}): {}",
+    let marker = if let Ok(marker) = serde_json::from_str::<EmbeddingMarker>(&raw) {
+        marker
+    } else {
+        let dimensions = raw.trim().parse().map_err(|e| {
+            anyhow::anyhow!(
+                "The embedding marker at {} is malformed ({:?}): {}",
+                path.display(),
+                raw,
+                e
+            )
+        })?;
+        EmbeddingMarker {
+            version: 1,
+            dimensions,
+            embedder_id: None,
+        }
+    };
+    if marker.version != 1 || marker.dimensions == 0 {
+        anyhow::bail!(
+            "The embedding marker at {} has unsupported version {} or zero width",
             path.display(),
-            raw,
-            e
-        )
-    })?;
+            marker.version
+        );
+    }
+    Ok(Some(marker))
+}
 
+fn persisted_embedding_width(db: &Database) -> Result<Option<usize>> {
+    let conn = Connection::new(db)?;
+    let mut rows = match conn.query("CALL table_info('Memory') RETURN *") {
+        Ok(rows) => rows,
+        Err(error) if error.to_string().contains("does not exist in catalog") => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut has_properties = false;
+    while let Some(row) = rows.next() {
+        has_properties = true;
+        if format!("{}", row[1]) != "embedding" {
+            continue;
+        }
+        let property_type = format!("{}", row[2]);
+        let Some((_, raw_width)) = property_type.split_once('[') else {
+            anyhow::bail!("Memory.embedding has unsupported schema type {property_type}");
+        };
+        let width = raw_width
+            .trim_end_matches(']')
+            .parse::<usize>()
+            .map_err(|e| {
+                anyhow::anyhow!("Memory.embedding has unsupported schema type {property_type}: {e}")
+            })?;
+        return Ok(Some(width));
+    }
+    if has_properties {
+        anyhow::bail!("Memory table exists but has no embedding property");
+    }
+    Ok(None)
+}
+
+fn check_embedding_width(db_path: &Path, recorded: usize, dimensions: usize) -> Result<()> {
     if recorded != dimensions {
         return Err(anyhow::anyhow!(
-            "Refusing to open {}: it was built with {}-dimension embeddings but the configured embedder produces {}. The Memory.embedding column is a fixed-width array, so this store cannot serve the current model. There is no re-embed migration yet -- delete the database and ingest again. Marker: {}",
+            "Refusing to open {}: its Memory.embedding column has width {} but the configured embedder produces {}. Keep this database intact and reopen it with a compatible embedder, or use a separate database path for the new model; no in-place re-embedding migration is available. Marker: {}",
             db_path.display(),
             recorded,
             dimensions,
-            path.display()
+            width_marker_path(db_path).display()
         ));
     }
 
@@ -638,14 +708,23 @@ fn check_width_marker(db_path: &Path, dimensions: usize) -> Result<()> {
 
 /// Record the width on first open. A failure here costs the guard, not the run,
 /// so it warns rather than failing the open.
-fn write_width_marker(db_path: &Path, dimensions: usize) {
+fn write_width_marker(db_path: &Path, dimensions: usize, embedder_id: Option<&str>) {
     let path = width_marker_path(db_path);
-    if path.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::write(&path, format!("{}\n", dimensions)) {
+    let marker = EmbeddingMarker {
+        version: 1,
+        dimensions,
+        embedder_id: embedder_id.map(str::to_string),
+    };
+    let tmp = path.with_extension(format!("embedding.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&marker)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
         eprintln!(
-            "could not record the embedding width at {}: {}. A later run with a different-width embedder will not be stopped.",
+            "could not record the embedding identity at {}: {}. A later model change may not be stopped.",
             path.display(),
             e
         );
@@ -827,6 +906,21 @@ impl LadybugStore {
         Self::with_system_config(local_path, dimensions, verifying_config(limits), limits)
     }
 
+    pub fn new_with_identity_limits(
+        local_path: impl Into<PathBuf>,
+        dimensions: usize,
+        embedder_id: String,
+        limits: StoreLimits,
+    ) -> Result<Self> {
+        Self::with_system_config_and_identity(
+            local_path,
+            dimensions,
+            Some(embedder_id),
+            verifying_config(limits),
+            limits,
+        )
+    }
+
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         Self::new_with_limits(local_path, dimensions, StoreLimits::default())
     }
@@ -842,13 +936,30 @@ impl LadybugStore {
         initial_config: SystemConfig,
         limits: StoreLimits,
     ) -> Result<Self> {
-        let local_path = local_path.into();
+        Self::with_system_config_and_identity(local_path, dimensions, None, initial_config, limits)
+    }
 
-        // A store built for one embedding width cannot serve another: the
-        // column is FLOAT[N] and nothing in the schema records N. Check before
-        // anything touches the file, so a misconfigured embedder fails loudly
-        // instead of reading and writing incompatible vectors.
-        check_width_marker(&local_path, dimensions)?;
+    fn with_system_config_and_identity(
+        local_path: impl Into<PathBuf>,
+        dimensions: usize,
+        embedder_id: Option<String>,
+        initial_config: SystemConfig,
+        limits: StoreLimits,
+    ) -> Result<Self> {
+        let local_path = local_path.into();
+        limits.validate()?;
+        if dimensions == 0 {
+            anyhow::bail!("embedding dimensions must be positive");
+        }
+        let database_preexisted = local_path.is_file();
+        // A marker cannot outlive the database it described. If the file is
+        // absent, ignore any sibling marker and replace it after opening this
+        // fresh path; otherwise a stale 768 marker can strand a new 384 DB.
+        let marker = if database_preexisted {
+            read_width_marker(&local_path)?
+        } else {
+            None
+        };
 
         // A WAL present at open time means the last process did not close cleanly:
         // a clean close checkpoints and removes it. Keep a copy before the engine
@@ -930,7 +1041,42 @@ impl LadybugStore {
             }
         };
 
-        write_width_marker(&local_path, dimensions);
+        let schema_width = persisted_embedding_width(&db)?;
+        if let Some(schema_width) = schema_width {
+            check_embedding_width(&local_path, schema_width, dimensions)?;
+            if let Some(marker) = &marker {
+                check_embedding_width(&local_path, marker.dimensions, schema_width)?;
+            }
+        } else if database_preexisted {
+            // An existing DB without Memory is either a new empty catalog or a
+            // partial/foreign schema; init() performs its own idempotent DDL.
+        }
+        if let Some(marker) = &marker {
+            check_embedding_width(&local_path, marker.dimensions, dimensions)?;
+            if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
+                if saved != current {
+                    return Err(anyhow::anyhow!(
+                        "Refusing to open {}: it was embedded with model identity {:?}, while the configured identity is {:?}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
+                        local_path.display(), saved, current
+                    ));
+                }
+            } else if marker.embedder_id.is_none() && embedder_id.is_some() {
+                eprintln!(
+                    "WARNING: {} records embedding width but no model identity; adopting the configured identity without verifying historical vectors. Future model changes will be blocked.",
+                    local_path.display()
+                );
+            }
+        } else if schema_width.is_some() && embedder_id.is_some() {
+            eprintln!(
+                "WARNING: {} has a fixed-width embedding schema but no sidecar identity; adopting the configured model identity without verifying historical vectors.",
+                local_path.display()
+            );
+        }
+        let marker_identity = marker
+            .as_ref()
+            .and_then(|marker| marker.embedder_id.as_deref())
+            .or(embedder_id.as_deref());
+        write_width_marker(&local_path, dimensions, marker_identity);
 
         Ok(Self {
             local_path,
@@ -1464,7 +1610,9 @@ fn norm_path(
     edges
         .iter()
         .map(|e| {
-            if *kind == crate::traits::EvidenceKind::OneHop && relations[e.relation.as_str()]["direction"] == "undirected" {
+            if *kind == crate::traits::EvidenceKind::OneHop
+                && relations[e.relation.as_str()]["direction"] == "undirected"
+            {
                 let (a, b) = if e.source <= e.target {
                     (e.source.clone(), e.target.clone())
                 } else {
@@ -1798,7 +1946,8 @@ impl VectorStore for LadybugStore {
         let scope = query.scope;
         let limit = query.limit;
         let namespace = namespace.to_string();
-        let is_procedure_scope = matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
+        let is_procedure_scope =
+            matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
         let proc_trigger = match &scope {
             crate::traits::DedupCandidateScope::Procedure { trigger } => Some(trigger.clone()),
             _ => None,
@@ -1942,7 +2091,8 @@ impl VectorStore for LadybugStore {
         exact_content: &str,
         scope: crate::traits::DedupCandidateScope,
     ) -> Result<Vec<crate::traits::ExactContentCandidate>> {
-        let is_procedure_scope = matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
+        let is_procedure_scope =
+            matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
         let proc_trigger = match &scope {
             crate::traits::DedupCandidateScope::Procedure { trigger } => Some(trigger.clone()),
             _ => None,
@@ -2140,6 +2290,15 @@ impl VectorStore for LadybugStore {
                 )
             })?;
         }
+        let source_marker = width_marker_path(&source);
+        if source_marker.exists() {
+            std::fs::copy(&source_marker, width_marker_path(&target)).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not copy the embedding marker into the snapshot: {}",
+                    e
+                )
+            })?;
+        }
         let manifest = serde_json::json!({
             "format": "neurostrata-snapshot",
             "version": 1,
@@ -2262,6 +2421,123 @@ impl VectorStore for LadybugStore {
             let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
             conn.query(&query)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn publish_ingested(
+        &self,
+        namespace: &str,
+        rows: Vec<(String, Vec<f32>, MemoryPayload)>,
+    ) -> Result<usize> {
+        let namespace = namespace.to_string();
+        self.write_with_deadline("publishing an ingested generation", move |conn| {
+            conn.query("BEGIN TRANSACTION")?;
+            let transaction = (|| -> Result<usize> {
+                let safe_namespace = escape_ladybug_string(&namespace);
+                conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m",
+                    safe_namespace
+                ))?;
+
+                for (id, vector, payload) in &rows {
+                    let vector_text = format!(
+                        "[{}]",
+                        vector
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    let values = [
+                        escape_ladybug_string(id),
+                        safe_namespace.clone(),
+                        escape_ladybug_string(&payload.content),
+                        escape_ladybug_string(&payload.user_id),
+                        escape_ladybug_string(&payload.memory_type),
+                        escape_ladybug_string(payload.agent_name.as_deref().unwrap_or("unknown")),
+                        escape_ladybug_string(&payload.location),
+                        escape_ladybug_string(&payload.location_lines),
+                        escape_ladybug_string(&serde_json::to_string(&payload.metadata)?),
+                    ];
+                    let query = format!(
+                        "MERGE (m:Memory {{id: '{}'}}) \
+                         ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {} \
+                         ON MATCH SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+                        values[0], values[1], values[2], values[3], values[4], values[5],
+                        values[6], values[7], values[8], vector_text,
+                        values[1], values[2], values[3], values[4], values[5], values[6],
+                        values[7], values[8], vector_text
+                    );
+                    conn.query(&query)?;
+                }
+
+                // Re-read declarations inside the transaction so the new nodes
+                // and the rules that point at them become visible together.
+                let mut memories = conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.user_id, m.metadata",
+                    safe_namespace
+                ))?;
+                let mut edge_rows = Vec::new();
+                let mut known_ids = Vec::new();
+                while let Some(row) = memories.next() {
+                    let id = format!("{}", row[0]);
+                    let user_id = format!("{}", row[1]);
+                    let metadata_text = format!("{}", row[2]);
+                    let metadata: serde_json::Value = serde_json::from_str(&metadata_text)
+                        .map_err(|e| anyhow::anyhow!("invalid metadata for {}: {}", id, e))?;
+                    known_ids.push(id.clone());
+                    edge_rows.push((id, user_id, metadata));
+                }
+                let known = KnownIds::new(known_ids.iter().map(String::as_str));
+                let mut wanted: std::collections::HashMap<
+                    &'static str,
+                    Vec<(String, String)>,
+                > = std::collections::HashMap::new();
+                for (id, _user_id, metadata) in &edge_rows {
+                    if is_retired(metadata) {
+                        continue;
+                    }
+                    for edge in edge_specs(metadata) {
+                        let target = known
+                            .resolve(&edge.target_id)
+                            .unwrap_or_else(|| edge.target_id.clone());
+                        let pair = if edge.points_at_target {
+                            (id.clone(), target)
+                        } else {
+                            (target, id.clone())
+                        };
+                        wanted.entry(edge.rel_type).or_default().push(pair);
+                    }
+                }
+                let mut created = 0;
+                for (rel_type, pairs) in &wanted {
+                    created += create_missing_edges(conn, rel_type, pairs)?;
+                }
+                Ok(created)
+            })();
+
+            match transaction {
+                Ok(created) => match conn.query("COMMIT") {
+                    Ok(_) => Ok(created),
+                    Err(commit) => match conn.query("ROLLBACK") {
+                        Ok(_) => Err(commit.into()),
+                        Err(rollback) => Err(anyhow::anyhow!(
+                            "atomic ingest commit failed: {}; rollback also failed: {}",
+                            commit,
+                            rollback
+                        )),
+                    },
+                },
+                Err(error) => match conn.query("ROLLBACK") {
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(anyhow::anyhow!(
+                        "atomic ingest publication failed: {}; rollback also failed: {}",
+                        error,
+                        rollback
+                    )),
+                },
+            }
         })
         .await
     }
@@ -2816,7 +3092,10 @@ mod tests {
     #[test]
     fn the_default_limits_are_a_ceiling_rather_than_most_of_ram() {
         let limits = StoreLimits::default();
-        assert!(limits.buffer_pool_bytes > 0, "a zero pool means 'ask the engine'");
+        assert!(
+            limits.buffer_pool_bytes > 0,
+            "a zero pool means 'ask the engine'"
+        );
         assert!(
             limits.buffer_pool_bytes <= 512 * 1024 * 1024,
             "the default pool must stay small enough not to scale with installed RAM"
@@ -2837,10 +3116,9 @@ mod tests {
 
         let marker = width_marker_path(&dir);
         assert!(marker.exists(), "the width is recorded beside the database");
-        assert_eq!(
-            std::fs::read_to_string(&marker).expect("read marker").trim(),
-            "4"
-        );
+        let marker_value: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(&marker).expect("read marker")).unwrap();
+        assert_eq!(marker_value.dimensions, 4);
 
         assert!(
             LadybugStore::for_testing(&dir, 4).is_ok(),
@@ -2862,7 +3140,7 @@ mod tests {
         };
         let message = format!("{error}");
         assert!(
-            message.contains("8-dimension"),
+            message.contains("width 8"),
             "names the recorded width: {message}"
         );
         assert!(
@@ -2871,6 +3149,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_database_without_marker_uses_catalog_width() {
+        let dir =
+            std::env::temp_dir().join(format!("ladybug-legacy-width-{}", uuid::Uuid::new_v4()));
+        {
+            let store = LadybugStore::for_testing(&dir, 8).expect("open at width 8");
+            store.init("probe").await.expect("create Memory schema");
+        }
+        std::fs::remove_file(width_marker_path(&dir)).expect("remove only test sidecar");
+        let error = match LadybugStore::for_testing(&dir, 4) {
+            Ok(_) => panic!("catalog width must guard a legacy DB without a sidecar"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("width 8"));
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn stale_marker_is_replaced_when_database_path_is_absent() {
+        let dir =
+            std::env::temp_dir().join(format!("ladybug-stale-marker-{}", uuid::Uuid::new_v4()));
+        std::fs::write(width_marker_path(&dir), "768\n").unwrap();
+        {
+            let _store =
+                LadybugStore::for_testing(&dir, 4).expect("fresh path ignores orphan marker");
+            let marker: EmbeddingMarker =
+                serde_json::from_slice(&std::fs::read(width_marker_path(&dir)).unwrap()).unwrap();
+            assert_eq!(marker.dimensions, 4);
+        }
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn same_width_model_identity_change_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ladybug-model-id-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("open model A");
+            store.init("probe").await.expect("create schema");
+        }
+        let error = match LadybugStore::new_with_identity_limits(
+            &dir,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        ) {
+            Ok(_) => panic!("same-width model changes alter the vector space"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("model identity"));
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
     }
 
     /// The resolution rule as every caller now reaches it: build the index
@@ -2910,6 +3245,13 @@ mod tests {
         assert!(
             out.join("manifest.json").exists(),
             "the snapshot carries a manifest"
+        );
+        let snapshot_marker = width_marker_path(&out.join("ladybug.store"));
+        let marker: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(snapshot_marker).unwrap()).unwrap();
+        assert_eq!(
+            marker.dimensions, 4,
+            "the snapshot stays paired with its width"
         );
     }
 
@@ -3477,6 +3819,174 @@ eurostrata\src\daemon.rs",
         );
         assert!(declared_target_candidates("probe", "C:/old/src/a.rs")
             .contains(&"probe::src/a.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ingest_publication_rolls_back_rows_and_rule_edges_on_store_failure() {
+        let dir = std::env::temp_dir().join(format!("atomic-ingest-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temporary database");
+        store.init("atomic").await.expect("create schema");
+        let old_id = format!("atomic{}old.rs", crate::parser::ingest::NAMESPACE_SEPARATOR);
+        store
+            .upsert(
+                "atomic",
+                &old_id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "Path: old.rs".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "old.rs".into(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "atomic",
+                "rule-atomic",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "rule".into(),
+                    user_id: "agent".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"governs": [old_id]}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let new_id = format!("atomic{}new.rs", crate::parser::ingest::NAMESPACE_SEPARATOR);
+        let result = store
+            .publish_ingested(
+                "atomic",
+                vec![(
+                    new_id.clone(),
+                    vec![0.0; 3], // violates the persisted FLOAT[4] width after the delete
+                    MemoryPayload {
+                        content: "Path: new.rs".into(),
+                        user_id: "auto-ingestor".into(),
+                        memory_type: "file".into(),
+                        agent_name: None,
+                        location: "new.rs".into(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the invalid staged vector aborts the transaction"
+        );
+        assert!(store.get("atomic", &old_id).await.unwrap().is_some());
+        assert!(store.get("atomic", &new_id).await.unwrap().is_none());
+        let graph = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(graph["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| { link["source"] == "rule-atomic" && link["target"] == old_id }));
+
+        let interrupted_namespace = "atomic".to_string();
+        let interrupted: Result<()> = store
+            .with_conn(move |conn| -> Result<()> {
+                conn.query("BEGIN TRANSACTION")?;
+                conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m",
+                    interrupted_namespace
+                ))?;
+                anyhow::bail!("simulated process interruption before commit");
+            })
+            .await;
+        assert!(interrupted.is_err());
+        assert!(
+            store.get("atomic", &old_id).await.unwrap().is_some(),
+            "disconnecting before COMMIT leaves the last committed generation intact"
+        );
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[tokio::test]
+    async fn readers_keep_seeing_the_old_ingest_until_atomic_commit() {
+        let dir = std::env::temp_dir().join(format!("atomic-reader-{}", uuid::Uuid::new_v4()));
+        let store = std::sync::Arc::new(LadybugStore::for_testing(&dir, 4).expect("open DB"));
+        store.init("atomic-reader").await.unwrap();
+        let old_id = format!(
+            "atomic-reader{}old.rs",
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        store
+            .upsert(
+                "atomic-reader",
+                &old_id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "Path: old.rs".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "old.rs".into(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let writer_store = store.clone();
+        let namespace = "atomic-reader".to_string();
+        let writer = tokio::spawn(async move {
+            writer_store
+                .write_with_deadline("test atomic publication", move |conn| {
+                    conn.query("BEGIN TRANSACTION")?;
+                    conn.query(&format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m",
+                        namespace
+                    ))?;
+                    started_tx
+                        .clone()
+                        .send(())
+                        .expect("signal uncommitted delete");
+                    release_rx.lock().unwrap().recv().expect("release transaction");
+                    conn.query("COMMIT")?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("writer began transaction"))
+            .await
+            .unwrap();
+
+        let visible = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.get("atomic-reader", &old_id),
+        )
+        .await;
+        let _ = release_tx.send(());
+        writer.await.unwrap().unwrap();
+        assert!(
+            visible
+                .expect("reader should not block behind the uncommitted writer")
+                .unwrap()
+                .is_some(),
+            "the old generation stays visible until commit"
+        );
+        assert!(store.get("atomic-reader", &old_id).await.unwrap().is_none());
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[tokio::test]
@@ -7243,7 +7753,10 @@ eurostrata\src\daemon.rs",
                     results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
                 )
             });
-        let evidence = file.evidence.as_ref().expect("the expansion row carries evidence");
+        let evidence = file
+            .evidence
+            .as_ref()
+            .expect("the expansion row carries evidence");
         assert!(
             evidence
                 .iter()
@@ -7455,7 +7968,10 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        let results = store.search("probe", query_vec, 10, false, false).await.unwrap();
+        let results = store
+            .search("probe", query_vec, 10, false, false)
+            .await
+            .unwrap();
         assert!(
             !results.iter().any(|r| r.id == registry_id),
             "the registry row must never appear in search results"

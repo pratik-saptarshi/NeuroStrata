@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -58,8 +59,11 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
         .map(|home| home.join(".config").join("neurostrata"))
         .unwrap_or_else(|| PathBuf::from(".neurostrata"));
 
+    // Configuration is optional: the built-in defaults remain usable when
+    // the home directory is read-only. Persisting those defaults is best
+    // effort, like the write below, rather than a prerequisite for startup.
     if !config_dir.exists() {
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
+        let _ = fs::create_dir_all(&config_dir);
     }
 
     let config_path = config_dir.join("embedders.json");
@@ -141,6 +145,29 @@ fn configured_model() -> Result<AcceptableEmbedder> {
         .clone())
 }
 
+/// Stable, non-secret identity for the configured embedding space. This is
+/// available without loading the local model, so backup, restore, and metadata
+/// reads can validate the same identity as the daemon.
+pub fn configured_embedder_id() -> Result<String> {
+    let model = configured_model()?;
+    Ok(match (&model.base_url, &model.api_key_env) {
+        (Some(base_url), Some(_)) => {
+            // Keep credential-bearing or tenant-specific endpoint URLs out of
+            // the adjacent database sidecar while retaining a stable identity.
+            let endpoint_hash = sha2::Sha256::digest(base_url.trim_end_matches('/').as_bytes());
+            format!(
+                "remote-sha256:{}:{}",
+                hex::encode(endpoint_hash),
+                model
+                    .api_model
+                    .as_deref()
+                    .unwrap_or("text-embedding-3-small")
+            )
+        }
+        _ => format!("fastembed:{}", model.model_name),
+    })
+}
+
 /// The embedding width of the configured model, without loading the model.
 ///
 /// Backup and restore need only this number to open the store. Loading the model
@@ -192,7 +219,7 @@ impl FastEmbedder {
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
-            model_name: target_model.model_name.clone(),
+            model_name: format!("fastembed:{}", target_model.model_name),
             dimensions: target_model.dimensions,
         })
     }
@@ -247,6 +274,7 @@ impl RemoteEmbedder {
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
+        let model_name = format!("remote:{}:{}", base_url.trim_end_matches('/'), api_model);
 
         Ok(Self {
             client,
@@ -254,7 +282,7 @@ impl RemoteEmbedder {
             api_key,
             api_model: api_model.clone(),
             dimensions,
-            model_name: api_model,
+            model_name,
         })
     }
 
@@ -354,6 +382,59 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    struct MockEndpoint {
+        statuses: AsyncMutex<VecDeque<u16>>,
+        requests: AtomicUsize,
+    }
+
+    async fn mock_embedding(State(state): State<Arc<MockEndpoint>>) -> impl IntoResponse {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let status = state.statuses.lock().await.pop_front().unwrap_or(200);
+        let status = StatusCode::from_u16(status).unwrap();
+        if status.is_success() {
+            (status, Json(json!({"data": [{"embedding": [0.25, 0.5]}]}))).into_response()
+        } else {
+            (status, Json(json!({"error": "mock failure"}))).into_response()
+        }
+    }
+
+    async fn exercise_retry(statuses: &[u16], expected_requests: usize, succeeds: bool) {
+        let state = Arc::new(MockEndpoint {
+            statuses: AsyncMutex::new(statuses.iter().copied().collect()),
+            requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/embeddings", post(mock_embedding))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{address}"),
+            "test-key".into(),
+            "test-model".into(),
+            2,
+        )
+        .unwrap();
+        let result = embedder.embed("test").await;
+        assert_eq!(result.is_ok(), succeeds, "status sequence {statuses:?}");
+        assert_eq!(
+            state.requests.load(Ordering::SeqCst),
+            expected_requests,
+            "status sequence {statuses:?}"
+        );
+        server.abort();
+    }
 
     #[test]
     fn the_configured_width_is_known_without_loading_a_model() {
@@ -393,11 +474,13 @@ mod tests {
     }
 
     #[test]
-    fn build_embedder_falls_back_to_local() {
-        // When no remote config, should use local
-        // This tests the factory logic
-        let embedder = build_embedder();
-        assert!(embedder.is_ok());
+    fn default_configuration_selects_local_embedding() {
+        // Verify backend selection without loading or downloading a model.
+        // Model availability is an installation concern, not a factory test.
+        let model = configured_model().expect("built-in embedding defaults resolve");
+        assert!(model.base_url.is_none());
+        assert!(model.api_key_env.is_none());
+        assert_eq!(model.model_name, "NomicEmbedTextV15");
     }
 
     /// The retry used to probe `downcast_ref::<StatusCode>()` on a string that
@@ -429,11 +512,23 @@ mod tests {
         assert!(should_retry(&status(429)), "429 is a rate limit");
         assert!(should_retry(&status(500)), "5xx is transient");
         assert!(should_retry(&status(503)), "5xx is transient");
-        assert!(!should_retry(&status(400)), "a bad request will not improve");
+        assert!(
+            !should_retry(&status(400)),
+            "a bad request will not improve"
+        );
         assert!(!should_retry(&status(401)), "a bad key will not improve");
         assert!(
             !should_retry(&anyhow::anyhow!("connection reset")),
             "an untyped error must not be retried as if it were a rate limit"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_retry_policy_runs_against_a_local_http_server() {
+        exercise_retry(&[429, 200], 2, true).await;
+        exercise_retry(&[503, 200], 2, true).await;
+        exercise_retry(&[503, 503], 2, false).await;
+        exercise_retry(&[400, 200], 1, false).await;
+        exercise_retry(&[401, 200], 1, false).await;
     }
 }

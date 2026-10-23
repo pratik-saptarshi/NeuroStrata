@@ -658,13 +658,18 @@ async fn direct_report(
             e
         )
     })?;
+    let embedder_id = embed::configured_embedder_id()
+        .map_err(|e| format!("the configured embedding identity could not be read: {}", e))?;
     let store: Arc<dyn VectorStore> = Arc::new(
-        LadybugStore::new_with_limits(
+        LadybugStore::new_with_identity_limits(
             config.db_path.to_string_lossy().to_string(),
             dimensions,
-            config.store_limits(),
+            embedder_id,
+            config
+                .store_limits()
+                .map_err(|e| format!("store limits are invalid: {}", e))?,
         )
-            .map_err(|e| format!("the database could not be opened: {}", e))?,
+        .map_err(|e| format!("the database could not be opened: {}", e))?,
     );
     store
         .init(namespace)
@@ -1882,11 +1887,13 @@ async fn run() -> anyhow::Result<()> {
                 // to be released rather than for the port to close.
                 let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
                 let embedder = build_embedder()?;
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new_with_limits(
-                    config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
-                    config.store_limits(),
-                )?);
+                let vector_store: Arc<dyn VectorStore> =
+                    Arc::new(LadybugStore::new_with_identity_limits(
+                        config.db_path.to_string_lossy().to_string(),
+                        embedder.dimensions(),
+                        embedder.embedder_id().to_string(),
+                        config.store_limits()?,
+                    )?);
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
                     embedder,
@@ -2120,11 +2127,13 @@ async fn run() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 // The width opens the store; exporting never embeds anything.
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new_with_limits(
-                    config.db_path.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                    config.store_limits(),
-                )?);
+                let vector_store: Arc<dyn VectorStore> =
+                    Arc::new(LadybugStore::new_with_identity_limits(
+                        config.db_path.to_string_lossy().to_string(),
+                        embed::configured_dimensions()?,
+                        embed::configured_embedder_id()?,
+                        config.store_limits()?,
+                    )?);
                 vector_store.export_database(&dir).await?;
                 println!("Backed up to {}", dir);
                 return Ok(());
@@ -2166,14 +2175,25 @@ async fn run() -> anyhow::Result<()> {
                     target_wal.push(".wal");
                     std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
                 }
+                let snapshot_marker = crate::store::ladybug::width_marker_path(&snapshot);
+                let target_marker = crate::store::ladybug::width_marker_path(&target);
+                if snapshot_marker.exists() {
+                    std::fs::copy(&snapshot_marker, &target_marker)?;
+                } else if target_marker.exists() {
+                    // The database target was absent; this sibling is stale.
+                    // Remove only the orphan marker, never database contents.
+                    std::fs::remove_file(&target_marker)?;
+                }
 
                 // Opened only after the copy, to verify the restored store
                 // reads back and to report what it holds.
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new_with_limits(
-                    target.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                    config.store_limits(),
-                )?);
+                let vector_store: Arc<dyn VectorStore> =
+                    Arc::new(LadybugStore::new_with_identity_limits(
+                        target.to_string_lossy().to_string(),
+                        embed::configured_dimensions()?,
+                        embed::configured_embedder_id()?,
+                        config.store_limits()?,
+                    )?);
 
                 let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
                 println!("Restored {} into {:?}", dir, target);
@@ -2441,11 +2461,13 @@ async fn run() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                         let embedder = build_embedder()?;
-                        let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new_with_limits(
-                            config.db_path.to_string_lossy().to_string(),
-                            embedder.dimensions(),
-                            config.store_limits(),
-                        )?);
+                        let vector_store: Arc<dyn VectorStore> =
+                            Arc::new(LadybugStore::new_with_identity_limits(
+                                config.db_path.to_string_lossy().to_string(),
+                                embedder.dimensions(),
+                                embedder.embedder_id().to_string(),
+                                config.store_limits()?,
+                            )?);
                         match crate::task::import_beads(
                             vector_store,
                             embedder.clone(),
@@ -2664,11 +2686,13 @@ async fn run() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 let embedder = build_embedder()?;
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new_with_limits(
-                    config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
-                    config.store_limits(),
-                )?);
+                let vector_store: Arc<dyn VectorStore> =
+                    Arc::new(LadybugStore::new_with_identity_limits(
+                        config.db_path.to_string_lossy().to_string(),
+                        embedder.dimensions(),
+                        embedder.embedder_id().to_string(),
+                        config.store_limits()?,
+                    )?);
                 let read = ReadSource::Direct(vector_store.clone());
 
                 match other {

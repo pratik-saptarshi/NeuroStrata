@@ -99,8 +99,7 @@ pub struct SearchEvidence {
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
     evidence.as_ref().map_or(false, |evs| {
-        evs.iter()
-            .any(|e| e.kind == EvidenceKind::DirectMatch)
+        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
     })
 }
 
@@ -264,6 +263,17 @@ pub trait VectorStore: Send + Sync {
     /// Remove every row owned by the directory ingester in a namespace: the AST
     /// symbols and the directory/file nodes, which ingestion then rebuilds.
     async fn clear_ingested(&self, namespace: &str) -> Result<()>;
+
+    /// Atomically replace the namespace's ingested rows with a fully prepared
+    /// generation and restore all declared edges before it becomes visible.
+    /// Backends without transactional publication must reject the operation.
+    async fn publish_ingested(
+        &self,
+        _namespace: &str,
+        _rows: Vec<(String, Vec<f32>, MemoryPayload)>,
+    ) -> Result<usize> {
+        anyhow::bail!("this vector store does not support atomic ingest publication")
+    }
 
     /// Rebuilds the edges a namespace's memories declare, and reports how many
     /// were materialised.

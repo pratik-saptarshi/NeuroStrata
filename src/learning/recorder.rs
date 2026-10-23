@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs::OpenOptions;
-use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::path::Path;
 
 use crate::learning::observation::{
     DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind, PayloadHash,
@@ -52,7 +50,11 @@ impl LearningRecorder {
         Ok(())
     }
 
-    pub async fn record_blob_hash(&self, _payload_hash: &PayloadHash, _input: &crate::traits::MemoryPayload) -> Result<()> {
+    pub async fn record_blob_hash(
+        &self,
+        _payload_hash: &PayloadHash,
+        _input: &crate::traits::MemoryPayload,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -82,12 +84,9 @@ mod tests {
         assert!(hash1.0.starts_with("sha256:"));
     }
 
-    #[test]
     #[tokio::test]
-    async fn observation_jsonl_append_write_atomic() {
-        // Append-only atomicity: two records must land on separate lines even if
-        // we close and reopen before the second flush completes.
-        let tmpdir = std::env::temp_dir().join("ns_learn_test");
+    async fn observation_jsonl_appends_records_across_reopen() {
+        let tmpdir = std::env::temp_dir().join(format!("ns-learn-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmpdir).unwrap();
         let rec = LearningRecorder::open(tmpdir.clone(), None).await.unwrap();
         let v1 = DecisionObservation {
@@ -112,11 +111,8 @@ mod tests {
             decision: crate::judgment::DedupDecision::Allowed,
         };
         rec.record_observation(&v1).await.unwrap();
-        // Reopen separately to ensure append semantics, no pre-existing data
-        // from previous test runs.
-        let tmpdir2 = std::env::temp_dir().join("ns_learn_test_2");
-        std::fs::create_dir_all(&tmpdir2).unwrap();
-        let rec2 = LearningRecorder::open(tmpdir2, None).await.unwrap();
+        drop(rec);
+        let reopened = LearningRecorder::open(tmpdir.clone(), None).await.unwrap();
         let v2 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-2".into(),
@@ -138,9 +134,19 @@ mod tests {
             shadow_model_version: None,
             decision: crate::judgment::DedupDecision::BlockedExact,
         };
-        rec2.record_observation(&v2).await.unwrap();
-        assert!(true);
-        let _ = tmpdir;
-        let _ = tmpdir2;
+        reopened.record_observation(&v2).await.unwrap();
+
+        let mut entries = std::fs::read_dir(&tmpdir).unwrap();
+        let path = entries.next().unwrap().unwrap().path();
+        assert!(entries.next().is_none(), "one log file per month");
+        let contents = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<DecisionObservation> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "each flushed append is a complete JSONL row");
+        assert_eq!(rows[0].observation_id, "obs-1");
+        assert_eq!(rows[1].observation_id, "obs-2");
+        std::fs::remove_dir_all(tmpdir).unwrap();
     }
 }

@@ -4,6 +4,21 @@
 **Source:** `review_panel_report.md` (verdict REJECT-AND-REWRITE, 3.2/10)
 **Sequencing rule:** evidence strength, not claimed byte savings.
 
+## Status record — 2026-10-23
+
+Source changes implemented: recorder append/reopen coverage, staged ingest with atomic
+publication and failure propagation, local HTTP retry tests, store-limit validation, and
+embedding width/identity plus backup/restore marker handling. The binary test suite passes
+758/758 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
+default locked build remains blocked because the `ort-sys` prebuilt download from
+`cdn.pyke.io` returned HTTP 403 through the environment proxy. That override is only a local
+verification path; it is not equivalent to the default-feature CI build. The reviewed PR
+head had workflow-dispatch run `39911946378`: its Ubuntu test job failed compilation on the
+stacked async test attributes in `src/learning/recorder.rs`; macOS, Ubuntu build, and Windows
+build jobs passed. The final changed SHA still requires CI. Runtime memory was not measured
+because no representative model, corpus, and workload were available; no empirical
+improvement is claimed.
+
 ## Scope decisions
 
 The review produced 13 action items. They are not all code, and two are "do not do this".
@@ -15,7 +30,7 @@ Each is settled here; nothing is left open.
 | 2 | Measure RSS baseline | **Not code** — operator procedure. Documented in report; requires a running daemon. |
 | 3 | Ingest clears before embed / swallows failures | **Implement** (T1) |
 | 4 | Remote 429/5xx retry never fires | **Implement** (T2) |
-| 5 | Model/dimension guard + migration | **Implement guard** (T4). Full re-embed migration is not implemented — see "Open item" below. |
+| 5 | Model/dimension guard + migration | **Implement catalog width and model identity guards** (T4). In-place re-embedding is unavailable; use the safe separate-database lifecycle below. |
 | 6 | Keep remote opt-in | **No code change** — current default is already local. Do not change it. |
 | 7 | Tokio feature trimming | **Rejected.** The proposed subset does not compile (`fs`/`net`/`signal` in use) and features do not set thread counts. Keep `full`. |
 | 8 | BlobStore bounding | **Rejected.** No production caller. |
@@ -25,16 +40,22 @@ Each is settled here; nothing is left open.
 | 12 | Prune finished ingest jobs | **Rejected.** `src/ingest_jobs.rs:132-135` documents retention as deliberate: one receiver per *namespace*, bounded by namespace count, and required so a finished walk's status stays queryable. The panel's "unbounded" claim is wrong. |
 | 13 | Lane numbering / split rollout | **Satisfied** — this plan splits work into independent commits. |
 
-### Open item (must not roll forward silently)
+### Embedding change disposition
 
-**Full re-embed migration for embedder changes.** T4 blocks a width mismatch at open, which
-prevents corruption; it does not move an existing 768-dim corpus to a 384-dim model. Doing
-that needs: a staging namespace or shadow DB, a re-embed pass over every stored `memory_type`
-that carries a real vector, and a swap. **Next action:** file as a task titled "Re-embed
-migration for embedder width/identity change" with the acceptance test "open a 768-dim DB
-under a 384-dim embedder, migrate, and assert search recall on a fixed query set". Owner: to
-be assigned. Until it exists, changing the model on an existing DB is a manual
-delete-and-reingest.
+There is no in-place re-embedding migration. The store checks persisted catalog width and,
+for databases with a v1 marker, model identity. On a mismatch, keep the original database and
+marker intact. Reopen with the original embedder to retain access, or configure a separate
+database path for the new embedder and ingest into that new database. Do not delete or
+overwrite the original database. A legacy database with width but no model identity adopts the
+currently configured model once with a warning; that historical identity cannot be proven.
+New writes record identity, and later identity changes are rejected.
+
+The supported operating behavior is to retain the original database with its original
+embedder, or use a separate database path and ingest the corpus again with the new embedder.
+In-place re-embedding is not supported or promised by this change; this is a resolved product
+boundary, not a deferred implementation task. No migration task ID or owner acceptance is
+claimed. The NeuroStrata task/memory CLI and MCP tracking tools were unavailable in this
+environment, so no external task could be created or assigned.
 
 ---
 
@@ -42,19 +63,24 @@ delete-and-reingest.
 
 **File:** `src/parser/ingest.rs`, `run_consumer` match block (~`:486-508`)
 
-Current: embed error → `eprintln!`; upsert error → `eprintln!`; loop continues;
-`ingest_directory` returns `Ok(())` because `consumer_result?` sees no error.
+Original defect: symbol embed/upsert errors propagated, structural-node upsert errors were
+logged and ignored, and the live namespace was cleared before the walk finished.
 
 Steps:
-1. Add a failing test: embedder that always errors, store from `for_testing`, assert
-   `ingest_directory` returns `Err`. Requires a fixture directory with one `.rs` file.
-   **Watch it fail** (it currently returns `Ok`).
-2. Replace both `eprintln!` branches with `?` propagation, each mapped to an `anyhow` error
-   that names the symbol, the file, and states the namespace was already cleared.
+1. Keep regression tests for embedder and structural upsert failures, asserting the old graph
+   remains available.
+2. Stage the new graph under a private namespace; propagate structural and symbol failures.
+   Publish rows and rebuild declared edges inside one LadybugDB transaction.
 3. Re-run the test; watch it pass.
 4. Run the existing ingest tests to confirm no regression.
 
-**Acceptance:** a failing embed makes the command fail; no path logs and continues.
+**Acceptance:** producer, embedder, and structural/symbol store failures return errors; a
+failed staged rebuild leaves the previously published ingested rows available. Publication
+deletes old ingested rows, writes the new rows, and recreates declared edges in one database
+transaction; readers see the prior committed generation until commit. A failed query rolls
+back before the error returns, and closing an interrupted transaction relies on LadybugDB's
+transaction recovery. Integration tests cover query failure rollback, a connection ending
+before commit, and reader visibility while a publication transaction is open.
 
 ---
 
@@ -62,13 +88,12 @@ Steps:
 
 **File:** `src/embed.rs`, `try_embed` (~`:267-271`) and `embed_with_retry` (~`:232-252`)
 
-Current: `try_embed` returns `anyhow!("API error {status}: {body}")`. `embed_with_retry`
-tests `e.downcast_ref::<reqwest::StatusCode>()`, which can never match a formatted string.
-The retry branch is dead.
+Original defect: `try_embed` returned a formatted status string that could not match the
+retry classifier, so the retry branch was dead.
 
 Steps:
-1. Add a failing test: build the error `try_embed` would return, assert
-   `downcast_ref::<EmbedApiStatus>().is_some()`. **Watch it fail** against the current shape.
+1. Preserve the typed API status in the error chain and test actual request counts against a
+   deterministic local HTTP server.
 2. Add `struct EmbedApiStatus(reqwest::StatusCode)` implementing `Display` + `Error`; return
    `anyhow::Error::new(EmbedApiStatus(status))` from the non-success branch.
 3. Re-run; watch it pass.
@@ -82,7 +107,7 @@ Steps:
 
 **Files:** `src/config.rs`, `src/store/ladybug.rs`, `src/main.rs`
 
-Current: `verifying_config()` = `SystemConfig::default().throw_on_wal_replay_failure(true)`.
+Original defect: `verifying_config()` used `SystemConfig::default().throw_on_wal_replay_failure(true)`.
 `SystemConfig::default()` sets `buffer_pool_size: 0`, which lbug resolves to **80% of
 physical RAM**, and `max_db_size: u32::MAX`, which resolves to an 8 TB virtual region. Tests
 bound both; production does not.
@@ -118,34 +143,45 @@ Steps:
 
 **File:** `src/store/ladybug.rs`
 
-Current: `CREATE NODE TABLE Memory (... embedding FLOAT[N] ...)` is sized from the embedder's
-declared width. Opening an existing 768-dim DB under a 384-dim embedder does not resize
-anything; queries and writes fail later, or worse, silently mix spaces. No identity is stored.
+Original defect: `CREATE NODE TABLE Memory (... embedding FLOAT[N] ...)` is sized from the
+embedder's declared width. A missing sidecar adopted configuration without checking catalog
+width, and same-width models shared an unguarded vector space.
 
 Steps:
-1. Add a sidecar `<db_path>.embedding` recording `{"dimensions": N}`.
-2. In `with_system_config`, before opening: if the sidecar exists and `N` differs, return an
-   error naming both widths and the file, and instruct delete-and-reingest (there is no
-   migration yet — see the open item).
-3. After a successful open with no sidecar, write it. A write failure is a warning, not fatal.
-4. Tests: mismatched sidecar is refused; matching sidecar opens; absent sidecar creates one.
+1. Persist a v1 JSON sidecar with width and embedder identity.
+2. When absent, inspect persisted `Memory.embedding` catalog width before adopting config.
+3. Ignore an orphan sidecar when the DB path is absent; replace it after opening a fresh DB.
+4. Copy the sidecar with backup and restore the paired sidecar with the database.
+5. Guard known same-width model identity changes; warn when a legacy DB's historical model is
+   unknown and adopt the configured identity once.
 
 **Acceptance:** a width mismatch fails loudly at open instead of corrupting later.
 
 ---
 
-## Verification
+## Verification status
 
-- `cargo build` (release check of the touched paths)
-- `cargo test parser::ingest` — T1
-- `cargo test embed` — T2
-- `cargo test config` — T3 resolver
-- `cargo test store::ladybug` — T3/T4
-- Full `cargo test` before finishing the branch.
+| Gate | Status |
+|---|---|
+| Source changes | Implemented; formatting applied; `git diff --check` passes |
+| Type-check | `cargo check --tests` passed with temporary `ort-load-dynamic` override and source-built LadybugDB |
+| Binary test suite | 758/758 passed with that same temporary override; actual local model loading/inference was not exercised because model weights are absent |
+| Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no download bypass was attempted |
+| Exact-head PR CI | Reviewed head `b904541f78e0f5840b77bcc431334dd5ad234eed` had workflow-dispatch run `39911946378`; Ubuntu test compilation failed on stacked async test attributes, while all three platform build jobs passed. Final changed SHA CI remains pending push and GitHub Actions execution |
+| Runtime memory comparison | Not measured: no matching model, corpus, and workload were available. Startup, inference, ingest peak, idle RSS, latency/throughput, and DB size remain unmeasured; no empirical improvement is claimed |
+| Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
+| NeuroStrata task/memory gate | Unavailable: task/memory MCP tools and the `neurostrata-mcp` CLI are not installed |
 
-## Commits (one per task, independent and revertible)
+Default-feature verification commands remain blocked by the ONNX prebuilt download:
 
-1. `fix(ingest): fail the walk when a symbol cannot be embedded or stored`
-2. `fix(embed): carry the HTTP status so the 429/5xx retry can fire`
-3. `fix(store): bound the buffer pool and database size in production`
-4. `fix(store): refuse to open a database whose embedding width changed`
+- `cargo build --locked --release`
+- `cargo test --locked parser::ingest`
+- `cargo test --locked embed`
+- `cargo test --locked config`
+- `cargo test --locked store::ladybug`
+- `cargo test --locked -- --test-threads=1`
+
+## Change organization
+
+The approved corrections share failure-handling and persistence boundaries. Commit them as
+one reviewable PR correction after the required tests and exact-head CI pass.

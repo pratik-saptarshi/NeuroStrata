@@ -32,6 +32,8 @@ struct Row {
 /// the tests need to decide which rules are candidates and in what order.
 pub struct MockStore {
     rows: Mutex<Vec<Row>>,
+    fail_upsert_containing: Mutex<Option<String>>,
+    fail_next_upsert_in_namespace: Mutex<Option<String>>,
     /// Toggle to make search/search_with_domain return an error.
     search_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
@@ -42,6 +44,8 @@ impl MockStore {
     pub fn new() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
+            fail_upsert_containing: Mutex::new(None),
+            fail_next_upsert_in_namespace: Mutex::new(None),
             search_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
         }
@@ -81,6 +85,17 @@ impl MockStore {
     pub(crate) fn set_search_fails(&self, fails: bool) {
         *self.search_fails.lock().expect("mock store lock") = fails;
     }
+
+    pub(crate) fn fail_upsert_containing(&self, needle: Option<String>) {
+        *self.fail_upsert_containing.lock().expect("mock store lock") = needle;
+    }
+
+    pub(crate) fn fail_next_upsert_in_namespace(&self, namespace: Option<String>) {
+        *self
+            .fail_next_upsert_in_namespace
+            .lock()
+            .expect("mock store lock") = namespace;
+    }
 }
 
 impl Default for MockStore {
@@ -102,6 +117,28 @@ impl VectorStore for MockStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<UpsertReport> {
+        let mut fail_namespace = self
+            .fail_next_upsert_in_namespace
+            .lock()
+            .expect("mock store lock");
+        if fail_namespace.as_deref() == Some(namespace) {
+            *fail_namespace = None;
+            return Err(anyhow::anyhow!(
+                "MockStore one-shot upsert failure in {namespace}"
+            ));
+        }
+        drop(fail_namespace);
+        if self
+            .fail_upsert_containing
+            .lock()
+            .expect("mock store lock")
+            .as_ref()
+            .is_some_and(|needle| id.contains(needle))
+        {
+            return Err(anyhow::anyhow!(
+                "MockStore upsert configured to fail for {id}"
+            ));
+        }
         let mut rows = self.rows.lock().expect("mock store lock");
         let row = Row {
             namespace: namespace.to_string(),
@@ -286,8 +323,40 @@ impl VectorStore for MockStore {
         Ok(())
     }
 
-    async fn clear_ingested(&self, _namespace: &str) -> Result<()> {
+    async fn clear_ingested(&self, namespace: &str) -> Result<()> {
+        self.rows
+            .lock()
+            .expect("mock store lock")
+            .retain(|row| row.namespace != namespace || row.payload.user_id != "auto-ingestor");
         Ok(())
+    }
+
+    async fn publish_ingested(
+        &self,
+        namespace: &str,
+        replacements: Vec<(String, Vec<f32>, MemoryPayload)>,
+    ) -> Result<usize> {
+        let mut fail_namespace = self
+            .fail_next_upsert_in_namespace
+            .lock()
+            .expect("mock store lock");
+        if fail_namespace.as_deref() == Some(namespace) {
+            *fail_namespace = None;
+            return Err(anyhow::anyhow!(
+                "MockStore atomic publication failure in {namespace}"
+            ));
+        }
+        drop(fail_namespace);
+
+        let mut rows = self.rows.lock().expect("mock store lock");
+        rows.retain(|row| row.namespace != namespace || row.payload.user_id != "auto-ingestor");
+        rows.extend(replacements.into_iter().map(|(id, vector, payload)| Row {
+            namespace: namespace.to_string(),
+            id,
+            vector,
+            payload,
+        }));
+        Ok(0)
     }
 
     async fn relink_edges(&self, _namespace: &str) -> Result<usize> {
