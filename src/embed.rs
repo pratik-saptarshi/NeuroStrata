@@ -148,21 +148,34 @@ fn configured_model() -> Result<AcceptableEmbedder> {
 /// Canonical identity for a remote embedding space. The endpoint is hashed so
 /// credentials embedded in a URL never enter the database marker or errors.
 /// Trailing slashes do not change the endpoint identity.
-fn remote_embedder_id(base_url: &str, api_model: &str) -> String {
+pub(crate) fn remote_embedder_id(base_url: &str, api_model: &str) -> String {
     let endpoint_hash = sha2::Sha256::digest(base_url.trim_end_matches('/').as_bytes());
     format!("remote-sha256:{}:{}", hex::encode(endpoint_hash), api_model)
 }
 
-/// Upgrade identities written by older runtime constructors, which included
-/// the raw remote URL, before comparing or persisting them again.
-pub(crate) fn canonicalize_persisted_embedder_id(identity: &str) -> String {
+/// Upgrade a legacy runtime identity only when it can be matched exactly to
+/// the configured canonical identity. Both endpoint URLs and model names may
+/// contain colons, so the legacy string cannot be split safely in isolation.
+pub(crate) fn canonicalize_persisted_embedder_id(
+    identity: &str,
+    configured_identity: &str,
+) -> Result<String> {
+    if identity == configured_identity || !identity.starts_with("remote:") {
+        return Ok(identity.to_string());
+    }
     let Some(legacy) = identity.strip_prefix("remote:") else {
-        return identity.to_string();
+        unreachable!();
     };
-    let Some((endpoint, model)) = legacy.rsplit_once(':') else {
-        return identity.to_string();
-    };
-    remote_embedder_id(endpoint, model)
+    if configured_identity.starts_with("remote-sha256:") {
+        for (split, _) in legacy.match_indices(':') {
+            let endpoint = &legacy[..split];
+            let model = &legacy[split + 1..];
+            if remote_embedder_id(endpoint, model) == configured_identity {
+                return Ok(configured_identity.to_string());
+            }
+        }
+    }
+    anyhow::bail!("legacy remote embedding model identity cannot be safely matched to the configured model; keep this database intact and reopen with its original endpoint and model, or use a separate database path")
 }
 
 fn configured_identity_for(model: &AcceptableEmbedder) -> String {
@@ -541,10 +554,33 @@ mod tests {
         assert_eq!(
             configured,
             canonicalize_persisted_embedder_id(
-                "remote:https://user:top-secret@example.test/v1:embed-v2"
-            ),
+                "remote:https://user:top-secret@example.test/v1:embed-v2",
+                &configured,
+            )
+            .unwrap(),
             "older markers are normalized before comparison and rewritten safely"
         );
+        let colon_model_identity = remote_embedder_id(
+            "https://user:top-secret@example.test/v1",
+            "nomic-embed-text:latest",
+        );
+        assert_eq!(
+            canonicalize_persisted_embedder_id(
+                "remote:https://user:top-secret@example.test/v1:nomic-embed-text:latest",
+                &colon_model_identity,
+            )
+            .unwrap(),
+            colon_model_identity,
+            "legacy model names with colons are matched against the full configured endpoint and model"
+        );
+        let mismatch = canonicalize_persisted_embedder_id(
+            "remote:https://other:secret@example.test/v1:nomic-embed-text:latest",
+            &colon_model_identity,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!mismatch.contains("secret"));
+        assert!(!mismatch.contains("https://"));
         assert_ne!(
             configured,
             configured_identity_for(&AcceptableEmbedder {

@@ -12,8 +12,12 @@ embedding width/identity plus backup/restore marker handling. The follow-up also
 configured and runtime remote embedder identity, removed URL credentials from persisted
 identity/error text, promoted staged records inside the database transaction without copying
 vectors or payloads through application memory, hid/recovered abandoned staging generations,
-and waits for definitive transaction resolution if publication exceeds its deadline. The
-binary test suite passes 764/764 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
+and waits for definitive transaction resolution if publication exceeds its deadline. Stage
+recovery now requires the exact generated UUID namespace plus its durable lease sidecar;
+legacy `-ingest-stage-<UUID>` names and reserved-prefix lookalikes without a sidecar remain
+visible and untouched. Malformed reserved identifiers do not block recovery of unrelated
+stages, and new writes cannot claim the reserved namespace. The
+binary test suite passes 765/765 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
 default locked build remains blocked because the `ort-sys` prebuilt download from
 `cdn.pyke.io` returned HTTP 403 through the environment proxy. That override is only a local
 verification path; it is not equivalent to the default-feature CI build. The reviewed PR
@@ -85,7 +89,9 @@ transaction; readers see the prior committed generation until commit. A failed q
 back before the error returns, and closing an interrupted transaction relies on LadybugDB's
 transaction recovery. Staged rows are promoted in bounded pages inside the transaction, with
 vectors and content kept in the database; successful commit also disposes of the staging
-generation. Abandoned generations are hidden and recovered on a later ingest. If the write
+generation. Abandoned generations with durable lease provenance are hidden and recovered on
+a later ingest. Legacy stage-shaped names without provenance are preserved as user data
+because the older naming scheme cannot prove ownership. If the write
 deadline expires, the caller waits for the transaction's definitive outcome before returning.
 Integration tests cover query failure rollback, a connection ending before commit, reader
 visibility while a publication transaction is open, timeout past commit resolution, and

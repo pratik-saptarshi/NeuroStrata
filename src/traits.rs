@@ -9,13 +9,18 @@ use std::sync::OnceLock;
 /// Namespace prefix reserved for unpublished ingestion generations.
 pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
 
-/// Also recognizes the pre-atomic staging namespace shape so an upgrade can
-/// hide and recover generations left behind by the prior implementation.
+/// Recognizes only the current UUID-shaped internal stage identifier. Older
+/// names based only on a `-ingest-stage-` suffix are ambiguous with user-owned
+/// namespaces and must never authorize hiding or deletion.
 pub fn is_internal_ingest_stage_namespace(namespace: &str) -> bool {
-    namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
-        || namespace
-            .rsplit_once("-ingest-stage-")
-            .is_some_and(|(_, generation)| uuid::Uuid::parse_str(generation).is_ok())
+    namespace
+        .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+        .and_then(|generation| uuid::Uuid::parse_str(generation).ok())
+        .is_some_and(|generation| {
+            namespace
+                .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+                .is_some_and(|raw| generation.to_string() == raw)
+        })
 }
 
 /// The shipped vocabulary schema, embedded at compile time. v2 adds the

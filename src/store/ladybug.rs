@@ -17,16 +17,16 @@ use crate::traits::{
 
 struct IngestStageLease {
     file: Option<File>,
-    path: PathBuf,
 }
 
 impl Drop for IngestStageLease {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             let _ = file.unlock();
+            // Keep the sidecar as durable provenance if staging exits before
+            // publication. The next ingest can then safely recover its rows.
             drop(file);
         }
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -34,11 +34,30 @@ fn ingest_stage_lease_path(db_path: &Path, namespace: &str) -> Result<PathBuf> {
     let generation = namespace
         .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
         .ok_or_else(|| anyhow::anyhow!("invalid internal ingest generation namespace"))?;
-    uuid::Uuid::parse_str(generation)
+    let parsed = uuid::Uuid::parse_str(generation)
         .map_err(|_| anyhow::anyhow!("invalid internal ingest generation identifier"))?;
+    if parsed.to_string() != generation {
+        anyhow::bail!("invalid internal ingest generation identifier");
+    }
     let mut path = db_path.as_os_str().to_os_string();
     path.push(format!(".stage-{generation}.lock"));
     Ok(PathBuf::from(path))
+}
+
+fn has_ingest_stage_provenance(db_path: &Path, namespace: &str) -> bool {
+    is_internal_ingest_stage_namespace(namespace)
+        && ingest_stage_lease_path(db_path, namespace).is_ok_and(|path| path.is_file())
+}
+
+fn cleanup_ingest_stage_lease_after_commit(path: &Path) -> Option<String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => Some(format!(
+            "Ingest generation committed, but staging lease cleanup failed: {}. The empty generation is safe and can be cleaned up later.",
+            error
+        )),
+    }
 }
 
 /// Read a boolean column out of a query row.
@@ -898,6 +917,10 @@ impl LadybugStore {
         if !is_internal_ingest_stage_namespace(namespace) {
             anyhow::bail!("refusing to clear a non-staging namespace as an ingest generation");
         }
+        let lease_path = ingest_stage_lease_path(&self.local_path, namespace)?;
+        if !lease_path.is_file() {
+            anyhow::bail!("refusing to clear an ingest generation without its lease provenance");
+        }
         let namespace = namespace.to_string();
         self.write_with_deadline("recovering an interrupted ingest generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
@@ -932,35 +955,29 @@ impl LadybugStore {
             .await?;
 
         for namespace in namespaces {
-            let lease_path = if namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX) {
-                Some(ingest_stage_lease_path(&self.local_path, &namespace)?)
-            } else {
-                None
-            };
-            let lease = match lease_path.as_ref() {
-                None => None,
-                Some(lease_path) => {
-                    match OpenOptions::new().read(true).write(true).open(lease_path) {
-                        Ok(file) => match file.try_lock() {
-                            Ok(()) => Some(file),
-                            Err(std::fs::TryLockError::WouldBlock) => continue,
-                            Err(std::fs::TryLockError::Error(error)) => {
-                                eprintln!(
+            let lease_path = ingest_stage_lease_path(&self.local_path, &namespace)?;
+            // A reserved-looking namespace is not proof that NeuroStrata owns
+            // its rows. Only the durable sidecar created with the stage lease
+            // authorizes recovery; absent provenance means preserve it.
+            let lease = match OpenOptions::new().read(true).write(true).open(&lease_path) {
+                Ok(file) => match file.try_lock() {
+                    Ok(()) => Some(file),
+                    Err(std::fs::TryLockError::WouldBlock) => continue,
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        eprintln!(
                             "Could not determine whether hidden ingest generation {} is active: {}. Leaving it intact.",
                             namespace, error
                         );
-                                continue;
-                            }
-                        },
-                        Err(error) if error.kind() == ErrorKind::NotFound => None,
-                        Err(error) => {
-                            eprintln!(
+                        continue;
+                    }
+                },
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    eprintln!(
                         "Could not inspect hidden ingest generation {}: {}. Leaving it intact.",
                         namespace, error
                     );
-                            continue;
-                        }
-                    }
+                    continue;
                 }
             };
 
@@ -970,9 +987,7 @@ impl LadybugStore {
                         let _ = file.unlock();
                         drop(file);
                     }
-                    if let Some(lease_path) = lease_path {
-                        let _ = std::fs::remove_file(lease_path);
-                    }
+                    let _ = std::fs::remove_file(&lease_path);
                 }
                 Err(error) => {
                     eprintln!(
@@ -1174,12 +1189,12 @@ impl LadybugStore {
         if let Some(marker) = &marker {
             check_embedding_width(&local_path, marker.dimensions, dimensions)?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
-                let saved_canonical = crate::embed::canonicalize_persisted_embedder_id(saved);
-                let current_canonical = crate::embed::canonicalize_persisted_embedder_id(current);
-                if saved_canonical != current_canonical {
+                let saved_canonical =
+                    crate::embed::canonicalize_persisted_embedder_id(saved, current)?;
+                if saved_canonical != current.as_str() {
                     return Err(anyhow::anyhow!(
                         "Refusing to open {}: it was embedded with model identity {:?}, while the configured identity is {:?}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
-                        local_path.display(), saved_canonical, current_canonical
+                        local_path.display(), saved_canonical, current
                     ));
                 }
             } else if marker.embedder_id.is_none() && embedder_id.is_some() {
@@ -1194,11 +1209,19 @@ impl LadybugStore {
                 local_path.display()
             );
         }
-        let marker_identity = marker
-            .as_ref()
-            .and_then(|marker| marker.embedder_id.as_deref())
-            .map(crate::embed::canonicalize_persisted_embedder_id)
-            .or(embedder_id.clone());
+        let marker_identity = match (
+            marker
+                .as_ref()
+                .and_then(|marker| marker.embedder_id.as_deref()),
+            embedder_id.as_deref(),
+        ) {
+            (Some(saved), Some(current)) => Some(crate::embed::canonicalize_persisted_embedder_id(
+                saved, current,
+            )?),
+            (Some(saved), None) => Some(saved.to_string()),
+            (None, Some(current)) => Some(current.to_string()),
+            (None, None) => None,
+        };
         write_width_marker(&local_path, dimensions, marker_identity.as_deref());
 
         Ok(Self {
@@ -1956,6 +1979,13 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<crate::traits::UpsertReport> {
+        if namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX) {
+            let authorized_stage_write = payload.user_id == "auto-ingestor"
+                && has_ingest_stage_provenance(&self.local_path, namespace);
+            if !authorized_stage_write {
+                anyhow::bail!("reserved ingest staging namespace is not available for this write");
+            }
+        }
         let namespace = namespace.to_string();
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
@@ -2625,10 +2655,32 @@ impl VectorStore for LadybugStore {
     }
 
     async fn begin_ingest_stage(&self, namespace: &str) -> Result<Box<dyn Send>> {
-        if !namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX) {
+        if !is_internal_ingest_stage_namespace(namespace) {
             anyhow::bail!("ingest staging namespace is not internal");
         }
         self.recover_interrupted_ingest_stages().await?;
+        let requested_namespace = namespace.to_string();
+        let already_present = self
+            .with_conn(move |conn| {
+                let safe_namespace = escape_ladybug_string(&requested_namespace);
+                let mut rows = match conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN count(m)",
+                    safe_namespace
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) if error.to_string().contains("does not exist in catalog") => {
+                        return Ok(false)
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                Ok(rows.next().is_some_and(|row| format!("{}", row[0]) != "0"))
+            })
+            .await?;
+        if already_present {
+            anyhow::bail!(
+                "ingest generation namespace already contains rows; preserving existing data"
+            );
+        }
         let path = ingest_stage_lease_path(&self.local_path, namespace)?;
         let file = OpenOptions::new()
             .read(true)
@@ -2642,22 +2694,20 @@ impl VectorStore for LadybugStore {
             let _ = std::fs::remove_file(&path);
             anyhow::anyhow!("could not lock the ingest generation lease: {}", error)
         })?;
-        Ok(Box::new(IngestStageLease {
-            file: Some(file),
-            path,
-        }))
+        Ok(Box::new(IngestStageLease { file: Some(file) }))
     }
 
     async fn publish_ingested(&self, namespace: &str, staged_namespace: &str) -> Result<usize> {
-        if !staged_namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
-            || namespace == staged_namespace
-        {
+        if !is_internal_ingest_stage_namespace(staged_namespace) || namespace == staged_namespace {
             anyhow::bail!("ingest publication requires a distinct internal staging generation");
         }
-        ingest_stage_lease_path(&self.local_path, staged_namespace)?;
+        let lease_path = ingest_stage_lease_path(&self.local_path, staged_namespace)?;
+        if !lease_path.is_file() {
+            anyhow::bail!("ingest publication requires an active staging lease");
+        }
         let namespace = namespace.to_string();
         let staged_namespace = staged_namespace.to_string();
-        self.write_to_completion(
+        let published = self.write_to_completion(
             "publishing an ingested generation",
             write_timeout(),
             move |conn| {
@@ -2803,7 +2853,11 @@ impl VectorStore for LadybugStore {
             }
         },
         )
-        .await
+        .await?;
+        if let Some(warning) = cleanup_ingest_stage_lease_after_commit(&lease_path) {
+            eprintln!("{}", warning);
+        }
+        Ok(published)
     }
 
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
@@ -2915,6 +2969,7 @@ impl VectorStore for LadybugStore {
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
+        let db_path = self.local_path.clone();
         self.with_conn(move |conn| {
             let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
             let mut result = conn.query(query)?;
@@ -2922,7 +2977,7 @@ impl VectorStore for LadybugStore {
             let mut namespaces = Vec::new();
             while let Some(row) = result.next() {
                 if let lbug::Value::String(ns) = row[0].clone() {
-                    if !is_internal_ingest_stage_namespace(&ns) {
+                    if !has_ingest_stage_provenance(&db_path, &ns) {
                         namespaces.push(ns);
                     }
                 }
@@ -2942,6 +2997,7 @@ impl VectorStore for LadybugStore {
     ) -> Result<serde_json::Value> {
         let project_contexts = project_contexts.clone();
         let anchor_override = anchor_override.cloned();
+        let db_path = self.local_path.clone();
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
 
@@ -2955,7 +3011,7 @@ impl VectorStore for LadybugStore {
             while let Some(row) = result_nodes.next() {
                 let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
-                if is_internal_ingest_stage_namespace(&namespace) {
+                if has_ingest_stage_provenance(&db_path, &namespace) {
                     hidden_stage_ids.insert(id);
                     continue;
                 }
@@ -3373,6 +3429,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    async fn seed_raw_reserved_namespace_row(
+        store: &LadybugStore,
+        namespace: &str,
+        id: &str,
+        user_id: &str,
+    ) {
+        let namespace = escape_ladybug_string(namespace);
+        let id = escape_ladybug_string(id);
+        let user_id = escape_ladybug_string(user_id);
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "CREATE (m:Memory {{id: '{}', namespace: '{}', content: 'preserve me', user_id: '{}', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{{}}', embedding: [0.0, 0.0, 0.0, 0.0]}})",
+                    id, namespace, user_id
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn post_commit_stage_lease_cleanup_failure_is_only_a_warning() {
+        let path = std::env::temp_dir().join(format!("stage-lease-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let warning = cleanup_ingest_stage_lease_after_commit(&path).unwrap();
+        assert!(warning.contains("generation committed"));
+        assert!(warning.contains("cleanup failed"));
+        assert!(
+            path.is_dir(),
+            "cleanup reports the failure without deleting data"
+        );
+        std::fs::remove_dir(path).unwrap();
+    }
+
     /// The production open path must never hand the engine its own defaults: a
     /// `buffer_pool_size` of 0 becomes 80% of physical memory, and a
     /// `max_db_size` of `u32::MAX` becomes an 8 TB virtual region.
@@ -3499,7 +3590,8 @@ mod tests {
     async fn legacy_remote_identity_is_upgraded_and_mismatch_errors_redact_it() {
         let dir = std::env::temp_dir().join(format!("ladybug-remote-id-{}", uuid::Uuid::new_v4()));
         let legacy = "remote:https://user:top-secret@example.test/v1:embed-v2";
-        let current = crate::embed::canonicalize_persisted_embedder_id(legacy);
+        let current =
+            crate::embed::remote_embedder_id("https://user:top-secret@example.test/v1", "embed-v2");
         let marker_path = width_marker_path(&dir);
         std::fs::write(
             &marker_path,
@@ -3541,8 +3633,9 @@ mod tests {
         let error = match LadybugStore::new_with_identity_limits(
             &dir,
             4,
-            crate::embed::canonicalize_persisted_embedder_id(
-                "remote:https://other:top-secret@example.test/v1:embed-v2",
+            crate::embed::remote_embedder_id(
+                "https://other:top-secret@example.test/v1",
+                "embed-v2",
             ),
             StoreLimits::default(),
         ) {
@@ -4410,7 +4503,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
-    async fn interrupted_stages_are_hidden_and_recovered_without_deleting_active_work() {
+    async fn stage_recovery_requires_lease_provenance_and_preserves_lookalike_namespaces() {
         let dir = std::env::temp_dir().join(format!("ingest-recovery-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temporary database");
         store.init("recovery").await.unwrap();
@@ -4440,7 +4533,17 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
+        // A crash leaves the lease file behind, unlocked. Its exact generated
+        // identifier plus this durable sidecar proves the rows are staging.
         let orphan_namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let orphan_lease_path = ingest_stage_lease_path(&dir, &orphan_namespace).unwrap();
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&orphan_lease_path)
+                .unwrap(),
+        );
         let orphan_id = format!(
             "{}{}orphan.rs",
             orphan_namespace,
@@ -4463,25 +4566,6 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        let unexpected_orphan_id = format!("{}::unexpected-agent-row", orphan_namespace);
-        store
-            .upsert(
-                &orphan_namespace,
-                &unexpected_orphan_id,
-                vec![0.0; 4],
-                MemoryPayload {
-                    content: "private staging residue".into(),
-                    user_id: "agent".into(),
-                    memory_type: "fact".into(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: json!({}),
-                },
-            )
-            .await
-            .unwrap();
-
         let legacy_namespace = format!("project-ingest-stage-{}", uuid::Uuid::new_v4());
         let legacy_id = format!(
             "{}{}legacy.rs",
@@ -4506,19 +4590,109 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
+        // These namespaces have no stage lease. Their spelling alone must
+        // never hide or authorize deletion, even when the name parses as a
+        // generated stage ID or starts with the reserved prefix malformed.
+        let lookalike_namespace =
+            format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let lookalike_system_id = format!("{}::system-row", lookalike_namespace);
+        let lookalike_user_id = format!("{}::user-row", lookalike_namespace);
+        seed_raw_reserved_namespace_row(
+            &store,
+            &lookalike_namespace,
+            &lookalike_system_id,
+            "system",
+        )
+        .await;
+        seed_raw_reserved_namespace_row(&store, &lookalike_namespace, &lookalike_user_id, "user-1")
+            .await;
+        let malformed_namespace = format!("{}notes", INTERNAL_INGEST_STAGE_PREFIX);
+        let malformed_id = format!("{}::user-row", malformed_namespace);
+        seed_raw_reserved_namespace_row(&store, &malformed_namespace, &malformed_id, "user-2")
+            .await;
+        let legacy_user_namespace = format!("project-ingest-stage-{}", uuid::Uuid::new_v4());
+        let legacy_user_id = format!("{}::user-row", legacy_user_namespace);
+        store
+            .upsert(
+                &legacy_user_namespace,
+                &legacy_user_id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "legacy user data".into(),
+                    user_id: "user-3".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let rejected_reserved_write = store
+            .upsert(
+                &malformed_namespace,
+                "new-user-write",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "must not write".into(),
+                    user_id: "system".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await;
+        assert!(rejected_reserved_write.is_err());
+        assert!(store
+            .begin_ingest_stage(&lookalike_namespace)
+            .await
+            .is_err());
+        assert!(store
+            .upsert(
+                &lookalike_namespace,
+                "lookalike-public-write",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "must not write".into(),
+                    user_id: "system".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .is_err());
+
         let visible_names = store.list_namespaces().await.unwrap();
         assert!(!visible_names.contains(&active_namespace));
         assert!(!visible_names.contains(&orphan_namespace));
-        assert!(!visible_names.contains(&legacy_namespace));
+        assert!(visible_names.contains(&legacy_namespace));
+        assert!(visible_names.contains(&legacy_user_namespace));
+        assert!(visible_names.contains(&lookalike_namespace));
+        assert!(visible_names.contains(&malformed_namespace));
         let exported = store
             .export_graph(false, false, &std::collections::HashMap::new(), None)
             .await
             .unwrap();
-        assert!(exported["nodes"].as_array().unwrap().iter().all(|node| {
-            node["namespace"] != active_namespace
-                && node["namespace"] != orphan_namespace
-                && node["namespace"] != legacy_namespace
+        let exported_nodes = exported["nodes"].as_array().unwrap();
+        assert!(exported_nodes.iter().all(|node| {
+            node["namespace"] != active_namespace && node["namespace"] != orphan_namespace
         }));
+        for namespace in [
+            legacy_namespace.as_str(),
+            legacy_user_namespace.as_str(),
+            lookalike_namespace.as_str(),
+            malformed_namespace.as_str(),
+        ] {
+            assert!(exported_nodes
+                .iter()
+                .any(|node| node["namespace"] == namespace));
+        }
 
         let new_namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
         let new_lease = store.begin_ingest_stage(&new_namespace).await.unwrap();
@@ -4533,26 +4707,35 @@ eurostrata\src\daemon.rs",
             .unwrap()
             .is_none());
         assert!(store
-            .get(&orphan_namespace, &unexpected_orphan_id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(store
             .get(&legacy_namespace, &legacy_id)
             .await
             .unwrap()
-            .is_none());
+            .is_some());
+        for (namespace, id) in [
+            (&lookalike_namespace, &lookalike_system_id),
+            (&lookalike_namespace, &lookalike_user_id),
+            (&malformed_namespace, &malformed_id),
+            (&legacy_user_namespace, &legacy_user_id),
+        ] {
+            assert!(store.get(namespace, id).await.unwrap().is_some());
+        }
+        assert!(!orphan_lease_path.exists());
+        let new_lease_path = ingest_stage_lease_path(&dir, &new_namespace).unwrap();
         drop(new_lease);
         drop(active_lease);
 
         let recovery_namespace =
             format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
-        let _recovery_lease = store.begin_ingest_stage(&recovery_namespace).await.unwrap();
+        let recovery_lease = store.begin_ingest_stage(&recovery_namespace).await.unwrap();
         assert!(store
             .get(&active_namespace, &active_id)
             .await
             .unwrap()
             .is_none());
+        let recovery_lease_path = ingest_stage_lease_path(&dir, &recovery_namespace).unwrap();
+        drop(recovery_lease);
+        let _ = std::fs::remove_file(new_lease_path);
+        let _ = std::fs::remove_file(recovery_lease_path);
 
         let _ = std::fs::remove_file(&dir);
     }
