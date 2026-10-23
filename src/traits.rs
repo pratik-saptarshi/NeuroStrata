@@ -6,6 +6,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// Namespace prefix reserved for unpublished ingestion generations.
+pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
+
+/// Also recognizes the pre-atomic staging namespace shape so an upgrade can
+/// hide and recover generations left behind by the prior implementation.
+pub fn is_internal_ingest_stage_namespace(namespace: &str) -> bool {
+    namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
+        || namespace
+            .rsplit_once("-ingest-stage-")
+            .is_some_and(|(_, generation)| uuid::Uuid::parse_str(generation).is_ok())
+}
+
 /// The shipped vocabulary schema, embedded at compile time. v2 adds the
 /// `task` memory type and the EXTRACTED_FROM relation that carries the
 /// extraction edge behind the completion gate (Lock 2).
@@ -264,14 +276,17 @@ pub trait VectorStore: Send + Sync {
     /// symbols and the directory/file nodes, which ingestion then rebuilds.
     async fn clear_ingested(&self, namespace: &str) -> Result<()>;
 
+    /// Start an unpublished generation and recover orphaned generations left
+    /// by prior interrupted ingests. The returned guard must be held until the
+    /// generation is either published or discarded.
+    async fn begin_ingest_stage(&self, _namespace: &str) -> Result<Box<dyn Send>> {
+        Ok(Box::new(()))
+    }
+
     /// Atomically replace the namespace's ingested rows with a fully prepared
     /// generation and restore all declared edges before it becomes visible.
     /// Backends without transactional publication must reject the operation.
-    async fn publish_ingested(
-        &self,
-        _namespace: &str,
-        _rows: Vec<(String, Vec<f32>, MemoryPayload)>,
-    ) -> Result<usize> {
+    async fn publish_ingested(&self, _namespace: &str, _staged_namespace: &str) -> Result<usize> {
         anyhow::bail!("this vector store does not support atomic ingest publication")
     }
 

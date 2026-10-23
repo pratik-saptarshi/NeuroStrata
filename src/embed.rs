@@ -145,27 +145,45 @@ fn configured_model() -> Result<AcceptableEmbedder> {
         .clone())
 }
 
+/// Canonical identity for a remote embedding space. The endpoint is hashed so
+/// credentials embedded in a URL never enter the database marker or errors.
+/// Trailing slashes do not change the endpoint identity.
+fn remote_embedder_id(base_url: &str, api_model: &str) -> String {
+    let endpoint_hash = sha2::Sha256::digest(base_url.trim_end_matches('/').as_bytes());
+    format!("remote-sha256:{}:{}", hex::encode(endpoint_hash), api_model)
+}
+
+/// Upgrade identities written by older runtime constructors, which included
+/// the raw remote URL, before comparing or persisting them again.
+pub(crate) fn canonicalize_persisted_embedder_id(identity: &str) -> String {
+    let Some(legacy) = identity.strip_prefix("remote:") else {
+        return identity.to_string();
+    };
+    let Some((endpoint, model)) = legacy.rsplit_once(':') else {
+        return identity.to_string();
+    };
+    remote_embedder_id(endpoint, model)
+}
+
+fn configured_identity_for(model: &AcceptableEmbedder) -> String {
+    match (&model.base_url, &model.api_key_env) {
+        (Some(base_url), Some(_)) => remote_embedder_id(
+            base_url,
+            model
+                .api_model
+                .as_deref()
+                .unwrap_or("text-embedding-3-small"),
+        ),
+        _ => format!("fastembed:{}", model.model_name),
+    }
+}
+
 /// Stable, non-secret identity for the configured embedding space. This is
 /// available without loading the local model, so backup, restore, and metadata
 /// reads can validate the same identity as the daemon.
 pub fn configured_embedder_id() -> Result<String> {
     let model = configured_model()?;
-    Ok(match (&model.base_url, &model.api_key_env) {
-        (Some(base_url), Some(_)) => {
-            // Keep credential-bearing or tenant-specific endpoint URLs out of
-            // the adjacent database sidecar while retaining a stable identity.
-            let endpoint_hash = sha2::Sha256::digest(base_url.trim_end_matches('/').as_bytes());
-            format!(
-                "remote-sha256:{}:{}",
-                hex::encode(endpoint_hash),
-                model
-                    .api_model
-                    .as_deref()
-                    .unwrap_or("text-embedding-3-small")
-            )
-        }
-        _ => format!("fastembed:{}", model.model_name),
-    })
+    Ok(configured_identity_for(&model))
 }
 
 /// The embedding width of the configured model, without loading the model.
@@ -274,11 +292,12 @@ impl RemoteEmbedder {
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
-        let model_name = format!("remote:{}:{}", base_url.trim_end_matches('/'), api_model);
+        let normalized_base_url = base_url.trim_end_matches('/').to_string();
+        let model_name = remote_embedder_id(&normalized_base_url, &api_model);
 
         Ok(Self {
             client,
-            base_url,
+            base_url: normalized_base_url,
             api_key,
             api_model: api_model.clone(),
             dimensions,
@@ -317,7 +336,7 @@ impl RemoteEmbedder {
             }))
             .send()
             .await
-            .context("HTTP request failed")?;
+            .map_err(|error| anyhow::anyhow!("HTTP request failed: {}", error.without_url()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -365,8 +384,8 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
             .unwrap_or_else(|| "text-embedding-3-small".to_string());
 
         eprintln!(
-            "Initializing RemoteEmbedder with model: {} at {}",
-            api_model, base_url
+            "Initializing RemoteEmbedder with configured model {}",
+            api_model
         );
         Ok(Arc::new(RemoteEmbedder::new(
             base_url.clone(),
@@ -481,6 +500,94 @@ mod tests {
         assert!(model.base_url.is_none());
         assert!(model.api_key_env.is_none());
         assert_eq!(model.model_name, "NomicEmbedTextV15");
+    }
+
+    #[test]
+    fn configured_and_runtime_remote_identities_are_canonical_and_secret_free() {
+        let endpoint = "https://user:top-secret@example.test/v1///";
+        let model = AcceptableEmbedder {
+            model_name: "tenant-remote".into(),
+            dimensions: 768,
+            base_url: Some(endpoint.into()),
+            api_key_env: Some("REMOTE_API_KEY".into()),
+            api_model: Some("embed-v2".into()),
+        };
+        let configured = configured_identity_for(&model);
+        let runtime = RemoteEmbedder::new(
+            endpoint.into(),
+            "not-part-of-the-identity".into(),
+            "embed-v2".into(),
+            768,
+        )
+        .unwrap();
+
+        assert_eq!(configured, runtime.embedder_id());
+        assert_eq!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                base_url: Some("https://user:top-secret@example.test/v1".into()),
+                ..model.clone()
+            }),
+            "trailing slashes do not change configured identity"
+        );
+        assert_ne!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                base_url: Some("https://user:top-secret@example.test/other".into()),
+                ..model.clone()
+            }),
+            "changing the endpoint changes identity"
+        );
+        assert_eq!(
+            configured,
+            canonicalize_persisted_embedder_id(
+                "remote:https://user:top-secret@example.test/v1:embed-v2"
+            ),
+            "older markers are normalized before comparison and rewritten safely"
+        );
+        assert_ne!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                base_url: Some("https://other:top-secret@example.test/v1".into()),
+                ..model.clone()
+            }),
+            "changing endpoint identity changes the hash"
+        );
+        assert_ne!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                api_model: Some("embed-v3".into()),
+                ..model
+            }),
+            "changing the model changes identity"
+        );
+        for secret in ["user", "top-secret", "example.test", "https://"] {
+            assert!(!configured.contains(secret), "identity leaked {secret}");
+            assert!(!runtime.embedder_id().contains(secret));
+        }
+        let marker = serde_json::json!({ "embedder_id": configured }).to_string();
+        assert!(!marker.contains("top-secret"));
+        assert!(!marker.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn remote_request_errors_do_not_format_url_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = RemoteEmbedder::new(
+            format!("http://user:top-secret@{address}"),
+            "secret-key".into(),
+            "embed-v2".into(),
+            2,
+        )
+        .unwrap()
+        .embed("test")
+        .await
+        .unwrap_err();
+        let safe = format!("{error:#}");
+        assert!(!safe.contains("top-secret"));
+        assert!(!safe.contains("user@"));
     }
 
     /// The retry used to probe `downcast_ref::<StatusCode>()` on a string that

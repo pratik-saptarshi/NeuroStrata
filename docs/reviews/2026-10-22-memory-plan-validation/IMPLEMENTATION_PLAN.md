@@ -8,8 +8,12 @@
 
 Source changes implemented: recorder append/reopen coverage, staged ingest with atomic
 publication and failure propagation, local HTTP retry tests, store-limit validation, and
-embedding width/identity plus backup/restore marker handling. The binary test suite passes
-758/758 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
+embedding width/identity plus backup/restore marker handling. The follow-up also unified the
+configured and runtime remote embedder identity, removed URL credentials from persisted
+identity/error text, promoted staged records inside the database transaction without copying
+vectors or payloads through application memory, hid/recovered abandoned staging generations,
+and waits for definitive transaction resolution if publication exceeds its deadline. The
+binary test suite passes 764/764 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
 default locked build remains blocked because the `ort-sys` prebuilt download from
 `cdn.pyke.io` returned HTTP 403 through the environment proxy. That override is only a local
 verification path; it is not equivalent to the default-feature CI build. The reviewed PR
@@ -79,8 +83,13 @@ failed staged rebuild leaves the previously published ingested rows available. P
 deletes old ingested rows, writes the new rows, and recreates declared edges in one database
 transaction; readers see the prior committed generation until commit. A failed query rolls
 back before the error returns, and closing an interrupted transaction relies on LadybugDB's
-transaction recovery. Integration tests cover query failure rollback, a connection ending
-before commit, and reader visibility while a publication transaction is open.
+transaction recovery. Staged rows are promoted in bounded pages inside the transaction, with
+vectors and content kept in the database; successful commit also disposes of the staging
+generation. Abandoned generations are hidden and recovered on a later ingest. If the write
+deadline expires, the caller waits for the transaction's definitive outcome before returning.
+Integration tests cover query failure rollback, a connection ending before commit, reader
+visibility while a publication transaction is open, timeout past commit resolution, and
+successful promotion with stage disposal.
 
 ---
 
@@ -165,7 +174,7 @@ Steps:
 |---|---|
 | Source changes | Implemented; formatting applied; `git diff --check` passes |
 | Type-check | `cargo check --tests` passed with temporary `ort-load-dynamic` override and source-built LadybugDB |
-| Binary test suite | 758/758 passed with that same temporary override; actual local model loading/inference was not exercised because model weights are absent |
+| Binary test suite | 764/764 passed with that same temporary override; remote embedder identity and failure handling are tested, but actual local model loading/inference was not exercised because model weights are absent. The backend-selection test checks config selection only; factory/model initialization remains an integration gate |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no download bypass was attempted |
 | Exact-head PR CI | Reviewed head `b904541f78e0f5840b77bcc431334dd5ad234eed` had workflow-dispatch run `39911946378`; Ubuntu test compilation failed on stacked async test attributes, while all three platform build jobs passed. Final changed SHA CI remains pending push and GitHub Actions execution |
 | Runtime memory comparison | Not measured: no matching model, corpus, and workload were available. Startup, inference, ingest peak, idle RSS, latency/throughput, and DB size remain unmeasured; no empirical improvement is claimed |

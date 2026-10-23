@@ -1,6 +1,6 @@
 use crate::parser::get_language;
 use crate::parser::schema::ParserSchema;
-use crate::traits::{Embedder, MemoryPayload, VectorStore};
+use crate::traits::{Embedder, MemoryPayload, VectorStore, INTERNAL_INGEST_STAGE_PREFIX};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
@@ -579,42 +579,6 @@ async fn populate_staging_namespace(
     Ok(())
 }
 
-async fn snapshot_staged(
-    store: &Arc<dyn VectorStore>,
-    namespace: &str,
-) -> anyhow::Result<Vec<(String, Vec<f32>, MemoryPayload)>> {
-    let listed = store.list(namespace, Some("auto-ingestor")).await?;
-    let mut snapshot = Vec::with_capacity(listed.len());
-    for row in listed {
-        let (vector, payload) = store.get(namespace, &row.id).await?.ok_or_else(|| {
-            anyhow::anyhow!("ingested row {} disappeared during snapshot", row.id)
-        })?;
-        snapshot.push((row.id, vector, payload));
-    }
-    Ok(snapshot)
-}
-
-fn replace_namespace_prefix(value: &mut serde_json::Value, from: &str, to: &str) {
-    match value {
-        serde_json::Value::String(text) => {
-            if let Some(rest) = text.strip_prefix(from) {
-                *text = format!("{to}{rest}");
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                replace_namespace_prefix(item, from, to);
-            }
-        }
-        serde_json::Value::Object(items) => {
-            for item in items.values_mut() {
-                replace_namespace_prefix(item, from, to);
-            }
-        }
-        _ => {}
-    }
-}
-
 async fn failed_staging(
     store: &Arc<dyn VectorStore>,
     stage_namespace: &str,
@@ -631,10 +595,10 @@ async fn failed_staging(
     }
 }
 
-/// Rebuild under a private namespace, then publish only after every producer,
-/// embed, and upsert step succeeds. A failed staged walk leaves the live rows
-/// and their edges untouched. If publication itself fails, restore the captured
-/// prior rows and replay their declared edges before returning the error.
+/// Rebuild under an internal database generation, then atomically promote its
+/// rows only after every producer, embed, and upsert step succeeds. Vectors stay
+/// in the database throughout; publication does not snapshot the corpus into
+/// process memory.
 pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
@@ -652,7 +616,8 @@ pub async fn ingest_directory(
         )
     })?;
 
-    let stage_namespace = format!("{}-ingest-stage-{}", namespace, uuid::Uuid::new_v4());
+    let stage_namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+    let _stage_lease = vector_store.begin_ingest_stage(&stage_namespace).await?;
     let stage_result = populate_staging_namespace(
         dir_path,
         schema,
@@ -666,37 +631,16 @@ pub async fn ingest_directory(
         return Err(failed_staging(&vector_store, &stage_namespace, error).await);
     }
 
-    if let Err(error) = vector_store.relink_edges(&stage_namespace).await {
-        return Err(failed_staging(&vector_store, &stage_namespace, error).await);
-    }
-    let staged_rows = match snapshot_staged(&vector_store, &stage_namespace).await {
-        Ok(rows) => rows,
-        Err(error) => return Err(failed_staging(&vector_store, &stage_namespace, error).await),
-    };
-    let from_prefix = format!("{}{}", stage_namespace, NAMESPACE_SEPARATOR);
-    let to_prefix = format!("{}{}", namespace, NAMESPACE_SEPARATOR);
-    let mut publish_rows = Vec::with_capacity(staged_rows.len());
-    for (staged_id, vector, mut payload) in staged_rows {
-        let path = staged_id.strip_prefix(&from_prefix).ok_or_else(|| {
-            anyhow::anyhow!(
-                "staged id {} does not belong to {}",
-                staged_id,
-                stage_namespace
-            )
-        })?;
-        let final_id = format!("{}{}", to_prefix, path);
-        replace_namespace_prefix(&mut payload.metadata, &from_prefix, &to_prefix);
-        publish_rows.push((final_id, vector, payload));
-    }
-
-    let linked = match vector_store.publish_ingested(namespace, publish_rows).await {
+    let linked = match vector_store
+        .publish_ingested(namespace, &stage_namespace)
+        .await
+    {
         Ok(linked) => linked,
         Err(error) => {
             return Err(failed_staging(&vector_store, &stage_namespace, error).await);
         }
     };
 
-    vector_store.clear_ingested(&stage_namespace).await?;
     println!(
         "Relinked {} declared edges in namespace {}",
         linked, namespace

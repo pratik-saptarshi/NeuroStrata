@@ -7,9 +7,9 @@
 
 use crate::domain::domain_key;
 use crate::traits::{
-    DedupCandidateScope, DomainMatchMode, DomainSearchOutcome, Embedder, ExactContentCandidate,
-    MemoryPayload, RawDistanceCandidate, RawDistanceQuery, RelocateOutcome, SearchResult,
-    UpsertReport, VectorStore,
+    is_internal_ingest_stage_namespace, DedupCandidateScope, DomainMatchMode, DomainSearchOutcome,
+    Embedder, ExactContentCandidate, MemoryPayload, RawDistanceCandidate, RawDistanceQuery,
+    RelocateOutcome, SearchResult, UpsertReport, VectorStore,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -331,11 +331,7 @@ impl VectorStore for MockStore {
         Ok(())
     }
 
-    async fn publish_ingested(
-        &self,
-        namespace: &str,
-        replacements: Vec<(String, Vec<f32>, MemoryPayload)>,
-    ) -> Result<usize> {
+    async fn publish_ingested(&self, namespace: &str, staged_namespace: &str) -> Result<usize> {
         let mut fail_namespace = self
             .fail_next_upsert_in_namespace
             .lock()
@@ -350,12 +346,33 @@ impl VectorStore for MockStore {
 
         let mut rows = self.rows.lock().expect("mock store lock");
         rows.retain(|row| row.namespace != namespace || row.payload.user_id != "auto-ingestor");
-        rows.extend(replacements.into_iter().map(|(id, vector, payload)| Row {
-            namespace: namespace.to_string(),
-            id,
-            vector,
-            payload,
-        }));
+        let staged_prefix = format!(
+            "{}{}",
+            staged_namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let final_prefix = format!(
+            "{}{}",
+            namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let mut promoted = Vec::new();
+        for mut row in rows
+            .iter()
+            .filter(|row| {
+                row.namespace == staged_namespace && row.payload.user_id == "auto-ingestor"
+            })
+            .cloned()
+        {
+            if let Some(path) = row.id.strip_prefix(&staged_prefix) {
+                row.id = format!("{}{}", final_prefix, path);
+            }
+            replace_stage_prefix(&mut row.payload.metadata, &staged_prefix, &final_prefix);
+            row.namespace = namespace.to_string();
+            promoted.push(row);
+        }
+        rows.retain(|row| row.namespace != staged_namespace);
+        rows.extend(promoted);
         Ok(0)
     }
 
@@ -394,7 +411,7 @@ impl VectorStore for MockStore {
         let rows = self.rows.lock().expect("mock store lock");
         let mut names: Vec<String> = Vec::new();
         for r in rows.iter() {
-            if !names.contains(&r.namespace) {
+            if !is_internal_ingest_stage_namespace(&r.namespace) && !names.contains(&r.namespace) {
                 names.push(r.namespace.clone());
             }
         }
@@ -425,6 +442,27 @@ impl VectorStore for MockStore {
 
     async fn checkpoint(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+fn replace_stage_prefix(value: &mut serde_json::Value, from: &str, to: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(rest) = text.strip_prefix(from) {
+                *text = format!("{to}{rest}");
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_stage_prefix(item, from, to);
+            }
+        }
+        serde_json::Value::Object(items) => {
+            for item in items.values_mut() {
+                replace_stage_prefix(item, from, to);
+            }
+        }
+        _ => {}
     }
 }
 
