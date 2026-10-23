@@ -47,6 +47,25 @@ fn default_cb_failure_threshold() -> u32 { 3 }
 fn default_cb_backoff_initial() -> u64 { 30 }
 fn default_cb_backoff_max() -> u64 { 3600 }
 
+/// Pure resolution of the store ceilings, so the precedence order can be tested
+/// without mutating the process environment.
+///
+/// Precedence: environment, then the config file, then the built-in default.
+fn resolve_store_limits(
+    configured_pool: Option<u64>,
+    configured_max_db: Option<u64>,
+    env: impl Fn(&str) -> Option<u64>,
+) -> crate::store::StoreLimits {
+    crate::store::StoreLimits {
+        buffer_pool_bytes: env("NEUROSTRATA_BUFFER_POOL_BYTES")
+            .or(configured_pool)
+            .unwrap_or(crate::store::StoreLimits::DEFAULT_BUFFER_POOL_BYTES),
+        max_db_bytes: env("NEUROSTRATA_MAX_DB_BYTES")
+            .or(configured_max_db)
+            .unwrap_or(crate::store::StoreLimits::DEFAULT_MAX_DB_BYTES),
+    }
+}
+
 impl Default for DedupProviderMode {
     fn default() -> Self { Self::Auto }
 }
@@ -68,6 +87,19 @@ impl Default for DeduplicationConfig {
     }
 }
 
+/// Memory ceilings for the embedded graph store.
+///
+/// Unset means "use the built-in ceiling", which is bounded on purpose: leaving
+/// the engine's own defaults in place lets the buffer pool grow to 80% of
+/// physical memory.
+#[derive(Debug, Default, Deserialize, serde::Serialize, Clone)]
+pub struct StoreConfig {
+    #[serde(default)]
+    pub buffer_pool_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_db_bytes: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -79,11 +111,28 @@ pub struct Config {
     #[serde(default)]
     pub project_contexts: HashMap<String, PathBuf>,
 
+    #[serde(default)]
+    pub store: StoreConfig,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl Config {
+    /// Resolve the store's memory ceilings: environment overrides win over the
+    /// config file, and the file wins over the built-in defaults.
+    ///
+    /// The environment exists so an operator can bound the pool without editing
+    /// JSON, and so a one-off run can be retried with a smaller ceiling without
+    /// changing the installed configuration.
+    pub fn store_limits(&self) -> crate::store::StoreLimits {
+        resolve_store_limits(
+            self.store.buffer_pool_bytes,
+            self.store.max_db_bytes,
+            |name| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()),
+        )
+    }
+
     pub fn default_path() -> Result<PathBuf> {
         let home_dir = dirs::home_dir().context("Could not find home directory")?;
         Ok(home_dir
@@ -106,6 +155,7 @@ impl Config {
                     .join("ladybug.db"),
                 deduplication: DeduplicationConfig::default(),
                 project_contexts: HashMap::new(),
+                store: StoreConfig::default(),
                 extra: HashMap::new(),
             };
 
@@ -257,6 +307,52 @@ mod tests {
     fn config_without_project_contexts_deserializes_empty_registry() {
         let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
         assert!(config.project_contexts.is_empty());
+    }
+
+    /// A store section is optional, and omitting it must not mean "let the
+    /// engine decide" -- it must mean the bounded default.
+    #[test]
+    fn a_config_without_a_store_section_resolves_to_the_bounded_default() {
+        let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
+        assert!(config.store.buffer_pool_bytes.is_none());
+
+        let limits = resolve_store_limits(None, None, |_| None);
+        assert_eq!(
+            limits.buffer_pool_bytes,
+            crate::store::StoreLimits::DEFAULT_BUFFER_POOL_BYTES
+        );
+        assert_eq!(
+            limits.max_db_bytes,
+            crate::store::StoreLimits::DEFAULT_MAX_DB_BYTES
+        );
+    }
+
+    #[test]
+    fn store_limit_precedence_is_environment_then_config_then_default() {
+        let from_config = resolve_store_limits(Some(100), Some(200), |_| None);
+        assert_eq!(from_config.buffer_pool_bytes, 100);
+        assert_eq!(from_config.max_db_bytes, 200);
+
+        let from_environment = resolve_store_limits(Some(100), Some(200), |name| match name {
+            "NEUROSTRATA_BUFFER_POOL_BYTES" => Some(7),
+            "NEUROSTRATA_MAX_DB_BYTES" => Some(9),
+            _ => None,
+        });
+        assert_eq!(
+            from_environment.buffer_pool_bytes, 7,
+            "the environment must win over the config file"
+        );
+        assert_eq!(from_environment.max_db_bytes, 9);
+
+        let partial = resolve_store_limits(None, Some(200), |name| match name {
+            "NEUROSTRATA_BUFFER_POOL_BYTES" => Some(7),
+            _ => None,
+        });
+        assert_eq!(partial.buffer_pool_bytes, 7);
+        assert_eq!(
+            partial.max_db_bytes, 200,
+            "an unset override must fall through to the config, not to zero"
+        );
     }
 
     #[test]

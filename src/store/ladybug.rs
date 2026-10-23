@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
@@ -549,6 +549,109 @@ async fn search_inner(
         .await
 }
 
+/// Memory ceilings for the embedded graph store.
+///
+/// Both defaults exist because the engine's own defaults are not ceilings:
+/// `SystemConfig::default()` leaves `buffer_pool_size` at 0, which lbug turns
+/// into 80% of the machine's physical memory, and `max_db_size` at `u32::MAX`,
+/// which it turns into an 8 TB virtual region. The test constructor has always
+/// bounded both; the production open path did not, so the pool was free to grow
+/// to most of RAM as pages were touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreLimits {
+    pub buffer_pool_bytes: u64,
+    pub max_db_bytes: u64,
+}
+
+impl StoreLimits {
+    /// 256 MiB is a ceiling, not an allocation -- the pool fills as pages are
+    /// read -- and is comfortably above the working set of a symbol index.
+    pub const DEFAULT_BUFFER_POOL_BYTES: u64 = 256 * 1024 * 1024;
+    /// 8 GiB of address space: far below the engine's 8 TB default, and far
+    /// above anything this tool has produced.
+    pub const DEFAULT_MAX_DB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self {
+            buffer_pool_bytes: Self::DEFAULT_BUFFER_POOL_BYTES,
+            max_db_bytes: Self::DEFAULT_MAX_DB_BYTES,
+        }
+    }
+}
+
+/// Where the embedding width a database was created with is recorded.
+///
+/// The `Memory` table stores `embedding FLOAT[N]`, sized from the embedder at
+/// creation time, and the schema records N nowhere. Re-opening a 768-wide store
+/// under a 384-wide embedder resizes nothing: writes and searches fail later, or
+/// -- for a same-width model swap -- quietly compare vectors from two different
+/// spaces. A sidecar next to the database makes the mismatch immediate and
+/// explicit instead.
+fn width_marker_path(db_path: &Path) -> PathBuf {
+    let mut marker = db_path.as_os_str().to_os_string();
+    marker.push(".embedding");
+    PathBuf::from(marker)
+}
+
+/// Refuse to open a store whose recorded width differs from `dimensions`.
+///
+/// A missing marker means the database predates this check (or is new); it is
+/// written by `write_width_marker` on the first successful open, so an old store
+/// adopts its current width rather than being rejected outright.
+fn check_width_marker(db_path: &Path, dimensions: usize) -> Result<()> {
+    let path = width_marker_path(db_path);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot read the embedding-width marker at {}: {}. Delete the marker only if you know the database's width.",
+            path.display(),
+            e
+        )
+    })?;
+
+    let recorded: usize = raw.trim().parse().map_err(|e| {
+        anyhow::anyhow!(
+            "The embedding-width marker at {} is not a number ({:?}): {}",
+            path.display(),
+            raw,
+            e
+        )
+    })?;
+
+    if recorded != dimensions {
+        return Err(anyhow::anyhow!(
+            "Refusing to open {}: it was built with {}-dimension embeddings but the configured embedder produces {}. The Memory.embedding column is a fixed-width array, so this store cannot serve the current model. There is no re-embed migration yet -- delete the database and ingest again. Marker: {}",
+            db_path.display(),
+            recorded,
+            dimensions,
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Record the width on first open. A failure here costs the guard, not the run,
+/// so it warns rather than failing the open.
+fn write_width_marker(db_path: &Path, dimensions: usize) {
+    let path = width_marker_path(db_path);
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, format!("{}\n", dimensions)) {
+        eprintln!(
+            "could not record the embedding width at {}: {}. A later run with a different-width embedder will not be stopped.",
+            path.display(),
+            e
+        );
+    }
+}
+
 pub struct LadybugStore {
     #[allow(dead_code)]
     local_path: PathBuf,
@@ -602,8 +705,11 @@ impl Dirty {
 /// point -- with it off the engine swallows a failed verification, opens anyway
 /// and silently drops every record it could not authenticate, which is exactly
 /// the outcome this code exists to make visible.
-fn verifying_config() -> SystemConfig {
-    SystemConfig::default().throw_on_wal_replay_failure(true)
+fn verifying_config(limits: StoreLimits) -> SystemConfig {
+    SystemConfig::default()
+        .buffer_pool_size(limits.buffer_pool_bytes)
+        .max_db_size(limits.max_db_bytes)
+        .throw_on_wal_replay_failure(true)
 }
 
 /// Recovery open, used only after verification has already failed. The engine
@@ -614,8 +720,10 @@ fn verifying_config() -> SystemConfig {
 ///
 /// This trades tamper-evidence for the writes, so it is never the normal path
 /// and never silent.
-fn unverified_config() -> SystemConfig {
+fn unverified_config(limits: StoreLimits) -> SystemConfig {
     SystemConfig::default()
+        .buffer_pool_size(limits.buffer_pool_bytes)
+        .max_db_size(limits.max_db_bytes)
         .throw_on_wal_replay_failure(false)
         .enable_checksums(false)
 }
@@ -697,27 +805,50 @@ impl LadybugStore {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64 * 1024 * 1024);
+        let limits = StoreLimits {
+            buffer_pool_bytes: buffer_pool_size,
+            max_db_bytes: max_db_size,
+        };
         let cfg = SystemConfig::default()
             .max_db_size(max_db_size)
             .buffer_pool_size(buffer_pool_size)
             .throw_on_wal_replay_failure(true);
-        Self::with_system_config(local_path, dimensions, cfg)
+        Self::with_system_config(local_path, dimensions, cfg, limits)
+    }
+
+    /// Production open with an explicit memory ceiling. Every caller that is not
+    /// a test should use this rather than `new`, so the pool cannot inherit the
+    /// engine default of 80% of physical memory.
+    pub fn new_with_limits(
+        local_path: impl Into<PathBuf>,
+        dimensions: usize,
+        limits: StoreLimits,
+    ) -> Result<Self> {
+        Self::with_system_config(local_path, dimensions, verifying_config(limits), limits)
     }
 
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
-        Self::with_system_config(local_path, dimensions, verifying_config())
+        Self::new_with_limits(local_path, dimensions, StoreLimits::default())
     }
 
     /// Open the database with a custom `SystemConfig`. Production paths go
-    /// through `new`; tests go through `for_testing`. The fallback path
-    /// (WAL verification failure) always uses the hardcoded `unverified_config`
-    /// recovery path; only the *initial* open is parameterized.
+    /// through `new_with_limits`; tests go through `for_testing`. The fallback
+    /// path (WAL verification failure) always uses the hardcoded recovery shape;
+    /// only the *initial* open is parameterized. `limits` is threaded into both
+    /// so recovery cannot silently drop the memory ceiling.
     pub fn with_system_config(
         local_path: impl Into<PathBuf>,
         dimensions: usize,
         initial_config: SystemConfig,
+        limits: StoreLimits,
     ) -> Result<Self> {
         let local_path = local_path.into();
+
+        // A store built for one embedding width cannot serve another: the
+        // column is FLOAT[N] and nothing in the schema records N. Check before
+        // anything touches the file, so a misconfigured embedder fails loudly
+        // instead of reading and writing incompatible vectors.
+        check_width_marker(&local_path, dimensions)?;
 
         // A WAL present at open time means the last process did not close cleanly:
         // a clean close checkpoints and removes it. Keep a copy before the engine
@@ -748,7 +879,7 @@ impl LadybugStore {
 
                 eprintln!("ERROR: retrying WITHOUT checksum verification to recover those writes. The records replayed this way are NOT authenticated -- if this database may have been tampered with, stop and inspect the preserved copy instead. Set NEUROSTRATA_STRICT_WAL=1 to refuse this fallback.");
 
-                match Database::new(&local_path, unverified_config()) {
+                match Database::new(&local_path, unverified_config(limits)) {
                     Ok(db) => {
                         eprintln!("Recovered by replaying the unverified write-ahead log.");
                         db
@@ -791,13 +922,15 @@ impl LadybugStore {
                         );
                         eprintln!("ERROR: they were kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
                         // No WAL left to verify at this point.
-                        Database::new(&local_path, verifying_config()).map_err(|last_e| {
+                        Database::new(&local_path, verifying_config(limits)).map_err(|last_e| {
                             anyhow::anyhow!("Retry failed after discarding the WAL: {}", last_e)
                         })?
                     }
                 }
             }
         };
+
+        write_width_marker(&local_path, dimensions);
 
         Ok(Self {
             local_path,
@@ -2676,6 +2809,69 @@ fn bump_access_count(metadata: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The production open path must never hand the engine its own defaults: a
+    /// `buffer_pool_size` of 0 becomes 80% of physical memory, and a
+    /// `max_db_size` of `u32::MAX` becomes an 8 TB virtual region.
+    #[test]
+    fn the_default_limits_are_a_ceiling_rather_than_most_of_ram() {
+        let limits = StoreLimits::default();
+        assert!(limits.buffer_pool_bytes > 0, "a zero pool means 'ask the engine'");
+        assert!(
+            limits.buffer_pool_bytes <= 512 * 1024 * 1024,
+            "the default pool must stay small enough not to scale with installed RAM"
+        );
+        assert!(limits.max_db_bytes > 0);
+        assert!(
+            limits.max_db_bytes < 1024 * 1024 * 1024 * 1024,
+            "the default must be far below the engine's 8 TB virtual reservation"
+        );
+    }
+
+    #[test]
+    fn a_missing_width_marker_is_written_on_first_open() {
+        let dir = std::env::temp_dir().join(format!("ladybug-marker-{}", uuid::Uuid::new_v4()));
+        {
+            let _store = LadybugStore::for_testing(&dir, 4).expect("open at width 4");
+        }
+
+        let marker = width_marker_path(&dir);
+        assert!(marker.exists(), "the width is recorded beside the database");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker").trim(),
+            "4"
+        );
+
+        assert!(
+            LadybugStore::for_testing(&dir, 4).is_ok(),
+            "the same width must reopen"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_a_database_with_a_different_embedding_width_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ladybug-width-{}", uuid::Uuid::new_v4()));
+        {
+            let _store = LadybugStore::for_testing(&dir, 8).expect("open at width 8");
+        }
+
+        let error = match LadybugStore::for_testing(&dir, 4) {
+            Ok(_) => panic!("a 4-wide embedder must not open an 8-wide database"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        assert!(
+            message.contains("8-dimension"),
+            "names the recorded width: {message}"
+        );
+        assert!(
+            message.contains("produces 4"),
+            "names the configured width: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The resolution rule as every caller now reaches it: build the index
     /// once, then ask it.
