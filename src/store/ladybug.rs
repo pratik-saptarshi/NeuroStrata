@@ -6111,9 +6111,10 @@ mod tests {
     /// lbug 0.20.4 has a FileHandle exception-safety defect — a file
     /// handle claims page capacity *before* allocating the frame group
     /// that capacity describes, so when the allocation throws at the
-    /// cap the handle is left claiming a group that does not exist, and
-    /// the next checkpoint, or the checkpoint on database close, indexes
-    /// the missing group and segfaults the process (fix loop round 2,
+    /// cap the handle is left claiming capacity for a group that was
+    /// never recorded, and the next checkpoint, or the checkpoint on
+    /// database close, indexes the frame-group table out of bounds and
+    /// segfaults the process (fix loop round 2,
     /// reproduced against the engine in both growth modes). The refusal
     /// itself is clean, and the refusal is what this test exercises; the
     /// defect is documented here rather than exercised — the child
