@@ -207,6 +207,7 @@ fn freeze_path_parent(path: &Path) -> Result<PathBuf> {
 /// is inspected before the engine opens.
 fn discover_database_path_aliases(resolved: &Path, supplied: &Path) -> Result<Vec<PathBuf>> {
     let supplied = lexical_absolute_path(supplied)?;
+    ensure_database_path_unchanged(resolved, &supplied)?;
     let mut pending = vec![supplied];
     let mut seen = HashSet::new();
     let mut aliases = Vec::new();
@@ -5683,13 +5684,11 @@ mod tests {
         std::os::unix::fs::symlink(&historical, &outer).unwrap();
 
         let resolved = resolve_database_path(&outer).unwrap();
-        let aliases = discover_database_path_aliases(&resolved, &outer).unwrap();
-        assert!(aliases.contains(&historical));
         std::fs::remove_file(&historical).unwrap();
         std::os::unix::fs::symlink(&primary_b, &historical).unwrap();
 
-        let error = ensure_database_path_unchanged(&resolved, &outer)
-            .expect_err("a retarget between resolution and marker preflight must fail closed");
+        let error = discover_database_path_aliases(&resolved, &outer)
+            .expect_err("a retarget between resolution and alias discovery must fail closed");
         assert!(error
             .to_string()
             .contains("changed while it was being inspected"));
