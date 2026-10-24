@@ -1009,6 +1009,29 @@ mod tests {
         let store: Arc<dyn VectorStore> = concrete.clone();
         let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
         let embeds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let _active_lease = concrete.begin_ingest_stage(&active_stage).await.unwrap();
+        let active_id = format!("{active_stage}{NAMESPACE_SEPARATOR}active.rs");
+        store
+            .upsert(
+                &active_stage,
+                &active_id,
+                vec![0.13, 0.24, 0.35, 0.46],
+                MemoryPayload {
+                    content: "held active generation".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: Some("active-fixture".into()),
+                    location: "active.rs".into(),
+                    location_lines: "3".into(),
+                    metadata: serde_json::json!({"generation": "keep"}),
+                },
+            )
+            .await
+            .unwrap();
+        let active_before = store.get(&active_stage, &active_id).await.unwrap().unwrap();
+        let stages_before = concrete.ingest_stage_namespaces().await.unwrap();
+        assert_eq!(stages_before, vec![active_stage.clone()]);
         let stage_files_before = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -1022,8 +1045,10 @@ mod tests {
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
 
+        let fresh_reserved = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
         for namespace in [
-            format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4()),
+            active_stage.clone(),
+            fresh_reserved,
             format!("{}malformed", INTERNAL_INGEST_STAGE_PREFIX),
             INTERNAL_INGEST_STAGE_PREFIX.to_string(),
         ] {
@@ -1042,7 +1067,22 @@ mod tests {
                 .contains("reserved internal staging namespace"));
         }
         assert_eq!(embeds.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(concrete.ingest_stage_namespaces().await.unwrap().is_empty());
+        assert_eq!(
+            concrete.ingest_stage_namespaces().await.unwrap(),
+            stages_before
+        );
+        let active_after = store.get(&active_stage, &active_id).await.unwrap().unwrap();
+        assert_eq!(active_after.0, active_before.0);
+        assert_eq!(active_after.1.content, active_before.1.content);
+        assert_eq!(active_after.1.user_id, active_before.1.user_id);
+        assert_eq!(active_after.1.memory_type, active_before.1.memory_type);
+        assert_eq!(active_after.1.agent_name, active_before.1.agent_name);
+        assert_eq!(active_after.1.location, active_before.1.location);
+        assert_eq!(
+            active_after.1.location_lines,
+            active_before.1.location_lines
+        );
+        assert_eq!(active_after.1.metadata, active_before.1.metadata);
         let stage_files_after = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -1059,6 +1099,25 @@ mod tests {
             stage_files_after, stage_files_before,
             "rejected public destinations create no stage lease"
         );
+        concrete
+            .publish_ingested("active-stage-published", &active_stage)
+            .await
+            .expect("the pre-existing active stage remains publishable");
+        let published = store
+            .get(
+                "active-stage-published",
+                "active-stage-published::active.rs",
+            )
+            .await
+            .unwrap()
+            .expect("the held generation publishes after rejected requests");
+        assert_eq!(published.0, active_before.0);
+        assert_eq!(published.1.content, "held active generation");
+        assert_eq!(
+            published.1.metadata,
+            serde_json::json!({"generation": "keep"})
+        );
+        assert!(concrete.ingest_stage_namespaces().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(db);
     }

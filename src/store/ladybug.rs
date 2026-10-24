@@ -166,14 +166,126 @@ fn anchor_path_spelling(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    let parent = anchored
+    lexical_absolute_path(&anchored)
+}
+
+fn lexical_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    if !normalized.is_absolute() {
+        anyhow::bail!("database path {} is not absolute", path.display());
+    }
+    Ok(normalized)
+}
+
+fn freeze_path_parent(path: &Path) -> Result<PathBuf> {
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let name = anchored
+    let name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("database path {} has no file name", path.display()))?;
     Ok(std::fs::canonicalize(parent)?.join(name))
+}
+
+/// Find supported path spellings that resolve to the same database. Follow
+/// symlink chains in file and parent components so every known sibling marker
+/// is inspected before the engine opens.
+fn discover_database_path_aliases(resolved: &Path, supplied: &Path) -> Result<Vec<PathBuf>> {
+    let supplied = lexical_absolute_path(supplied)?;
+    let mut pending = vec![supplied];
+    let mut seen = HashSet::new();
+    let mut aliases = Vec::new();
+    while let Some(candidate) = pending.pop() {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if seen.len() > 64 {
+            anyhow::bail!("database alias chain exceeds the supported 64-path limit");
+        }
+        if resolve_database_path(&candidate).ok().as_deref() == Some(resolved)
+            && candidate != resolved
+        {
+            // Sidecars are siblings, so freeze the containing directory while
+            // retaining this alias's filename. A later parent-symlink retarget
+            // must not redirect recovery into another database's sidecars.
+            let frozen = freeze_path_parent(&candidate)?;
+            if frozen != resolved {
+                aliases.push(frozen);
+            }
+        }
+
+        let mut prefix = PathBuf::new();
+        for component in candidate.components() {
+            if matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            ) {
+                continue;
+            }
+            prefix.push(component.as_os_str());
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&prefix).map_err(|error| {
+                        anyhow::anyhow!(
+                            "cannot inspect database alias {}: {}",
+                            prefix.display(),
+                            error
+                        )
+                    })?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        prefix
+                            .parent()
+                            .unwrap_or_else(|| Path::new("/"))
+                            .join(target)
+                    };
+                    let remainder = candidate.strip_prefix(&prefix).map_err(|error| {
+                        anyhow::anyhow!("cannot expand database alias: {}", error)
+                    })?;
+                    pending.push(lexical_absolute_path(&target.join(remainder))?);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    anyhow::bail!(
+                        "cannot inspect database path component {}: {}",
+                        prefix.display(),
+                        error
+                    )
+                }
+            }
+        }
+    }
+    aliases.sort();
+    aliases.dedup();
+    Ok(aliases)
+}
+
+fn ensure_database_path_unchanged(resolved: &Path, supplied: &Path) -> Result<()> {
+    let current = resolve_database_path(supplied)?;
+    if current != resolved {
+        anyhow::bail!(
+            "database path alias {} changed while it was being inspected; no database was opened. Retry with a stable path and preserve all marker files",
+            supplied.display()
+        );
+    }
+    Ok(())
 }
 
 fn raw_database_sibling(db_path: &Path, suffix: &str) -> PathBuf {
@@ -1211,17 +1323,19 @@ pub(crate) fn width_marker_path(db_path: &Path) -> PathBuf {
 /// warned identity adoption.
 fn read_width_marker(
     resolved_db_path: &Path,
-    supplied_db_path: &Path,
+    supplied_db_paths: &[PathBuf],
     configured_embedder_id: Option<&str>,
 ) -> Result<Option<EmbeddingMarker>> {
     // `resolved_db_path` is the exact file identity locked and passed to the
     // engine. Do not resolve the caller's symlink again here: it could be
     // retargeted between resolution and marker preflight.
     let canonical = raw_database_sibling(resolved_db_path, ".embedding");
-    let supplied = raw_database_sibling(supplied_db_path, ".embedding");
     let mut paths = vec![canonical.clone()];
-    if supplied != canonical {
-        paths.push(supplied);
+    for supplied in supplied_db_paths {
+        let marker = raw_database_sibling(supplied, ".embedding");
+        if marker != canonical && !paths.contains(&marker) {
+            paths.push(marker);
+        }
     }
     let mut found: Vec<(PathBuf, EmbeddingMarker)> = Vec::new();
     for path in paths {
@@ -2000,9 +2114,9 @@ impl LadybugStore {
                 )
             })?;
         }
-        // Freeze the supplied spelling's parent before deriving the engine
-        // identity. The final filename is preserved so a file-symlink alias
-        // still has its own legacy sidecar name.
+        // Anchor the caller's path to this working directory without resolving
+        // symlinks. Alias discovery must see every original chain spelling so
+        // its marker evidence can be checked before the engine open.
         let supplied_path = anchor_path_spelling(&local_path)?;
         // Serialize the marker check and engine open with snapshot restore. A
         // restore holds this same canonical writer lock from destination
@@ -2010,6 +2124,8 @@ impl LadybugStore {
         // just before the restore interlock appears and then race its rename.
         let resolved_path = resolve_database_path(&supplied_path)?;
         let _open_writer = acquire_database_writer_lock(&resolved_path)?;
+        let path_aliases = discover_database_path_aliases(&resolved_path, &supplied_path)?;
+        ensure_database_path_unchanged(&resolved_path, &supplied_path)?;
         if restore_in_progress_path(&resolved_path).exists() {
             anyhow::bail!(
                 "database restore at {} is incomplete; finish or recover it before opening",
@@ -2024,10 +2140,11 @@ impl LadybugStore {
         // absent, ignore any sibling marker and replace it after opening this
         // fresh path; otherwise a stale 768 marker can strand a new 384 DB.
         let marker = if database_preexisted {
-            read_width_marker(&resolved_path, &supplied_path, embedder_id.as_deref())?
+            read_width_marker(&resolved_path, &path_aliases, embedder_id.as_deref())?
         } else {
             None
         };
+        ensure_database_path_unchanged(&resolved_path, &supplied_path)?;
         if let Some(marker) = &marker {
             check_embedding_width(&resolved_path, marker.dimensions, dimensions)?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
@@ -2170,11 +2287,6 @@ impl LadybugStore {
             (None, None) => None,
         };
         write_width_marker(&resolved_path, dimensions, marker_identity.as_deref())?;
-        let path_aliases = if supplied_path == resolved_path {
-            Vec::new()
-        } else {
-            vec![supplied_path]
-        };
 
         Ok(Self {
             local_path: resolved_path,
@@ -5493,12 +5605,116 @@ mod tests {
 
         // Models the alias being retargeted after the constructor resolved and
         // locked `resolved_db`, but before it inspects the caller's old spelling.
-        let marker = read_width_marker(&resolved_db, &supplied_alias, Some("fastembed:model-a"))
-            .expect("resolved database marker should be authoritative")
-            .expect("resolved marker exists");
+        let marker = read_width_marker(
+            &resolved_db,
+            std::slice::from_ref(&supplied_alias),
+            Some("fastembed:model-a"),
+        )
+        .expect("resolved database marker should be authoritative")
+        .expect("resolved marker exists");
         assert_eq!(marker.dimensions, 4);
         assert_eq!(marker.embedder_id.as_deref(), Some("fastembed:model-a"));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn alias_retarget_after_resolution_fails_before_marker_adoption() {
+        let root = std::env::temp_dir().join(format!(
+            "ladybug-alias-retarget-preflight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let primary_a = root.join("primary-a.store");
+        let primary_b = root.join("primary-b.store");
+        let historical = root.join("historical.store");
+        let outer = root.join("outer.store");
+        let limits = StoreLimits::default();
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &primary_a,
+                4,
+                "fastembed:model-a".into(),
+                limits,
+            )
+            .unwrap();
+            store.init("retarget-fixture").await.unwrap();
+            store
+                .upsert(
+                    "retarget-fixture",
+                    "retarget-fixture::row",
+                    vec![0.11, 0.22, 0.33, 0.44],
+                    MemoryPayload {
+                        content: "retargeted alias evidence".into(),
+                        user_id: "agent".into(),
+                        memory_type: "fact".into(),
+                        agent_name: None,
+                        location: "fixture.json".into(),
+                        location_lines: "1".into(),
+                        metadata: json!({"keep": true}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &primary_b,
+                4,
+                "fastembed:model-b".into(),
+                limits,
+            )
+            .unwrap();
+            store.init("other-retarget-fixture").await.unwrap();
+        }
+        let primary_marker = raw_database_sibling(&primary_a, ".embedding");
+        let primary_marker_original = std::fs::read(&primary_marker).unwrap();
+        std::fs::remove_file(&primary_marker).unwrap();
+        let historical_marker = raw_database_sibling(&historical, ".embedding");
+        let identity_a = serde_json::to_vec(&EmbeddingMarker {
+            version: 1,
+            dimensions: 4,
+            embedder_id: Some("fastembed:model-a".into()),
+        })
+        .unwrap();
+        std::fs::write(&historical_marker, &identity_a).unwrap();
+        std::os::unix::fs::symlink(&primary_a, &historical).unwrap();
+        std::os::unix::fs::symlink(&historical, &outer).unwrap();
+
+        let resolved = resolve_database_path(&outer).unwrap();
+        let aliases = discover_database_path_aliases(&resolved, &outer).unwrap();
+        assert!(aliases.contains(&historical));
+        std::fs::remove_file(&historical).unwrap();
+        std::os::unix::fs::symlink(&primary_b, &historical).unwrap();
+
+        let error = ensure_database_path_unchanged(&resolved, &outer)
+            .expect_err("a retarget between resolution and marker preflight must fail closed");
+        assert!(error
+            .to_string()
+            .contains("changed while it was being inspected"));
+        assert_eq!(std::fs::read(&historical_marker).unwrap(), identity_a);
+        assert!(!primary_marker.exists());
+
+        let store = LadybugStore::new_with_identity_limits(
+            &primary_a,
+            4,
+            "fastembed:model-a".into(),
+            limits,
+        )
+        .unwrap();
+        let row = store
+            .get("retarget-fixture", "retarget-fixture::row")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.1.content, "retargeted alias evidence");
+        assert_eq!(row.1.metadata, json!({"keep": true}));
+        assert_eq!(row.0, vec![0.11, 0.22, 0.33, 0.44]);
+        assert_eq!(
+            std::fs::read(&primary_marker).unwrap(),
+            primary_marker_original
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5807,6 +6023,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_vector, before_vector);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chained_file_alias_markers_are_all_checked_before_open() {
+        let root =
+            std::env::temp_dir().join(format!("ladybug-chained-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let primary = root.join("primary.store");
+        let historical = root.join("historical.store");
+        let outer = root.join("outer.store");
+        let limits = StoreLimits::default();
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &primary,
+                4,
+                "fastembed:model-a".into(),
+                limits,
+            )
+            .unwrap();
+            store.init("chained-alias-fixture").await.unwrap();
+            store
+                .upsert(
+                    "chained-alias-fixture",
+                    "chained-alias-fixture::row",
+                    vec![0.12, 0.23, 0.34, 0.45],
+                    MemoryPayload {
+                        content: "chained alias evidence".into(),
+                        user_id: "agent".into(),
+                        memory_type: "fact".into(),
+                        agent_name: Some("alias-fixture".into()),
+                        location: "fixture.json".into(),
+                        location_lines: "7".into(),
+                        metadata: json!({"preserve": "exact"}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        std::os::unix::fs::symlink(&primary, &historical).unwrap();
+        std::os::unix::fs::symlink(&historical, &outer).unwrap();
+        let canonical_marker = raw_database_sibling(&primary, ".embedding");
+        let historical_marker = raw_database_sibling(&historical, ".embedding");
+        let outer_marker = raw_database_sibling(&outer, ".embedding");
+        let canonical_original = std::fs::read(&canonical_marker).unwrap();
+        std::fs::remove_file(&canonical_marker).unwrap();
+
+        let legacy_identity = serde_json::to_vec(&EmbeddingMarker {
+            version: 1,
+            dimensions: 4,
+            embedder_id: Some("fastembed:model-a".into()),
+        })
+        .unwrap();
+        std::fs::write(&historical_marker, &legacy_identity).unwrap();
+        let error =
+            LadybugStore::new_with_identity_limits(&outer, 4, "fastembed:model-b".into(), limits)
+                .err()
+                .expect("intermediate file-alias identity must block same-width model B");
+        assert!(error.to_string().contains("model identity"));
+        assert_eq!(std::fs::read(&historical_marker).unwrap(), legacy_identity);
+        assert!(!canonical_marker.exists());
+        assert!(!outer_marker.exists());
+
+        std::fs::write(&canonical_marker, &canonical_original).unwrap();
+        let intermediate_conflict = serde_json::to_vec(&EmbeddingMarker {
+            version: 1,
+            dimensions: 4,
+            embedder_id: Some("fastembed:model-b".into()),
+        })
+        .unwrap();
+        std::fs::write(&historical_marker, &intermediate_conflict).unwrap();
+        let error =
+            LadybugStore::new_with_identity_limits(&outer, 4, "fastembed:model-a".into(), limits)
+                .err()
+                .expect("conflicting intermediate marker must fail before engine open");
+        assert!(error.to_string().contains("Conflicting embedding markers"));
+        assert_eq!(
+            std::fs::read(&canonical_marker).unwrap(),
+            canonical_original
+        );
+        assert_eq!(
+            std::fs::read(&historical_marker).unwrap(),
+            intermediate_conflict
+        );
+
+        let store =
+            LadybugStore::new_with_identity_limits(&primary, 4, "fastembed:model-a".into(), limits)
+                .unwrap();
+        let row = store
+            .get("chained-alias-fixture", "chained-alias-fixture::row")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.1.content, "chained alias evidence");
+        assert_eq!(row.1.agent_name.as_deref(), Some("alias-fixture"));
+        assert_eq!(row.1.location_lines, "7");
+        assert_eq!(row.1.metadata, json!({"preserve": "exact"}));
+        assert_eq!(row.0, vec![0.12, 0.23, 0.34, 0.45]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chained_alias_parent_is_frozen_for_stage_recovery() {
+        let root =
+            std::env::temp_dir().join(format!("ladybug-chained-parent-{}", uuid::Uuid::new_v4()));
+        let real_a = root.join("real-a");
+        let real_b = root.join("real-b");
+        std::fs::create_dir_all(&real_a).unwrap();
+        std::fs::create_dir_all(&real_b).unwrap();
+        let parent_alias = root.join("parent-alias");
+        let primary_a = real_a.join("primary.store");
+        let historical_a = real_a.join("historical.store");
+        let primary_b = real_b.join("primary.store");
+        let historical_b = real_b.join("historical.store");
+        let outer = root.join("outer.store");
+        let limits = StoreLimits::default();
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &primary_a,
+                4,
+                "fastembed:model-a".into(),
+                limits,
+            )
+            .unwrap();
+            store.init("parent-alias-a").await.unwrap();
+        }
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &primary_b,
+                4,
+                "fastembed:model-b".into(),
+                limits,
+            )
+            .unwrap();
+            store.init("parent-alias-b").await.unwrap();
+        }
+        std::os::unix::fs::symlink(&primary_a, &historical_a).unwrap();
+        std::os::unix::fs::symlink(&primary_b, &historical_b).unwrap();
+        std::os::unix::fs::symlink(&real_a, &parent_alias).unwrap();
+        std::os::unix::fs::symlink(parent_alias.join("historical.store"), &outer).unwrap();
+        let store =
+            LadybugStore::new_with_identity_limits(&outer, 4, "fastembed:model-a".into(), limits)
+                .unwrap();
+
+        let other_generation = uuid::Uuid::new_v4().to_string();
+        let other_alias_lease =
+            raw_database_sibling(&historical_b, &format!(".stage-{other_generation}.lock"));
+        std::fs::write(&other_alias_lease, b"other database lease").unwrap();
+        let other_marker = width_marker_path(&primary_b);
+        let other_marker_before = std::fs::read(&other_marker).unwrap();
+
+        std::fs::remove_file(&parent_alias).unwrap();
+        std::os::unix::fs::symlink(&real_b, &parent_alias).unwrap();
+        store.recover_interrupted_ingest_stages().await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&other_alias_lease).unwrap(),
+            b"other database lease",
+            "recovery must not follow a retargeted intermediate parent alias"
+        );
+        assert_eq!(std::fs::read(&other_marker).unwrap(), other_marker_before);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7052,6 +7431,7 @@ eurostrata\src\daemon.rs",
         store.init("reserved-publish").await.unwrap();
         let destination = format!("{INTERNAL_INGEST_STAGE_PREFIX}{}", uuid::Uuid::new_v4());
         let source = format!("{INTERNAL_INGEST_STAGE_PREFIX}{}", uuid::Uuid::new_v4());
+        let fresh_destination = format!("{INTERNAL_INGEST_STAGE_PREFIX}{}", uuid::Uuid::new_v4());
         let _destination_lease = store.begin_ingest_stage(&destination).await.unwrap();
         let _source_lease = store.begin_ingest_stage(&source).await.unwrap();
         let destination_id = format!(
@@ -7120,6 +7500,21 @@ eurostrata\src\daemon.rs",
                 Ok(values)
             }).await.unwrap()
         }
+        async fn catalog_snapshot(store: &LadybugStore) -> Vec<(String, String)> {
+            store
+                .with_conn(|conn| {
+                    let mut rows = conn.query(
+                    "MATCH (s:IngestStage) RETURN s.namespace, s.generation ORDER BY s.namespace",
+                )?;
+                    let mut values = Vec::new();
+                    while let Some(row) = rows.next() {
+                        values.push((format!("{}", row[0]), format!("{}", row[1])));
+                    }
+                    Ok(values)
+                })
+                .await
+                .unwrap()
+        }
         store
             .with_conn({
                 let edge = (destination_id.clone(), source_id.clone());
@@ -7138,12 +7533,23 @@ eurostrata\src\daemon.rs",
             "RELATES_TO".into(),
             source_id.clone(),
         ]));
-        let stages_before = store.ingest_stage_namespaces().await.unwrap();
-        assert!(stages_before.contains(&destination));
-        assert!(stages_before.contains(&source));
+        let catalog_before = catalog_snapshot(&store).await;
+        assert!(catalog_before.iter().any(|(ns, generation)| {
+            ns == &destination
+                && generation == destination.trim_start_matches(INTERNAL_INGEST_STAGE_PREFIX)
+        }));
+        assert!(catalog_before.iter().any(|(ns, generation)| {
+            ns == &source && generation == source.trim_start_matches(INTERNAL_INGEST_STAGE_PREFIX)
+        }));
+        assert!(!has_ingest_stage_lease(
+            &store.local_path,
+            &store.path_aliases,
+            &fresh_destination
+        ));
 
         for invalid in [
             destination.as_str(),
+            fresh_destination.as_str(),
             "__neurostrata_ingest_stage__malformed",
             INTERNAL_INGEST_STAGE_PREFIX,
         ] {
@@ -7157,10 +7563,7 @@ eurostrata\src\daemon.rs",
             );
             assert_eq!(snapshot(&store, source.clone()).await, source_before);
             assert_eq!(edge_snapshot(&store).await, edges_before);
-            assert_eq!(
-                store.ingest_stage_namespaces().await.unwrap(),
-                stages_before
-            );
+            assert_eq!(catalog_snapshot(&store).await, catalog_before);
         }
 
         let same_error = store
@@ -7185,6 +7588,11 @@ eurostrata\src\daemon.rs",
             &store.local_path,
             &store.path_aliases,
             &source
+        ));
+        assert!(!has_ingest_stage_lease(
+            &store.local_path,
+            &store.path_aliases,
+            &fresh_destination
         ));
 
         store
