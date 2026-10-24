@@ -479,7 +479,15 @@ pub(crate) fn canonicalize_persisted_embedder_id(
             }
         }
     }
-    anyhow::bail!("legacy remote embedding model identity cannot be safely matched to the configured model; keep this database intact and reopen with its original endpoint and model, or use a separate database path")
+    // Refusal Standard, maximal satisfiable form at this site: the saved
+    // legacy identity cannot be shown (it is precisely the string that
+    // could not be canonicalized, and it can embed a credential-bearing
+    // URL — element 6 is absolute), so the message describes it and names
+    // the configured canonical identity instead. Widths are out of
+    // context here: this function receives only the two identities, and
+    // its store-open caller in read_width_marker has no configured width
+    // in scope.
+    anyhow::bail!("Refusing to open: the database's saved legacy remote embedding model identity cannot be safely matched to the configured identity {:?}. Keep the database intact and reopen it with its original endpoint and model (the original embedder), or use a separate database path for the new model; no in-place re-embedding migration is available.", configured_identity)
 }
 
 pub(crate) fn configured_identity_for(model: &AcceptableEmbedder) -> Result<String> {
@@ -995,6 +1003,23 @@ mod tests {
         .to_string();
         assert!(!mismatch.contains("secret"));
         assert!(!mismatch.contains("https://"));
+        // Refusal Standard, maximal satisfiable form at this site: the
+        // configured canonical identity (element 2) and the no-migration
+        // truth (element 5) are present; the saved legacy identity can
+        // never be printed (element 6) — it is the un-canonicalizable
+        // string, so the message describes it instead of quoting it.
+        assert!(
+            mismatch.contains(&colon_model_identity),
+            "names the configured canonical identity: {mismatch}"
+        );
+        assert!(
+            mismatch.contains("no in-place re-embedding migration is available"),
+            "states the no-migration truth: {mismatch}"
+        );
+        assert!(
+            mismatch.contains("model identity"),
+            "retains the refusal family's phrasing: {mismatch}"
+        );
         assert_ne!(
             configured,
             configured_identity_for(&AcceptableEmbedder {

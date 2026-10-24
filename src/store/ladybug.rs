@@ -7149,10 +7149,24 @@ mod tests {
         );
 
         // Marker-identity site: same width, mismatched configured endpoint.
+        // The refusal that surfaces is the canonicalization bail (via
+        // read_width_marker, which precedes the ladybug identity bails);
+        // pin its upgraded Refusal Standard content positively, not only
+        // its redaction.
         let error = LadybugStore::new_with_identity_limits(&dir, 4, other.clone(), StoreLimits::default())
             .err()
             .expect("endpoint mismatch with a legacy identity is refused");
         assert_redacted(&error, "marker-identity");
+        let message = format!("{error:#}");
+        for element in [
+            other.as_str(),
+            "Keep the database intact",
+            "original endpoint and model",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "canonicalization refusal element {element:?} missing: {message}");
+        }
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(&marker_path);
 
@@ -7196,6 +7210,13 @@ mod tests {
             .err()
             .expect("alias endpoint mismatch with a legacy identity is refused");
             assert_redacted(&error, "alias");
+            let message = format!("{error:#}");
+            for element in [
+                other.as_str(),
+                "no in-place re-embedding migration is available",
+            ] {
+                assert!(message.contains(element), "alias canonicalization refusal element {element:?} missing: {message}");
+            }
             let _ = std::fs::remove_dir_all(root);
         }
     }
