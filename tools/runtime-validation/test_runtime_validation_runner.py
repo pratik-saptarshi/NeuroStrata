@@ -498,6 +498,29 @@ class MatrixModeTests(unittest.TestCase):
         self.assertIn("--model-spec", completed.stdout)
 
 
+class EnvironmentBlockHonestyTests(unittest.TestCase):
+    def test_importable_harness_onnxruntime_is_not_asserted_as_binary_version(self) -> None:
+        # A version importable by the harness interpreter belongs to the
+        # harness's Python environment, not to the binary under test (whose
+        # ONNX Runtime is linked in and unmeasured here). The environment
+        # block must not present it as the run's ONNX Runtime version.
+        import types
+
+        fake_onnxruntime = types.ModuleType("onnxruntime")
+        fake_onnxruntime.__version__ = "9.9.9-harness-only"
+        with tempfile.TemporaryDirectory(prefix="runtime-runner-env-") as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline-binary"
+            baseline.write_bytes(b"baseline bytes")
+            candidate = root / "candidate-binary"
+            candidate.write_bytes(b"candidate bytes")
+            with mock.patch.dict(sys.modules, {"onnxruntime": fake_onnxruntime}):
+                self.assertEqual(harness.onnx_runtime_version(), "UNVERIFIED")
+                environment = harness.build_environment_block(
+                    [], baseline, candidate, "stub-candidate-revision", None)
+            self.assertEqual(environment["onnx_runtime_version"], "UNVERIFIED")
+
+
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] in {"parent", "grandchild", "flood", "burst"}:
     helper_process(sys.argv[1], sys.argv[2])
 elif __name__ == "__main__":

@@ -530,15 +530,12 @@ def run_binary(label: str, binary: Path, revision: str, root: Path, model: Path,
 
 
 def onnx_runtime_version() -> str:
-    """The ONNX Runtime version visible to this harness, for the matrix
-    report's environment block. The harness itself links no ONNX Runtime
-    (the binary under test does), so an unimportable runtime is reported
-    as UNVERIFIED rather than guessed."""
-    try:
-        import onnxruntime
-    except ImportError:
-        return "UNVERIFIED"
-    return str(getattr(onnxruntime, "__version__", "UNVERIFIED"))
+    """The ONNX Runtime version of the binary under test, for the matrix
+    report's environment block. That runtime is linked into the binary,
+    not measured by this harness — a version importable by the harness's
+    own Python interpreter would be the harness package's version, not
+    the binary's — so the value is UNVERIFIED rather than mislabeled."""
+    return "UNVERIFIED"
 
 
 def summarize_legs(legs: list[dict]) -> dict[str, int]:
