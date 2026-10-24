@@ -954,6 +954,261 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn release_test_barrier(path: &std::path::Path) {
+        let mut release = path.as_os_str().to_os_string();
+        release.push(".release");
+        std::fs::write(std::path::PathBuf::from(release), "continue").unwrap();
+    }
+
+    async fn verify_wal_snapshot_restore(
+        snapshot: &std::path::Path,
+        target: &std::path::Path,
+        root: &std::path::Path,
+        stage: &str,
+        abandoned_stage: &str,
+        legacy_stage: &str,
+        lookalike: &str,
+        malformed: &str,
+    ) {
+        use serde_json::json;
+
+        let config: Config = serde_json::from_value(json!({})).unwrap();
+        let visible = restore_snapshot_bundle(snapshot, target, &config)
+            .await
+            .unwrap();
+        assert!(visible.contains(&"ordinary".to_string()));
+        assert!(visible.contains(&lookalike.to_string()));
+        assert!(visible.contains(&malformed.to_string()));
+        assert!(!visible.contains(&stage.to_string()));
+        assert!(!visible.contains(&abandoned_stage.to_string()));
+        assert!(!visible.contains(&legacy_stage.to_string()));
+        assert!(
+            crate::store::ladybug::ingest_stage_lease_path(target, stage)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            crate::store::ladybug::ingest_stage_lease_path(target, abandoned_stage)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            crate::store::ladybug::ingest_stage_lease_path(target, legacy_stage)
+                .unwrap()
+                .is_file()
+        );
+
+        let dimensions = embed::configured_dimensions().unwrap();
+        let restored = LadybugStore::new_with_identity_limits(
+            target,
+            dimensions,
+            embed::configured_embedder_id().unwrap(),
+            config.store_limits().unwrap(),
+        )
+        .unwrap();
+        restored.init("restore-recovery-test").await.unwrap();
+        for (namespace, id, expected) in [
+            (lookalike, "legacy-row", "legacy user-owned lookalike"),
+            (malformed, "malformed-row", "malformed prefix user content"),
+            ("ordinary", "ordinary-row", "ordinary memory"),
+            ("ordinary", "saved-fact", "preserved fact"),
+            ("ordinary", "saved-task", "preserved task"),
+            ("ordinary", "saved-procedure", "preserved procedure"),
+            ("ordinary", "saved-history", "preserved history"),
+        ] {
+            assert_eq!(
+                restored
+                    .get(namespace, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .content,
+                expected
+            );
+        }
+        let graph = restored
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(graph["links"].as_array().unwrap().iter().any(|link| {
+            link["source"] == "ordinary-rule"
+                && link["target"] == "ordinary-row"
+                && link["type"] == "GOVERNS"
+        }));
+
+        let next_stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let _next_stage_lease = restored.begin_ingest_stage(&next_stage).await.unwrap();
+        assert!(restored.get(stage, "stage-row").await.unwrap().is_none());
+        assert!(restored
+            .get(abandoned_stage, "abandoned-row")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(restored
+            .get(legacy_stage, &format!("{legacy_stage}::src/old.rs"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(restored
+            .get(lookalike, "legacy-row")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(restored
+            .get(malformed, "malformed-row")
+            .await
+            .unwrap()
+            .is_some());
+
+        let corrupt_snapshot = root.join("corrupt-snapshot");
+        std::fs::create_dir(&corrupt_snapshot).unwrap();
+        std::fs::copy(
+            snapshot.join("ladybug.store"),
+            corrupt_snapshot.join("ladybug.store"),
+        )
+        .unwrap();
+        std::fs::copy(
+            snapshot.join("ladybug.store.embedding"),
+            corrupt_snapshot.join("ladybug.store.embedding"),
+        )
+        .unwrap();
+        let snapshot_wal = appended_path(&snapshot.join("ladybug.store"), ".wal");
+        if snapshot_wal.exists() {
+            std::fs::copy(
+                snapshot_wal,
+                appended_path(&corrupt_snapshot.join("ladybug.store"), ".wal"),
+            )
+            .unwrap();
+        }
+        let mut corrupt_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snapshot.join("manifest.json")).unwrap())
+                .unwrap();
+        corrupt_manifest["stage_generations"] = json!(["../escape"]);
+        std::fs::write(
+            corrupt_snapshot.join("manifest.json"),
+            serde_json::to_vec(&corrupt_manifest).unwrap(),
+        )
+        .unwrap();
+        let rejected_target = root.join("rejected.store");
+        assert!(
+            restore_snapshot_bundle(&corrupt_snapshot, &rejected_target, &config)
+                .await
+                .is_err()
+        );
+        assert!(!rejected_target.exists());
+        assert!(!crate::store::ladybug::restore_in_progress_path(&rejected_target).exists());
+
+        let stale_sidecar_target = root.join("stale-sidecar.store");
+        std::fs::write(appended_path(&stale_sidecar_target, ".wal"), b"stale").unwrap();
+        assert!(
+            restore_snapshot_bundle(snapshot, &stale_sidecar_target, &config)
+                .await
+                .is_err()
+        );
+        assert!(!stale_sidecar_target.exists());
+        std::fs::remove_file(appended_path(&stale_sidecar_target, ".wal")).unwrap();
+        drop(restored);
+    }
+
+    #[tokio::test]
+    async fn restore_holds_target_open_lock_until_database_and_provenance_are_installed() {
+        use crate::traits::MemoryPayload;
+        use serde_json::json;
+
+        let root = std::env::temp_dir().join(format!("restore-open-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source_db = root.join("source.store");
+        let dimensions = embed::configured_dimensions().unwrap();
+        let embedder_id = embed::configured_embedder_id().unwrap();
+        let test_config: Config = serde_json::from_value(json!({})).unwrap();
+        let limits = test_config.store_limits().unwrap();
+        let source = LadybugStore::new_with_identity_limits(
+            &source_db,
+            dimensions,
+            embedder_id.clone(),
+            limits,
+        )
+        .unwrap();
+        source.init("restore-lock-source").await.unwrap();
+        source
+            .upsert(
+                "preserved",
+                "exact-row",
+                vec![0.125; dimensions],
+                MemoryPayload {
+                    content: "complete restored content".into(),
+                    user_id: "owner".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = root.join("snapshot");
+        source
+            .export_database(&snapshot.to_string_lossy())
+            .await
+            .unwrap();
+        drop(source);
+
+        let target = root.join("restored.store");
+        let barrier = root.join("restore-lock-entered");
+        set_test_restore_target_lock_barrier(target.clone(), barrier.clone());
+        let snapshot_for_thread = snapshot.clone();
+        let target_for_thread = target.clone();
+        let restore = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(restore_snapshot_bundle(
+                    &snapshot_for_thread,
+                    &target_for_thread,
+                    &serde_json::from_value(json!({})).unwrap(),
+                ))
+        });
+        let started = std::time::Instant::now();
+        while !barrier.exists() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(15));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let open_target = target.clone();
+        let open_identity = embedder_id.clone();
+        let opener = tokio::task::spawn_blocking(move || {
+            LadybugStore::new_with_identity_limits(open_target, dimensions, open_identity, limits)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !opener.is_finished(),
+            "constructor must wait while restore owns the destination writer lock"
+        );
+        release_test_barrier(&barrier);
+        let visible = restore.join().unwrap().unwrap();
+        assert!(visible.contains(&"preserved".to_string()));
+        let opened = opener.await.unwrap().unwrap();
+        assert_eq!(
+            opened
+                .get("preserved", "exact-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "complete restored content"
+        );
+        drop(opened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
@@ -1004,6 +1259,11 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let malformed = format!("{}not-a-uuid", crate::traits::INTERNAL_INGEST_STAGE_PREFIX);
+        let legacy_stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
         let ordinary = "ordinary".to_string();
         for (namespace, id, content, user_id) in [
             (
@@ -1101,164 +1361,144 @@ mod tests {
                 .await
                 .unwrap();
         }
-        drop(abandoned_lease);
+        let legacy_lease_path =
+            crate::store::ladybug::ingest_stage_lease_path(&source, &legacy_stage).unwrap();
+        let legacy_lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&legacy_lease_path)
+            .unwrap();
+        legacy_lease.try_lock().unwrap();
         source_store
+            .seed_legacy_memory_for_test(
+                &legacy_stage,
+                &format!("{legacy_stage}::src/old.rs"),
+                vec![0.375; dimensions],
+                MemoryPayload {
+                    content: "pre-catalog active staged file".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "src/old.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let active_legacy_snapshot_error = source_store
             .export_database(&snapshot.to_string_lossy())
             .await
-            .unwrap();
-        assert!(source_store
-            .export_database(&snapshot.to_string_lossy())
-            .await
-            .is_err());
-
-        let config: Config = serde_json::from_value(json!({})).unwrap();
-        let visible = restore_snapshot_bundle(&snapshot, &target, &config)
-            .await
-            .unwrap();
-        assert!(visible.contains(&"ordinary".to_string()));
-        assert!(visible.contains(&lookalike));
-        assert!(visible.contains(&malformed));
-        assert!(!visible.contains(&stage));
-        assert!(!visible.contains(&abandoned_stage));
+            .expect_err("snapshot must refuse an active pre-catalog stage")
+            .to_string();
+        assert!(active_legacy_snapshot_error.contains("legacy ingest generation"));
+        assert!(!snapshot.exists());
+        assert_eq!(
+            source_store
+                .get(&legacy_stage, &format!("{legacy_stage}::src/old.rs"))
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "pre-catalog active staged file"
+        );
+        drop(legacy_lease);
+        drop(abandoned_lease);
+        // Copy the open engine's database and active WAL outside the snapshot
+        // API. This is deliberately an unverified, potentially inconsistent
+        // crash-state pair, not a supported snapshot. Strict restore must fail
+        // closed and leave both source and destination state unchanged.
+        std::fs::create_dir(&snapshot).unwrap();
+        let snapshot_db = snapshot.join("ladybug.store");
+        std::fs::copy(&source, &snapshot_db).unwrap();
+        let source_wal = appended_path(&source, ".wal");
+        let snapshot_wal = appended_path(&snapshot_db, ".wal");
         assert!(
-            crate::store::ladybug::ingest_stage_lease_path(&target, &stage)
-                .unwrap()
-                .is_file()
+            source_wal.is_file() && std::fs::metadata(&source_wal).unwrap().len() > 0,
+            "restore regression requires a nonempty source WAL"
         );
-        assert!(
-            crate::store::ladybug::ingest_stage_lease_path(&target, &abandoned_stage)
-                .unwrap()
-                .is_file()
-        );
-
-        let restored = LadybugStore::new_with_identity_limits(
-            &target,
-            dimensions,
-            embed::configured_embedder_id().unwrap(),
-            config.store_limits().unwrap(),
-        )
-        .unwrap();
-        restored.init("restore-recovery-test").await.unwrap();
-        assert_eq!(
-            restored
-                .get(&lookalike, "legacy-row")
-                .await
-                .unwrap()
-                .unwrap()
-                .1
-                .content,
-            "legacy user-owned lookalike"
-        );
-        assert_eq!(
-            restored
-                .get(&malformed, "malformed-row")
-                .await
-                .unwrap()
-                .unwrap()
-                .1
-                .content,
-            "malformed prefix user content"
-        );
-        assert_eq!(
-            restored
-                .get("ordinary", "ordinary-row")
-                .await
-                .unwrap()
-                .unwrap()
-                .1
-                .content,
-            "ordinary memory"
-        );
-        for (id, expected) in [
-            ("saved-fact", "preserved fact"),
-            ("saved-task", "preserved task"),
-            ("saved-procedure", "preserved procedure"),
-            ("saved-history", "preserved history"),
-        ] {
-            assert_eq!(
-                restored
-                    .get("ordinary", id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .1
-                    .content,
-                expected
-            );
-        }
-        let graph = restored
-            .export_graph(false, false, &std::collections::HashMap::new(), None)
-            .await
-            .unwrap();
-        assert!(graph["links"].as_array().unwrap().iter().any(|link| {
-            link["source"] == "ordinary-rule"
-                && link["target"] == "ordinary-row"
-                && link["type"] == "GOVERNS"
-        }));
-
-        let next_stage = format!(
-            "{}{}",
-            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
-            uuid::Uuid::new_v4()
-        );
-        let _next_stage_lease = restored.begin_ingest_stage(&next_stage).await.unwrap();
-        assert!(restored.get(&stage, "stage-row").await.unwrap().is_none());
-        assert!(restored
-            .get(&abandoned_stage, "abandoned-row")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(restored
-            .get(&lookalike, "legacy-row")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(restored
-            .get(&malformed, "malformed-row")
-            .await
-            .unwrap()
-            .is_some());
-
-        let corrupt_snapshot = root.join("corrupt-snapshot");
-        std::fs::create_dir(&corrupt_snapshot).unwrap();
+        std::fs::copy(&source_wal, &snapshot_wal).unwrap();
         std::fs::copy(
-            snapshot.join("ladybug.store"),
-            corrupt_snapshot.join("ladybug.store"),
+            crate::store::ladybug::width_marker_path(&source),
+            crate::store::ladybug::width_marker_path(&snapshot_db),
         )
         .unwrap();
-        std::fs::copy(
-            snapshot.join("ladybug.store.embedding"),
-            corrupt_snapshot.join("ladybug.store.embedding"),
-        )
-        .unwrap();
-        let mut corrupt_manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(snapshot.join("manifest.json")).unwrap())
-                .unwrap();
-        corrupt_manifest["stage_generations"] = json!(["../escape"]);
         std::fs::write(
-            corrupt_snapshot.join("manifest.json"),
-            serde_json::to_vec(&corrupt_manifest).unwrap(),
+            snapshot.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "format": "neurostrata-snapshot",
+                "version": 2,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "bytes": std::fs::metadata(&snapshot_db).unwrap().len(),
+                "stage_generations": [stage, abandoned_stage],
+            }))
+            .unwrap(),
         )
         .unwrap();
-        let rejected_target = root.join("rejected.store");
+        let source_db_before = std::fs::read(&source).unwrap();
+        let source_wal_before = std::fs::read(&source_wal).unwrap();
+        let source_marker_path = crate::store::ladybug::width_marker_path(&source);
+        let source_marker_before = std::fs::read(&source_marker_path).unwrap();
+        let active_lease_path =
+            crate::store::ladybug::ingest_stage_lease_path(&source, &stage).unwrap();
+        let abandoned_lease_path =
+            crate::store::ladybug::ingest_stage_lease_path(&source, &abandoned_stage).unwrap();
+        let legacy_lease_before = std::fs::read(&legacy_lease_path).unwrap();
+        let active_lease_before = std::fs::read(&active_lease_path).unwrap();
+        let abandoned_lease_before = std::fs::read(&abandoned_lease_path).unwrap();
+        let rejected_wal_target = root.join("rejected-wal.store");
+        let config: Config = serde_json::from_value(json!({})).unwrap();
+        let rejected_wal_error = restore_snapshot_bundle(&snapshot, &rejected_wal_target, &config)
+            .await
+            .expect_err("the engine's checksum-rejected nonempty WAL must fail closed")
+            .to_string();
         assert!(
-            restore_snapshot_bundle(&corrupt_snapshot, &rejected_target, &config)
-                .await
-                .is_err()
+            rejected_wal_error.contains("write-ahead log did not verify"),
+            "expected strict checksum rejection, got: {rejected_wal_error}"
         );
-        assert!(!rejected_target.exists());
-        assert!(!crate::store::ladybug::restore_in_progress_path(&rejected_target).exists());
+        assert!(!rejected_wal_target.exists());
+        assert!(!appended_path(&rejected_wal_target, ".wal").exists());
+        assert!(!crate::store::ladybug::width_marker_path(&rejected_wal_target).exists());
+        assert!(!crate::store::ladybug::restore_in_progress_path(&rejected_wal_target).exists());
+        assert_eq!(std::fs::read(&source).unwrap(), source_db_before);
+        assert_eq!(std::fs::read(&source_wal).unwrap(), source_wal_before);
+        assert_eq!(
+            std::fs::read(&source_marker_path).unwrap(),
+            source_marker_before
+        );
+        assert_eq!(
+            std::fs::read(&active_lease_path).unwrap(),
+            active_lease_before
+        );
+        assert_eq!(
+            std::fs::read(&abandoned_lease_path).unwrap(),
+            abandoned_lease_before
+        );
+        assert_eq!(
+            std::fs::read(&legacy_lease_path).unwrap(),
+            legacy_lease_before
+        );
 
-        let stale_sidecar_target = root.join("stale-sidecar.store");
-        std::fs::write(appended_path(&stale_sidecar_target, ".wal"), b"stale").unwrap();
-        assert!(
-            restore_snapshot_bundle(&snapshot, &stale_sidecar_target, &config)
-                .await
-                .is_err()
-        );
-        assert!(!stale_sidecar_target.exists());
-        std::fs::remove_file(appended_path(&stale_sidecar_target, ".wal")).unwrap();
+        let api_snapshot = root.join("api-snapshot");
+        source_store
+            .export_database(&api_snapshot.to_string_lossy())
+            .await
+            .unwrap();
+        verify_wal_snapshot_restore(
+            &api_snapshot,
+            &target,
+            &root,
+            &stage,
+            &abandoned_stage,
+            &legacy_stage,
+            &lookalike,
+            &malformed,
+        )
+        .await;
         drop(_active_stage_lease);
+        drop(source_store);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2083,14 +2323,21 @@ async fn restore_snapshot_bundle(
     let dimensions = embed::configured_dimensions()?;
     let embedder_id = embed::configured_embedder_id()?;
     let limits = config.store_limits()?;
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let writer_target = target.to_path_buf();
+    let _restore_writer = tokio::task::spawn_blocking(move || {
+        crate::store::ladybug::acquire_database_writer_lock(&writer_target)
+    })
+    .await??;
+    #[cfg(test)]
+    test_restore_target_lock_barrier(target);
     let target_wal = appended_path(target, ".wal");
     let target_marker = crate::store::ladybug::width_marker_path(target);
     let restore_marker = crate::store::ladybug::restore_in_progress_path(target);
     if target.exists() || target_wal.exists() || target_marker.exists() || restore_marker.exists() {
         anyhow::bail!("restore destination or a sibling sidecar already exists");
     }
-    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)?;
     let target_name = target
         .file_name()
         .and_then(|name| name.to_str())
@@ -2140,14 +2387,23 @@ async fn restore_snapshot_bundle(
         if let Some(mut listed) = manifest_stages.clone() {
             listed.sort();
             if listed != db_stages {
-                anyhow::bail!("snapshot manifest and database stage provenance do not match");
+                anyhow::bail!(
+                    "snapshot manifest and database stage provenance do not match (manifest: {:?}; database: {:?})",
+                    listed,
+                    db_stages
+                );
             }
         }
         drop(candidate);
 
         restored_leases = crate::store::ladybug::create_restored_stage_leases(target, &db_stages)?;
-        if snapshot_wal.exists() {
-            std::fs::copy(&snapshot_wal, &target_wal)?;
+        // Opening the temporary bundle above may replay its WAL and the
+        // validation init may update the catalog. Install the WAL that now
+        // belongs to the validated temporary database; pairing that database
+        // with the pre-validation snapshot WAL can replay changes twice or
+        // apply offsets against a different DB image.
+        if temp_wal.exists() {
+            std::fs::copy(&temp_wal, &target_wal)?;
             target_wal_installed = true;
         }
         if temp_marker.exists() {
@@ -2157,6 +2413,10 @@ async fn restore_snapshot_bundle(
         std::fs::rename(&temp_db, target)?;
         target_db_installed = true;
         std::fs::remove_file(&restore_marker)?;
+        // The complete DB, WAL, marker, and fresh lease provenance are now
+        // visible. Release the installation lock before the normal constructor
+        // below reacquires it for post-restore validation.
+        drop(_restore_writer);
 
         // The database plus all sibling provenance is now complete. Verify the
         // installed copy after removing the interlock; a failure leaves a
@@ -2182,6 +2442,45 @@ async fn restore_snapshot_bundle(
         let _ = std::fs::remove_file(&restore_marker);
     }
     outcome
+}
+
+#[cfg(test)]
+static TEST_RESTORE_TARGET_LOCK_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_test_restore_target_lock_barrier(target: std::path::PathBuf, barrier: std::path::PathBuf) {
+    *TEST_RESTORE_TARGET_LOCK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap() = Some((target, barrier));
+}
+
+#[cfg(test)]
+fn test_restore_target_lock_barrier(target: &std::path::Path) {
+    let barrier = {
+        let mut state = TEST_RESTORE_TARGET_LOCK_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        match state.as_ref() {
+            Some((expected, _)) if expected == target => state.take().unwrap().1,
+            _ => return,
+        }
+    };
+    std::fs::write(&barrier, "entered").unwrap();
+    let mut release = barrier.as_os_str().to_os_string();
+    release.push(".release");
+    let release = std::path::PathBuf::from(release);
+    let started = std::time::Instant::now();
+    while !release.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "restore target-lock test barrier timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 fn appended_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {

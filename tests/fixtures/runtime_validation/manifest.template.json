@@ -1,0 +1,96 @@
+{
+  "baseline_revision": "219e47de604a283c6fb8d4249db77b9824e35188",
+  "budget": {
+    "address_space_bytes": 8589934592,
+    "command_timeout_seconds": 120,
+    "db_wal_bundle_bytes": 1073741824,
+    "fixture_bytes": 2097152,
+    "peak_rss_kib": 4194304,
+    "wall_seconds": 1200
+  },
+  "candidate_revision": "supplied to runner",
+  "corpus_sha256": {
+    "docs/fixture.md": "d2f675832124cb743941eb3dc2d1d07c4b10ff61d3d688cb1d362f85894bb5bb",
+    "src/core.rs": "dcf939c2a84f32dfdafd1438fc714d2f5dbd515767da3d539a8cc6a756cbcaaa",
+    "src/long_symbol.rs": "8df7dbcf5a858f27f1064ed69d8b7aa4a4021bdc72dd23442a38bf8d7406c222",
+    "src/recovery.rs": "ec0a9f2c6efd4ae9e057a22cc3b4142986a1356900072f9b38ec567111c5a837"
+  },
+  "fixture": {
+    "classification": "synthetic, small workflow fixture; not production representative",
+    "corpus_files": [
+      "docs/fixture.md",
+      "src/core.rs",
+      "src/long_symbol.rs",
+      "src/recovery.rs"
+    ],
+    "implemented_assertions": [
+      "preserved record content and types",
+      "manual rule GOVERNS edge points to ingested src/core.rs",
+      "database and WAL fit predeclared cap"
+    ],
+    "not_implemented_in_runner": [
+      "old/new generation visibility at process-crash boundary",
+      "no mixed IDs, vectors, or payloads",
+      "restore round-trip",
+      "source removal and reingest"
+    ],
+    "planned_but_not_run_here": [
+      "identical reingest",
+      "source removal/replacement",
+      "backup and restore",
+      "process crash boundaries",
+      "reader concurrency"
+    ],
+    "preservation_records": [
+      {
+        "content": "synthetic fact: keep exact text",
+        "namespace": "validation-preservation",
+        "type": "fact"
+      },
+      {
+        "content": "synthetic task: keep status",
+        "namespace": "validation-preservation",
+        "type": "task"
+      },
+      {
+        "content": "synthetic procedure: keep steps",
+        "namespace": "validation-preservation",
+        "type": "procedure"
+      },
+      {
+        "content": "synthetic history: keep provenance",
+        "namespace": "validation-preservation",
+        "type": "history"
+      },
+      {
+        "content": "synthetic rule: governs src/core.rs",
+        "edge": {
+          "target": "src/core.rs",
+          "type": "GOVERNS"
+        },
+        "namespace": "validation-preservation",
+        "type": "rule"
+      }
+    ],
+    "runner_cases": [
+      "one initial real CLI ingest",
+      "preservation readback of five hand-written memory types",
+      "manual rule edge relinks to synthetic source"
+    ]
+  },
+  "host": {
+    "cgroup_cpu_quota": "400000 100000",
+    "cgroup_memory_limit": "17179869184",
+    "cpu_count": 5,
+    "os": "Linux-6.18.55-x86_64-with-glibc2.41",
+    "python": "3.12.14",
+    "temporary_filesystem_free_bytes": 6844035072
+  },
+  "model": {
+    "note": "official pinned file; runtime compatibility must be verified before loading",
+    "path": "onnx/model.onnx",
+    "repository": "nomic-ai/nomic-embed-text-v1.5",
+    "revision": "0a3f1bfa99207a5448900a6daaaf6add10eaa058",
+    "sha256": "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+  }
+}

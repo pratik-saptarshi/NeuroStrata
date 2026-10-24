@@ -4,7 +4,7 @@
 **Source:** `review_panel_report.md` (verdict REJECT-AND-REWRITE, 3.2/10)
 **Sequencing rule:** evidence strength, not claimed byte savings.
 
-## Status record — 2026-10-23
+## Status record — 2026-10-24
 
 Source changes implemented: recorder append/reopen coverage, staged ingest with atomic
 publication and failure propagation, local HTTP retry tests, store-limit validation, and
@@ -16,15 +16,19 @@ and waits for definitive transaction resolution if publication exceeds its deadl
 recovery now requires the exact generated UUID namespace plus its durable lease sidecar;
 legacy `-ingest-stage-<UUID>` names and reserved-prefix lookalikes without a sidecar remain
 visible and untouched. Malformed reserved identifiers do not block recovery of unrelated
-stages, and new writes cannot claim the reserved namespace. The
-binary test suite passes 774/774 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
-default locked local build was blocked because the `ort-sys` prebuilt download from
+stages, and new writes cannot claim the reserved namespace.
+The exact remote base for the current local work is `1abf0c3cd1313f2f272c378650c6e23da04b3bf0`; the working tree adds snapshot/restore, stage-provenance upgrade, cancellation, export-lock, restore-open-lock, and symlink-alias corrections. The full binary test suite passed 780/780 with a temporary `ort-load-dynamic` override and LadybugDB built from source. Export now refuses an active legacy stage that lacks durable provenance, and holds its lease while registering abandoned legacy stages at the snapshot cut. A concurrent pre-catalog writer that ignores the canonical database writer lock is outside the stable-cut guarantee; stop any such old process before exporting. A copied, open database plus active WAL is an unverified crash-state fixture, not a supported snapshot: strict restore rejected it on checksum verification and the regression asserts the source bytes, lease sidecars, target siblings, and restore interlock remain unchanged. Production `export_database` checkpoints before copying; its resulting snapshot has a separate restore-preservation test. No successful strict-mode restore from a known-valid nonempty WAL has been demonstrated. The default locked local build was blocked because the `ort-sys` prebuilt download from
 `cdn.pyke.io` returned HTTP 403 through the environment proxy. That override is only a local
-verification path; the previous pushed head was validated by hosted default CI:
-workflow-dispatch run `40036052762` for `bd5cdf75332badf8def9e19f5745316c2a82948e` passed all four jobs, including the Ubuntu 765-test job. The additional snapshot, restore, locking, and model-validation changes in the current candidate have not yet run on hosted CI.
+verification path; it is distinct from hosted default-feature CI. Workflow-dispatch run
+`40036052762` for `bd5cdf75332badf8def9e19f5745316c2a82948e` passed all four jobs, including
+the Ubuntu 765-test job. A newer run `40056891840` on the then-published head
+`1abf0c3cd1313f2f272c378650c6e23da04b3bf0` passed Ubuntu tests, macOS and Ubuntu builds;
+the Windows build was still in progress at the latest check. Neither run contains the
+additional uncommitted snapshot, restore, locking, and model-validation changes documented
+here; those require CI on the exact pushed candidate SHA.
 An earlier run (`39911946378`) failed Ubuntu test compilation on the stacked async test
 attributes in `src/learning/recorder.rs`; macOS, Ubuntu build, and Windows build jobs passed.
-Runtime memory was not measured because no pinned model artifact or representative corpus was present. The last environment inventory showed a 16 GiB cgroup, 4 CPU quota, about 11 GiB free workspace space and 6.7 GiB free in `/tmp`; the exact before/after workload and model revision were unavailable. I did not allocate a machine-specific measurement budget or start runs that could exhaust the workspace. No empirical improvement is claimed.
+Runtime memory was not measured. A small synthetic fixture and a runner with common offline flags now exist at `tests/fixtures/runtime_validation/` and `scripts/runtime_validation.py`; the script itself does not restrict network access, so outbound access must be disabled externally before any real-inference run. The corpus is 1,977 bytes across four files and is not production-representative. Budgets are an 8 GiB per-process virtual-address limit, a 4 GiB observed RSS stop threshold, 1 GiB DB/WAL, 120 seconds per command, and 20 minutes total. The runner refuses symlinked model-cache entries, budgets two isolated copies, and records hashes for every supplied cache file. The pinned official Nomic model artifact is not present in the local cache, and the installed system ONNX Runtime 1.21 is incompatible with this build's ort API-24 requirement. The normal `ort-sys` prebuilt download returned proxy HTTP 403; no retry or alternate download route was used. Therefore real local inference and matched base/candidate measurements remain blocked; the prepared harness has only been exercised in fixture-generation mode. It records one CLI lifecycle per binary and labels idle RSS, steady-state inference, reader responsiveness, and warm-run variance as unmeasured. No empirical memory/throughput improvement is claimed. The last resource inventory showed a 16 GiB cgroup, 4 CPU quota, about 11 GiB free workspace space and 6.7 GiB free in `/tmp`.
 The cooperating writer/snapshot sidecar lock resolves relative paths and symlinks to one canonical path. Hard-link aliases are not unified by that sidecar; the storage engine separately refuses concurrent opens of a database file.
 
 ## Scope decisions
@@ -180,14 +184,16 @@ Steps:
 |---|---|
 | Source changes | Implemented; changed Rust files formatted; `git diff --check` passes |
 | Type-check | `cargo check --tests` passed with temporary `ort-load-dynamic` override and source-built LadybugDB |
-| Binary test suite | 774/774 passed with temporary `ort-load-dynamic` and source-built LadybugDB; includes subprocess process-kill, cancellation, snapshot/restore, symlink alias, and cross-process writer-lock regressions. Actual local model loading/inference was not exercised because model weights are absent; backend-selection tests do not substitute for model inference |
-| Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no download bypass was attempted |
-| Exact-head PR CI | Previous pushed head `bd5cdf75332badf8def9e19f5745316c2a82948e` passed workflow-dispatch run `40036052762`: macOS, Ubuntu, Windows builds and Ubuntu tests all succeeded (765 tests). Current candidate still needs CI on its exact pushed SHA |
-| Runtime memory comparison | Not executed: no pinned model artifacts or corpus; last observed limits were 16 GiB cgroup, 4 CPU quota, 11 GiB workspace free and 6.7 GiB `/tmp` free. No matched base/candidate runs, raw measurement logs, or empirical improvement claim |
+| Binary test suite | 780/780 passed in the final run with temporary `ort-load-dynamic` and source-built LadybugDB, including the active-legacy-stage refusal guard. Other focused snapshot/restore, legacy lease migration, symlinked-parent alias, canceled export/checkpoint/init, and restore-open serialization regressions passed; strict restore rejects the unverified active-WAL fixture without changing source or destination. Actual local inference was not exercised |
+| Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; the installed system ONNX Runtime 1.21 is incompatible with the ort API-24 requirement. No download bypass was attempted |
+| Exact-head PR CI | `bd5cdf75332badf8def9e19f5745316c2a82948e` passed workflow-dispatch run `40036052762` (all four jobs; 765 Ubuntu tests). Then-published head `1abf0c3cd1313f2f272c378650c6e23da04b3bf0` run `40056891840`: Ubuntu tests, macOS and Ubuntu builds passed; Windows build remained in progress at latest check. Current follow-up is uncommitted and needs hosted CI on its exact pushed SHA |
+| Runtime harness | Synthetic fixture generation passed; 1,977 bytes across four files. Runner not executed because the complete compatible ONNX runtime/model cache is unavailable. Budgets: 8 GiB process virtual address space, observed 4 GiB RSS stop threshold, 1 GiB DB/WAL, 120 seconds per command, 20 minutes total. Network access must be disabled externally for any later inference run |
+| Runtime memory comparison | Not executed: no matched base/candidate runs, no real inference, no raw measurement logs, and no empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
 | NeuroStrata task/memory gate | Unavailable: task/memory MCP tools and the `neurostrata-mcp` CLI are not installed |
 
-Default-feature verification commands remain blocked by the ONNX prebuilt download:
+Default-feature verification commands for this local environment remain blocked by the ONNX
+prebuilt download:
 
 - `cargo build --locked --release`
 - `cargo test --locked parser::ingest`
