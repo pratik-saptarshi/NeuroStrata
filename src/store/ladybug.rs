@@ -1298,7 +1298,9 @@ impl Default for StoreLimits {
 /// creation time. The fixed width can be read from the catalog, but the schema
 /// does not record which model produced each vector. A sidecar records both for
 /// new stores; a legacy store without identity adopts its current model with a
-/// visible warning, then blocks subsequent identity changes.
+/// visible warning, then blocks subsequent identity changes. The adoption is
+/// itself recorded in the persisted marker as provenance (see
+/// `PersistedEmbeddingMarker`); adopting never refuses the open.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct EmbeddingMarker {
     version: u8,
@@ -1313,13 +1315,38 @@ pub(crate) fn width_marker_path(db_path: &Path) -> PathBuf {
     PathBuf::from(marker)
 }
 
+/// Adoption provenance recorded in a marker's JSON, if any. Legacy numeric
+/// markers and markers written before provenance existed carry none.
+fn adopted_from_in_marker_bytes(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    value.get("adopted_from")?.as_str().map(str::to_string)
+}
+
 /// Read the marker; legacy numeric markers remain readable for an explicit,
 /// warned identity adoption.
+#[allow(dead_code)] // the open path uses the provenance-aware form below
 fn read_width_marker(
     resolved_db_path: &Path,
     supplied_db_paths: &[PathBuf],
     configured_embedder_id: Option<&str>,
 ) -> Result<Option<EmbeddingMarker>> {
+    Ok(read_width_marker_with_provenance(
+        resolved_db_path,
+        supplied_db_paths,
+        configured_embedder_id,
+    )?
+    .map(|(marker, _)| marker))
+}
+
+/// Read the marker together with any adoption provenance recorded in it.
+/// Provenance is not a field of `EmbeddingMarker`: it describes how the
+/// marker came to carry its identity, not the identity itself, and keeping
+/// it alongside leaves every existing marker construction untouched.
+fn read_width_marker_with_provenance(
+    resolved_db_path: &Path,
+    supplied_db_paths: &[PathBuf],
+    configured_embedder_id: Option<&str>,
+) -> Result<Option<(EmbeddingMarker, Option<String>)>> {
     // `resolved_db_path` is the exact file identity locked and passed to the
     // engine. Do not resolve the caller's symlink again here: it could be
     // retargeted between resolution and marker preflight.
@@ -1331,10 +1358,14 @@ fn read_width_marker(
             paths.push(marker);
         }
     }
-    let mut found: Vec<(PathBuf, EmbeddingMarker)> = Vec::new();
+    let mut found: Vec<(PathBuf, EmbeddingMarker, Option<String>)> = Vec::new();
     for path in paths {
         match std::fs::read(&path) {
-            Ok(bytes) => found.push((path.clone(), parse_width_marker(&path, &bytes)?)),
+            Ok(bytes) => {
+                let adopted_from = adopted_from_in_marker_bytes(&bytes);
+                let marker = parse_width_marker(&path, &bytes)?;
+                found.push((path.clone(), marker, adopted_from));
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 // A dangling symlink or other existing but unreadable marker is
                 // evidence, not absence. Never adopt a new identity over it.
@@ -1348,12 +1379,12 @@ fn read_width_marker(
             ),
         }
     }
-    let Some((_, first)) = found.first() else {
+    let Some((_, first, _)) = found.first() else {
         return Ok(None);
     };
     let identities = found
         .iter()
-        .filter_map(|(_, marker)| marker.embedder_id.as_deref())
+        .filter_map(|(_, marker, _)| marker.embedder_id.as_deref())
         .map(|identity| match configured_embedder_id {
             Some(configured) => {
                 crate::embed::canonicalize_persisted_embedder_id(identity, configured)
@@ -1363,12 +1394,12 @@ fn read_width_marker(
         .collect::<Result<HashSet<_>>>()?;
     if found
         .iter()
-        .any(|(_, other)| other.dimensions != first.dimensions)
+        .any(|(_, other, _)| other.dimensions != first.dimensions)
         || identities.len() > 1
     {
         let paths = found
             .iter()
-            .map(|(path, _)| path.display().to_string())
+            .map(|(path, _, _)| path.display().to_string())
             .collect::<Vec<_>>()
             .join(" and ");
         anyhow::bail!(
@@ -1378,9 +1409,10 @@ fn read_width_marker(
     }
     let identity_marker = found
         .iter()
-        .find(|(_, marker)| marker.embedder_id.is_some())
-        .map(|(_, marker)| marker);
-    Ok(Some(identity_marker.unwrap_or(first).clone()))
+        .find(|(_, marker, _)| marker.embedder_id.is_some())
+        .map(|(_, marker, adopted_from)| (marker, adopted_from));
+    let (selected, adopted_from) = identity_marker.unwrap_or((first, &found[0].2));
+    Ok(Some((selected.clone(), adopted_from.clone())))
 }
 
 fn parse_width_marker(path: &Path, bytes: &[u8]) -> Result<EmbeddingMarker> {
@@ -1459,12 +1491,37 @@ fn check_embedding_width(db_path: &Path, recorded: usize, dimensions: usize) -> 
 /// Persist the schema width and embedding identity used to create the database.
 /// A failed write must stop the open; otherwise a later same-width model could
 /// silently adopt an unmarked database.
+#[allow(dead_code)] // the open path uses the provenance-aware form below
 fn write_width_marker(db_path: &Path, dimensions: usize, embedder_id: Option<&str>) -> Result<()> {
+    write_width_marker_with_adopted_from(db_path, dimensions, embedder_id, None)
+}
+
+/// The marker's serialization form. `adopted_from` records that this store's
+/// identity was adopted from a legacy marker (`"width-only"`) or from its
+/// fixed-width schema alone (`"schema-only"`); it is serialized only when an
+/// adoption occurred, so natively marked stores keep the pre-existing shape
+/// and markers written before it existed parse unchanged.
+#[derive(serde::Serialize)]
+struct PersistedEmbeddingMarker {
+    version: u8,
+    dimensions: usize,
+    embedder_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adopted_from: Option<String>,
+}
+
+fn write_width_marker_with_adopted_from(
+    db_path: &Path,
+    dimensions: usize,
+    embedder_id: Option<&str>,
+    adopted_from: Option<&str>,
+) -> Result<()> {
     let path = width_marker_path(db_path);
-    let marker = EmbeddingMarker {
+    let marker = PersistedEmbeddingMarker {
         version: 1,
         dimensions,
         embedder_id: embedder_id.map(str::to_string),
+        adopted_from: adopted_from.map(str::to_string),
     };
     let tmp = path.with_extension(format!("embedding.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -2133,10 +2190,17 @@ impl LadybugStore {
         // A marker cannot outlive the database it described. If the file is
         // absent, ignore any sibling marker and replace it after opening this
         // fresh path; otherwise a stale 768 marker can strand a new 384 DB.
-        let marker = if database_preexisted {
-            read_width_marker(&resolved_path, &path_aliases, embedder_id.as_deref())?
+        let (marker, existing_adopted_from) = if database_preexisted {
+            match read_width_marker_with_provenance(
+                &resolved_path,
+                &path_aliases,
+                embedder_id.as_deref(),
+            )? {
+                Some((marker, adopted_from)) => (Some(marker), adopted_from),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         ensure_database_path_unchanged(&resolved_path, &supplied_path)?;
         if let Some(marker) = &marker {
@@ -2244,6 +2308,7 @@ impl LadybugStore {
             // An existing DB without Memory is either a new empty catalog or a
             // partial/foreign schema; init() performs its own idempotent DDL.
         }
+        let mut adopted_from: Option<&str> = None;
         if let Some(marker) = &marker {
             check_embedding_width(&resolved_path, marker.dimensions, dimensions)?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
@@ -2256,14 +2321,16 @@ impl LadybugStore {
                     ));
                 }
             } else if marker.embedder_id.is_none() && embedder_id.is_some() {
+                adopted_from = Some("width-only");
                 eprintln!(
-                    "WARNING: {} records embedding width but no model identity; adopting the configured identity without verifying historical vectors. Future model changes will be blocked.",
+                    "WARNING: {} records embedding width but no model identity; adopting the configured identity without verifying historical vectors. Future model changes will be blocked. This adoption has been recorded in the store's marker.",
                     local_path.display()
                 );
             }
         } else if schema_width.is_some() && embedder_id.is_some() {
+            adopted_from = Some("schema-only");
             eprintln!(
-                "WARNING: {} has a fixed-width embedding schema but no sidecar identity; adopting the configured model identity without verifying historical vectors.",
+                "WARNING: {} has a fixed-width embedding schema but no sidecar identity; adopting the configured model identity without verifying historical vectors. This adoption has been recorded in the store's marker.",
                 local_path.display()
             );
         }
@@ -2280,7 +2347,16 @@ impl LadybugStore {
             (None, Some(current)) => Some(current.to_string()),
             (None, None) => None,
         };
-        write_width_marker(&resolved_path, dimensions, marker_identity.as_deref())?;
+        // Provenance is sticky: a fresh adoption records its origin, and a
+        // later open under the adopted identity carries the existing record
+        // forward instead of dropping it in this rewrite.
+        let marker_provenance = adopted_from.or(existing_adopted_from.as_deref());
+        write_width_marker_with_adopted_from(
+            &resolved_path,
+            dimensions,
+            marker_identity.as_deref(),
+            marker_provenance,
+        )?;
 
         Ok(Self {
             local_path: resolved_path,
@@ -5389,6 +5465,195 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("model identity"));
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+
+    fn read_marker_json(db_path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(width_marker_path(db_path)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn width_only_store_adoption_records_provenance() {
+        let dir =
+            std::env::temp_dir().join(format!("ladybug-adopt-width-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("open model A");
+            store.init("probe").await.expect("create schema");
+        }
+        // Rewrite the sidecar as a legacy marker: width recorded, no identity.
+        std::fs::write(
+            width_marker_path(&dir),
+            serde_json::to_vec(&json!({"version": 1, "dimensions": 4})).unwrap(),
+        )
+        .unwrap();
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("width-only store is adopted under the configured identity");
+        }
+        let marker: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(width_marker_path(&dir)).unwrap()).unwrap();
+        assert_eq!(marker.embedder_id.as_deref(), Some("fastembed:model-a"));
+        assert_eq!(
+            read_marker_json(&dir).get("adopted_from"),
+            Some(&json!("width-only")),
+            "the adoption is recorded in the marker itself"
+        );
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn schema_only_adoption_records_provenance() {
+        let dir =
+            std::env::temp_dir().join(format!("ladybug-adopt-schema-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("open model A");
+            store.init("probe").await.expect("create schema");
+        }
+        // No sidecar at all: the width can only come from the fixed schema.
+        std::fs::remove_file(width_marker_path(&dir)).expect("remove only test sidecar");
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("schema-only store is adopted under the configured identity");
+        }
+        let marker: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(width_marker_path(&dir)).unwrap()).unwrap();
+        assert_eq!(marker.embedder_id.as_deref(), Some("fastembed:model-a"));
+        assert_eq!(
+            read_marker_json(&dir).get("adopted_from"),
+            Some(&json!("schema-only")),
+            "the adoption is recorded in the marker itself"
+        );
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+
+    #[tokio::test]
+    async fn adopted_store_refuses_a_different_same_width_model() {
+        let dir =
+            std::env::temp_dir().join(format!("ladybug-adopt-refuse-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("open model A");
+            store.init("probe").await.expect("create schema");
+        }
+        std::fs::write(
+            width_marker_path(&dir),
+            serde_json::to_vec(&json!({"version": 1, "dimensions": 4})).unwrap(),
+        )
+        .unwrap();
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("model A adopts the width-only store");
+        }
+        // Model B has the same width, so only the recorded identity — now
+        // persisted by the adoption — can refuse it.
+        let error = match LadybugStore::new_with_identity_limits(
+            &dir,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        ) {
+            Ok(_) => panic!("an adopted store must refuse a different same-width model"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("model identity"));
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+
+    #[test]
+    fn native_store_has_no_adoption_provenance() {
+        let dir = std::env::temp_dir().join(format!("ladybug-native-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("open model A");
+        }
+        let marker: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(width_marker_path(&dir)).unwrap()).unwrap();
+        assert_eq!(marker.embedder_id.as_deref(), Some("fastembed:model-a"));
+        assert_eq!(
+            read_marker_json(&dir).get("adopted_from"),
+            None,
+            "a store created fresh under an identity was never adopted"
+        );
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+
+    #[test]
+    fn pre_change_marker_still_parses() {
+        let dir = std::env::temp_dir().join(format!("ladybug-pre-change-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("fixture.store");
+        std::fs::write(&database, b"disposable database fixture").unwrap();
+        // A marker written before adoption provenance existed has no field.
+        let legacy = b"{\"version\":1,\"dimensions\":4,\"embedder_id\":\"fastembed:model-a\"}";
+        std::fs::write(width_marker_path(&database), legacy).unwrap();
+        let (marker, adopted_from) =
+            read_width_marker_with_provenance(&database, &[], Some("fastembed:model-a"))
+                .expect("pre-change marker still loads")
+                .expect("pre-change marker exists");
+        assert_eq!(marker.dimensions, 4);
+        assert_eq!(marker.embedder_id.as_deref(), Some("fastembed:model-a"));
+        assert_eq!(adopted_from, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn adoption_provenance_is_sticky() {
+        let dir =
+            std::env::temp_dir().join(format!("ladybug-adopt-sticky-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("open model A");
+            store.init("probe").await.expect("create schema");
+        }
+        std::fs::write(
+            width_marker_path(&dir),
+            serde_json::to_vec(&json!({"version": 1, "dimensions": 4})).unwrap(),
+        )
+        .unwrap();
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("model A adopts the width-only store");
+        }
+        assert_eq!(
+            read_marker_json(&dir).get("adopted_from"),
+            Some(&json!("width-only"))
+        );
+        // A later open is a normal marked open — no adoption branch runs —
+        // but the open path rewrites the marker and must not drop the record.
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 4, "fastembed:model-a".into(), limits)
+                    .expect("adopted store reopens under the adopted identity");
+        }
+        let marker: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(width_marker_path(&dir)).unwrap()).unwrap();
+        assert_eq!(marker.embedder_id.as_deref(), Some("fastembed:model-a"));
+        assert_eq!(
+            read_marker_json(&dir).get("adopted_from"),
+            Some(&json!("width-only")),
+            "provenance survives the marker rewrite on a later open"
+        );
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
