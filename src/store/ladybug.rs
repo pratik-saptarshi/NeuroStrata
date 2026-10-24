@@ -7422,7 +7422,7 @@ eurostrata\src\daemon.rs",
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while ENGINE_CALLS_STARTED.load(std::sync::atomic::Ordering::Acquire)
-                < started_before_checkpoint + 1
+                < started_before_checkpoint + 2
             {
                 tokio::task::yield_now().await;
             }
