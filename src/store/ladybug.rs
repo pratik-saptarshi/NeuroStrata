@@ -5823,24 +5823,49 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
-    /// Spec Feature 1 AC7: a real store driven to the profile-low max-DB
-    /// cap refuses further growth with the engine's loud error. Writing
-    /// 2 GiB of genuine content is not the mechanism: the store file is
-    /// pre-grown to just under the cap (on open the engine derives its
-    /// page count from the file length, so the pre-grown file sits one
-    /// page under the frame-group ceiling the cap imposes), then inserts
-    /// run — each followed by a checkpoint, because a transaction's rows
-    /// only reach the data file, and the capped page accounting, when a
-    /// checkpoint merges the WAL — until the engine refuses.
+    /// Child worker for `profile_cap_refusal_fires_at_reduced_cap`:
+    /// grows a store at an 8 MiB max-DB cap on incompressible rows,
+    /// checkpointing after each upsert — a
+    /// transaction's rows only reach the data file, and the capped page
+    /// accounting, when a checkpoint merges the WAL — until the engine
+    /// refuses. Asserts the refusal is the engine's max-DB-size error and
+    /// that the seeded row still reads back after it, prints the PASS
+    /// marker the parent asserts on, then exits directly: running the
+    /// store's destructor would run the checkpoint-on-close that
+    /// segfaults on lbug 0.20.4 after a cap refusal (see the parent
+    /// test's comment).
+    ///
+    /// Marked `#[ignore]`: the body ends in `std::process::exit`, so it
+    /// must never run as part of the suite proper — not even if the gate
+    /// variable leaks into the suite's own environment. The parent
+    /// spawns it by name with `--ignored`.
+    ///
+    /// Row math: at an 8 MiB cap the engine's VM region holds exactly
+    /// two frame groups — one shadow, one data — so the data file has
+    /// 1024 pages (4 MiB). Each row stores ~32 KiB of incompressible hex
+    /// (~8 pages) plus its node record, so the refusal must fire within
+    /// roughly 4 MiB / 32 KiB ≈ 128 rows; the 1024-row bound is ~8x
+    /// headroom and is unreachable unless the cap is not enforced at all.
     #[tokio::test]
-    async fn profile_low_max_db_cap_refuses_further_growth() {
-        let profile = crate::config::CapacityProfile::Low;
-        let limits = StoreLimits {
-            buffer_pool_bytes: profile.buffer_pool_bytes(),
-            max_db_bytes: profile.max_db_bytes(),
+    #[ignore = "child worker: spawned by profile_cap_refusal_fires_at_reduced_cap"]
+    async fn profile_cap_refusal_child_worker() {
+        let Ok(db) = std::env::var("NEUROSTRATA_TEST_PROFILE_CAP_DB") else {
+            return;
         };
-        let dir =
-            std::env::temp_dir().join(format!("ladybug-profile-cap-{}", uuid::Uuid::new_v4()));
+        let db = PathBuf::from(db);
+        // The pool rides at the cap rather than at the profile's 64 MiB:
+        // this repo's StoreLimits::validate refuses a buffer pool larger
+        // than the max-DB ceiling ("the buffer-pool ceiling cannot
+        // exceed the database-size ceiling"), a coupling the engine
+        // itself does not impose — its verifySizeParams checks each
+        // value on its own. The pool size plays no part in the cap
+        // mechanism under test (frame-group accounting on the data
+        // file); the profile's pool pairs with the profile's 2 GiB cap,
+        // which satisfies the same validation.
+        let limits = StoreLimits {
+            buffer_pool_bytes: 8 * 1024 * 1024,
+            max_db_bytes: 8 * 1024 * 1024,
+        };
         let payload = |content: String| MemoryPayload {
             content,
             user_id: "agent".into(),
@@ -5850,58 +5875,36 @@ mod tests {
             location_lines: "1".into(),
             metadata: json!({"evidence": "cap"}),
         };
-        {
-            let store = LadybugStore::new_with_identity_limits(
-                &dir,
-                4,
-                "fastembed:BGESmallENV15Q".into(),
-                limits,
-            )
-            .expect("open a new store at profile-low limits");
-            store.init("profile-cap").await.expect("create schema");
-            store
-                .upsert(
-                    "profile-cap",
-                    "profile-cap::seed",
-                    vec![0.11, 0.22, 0.33, 0.44],
-                    payload("seed row".into()),
-                )
-                .await
-                .expect("seed insert under the cap");
-        }
-        // Pre-grow the database file to just under the cap.
-        {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&dir)
-                .expect("reopen the store file for pre-growing");
-            file.set_len(profile.max_db_bytes() - 4096)
-                .expect("pre-grow the store file to just under the cap");
-        }
         let store = LadybugStore::new_with_identity_limits(
-            &dir,
+            &db,
             4,
             "fastembed:BGESmallENV15Q".into(),
             limits,
         )
-        .expect("reopen the pre-grown store");
-        store.init("profile-cap").await.expect("schema survives reopen");
-        let filler = "x".repeat(16 * 1024);
+        .expect("open a new store at the reduced cap");
+        store.init("profile-cap").await.expect("create schema");
+        store
+            .upsert(
+                "profile-cap",
+                "profile-cap::seed",
+                vec![0.11, 0.22, 0.33, 0.44],
+                payload("seed row".into()),
+            )
+            .await
+            .expect("seed insert under the cap");
         let mut refusal = None;
-        for i in 0..512 {
+        for i in 0..1024u64 {
             let inserted = store
                 .upsert(
                     "profile-cap",
                     &format!("profile-cap::row-{i}"),
                     vec![0.11, 0.22, 0.33, 0.44],
-                    payload(filler.clone()),
+                    payload(incompressible_filler(i)),
                 )
                 .await;
             // The checkpoint is part of the growth mechanism, not an
             // afterthought: upserts only mark the store dirty, and the
             // merge is what allocates data-file pages against the cap.
-            // The first merge that needs a second new page claims a frame
-            // group past the ceiling and the engine refuses.
             let step = match inserted {
                 Ok(_) => store.checkpoint().await,
                 Err(error) => Err(error),
@@ -5915,21 +5918,20 @@ mod tests {
             }
         }
         let refusal = refusal.expect(
-            "a store pre-grown to the profile-low max-DB cap must refuse further growth",
+            "a store grown to its max-DB cap must refuse further growth",
         );
         // The refusal must be the engine's size-cap error, not any loud
-        // error: an identity, marker, schema, or WAL failure along the way
-        // must fail this test, not satisfy it. The engine surfaces its
-        // max-DB-size refusal as a database-size message (the VM region
-        // the store is mapped into is full); the full text is printed on
-        // failure so a phrasing change is a one-line correction here.
+        // error: an identity, marker, schema, or WAL failure along the
+        // way must fail this test, not satisfy it. Rounds 1–2 of the CI
+        // fix loop verified the engine's exact text ("Maximum database
+        // size of {} bytes has been reached. Reopen the database with a
+        // larger max_db_size to continue."), so the assertion names that
+        // family directly instead of the broader alternation the
+        // unverified text once required.
         let message = format!("{refusal:#}");
         let lowered = message.to_lowercase();
         assert!(
-            lowered.contains("size")
-                && (lowered.contains("maximum")
-                    || lowered.contains("exceed")
-                    || lowered.contains("vm region")),
+            lowered.contains("maximum database size") && lowered.contains("has been reached"),
             "the refusal must be the engine's max-DB-size error, got: {message}"
         );
         for other_path in ["model identity", "marker", "checksum", "width"] {
@@ -5938,8 +5940,136 @@ mod tests {
                 "the refusal came from the {other_path} path, not the size cap: {message}"
             );
         }
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(width_marker_path(&dir));
+        // The refusal is clean: the store stays readable afterwards
+        // (round 2 probe — a post-refusal scan returned the row count).
+        let seed = store
+            .get("profile-cap", "profile-cap::seed")
+            .await
+            .expect("a read after the refusal must still succeed")
+            .expect("the seed row must survive the refusal");
+        assert_eq!(seed.1.content, "seed row");
+        println!("PROFILE_CAP_REFUSAL_PASS refusal: {message}");
+        {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        // Exit without unwinding: dropping the store would run the
+        // engine's checkpoint-on-close, which is exactly the path that
+        // segfaults after a cap refusal on lbug 0.20.4 (documented on
+        // the parent test, not exercised here).
+        std::process::exit(0);
+    }
+
+    /// Deterministic incompressible filler: xorshift64* output, hex
+    /// encoded — 2048 words become a 32 KiB string. Hex of pseudo-random
+    /// bytes carries 4 bits of entropy per stored character, so even
+    /// ideal entropy coding could at best halve it — where
+    /// repeated-character filler compresses ~1000:1 and plateaus at
+    /// ~2.2 MB, never approaching any cap (CI fix loop round 2 probe).
+    /// The growth loop's row bound is sized to survive the halving.
+    fn incompressible_filler(seed: u64) -> String {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut out = String::with_capacity(32 * 1024);
+        for _ in 0..2048 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let word = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            out.push_str(&format!("{word:016x}"));
+        }
+        out
+    }
+
+    /// Spec Feature 1 AC7, reduced-cap subprocess form (Pratik's
+    /// decision, 2026-10-24 — CI fix loop round 3). A real store opened
+    /// through the production path refuses further growth with the
+    /// engine's max-DB-size error once it reaches its configured cap.
+    /// The growth runs in a child process (the
+    /// `profile_cap_refusal_child_worker` test above, spawned the same
+    /// way the publication crash-recovery tests spawn theirs); this
+    /// parent asserts on the child's exit status and output.
+    ///
+    /// Why a reduced cap: the cap under test is 8 MiB, the smallest
+    /// value the engine admits — `BufferManager::verifySizeParams` (lbug
+    /// v0.20.4, src/storage/buffer_manager/buffer_manager.cpp) requires
+    /// at least two page groups, one for the main data file and one for
+    /// the shadow file: 2 * 4096 * 1024 = 8 MiB. The limit reaches the
+    /// engine through the same `StoreLimits` -> `SystemConfig::
+    /// max_db_size` flow as any other value (fix loop round 1 verified
+    /// that leg end to end), with one repo-level qualification:
+    /// `StoreLimits::validate` requires the buffer pool to be no larger
+    /// than the max-DB ceiling, so at this reduced cap the child's pool
+    /// rides at the cap instead of the profile's 64 MiB. The profile-low
+    /// value itself, 2 GiB, is pinned by
+    /// `profile_values_are_the_spec_starting_values` in src/config.rs.
+    ///
+    /// Why a subprocess, and why the 2 GiB end-to-end form is BLOCKED:
+    /// lbug 0.20.4 has a FileHandle exception-safety defect — a file
+    /// handle claims page capacity *before* allocating the frame group
+    /// that capacity describes, so when the allocation throws at the
+    /// cap the handle is left claiming a group that does not exist, and
+    /// the next checkpoint, or the checkpoint on database close, indexes
+    /// the missing group and segfaults the process (fix loop round 2,
+    /// reproduced against the engine in both growth modes). The refusal
+    /// itself is clean, and the refusal is what this test exercises; the
+    /// defect is documented here rather than exercised — the child
+    /// asserts the refusal, prints its marker, and exits via
+    /// `std::process::exit`, never running the destructor checkpoint
+    /// that would crash. A 2 GiB end-to-end variant cannot do that
+    /// inside the test harness: it would segfault in teardown and fail
+    /// the suite over an engine defect this repo does not own. It stays
+    /// blocked on an upstream engine fix.
+    ///
+    /// Growth is natural only — no file pre-grow (round 2: the pre-grow
+    /// was an accelerant, never the cause), and the filler is
+    /// incompressible (see `incompressible_filler`).
+    #[tokio::test]
+    async fn profile_cap_refusal_fires_at_reduced_cap() {
+        use std::io::Read as _;
+        let db =
+            std::env::temp_dir().join(format!("ladybug-profile-cap-{}", uuid::Uuid::new_v4()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::ladybug::tests::profile_cap_refusal_child_worker")
+            .arg("--nocapture")
+            .arg("--ignored")
+            .env("NEUROSTRATA_TEST_PROFILE_CAP_DB", &db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(120) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("profile cap child did not finish before the watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(
+            status.success(),
+            "profile cap child failed: {status}; child output:\n{output}"
+        );
+        assert!(
+            output.contains("PROFILE_CAP_REFUSAL_PASS"),
+            "child never reported the cap refusal; child output:\n{output}"
+        );
+        assert!(
+            output.contains("Maximum database size"),
+            "child's refusal was not the engine's max-DB-size error; child output:\n{output}"
+        );
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(width_marker_path(&db));
     }
 
     #[cfg(unix)]
