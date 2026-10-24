@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use crate::parser::ingest::IngestObserver;
 use crate::parser::schema::ParserSchema;
-use crate::traits::{Embedder, VectorStore};
+use crate::traits::{is_reserved_ingest_destination, Embedder, VectorStore};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +154,9 @@ impl IngestJobs {
         embedder: Arc<dyn Embedder>,
         vector_store: Arc<dyn VectorStore>,
     ) -> anyhow::Result<IngestProgress> {
+        if is_reserved_ingest_destination(namespace) {
+            anyhow::bail!("ingest destination uses the reserved internal staging namespace");
+        }
         // Canonicalize the incoming root before acquiring the jobs registry
         // mutex. NFS mounts or slow filesystems would stall every other job
         // if this happened inside the critical section.
@@ -340,6 +343,28 @@ mod tests {
             "and is waited for until it finishes"
         );
         finish.await.expect("the walk reports its end");
+    }
+
+    #[tokio::test]
+    async fn reserved_destination_is_rejected_before_directory_or_job_registry_work() {
+        let jobs = Arc::new(IngestJobs::new());
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::guard::testkit::StubEmbedder);
+        let schema = ParserSchema::load(include_str!("schema.json")).unwrap();
+        let error = jobs
+            .run(
+                "__neurostrata_ingest_stage__malformed",
+                "/path/that/does/not/exist",
+                schema,
+                embedder,
+                store,
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reserved internal staging namespace"));
+        assert!(jobs.jobs.lock().unwrap().is_empty());
     }
 
     #[test]

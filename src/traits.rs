@@ -9,6 +9,12 @@ use std::sync::OnceLock;
 /// Namespace prefix reserved for unpublished ingestion generations.
 pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
 
+/// Reject every user-selected ingest destination in the internal namespace,
+/// including malformed or partial generation names.
+pub fn is_reserved_ingest_destination(namespace: &str) -> bool {
+    namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
+}
+
 /// Recognizes only the current UUID-shaped internal stage identifier. Older
 /// names based only on a `-ingest-stage-` suffix are ambiguous with user-owned
 /// namespaces and must never authorize hiding or deletion.

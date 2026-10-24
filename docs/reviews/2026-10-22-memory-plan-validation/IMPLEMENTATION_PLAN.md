@@ -171,6 +171,51 @@ Steps:
 
 **Acceptance:** a width mismatch fails loudly at open instead of corrupting later.
 
+### Follow-up safeguards from PR review comment 6380491674
+
+The review found two source-traced gaps after the 3db8372 CI run. This correction
+slice is being developed on top of that reviewed head; it is not yet committed or
+hosted-CI verified.
+
+**Database path aliases.** Resolve existing DB files through symlinks and relative
+spellings to one canonical engine, writer-lock, marker, WAL, and snapshot path.
+Check the canonical marker and the marker beside the supplied spelling before
+opening/replaying the DB. Conflicting identities, widths, malformed entries, and
+dangling marker symlinks fail closed without replacing marker evidence. A matching
+historical alias marker remains in place while the canonical marker becomes the
+authoritative copy. Preserve supplied spellings only for legacy ingest-lease sidecar
+discovery. Bare relative DB creation resolves against the current directory.
+Arbitrary hard-link aliases are not supported: the filesystem does not provide a
+portable way to discover all names for one inode, so use the original DB path or a
+separate copied database. No hard-link compatibility claim is made.
+
+**Reserved ingest destinations.** A shared prefix validator rejects every
+user-selected `__neurostrata_ingest_stage__...` destination, including malformed
+names, in `IngestJobs::run` and `ingest_directory` before job registration, file
+walking, staging, or embedding. `publish_ingested` repeats the guard before lease
+lookup or transaction start. Direct-store and public-boundary regressions cover
+active stage preservation, full row/vector/edge equality, lease ownership, and
+subsequent successful publication.
+
+**Current candidate evidence.** Changed Rust files pass `rustfmt --check` and
+`git diff --check`; Python runtime-harness tests pass 4/4. The complete locked
+serial Rust suite passes 796/796 on the current local working tree with the
+temporary `fastembed/ort-load-dynamic` feature and lbug built from cached source
+using `LBUG_BUILD_FROM_SOURCE=1` and the installed CMake executable at
+`/tmp/neuro-python-cmake/cmake/data/bin/cmake`. Fourteen focused marker-alias,
+lease-recovery, reserved-destination, and marker-write-failure regressions also
+pass. Marker write/replace failure now propagates from construction, and the
+failure regression verifies prior evidence and temporary-file cleanup. This is local
+alternative-build evidence, not default-feature verification or hosted CI. An
+initial lbug prebuilt fetch returned proxy HTTP 403 (one alternate artifact URL
+returned 404); no retry was made. The CMake distribution was already present in
+`/tmp`, but its wrapper referenced an unavailable Python interpreter, so the
+source build used the executable directly. No Cargo manifest or lockfile change
+was made. The candidate remains local and dirty; the last remote/hosted-CI head
+remains 3db83724e6e2261d329b261f3e9e455079f7a6d6. Task and memory MCP tools and
+`neurostrata-mcp` are unavailable here, so no task was claimed or invented. The
+3db8372 CI result does not validate these edits.
+
 ---
 
 ## Verification status
@@ -178,10 +223,10 @@ Steps:
 | Gate | Status |
 |---|---|
 | Source changes | Implemented; changed Rust files formatted; `git diff --check` passes |
-| Type-check | `cargo check --tests` passed with temporary `ort-load-dynamic` override and source-built LadybugDB |
-| Binary test suite | 782/782 passed in 97.16 seconds after the final WAL/output-cap assertions. Full and focused local runs used temporary `ort-load-dynamic` and source-built LadybugDB; they are not default-feature verification. Actual local inference was not exercised |
+| Type-check | Full locked Cargo test build compiled the current test binary with temporary `ort-load-dynamic` override and source-built LadybugDB |
+| Binary test suite | 796/796 passed in 93.66 seconds on the current local working tree; 14 focused safeguard regressions passed. This is alternative local verification, not default-feature verification. Actual local inference was not exercised |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; the installed system ONNX Runtime 1.21 is incompatible with the ort API-24 requirement. No download bypass was attempted |
-| Exact-head PR CI | `bd5cdf75332badf8def9e19f5745316c2a82948e` passed workflow-dispatch run `40036052762` (all four jobs; 765 Ubuntu tests). Then-published head `1abf0c3cd1313f2f272c378650c6e23da04b3bf0` run `40056891840` passed Ubuntu tests, macOS and Ubuntu builds. Run `40058139853` on SHA `9798742669e157b8c1cc0d0fa50c8c2a7d011f4e` had 779 tests pass and one environment-dependent active-WAL fixture fail; no CI run yet covers the corrected tree |
+| Exact-head PR CI | Previously published head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). The current candidate remains uncommitted and unpushed; no hosted CI run covers it |
 | Runtime harness | Synthetic fixture generation passed; 1,977 bytes across four files. Runner process-group timeout, output-cap, fast-exit output-cap, and model-cache symlink tests passed 4/4. No real CLI inference run. It uses an 8 GiB per-process address-space limit and 120s per-command timeouts. The 20m wall-time window is an acceptance deadline checked after synchronous setup copies and before/after CLI phases; a single copy call cannot be interrupted. RSS 4 GiB and DB/WAL 1 GiB are post-command acceptance thresholds, not live enforcement; independent memory and temporary-disk quotas are required around actual runs |
 | Runtime memory comparison | Not executed: no matched base/candidate runs, no real inference, no raw measurement logs, and no empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |

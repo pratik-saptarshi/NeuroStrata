@@ -1,6 +1,9 @@
 use crate::parser::get_language;
 use crate::parser::schema::ParserSchema;
-use crate::traits::{Embedder, MemoryPayload, VectorStore, INTERNAL_INGEST_STAGE_PREFIX};
+use crate::traits::{
+    is_reserved_ingest_destination, Embedder, MemoryPayload, VectorStore,
+    INTERNAL_INGEST_STAGE_PREFIX,
+};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
@@ -607,6 +610,9 @@ pub async fn ingest_directory(
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
+    if is_reserved_ingest_destination(namespace) {
+        anyhow::bail!("ingest destination uses the reserved internal staging namespace");
+    }
     std::fs::read_dir(dir_path).map_err(|e| {
         anyhow::anyhow!(
             "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so the current graph remains intact: {}",
@@ -928,6 +934,20 @@ mod tests {
         }
     }
 
+    struct CountingEmbedder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0; 4])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
     #[tokio::test]
     async fn a_missing_root_is_refused_before_anything_is_cleared() {
         let db = std::env::temp_dir().join(format!("ns-missing-root-{}", uuid::Uuid::new_v4()));
@@ -975,6 +995,72 @@ mod tests {
                 .is_some(),
             "and the previous ingest is still there"
         );
+    }
+
+    #[tokio::test]
+    async fn reserved_ingest_destinations_are_rejected_before_staging_or_embedding() {
+        let root = std::env::temp_dir().join(format!("reserved-ingest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+        let db = std::env::temp_dir().join(format!("reserved-ingest-db-{}", uuid::Uuid::new_v4()));
+        let concrete =
+            std::sync::Arc::new(crate::store::LadybugStore::for_testing(&db, 4).unwrap());
+        concrete.init("reserved-ingest").await.unwrap();
+        let store: Arc<dyn VectorStore> = concrete.clone();
+        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
+        let embeds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stage_files_before = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("reserved-ingest-db-")
+                    && entry.file_name().to_string_lossy().contains(".stage-")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+
+        for namespace in [
+            format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4()),
+            format!("{}malformed", INTERNAL_INGEST_STAGE_PREFIX),
+            INTERNAL_INGEST_STAGE_PREFIX.to_string(),
+        ] {
+            let result = ingest_directory(
+                &root,
+                &schema,
+                Arc::new(CountingEmbedder(embeds.clone())),
+                store.clone(),
+                &namespace,
+                None,
+            )
+            .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("reserved internal staging namespace"));
+        }
+        assert_eq!(embeds.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(concrete.ingest_stage_namespaces().await.unwrap().is_empty());
+        let stage_files_after = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("reserved-ingest-db-")
+                    && entry.file_name().to_string_lossy().contains(".stage-")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stage_files_after, stage_files_before,
+            "rejected public destinations create no stage lease"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(db);
     }
 
     #[tokio::test]
