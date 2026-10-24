@@ -11,12 +11,20 @@ The overall wall-time deadline is checked after synchronous setup copies and
 before/after CLI phases; a single file-copy call itself cannot be interrupted.
 It does not change network controls; only run it where outbound inference/model
 downloads are independently disabled.
+
+The model under test is a spec {name, repository, revision, sha256, model
+path}: the built-in default is the pinned Nomic artifact, a supplied spec
+arrives as a JSON file (--model-spec, single run), and --matrix runs the full
+baseline+candidate scenario per spec against the same candidate binary,
+writing a self-labeling matrix-report.json whose legs are PASS, FAIL, or
+SKIPPED with a machine-readable reason — a SKIPPED leg is never a pass.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+from dataclasses import dataclass
 import json
 import os
 import platform
@@ -39,6 +47,73 @@ MODEL_REPO = "nomic-ai/nomic-embed-text-v1.5"
 MODEL_REVISION = "0a3f1bfa99207a5448900a6daaaf6add10eaa058"
 MODEL_PATH = "onnx/model.onnx"
 MODEL_SHA256 = "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """One model's validation identity: the fastembed model name the binary
+    is told to load (NEUROSTRATA_MODEL), where the artifact is published, and
+    the pinned artifact the SHA gate verifies, at its path inside the cache."""
+
+    name: str
+    repository: str
+    revision: str
+    sha256: str
+    model_path: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"name": self.name, "repository": self.repository, "revision": self.revision,
+                "sha256": self.sha256, "model_path": self.model_path}
+
+
+MODEL_SPEC_FIELDS = ("name", "repository", "revision", "sha256", "model_path")
+
+# The built-in default spec is exactly the pre-matrix Nomic constants above:
+# invoking the runner with no new flags keeps the same gates and messages.
+DEFAULT_MODEL_SPEC = ModelSpec(
+    name="NomicEmbedTextV15",
+    repository=MODEL_REPO,
+    revision=MODEL_REVISION,
+    sha256=MODEL_SHA256,
+    model_path=MODEL_PATH,
+)
+
+# Second spec of record. Only the name (src/config.rs profile table,
+# src/embed.rs) and the 384 width have in-tree sources; the repository,
+# revision, sha256, and model path appear nowhere in this tree, so they are
+# recorded as UNVERIFIED rather than invented. A leg using this spec SKIPs at
+# preflight (its artifact cannot be SHA-verified) until a real run supplies
+# verified values through a supplied spec file.
+BGE_SMALL_MODEL_SPEC = ModelSpec(
+    name="BGESmallENV15Q",
+    repository="UNVERIFIED",
+    revision="UNVERIFIED",
+    sha256="UNVERIFIED",
+    model_path="UNVERIFIED",
+)
+
+BUILTIN_MODEL_SPECS = {spec.name: spec for spec in (DEFAULT_MODEL_SPEC, BGE_SMALL_MODEL_SPEC)}
+
+
+def load_model_spec(path: Path) -> ModelSpec:
+    """Load a supplied model spec from a JSON file (the --model-spec /
+    --matrix argument encoding)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot read model spec {path}: {error}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"model spec must be a JSON object: {path}")
+    missing = [field for field in MODEL_SPEC_FIELDS if field not in data]
+    if missing:
+        raise SystemExit(f"model spec {path} is missing required field(s): {', '.join(missing)}")
+    values: dict[str, str] = {}
+    for field in MODEL_SPEC_FIELDS:
+        value = data[field]
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(f"model spec field {field!r} must be a non-empty string: {path}")
+        values[field] = value
+    return ModelSpec(**values)
 
 # Conservative machine-specific budgets. Address space and CPU time are
 # OS-limited per child. RSS and the combined DB/WAL size are post-command
@@ -197,12 +272,12 @@ def make_fixtures() -> dict:
     return manifest
 
 
-def check_model(path: Path) -> None:
+def check_model(path: Path, spec: ModelSpec = DEFAULT_MODEL_SPEC) -> None:
     if not path.is_file():
         raise SystemExit(f"model artifact missing; no inference started: {path}")
     actual = sha256(path)
-    if actual != MODEL_SHA256:
-        raise SystemExit(f"model SHA-256 mismatch; no inference started: expected {MODEL_SHA256}, got {actual}")
+    if actual != spec.sha256:
+        raise SystemExit(f"model SHA-256 mismatch; no inference started: expected {spec.sha256}, got {actual}")
 
 
 def run_command(command: list[str], env: dict[str, str], timeout: int, log: Path,
@@ -330,7 +405,7 @@ def check_measured_rss(rss_kib: int | None, maximum: int, phase: str) -> int:
 
 
 def run_binary(label: str, binary: Path, revision: str, root: Path, model: Path,
-               model_cache: Path, deadline: float) -> dict:
+               model_cache: Path, deadline: float, spec: ModelSpec = DEFAULT_MODEL_SPEC) -> dict:
     binary = binary.resolve(strict=True)
     work = root / label
     home = work / "home"
@@ -353,7 +428,7 @@ def run_binary(label: str, binary: Path, revision: str, root: Path, model: Path,
         raise RuntimeError("20-minute overall acceptance deadline expired while copying the model cache")
     env = os.environ.copy()
     env.update({"HOME": str(home), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-                "NEUROSTRATA_MODEL": "NomicEmbedTextV15"})
+                "NEUROSTRATA_MODEL": spec.name})
     log = work / "run.log"
     commands = [
         [str(binary), "add", "validation-preservation", "fact", "synthetic fact: keep exact text"],
@@ -454,6 +529,270 @@ def run_binary(label: str, binary: Path, revision: str, root: Path, model: Path,
             "log": str(log), "disclaimer": "one CLI lifecycle per binary; timing includes process/model startup, synthetic scale only"}
 
 
+def onnx_runtime_version() -> str:
+    """The ONNX Runtime version visible to this harness, for the matrix
+    report's environment block. The harness itself links no ONNX Runtime
+    (the binary under test does), so an unimportable runtime is reported
+    as UNVERIFIED rather than guessed."""
+    try:
+        import onnxruntime
+    except ImportError:
+        return "UNVERIFIED"
+    return str(getattr(onnxruntime, "__version__", "UNVERIFIED"))
+
+
+def summarize_legs(legs: list[dict]) -> dict[str, int]:
+    """Leg counts by status. A SKIPPED leg is never counted as passed."""
+    return {
+        "total": len(legs),
+        "passed": sum(1 for leg in legs if leg["status"] == "PASS"),
+        "failed": sum(1 for leg in legs if leg["status"] == "FAIL"),
+        "skipped": sum(1 for leg in legs if leg["status"] == "SKIPPED"),
+    }
+
+
+def matrix_exit_code(report: dict) -> int:
+    """Every matrix leg is required: the run exits 0 only when all legs
+    PASS. Any FAIL or SKIPPED leg is a nonzero exit, with the report
+    already written so the reason survives."""
+    summary = report["summary"]
+    return 0 if summary["total"] > 0 and summary["passed"] == summary["total"] else 1
+
+
+def leg_preflight(spec: ModelSpec, model_cache: Path) -> tuple[str, str] | None:
+    """The model-specific refuse-to-start gates for one matrix leg, as a
+    (machine-readable code, message) pair, or None when the leg may run.
+    Only model-specific gates live here — cache presence, model-file-inside-
+    cache, the spec's SHA gate, and disk-space arithmetic recomputed against
+    this leg's cache. The bounded-environment confirmation, build-settings
+    requirement, and output handling stay global in main()."""
+    if not model_cache.is_dir():
+        return ("model_cache_missing",
+                f"complete FastEmbed model cache missing; leg skipped: {model_cache}")
+    model_file = (model_cache / spec.model_path).resolve()
+    if not model_file.is_relative_to(model_cache.resolve()):
+        return ("model_file_outside_cache",
+                f"model file for spec {spec.name} resolves outside the model cache; leg skipped: {model_file}")
+    if not model_file.is_file():
+        return ("model_artifact_missing",
+                f"model artifact missing; leg skipped: {model_file}")
+    actual = sha256(model_file)
+    if actual != spec.sha256:
+        return ("model_sha_mismatch",
+                f"model SHA-256 mismatch; leg skipped: expected {spec.sha256}, got {actual}")
+    try:
+        cache_bytes, _ = inventory_model_cache(model_cache)
+    except SystemExit as error:
+        return ("model_cache_invalid", f"model cache rejected; leg skipped: {error}")
+    required_free = 2 * cache_bytes + 2 * MAX_DB_BUNDLE_BYTES
+    if shutil.disk_usage(Path(tempfile.gettempdir())).free < required_free:
+        return ("insufficient_disk_space",
+                f"temporary filesystem needs {required_free} free bytes for this leg's isolated "
+                "caches and DB budgets; leg skipped")
+    return None
+
+
+def build_environment_block(specs: list[ModelSpec], baseline_bin: Path, candidate_bin: Path,
+                            candidate_revision: str, external_bounds: dict | None) -> dict:
+    """The self-labeling environment block inside matrix-report.json: the
+    report cannot be quoted as tier evidence without its environment."""
+    return {
+        "host": {
+            "os": platform.platform(),
+            "machine": platform.machine(),
+            "python": sys.version.split()[0],
+            "cpu_count": os.cpu_count(),
+        },
+        "onnx_runtime_version": onnx_runtime_version(),
+        "artifact_provenance": [spec.to_dict() for spec in specs],
+        "binary_provenance": {
+            "baseline": {"path": str(baseline_bin), "sha256": sha256(baseline_bin.resolve()),
+                         "revision": BASELINE},
+            "candidate": {"path": str(candidate_bin), "sha256": sha256(candidate_bin.resolve()),
+                          "revision": candidate_revision},
+        },
+        "containment": external_bounds,
+        "deadline": {"overall_seconds": MAX_RUN_SECONDS, "shared_across_legs": True},
+    }
+
+
+def _leg_fixture_smoke(leg_root: Path, results: dict[str, dict]) -> dict:
+    ingested_file_ids: list[str] = []
+    for label in ("baseline", "candidate"):
+        graph_path = leg_root / label / "graph.json"
+        if not graph_path.is_file():
+            continue
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        ingested_file_ids = sorted(
+            {node["id"] for node in graph.get("nodes", [])
+             if isinstance(node.get("id"), str) and node["id"].startswith("synthetic-validation::")}
+        )
+    primary = results.get("candidate") or results.get("baseline") or {}
+    return {
+        "preservation_record_count": primary.get("preservation_record_count"),
+        "governs_edge_verified": bool(primary.get("governs_edge_verified")),
+        "graph_nodes": primary.get("graph_nodes"),
+        "ingested_file_ids": ingested_file_ids,
+        "long_symbol_ingested": "synthetic-validation::src/long_symbol.rs" in ingested_file_ids,
+    }
+
+
+def run_matrix(specs: list[ModelSpec], *, baseline_bin: Path, candidate_bin: Path,
+               candidate_revision: str, model_cache: Path, output: Path, workspace: Path,
+               deadline: float, external_bounds: dict | None = None,
+               run_binary_fn=None) -> dict:
+    """Run the full baseline+candidate scenario pair per model spec against
+    the same candidate binary and write matrix-report.json under output.
+    The single overall deadline is shared across all legs. A leg whose
+    model-specific preflight fails, or that the shared deadline preempts,
+    is SKIPPED with a machine-readable reason — never a pass, and never a
+    crash of the whole run."""
+    run_binary_fn = run_binary_fn or run_binary
+    baseline_bin = Path(baseline_bin)
+    candidate_bin = Path(candidate_bin)
+    model_cache = Path(model_cache)
+    workspace.mkdir(parents=True, exist_ok=True)
+    legs: list[dict] = []
+    for index, spec in enumerate(specs):
+        leg: dict = {
+            "spec": spec.to_dict(),
+            "status": "SKIPPED",
+            "reason": None,
+            "required": True,
+            "baseline": None,
+            "candidate": None,
+            "peak_rss_kib": None,
+            "idle_rss_kib": None,
+            "db_wal_bytes": {"baseline": None, "candidate": None},
+            "fixture_smoke": _leg_fixture_smoke(workspace, {}),
+        }
+        legs.append(leg)
+        if time.monotonic() >= deadline:
+            leg["reason"] = {
+                "code": "deadline_expired",
+                "message": "the shared 20-minute overall deadline expired before this leg "
+                           "started; leg skipped",
+            }
+            continue
+        preflight = leg_preflight(spec, model_cache)
+        if preflight is not None:
+            leg["reason"] = {"code": preflight[0], "message": preflight[1]}
+            continue
+        model_file = (model_cache / spec.model_path).resolve()
+        leg_root = workspace / f"leg-{index}-{spec.name}"
+        results: dict[str, dict] = {}
+        try:
+            results["baseline"] = run_binary_fn(
+                "baseline", baseline_bin, BASELINE, leg_root, model_file, model_cache,
+                deadline, spec=spec)
+            if time.monotonic() >= deadline:
+                raise RuntimeError("20-minute overall benchmark budget expired between matrix leg runs")
+            results["candidate"] = run_binary_fn(
+                "candidate", candidate_bin, candidate_revision, leg_root, model_file,
+                model_cache, deadline, spec=spec)
+        except RuntimeError as error:
+            message = str(error)
+            if "deadline" in message or "budget expired" in message:
+                leg["status"] = "SKIPPED"
+                leg["reason"] = {"code": "deadline_expired", "message": message}
+            else:
+                leg["status"] = "FAIL"
+                leg["reason"] = {"code": "scenario_failed", "message": message}
+        else:
+            leg["status"] = "PASS"
+        leg["baseline"] = results.get("baseline")
+        leg["candidate"] = results.get("candidate")
+        rss_values = [result["peak_rss_kib"] for result in results.values()
+                      if result.get("peak_rss_kib") is not None]
+        leg["peak_rss_kib"] = max(rss_values) if rss_values else None
+        leg["db_wal_bytes"] = {
+            label: (results[label]["db_bundle_bytes"] if label in results else None)
+            for label in ("baseline", "candidate")
+        }
+        leg["fixture_smoke"] = _leg_fixture_smoke(leg_root, results)
+    report: dict = {
+        "kind": "runtime-validation-matrix",
+        "candidate_revision": candidate_revision,
+        "environment": build_environment_block(
+            specs, baseline_bin, candidate_bin, candidate_revision, external_bounds),
+        "legs": legs,
+        "summary": summarize_legs(legs),
+        "execution": "matrix plumbing: each leg runs the harness baseline+candidate scenario "
+                     "pair for one model spec against the same candidate binary",
+        "not_measured": [
+            "idle daemon RSS: idle_rss_kib is null per leg; the harness measures CLI "
+            "lifecycle peak RSS only",
+        ],
+    }
+    report["exit_code"] = matrix_exit_code(report)
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "matrix-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
+def run_matrix_cli(args: argparse.Namespace) -> None:
+    """Matrix-mode entry: global gates (bounded environment, build settings,
+    output handling, binary presence) run once here; the model-specific
+    gates are per-leg preflight inside run_matrix."""
+    if len(args.matrix) < 2:
+        raise SystemExit("--matrix requires at least two model spec files; no inference started")
+    if args.model_spec:
+        raise SystemExit("--model-spec is the single-run spec surface; in matrix mode the spec "
+                         "files are the --matrix arguments themselves; no inference started")
+    if args.model_file:
+        raise SystemExit("--model-file is not used in matrix mode; each leg's artifact is its "
+                         "spec's model_path inside --model-cache; no inference started")
+    if not all((args.baseline_bin, args.candidate_bin, args.model_cache)):
+        raise SystemExit("matrix mode requires both binaries and --model-cache; no inference started")
+    for binary in (args.baseline_bin, args.candidate_bin):
+        if not binary.is_file():
+            raise SystemExit(f"binary missing; no inference started: {binary}")
+    specs = [load_model_spec(path) for path in args.matrix]
+    external_bounds = require_bounded_environment(args.confirm_external_bounds)
+    if args.baseline_build_settings.startswith("caller must") or args.candidate_build_settings.startswith("caller must"):
+        raise SystemExit("provide exact --baseline-build-settings and --candidate-build-settings; no inference started")
+    make_fixtures()
+    print(f"Checked-in synthetic fixtures validated at {FIXTURE}")
+    args.output.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    deadline = started + MAX_RUN_SECONDS
+    with tempfile.TemporaryDirectory(prefix="neurostrata-runtime-validation-matrix-") as temporary:
+        workspace = Path(temporary)
+        report = run_matrix(
+            specs,
+            baseline_bin=args.baseline_bin,
+            candidate_bin=args.candidate_bin,
+            candidate_revision=args.candidate_revision,
+            model_cache=args.model_cache,
+            output=args.output,
+            workspace=workspace,
+            deadline=deadline,
+            external_bounds=external_bounds,
+        )
+        # Preserve per-leg diagnostic logs like the single-run path does; the
+        # temporary workspaces (and their private caches/DBs) are discarded.
+        logs_dir = args.output / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        for index, (spec, leg) in enumerate(zip(specs, report["legs"])):
+            for label in ("baseline", "candidate"):
+                temporary_log = workspace / f"leg-{index}-{spec.name}" / label / "run.log"
+                if temporary_log.is_file():
+                    stored_log = logs_dir / f"leg-{index}-{spec.name}-{label}.log"
+                    shutil.copyfile(temporary_log, stored_log)
+                    if leg.get(label):
+                        leg[label]["log"] = str(stored_log)
+        (args.output / "matrix-report.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Matrix report recorded at {args.output / 'matrix-report.json'}")
+    exit_code = matrix_exit_code(report)
+    if exit_code:
+        raise SystemExit(exit_code)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-bin", type=Path)
@@ -464,6 +803,14 @@ def main() -> None:
     parser.add_argument("--model-file", type=Path)
     parser.add_argument("--model-cache", type=Path,
                         help="existing complete FastEmbed cache root; copied into isolated per-binary homes")
+    parser.add_argument("--model-spec", type=Path,
+                        help="path to a JSON model spec {name, repository, revision, sha256, "
+                             "model_path} driving the single run's SHA gate and NEUROSTRATA_MODEL; "
+                             "default is the built-in Nomic spec")
+    parser.add_argument("--matrix", type=Path, nargs="+", metavar="SPEC",
+                        help="matrix mode: paths to two or more JSON model spec files; runs the "
+                             "full scenario per spec against the same candidate binary and "
+                             "writes matrix-report.json")
     parser.add_argument(
         "--confirm-external-bounds",
         action="store_true",
@@ -471,15 +818,19 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=Path("runtime-validation-results"))
     args = parser.parse_args()
-    if not args.baseline_bin and not args.candidate_bin:
+    if not args.baseline_bin and not args.candidate_bin and not args.matrix:
         make_fixtures()
         print(f"Checked-in synthetic fixtures validated at {FIXTURE}")
         print("Preparation only; no inference or measurements were run.")
         return
+    if args.matrix:
+        run_matrix_cli(args)
+        return
     if not all((args.baseline_bin, args.candidate_bin, args.model_file, args.model_cache)):
         raise SystemExit("running requires both binaries, --model-file, and --model-cache; no inference started")
+    spec = load_model_spec(args.model_spec) if args.model_spec else DEFAULT_MODEL_SPEC
     external_bounds = require_bounded_environment(args.confirm_external_bounds)
-    check_model(args.model_file.resolve())
+    check_model(args.model_file.resolve(), spec)
     if not args.model_cache.is_dir():
         raise SystemExit(f"complete FastEmbed model cache missing; no inference started: {args.model_cache}")
     if not args.model_file.resolve().is_relative_to(args.model_cache.resolve()):
@@ -502,9 +853,9 @@ def main() -> None:
             raise RuntimeError("temporary filesystem budget changed before model-cache copy")
         try:
             results.append(run_binary("baseline", args.baseline_bin, BASELINE, root,
-                                      args.model_file, args.model_cache, deadline))
+                                      args.model_file, args.model_cache, deadline, spec=spec))
             results.append(run_binary("candidate", args.candidate_bin, args.candidate_revision,
-                                      root, args.model_file, args.model_cache, deadline))
+                                      root, args.model_file, args.model_cache, deadline, spec=spec))
             if time.monotonic() > deadline:
                 raise RuntimeError("20-minute overall benchmark budget expired")
         finally:
