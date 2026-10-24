@@ -211,10 +211,13 @@ initial lbug prebuilt fetch returned proxy HTTP 403 (one alternate artifact URL
 returned 404); no retry was made. The CMake distribution was already present in
 `/tmp`, but its wrapper referenced an unavailable Python interpreter, so the
 source build used the executable directly. No Cargo manifest or lockfile change
-was made. The candidate remains local and dirty; the last remote/hosted-CI head
-remains 3db83724e6e2261d329b261f3e9e455079f7a6d6. Task and memory MCP tools and
-`neurostrata-mcp` are unavailable here, so no task was claimed or invented. The
-3db8372 CI result does not validate these edits.
+was made. The tested source was pushed as commit
+`6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` to the fork branch; PR #1 remains
+open and draft. Exact-head workflow and combined-status queries returned no
+run/status, and no workflow-dispatch action is available here, so default hosted
+CI is pending rather than passed. Task and memory MCP tools and `neurostrata-mcp`
+are unavailable here, so no task was claimed or invented. Earlier CI on
+`3db8372` does not validate these edits.
 
 ---
 
@@ -226,7 +229,7 @@ remains 3db83724e6e2261d329b261f3e9e455079f7a6d6. Task and memory MCP tools and
 | Type-check | Full locked Cargo test build compiled the current test binary with temporary `ort-load-dynamic` override and source-built LadybugDB |
 | Binary test suite | 796/796 passed in 93.66 seconds on the current local working tree; 14 focused safeguard regressions passed. This is alternative local verification, not default-feature verification. Actual local inference was not exercised |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; the installed system ONNX Runtime 1.21 is incompatible with the ort API-24 requirement. No download bypass was attempted |
-| Exact-head PR CI | Previously published head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). The current candidate remains uncommitted and unpushed; no hosted CI run covers it |
+| Exact-head PR CI | Previously published head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). Current pushed head `6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` has no hosted run/status yet; the available GitHub tools expose no workflow-dispatch action |
 | Runtime harness | Synthetic fixture generation passed; 1,977 bytes across four files. Runner process-group timeout, output-cap, fast-exit output-cap, and model-cache symlink tests passed 4/4. No real CLI inference run. It uses an 8 GiB per-process address-space limit and 120s per-command timeouts. The 20m wall-time window is an acceptance deadline checked after synchronous setup copies and before/after CLI phases; a single copy call cannot be interrupted. RSS 4 GiB and DB/WAL 1 GiB are post-command acceptance thresholds, not live enforcement; independent memory and temporary-disk quotas are required around actual runs |
 | Runtime memory comparison | Not executed: no matched base/candidate runs, no real inference, no raw measurement logs, and no empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
