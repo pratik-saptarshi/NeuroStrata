@@ -628,6 +628,60 @@ static TEST_SNAPSHOT_OPERATION_BARRIER: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+static TEST_WRITE_LOCK_ATTEMPT: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, PathBuf)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_test_write_lock_attempt(db_path: PathBuf, marker: PathBuf) {
+    *TEST_WRITE_LOCK_ATTEMPT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap() = Some((db_path, marker));
+}
+
+#[cfg(test)]
+fn test_write_lock_attempt(db_path: &Path) {
+    let marker = {
+        let mut state = TEST_WRITE_LOCK_ATTEMPT
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        match state.as_ref() {
+            Some((path, _))
+                if std::fs::canonicalize(path).ok() == std::fs::canonicalize(db_path).ok() =>
+            {
+                Some(state.take().unwrap().1)
+            }
+            _ => None,
+        }
+    };
+    if let Some(marker) = marker {
+        let lock_path = database_writer_lock_path(db_path);
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .expect("writer lock probe file is openable");
+        match probe.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::fs::write(marker, "writer lock was contended")
+                    .expect("write lock contention marker is writable");
+            }
+            Ok(()) => {
+                let _ = probe.unlock();
+                panic!("expected the checkpoint to hold the writer lock");
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                panic!("could not verify writer lock contention: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn set_test_snapshot_operation_barrier(operation: &str, db_path: PathBuf, barrier: PathBuf) {
     *TEST_SNAPSHOT_OPERATION_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -2550,6 +2604,8 @@ impl LadybugStore {
             // before it touches the engine. The call is idempotent, so the
             // pool reusing this thread does not leak another stack.
             let _ = crate::crash::install_alt_stack();
+            #[cfg(test)]
+            test_write_lock_attempt(&db_path);
             let outcome = (|| -> Result<T> {
                 let _cross_process_writer = acquire_database_writer_lock(&db_path)?;
                 let conn = Connection::new(&db)?;
@@ -7392,8 +7448,6 @@ eurostrata\src\daemon.rs",
         store.checkpoint().await.unwrap();
         assert!(!store.is_dirty(), "staging work was checkpointed first");
 
-        let started_before_checkpoint =
-            ENGINE_CALLS_STARTED.load(std::sync::atomic::Ordering::Acquire);
         let checkpoint_barrier = root.join("checkpoint-entered");
         set_test_snapshot_operation_barrier("checkpoint", db.clone(), checkpoint_barrier.clone());
         let checkpoint_store = store.clone();
@@ -7401,6 +7455,8 @@ eurostrata\src\daemon.rs",
         wait_for_test_barrier(&checkpoint_barrier).await;
         assert!(!store.is_dirty(), "checkpoint took the previous dirty flag");
 
+        let write_lock_attempt = root.join("write-lock-attempted");
+        set_test_write_lock_attempt(db.clone(), write_lock_attempt.clone());
         let write_store = store.clone();
         let write = tokio::spawn(async move {
             write_store
@@ -7420,18 +7476,10 @@ eurostrata\src\daemon.rs",
                 )
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while ENGINE_CALLS_STARTED.load(std::sync::atomic::Ordering::Acquire)
-                < started_before_checkpoint + 2
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("queued write is dispatched while checkpoint holds the lock");
+        wait_for_test_barrier(&write_lock_attempt).await;
         assert!(
             !write.is_finished(),
-            "the dispatched write cannot pass the checkpoint's writer lock"
+            "the write cannot pass the checkpoint's writer lock"
         );
         release_test_barrier(&checkpoint_barrier);
         checkpoint.await.unwrap().unwrap();
