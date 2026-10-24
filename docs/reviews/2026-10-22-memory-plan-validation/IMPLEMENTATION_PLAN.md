@@ -17,13 +17,13 @@ recovery now requires the exact generated UUID namespace plus its durable lease 
 legacy `-ingest-stage-<UUID>` names and reserved-prefix lookalikes without a sidecar remain
 visible and untouched. Malformed reserved identifiers do not block recovery of unrelated
 stages, and new writes cannot claim the reserved namespace.
-Source under test: commit `442a509374e2f45b3c46132f8e23b3206304aa96` (`test(runtime): tighten snapshot and harness regressions`), based on the prior remote head `9798742669e157b8c1cc0d0fa50c8c2a7d011f4e`. It adds stricter first-read hiding for proven pre-catalog stage rows, reopen/list/export and active-lease regressions, exact crash-state payload/vector/edge checks, awaited cancellation, same-namespace qualified CLI edge checks, and bounded benchmark-runner process cleanup. Focused results on the source commit: Python runner tests 4/4; legacy-stage reopen/list/export and strict active-WAL tests 1/1 each; crash-boundary publication (five killed subprocess phases, exact 130-row identity/content/vector/edge state) 1/1; cancellation resolution 1/1; same-namespace qualified rule relinking 1/1. The full binary suite on this exact source commit passed 782/782 (97.16 seconds) with a temporary `ort-load-dynamic` override and source-built LadybugDB.
+Historical source commit `442a509374e2f45b3c46132f8e23b3206304aa96` (`test(runtime): tighten snapshot and harness regressions`) added stricter first-read hiding, exact crash-state assertions, awaited cancellation, qualified edge checks, and bounded runner cleanup. Its 782/782 result is historical. Safeguard source commit `6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` then implemented canonical database-alias identity checks, reserved-destination rejection, marker-write failure propagation, and preservation regressions. The tooling relocation is in `4bd978b2e7d0bc882c2e7712db6604321a7efd94`. Alias-chain changes were committed in `af81d33f9ac8665dfa0f3964e4c12512d1564abd`; follow-up `052cde88001e46d8fb3a9394c431ce3b05d9b57c` also fails closed if the supplied symlink mapping changes between initial resolution and alias discovery. The final tested Rust source commit `052cde8` checks all discovered file and parent symlink-chain marker spellings, freezes alias parents for recovery, and strengthens active-stage and exact-generation catalog regressions. Independent source reviews found no actionable issue in the final safeguards. Its full serial binary suite passed 799/799 in 93.60 seconds using a temporary `ort-load-dynamic` override and source-built LadybugDB; the relocated Python harness passes 5/5.
 
 The copied open database plus active WAL is an unverified crash-state capture, not a supported snapshot. The latest Ubuntu run `40058139853` on SHA `9798742669e157b8c1cc0d0fa50c8c2a7d011f4e` completed 779 tests and failed the test that incorrectly required this capture to fail checksum verification; its logs show no verification-failure diagnostic, and CI returned the recovered namespaces. The correction now distinguishes an intentionally byte-corrupted WAL (strict rejection required) from an unverified live-copy WAL: strict restore may reject it, in which case the test checks the exact verification error, untouched source bytes, and clean destination/interlock; if the engine accepts it, the test requires exact restored fact/rule/vector/edge/stage state and unchanged source. This is not evidence that a known-valid, engine-consistent nonempty WAL fixture has been restored. Production `export_database` checkpoints at its stable snapshot cut and has separate restore-preservation coverage. Active legacy leases are not migrated to durable provenance while the lease is held; pre-catalog stage rows with exact reserved UUID namespace, lease sidecar, and auto-ingestor-qualified IDs are hidden on the first read after reopen without being treated as deletion authority. Malformed names and user-owned lookalikes remain visible.
 
-The default locked local build remains blocked because the `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no retry or alternate download route was used. A temporary `ort-load-dynamic` override plus source-built LadybugDB is only a local alternative verification path, distinct from hosted default-feature CI. Earlier hosted run `40036052762` on `bd5cdf75332badf8def9e19f5745316c2a82948e` passed four jobs and 765 Ubuntu tests; run `40056891840` on `1abf0c3cd1313f2f272c378650c6e23da04b3bf0` was green on Ubuntu tests, macOS and Ubuntu builds. Run `40058139853` on SHA `9798742669e157b8c1cc0d0fa50c8c2a7d011f4e` reported 779 passed and one WAL-fixture failure. No run for the corrected source tree exists yet.
+The default locked local build remains blocked because the `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no retry or alternate download route was used. A temporary `ort-load-dynamic` override plus source-built LadybugDB is only a local alternative verification path, distinct from hosted default-feature CI. Earlier hosted run `40036052762` on `bd5cdf75332badf8def9e19f5745316c2a82948e` passed four jobs and 765 Ubuntu tests; run `40056891840` on `1abf0c3cd1313f2f272c378650c6e23da04b3bf0` was green on Ubuntu tests, macOS and Ubuntu builds. Run `40058139853` on SHA `9798742669e157b8c1cc0d0fa50c8c2a7d011f4e` reported 779 passed and one WAL-fixture failure. Run `40070792229` was started for the preceding pushed head `6bc82e7108b4029697c888aad0b9a23b8cde3fc1`; it does not cover `052cde8`. Exact-head hosted CI for `052cde8` remains pending.
 
-Runtime memory was not measured. The deterministic synthetic corpus is 1,977 bytes across four files and is not production-representative. The runner sets an 8 GiB per-child address-space and CPU-time limit, kills timed-out/output-overflowing process groups, caps captured output at 4 MiB per stream, and checks RSS (4 GiB) and DB/WAL size (1 GiB) after every CLI command as acceptance thresholds. RSS and DB/WAL thresholds are not live caps; real runs require an independently bounded memory and temporary-disk environment. Its 20-minute wall-time window is checked after synchronous setup copies and before/after CLI phases; an individual copy call cannot be interrupted. It uses the fixture project root as `cwd`, ingests `./src`, and expects the full `synthetic-validation::src/core.rs` ID and same-namespace rule edge. Runner tests passed 4/4 and fixture generation completed; no real CLI inference was run. The pinned official Nomic artifact is absent, installed system ONNX Runtime 1.21 is incompatible with the build's ort API-24 requirement, and the allowed prebuilt download returned proxy 403. Matched baseline/candidate memory and performance measurements, model inference, idle RSS, throughput/latency comparison, and database-growth measurements remain unexecuted; no empirical improvement is claimed.
+Runtime memory was not measured. The deterministic synthetic corpus is 1,977 bytes across four files and is not production-representative. The runner sets an 8 GiB per-child address-space and CPU-time limit, kills timed-out/output-overflowing process groups, caps captured output at 4 MiB per stream, and checks RSS (4 GiB) and DB/WAL size (1 GiB) after every CLI command as acceptance thresholds. RSS and DB/WAL thresholds are not live caps; real runs require an independently bounded memory and temporary-disk environment. Its 20-minute wall-time window is checked after synchronous setup copies and before/after CLI phases; an individual copy call cannot be interrupted. It uses the fixture project root as `cwd`, ingests `./src`, and expects the full `synthetic-validation::src/core.rs` ID and same-namespace rule edge. Runner tests pass 5/5 and fixture preparation completed; no real CLI inference was run. The pinned official Nomic artifact is absent, installed system ONNX Runtime 1.21 is incompatible with the build's ort API-24 requirement, and the allowed prebuilt download returned proxy 403. Matched baseline/candidate memory and performance measurements, model inference, idle RSS, throughput/latency comparison, and database-growth measurements remain unexecuted; no empirical improvement is claimed.
 
 The optional Python validation harness, its tests, and its synthetic project fixture
 are isolated under `tools/runtime-validation/`; the fixture source is in that
@@ -180,9 +180,10 @@ Steps:
 
 ### Follow-up safeguards from PR review comment 6380491674
 
-The review found two source-traced gaps after the 3db8372 CI run. This correction
-slice is being developed on top of that reviewed head; it is not yet committed or
-hosted-CI verified.
+The review found two source-traced gaps after the 3db8372 CI run. The alias and
+reserved-destination fixes are committed in `6e652ab`; additional alias-chain,
+retarget, active-stage, and exact-generation regressions are in the tested source
+commit `052cde8`. Hosted CI for that follow-up remains pending.
 
 **Database path aliases.** Resolve existing DB files through symlinks and relative
 spellings to one canonical engine, writer-lock, marker, WAL, and snapshot path.
@@ -204,28 +205,25 @@ lookup or transaction start. Direct-store and public-boundary regressions cover
 active stage preservation, full row/vector/edge equality, lease ownership, and
 subsequent successful publication.
 
-**Current candidate evidence.** Changed Rust files pass `rustfmt --check` and
-`git diff --check`; relocated Python runtime-harness tests pass 5/5. The complete
-serial Rust suite for the latest Rust source commit
-`442a509374e2f45b3c46132f8e23b3206304aa96` passed 782/782 in 97.16 seconds
-with the temporary `fastembed/ort-load-dynamic` feature and source-built
-LadybugDB. The follow-up tooling-only commit `4bd978b2e7d0bc882c2e7712db6604321a7efd94`
-also compiled the locked Rust test binary with that feature, and package listing
-confirmed the Python subtree is excluded. These are local alternative-build
-results, not default-feature verification or hosted CI. The default ONNX
-prebuilt download was denied by the proxy with HTTP 403; no retry or alternate
-download route was used. The compatible CMake executable was already present in
-`/tmp` and used directly for source-built LadybugDB. The harness, tests, README,
-and immutable synthetic corpus live under `tools/runtime-validation/`; Python
-uses only the standard library. The fixture generator reads source/docs and
-metadata without rewriting checked-in files, verified by a byte-preservation
-regression. Cargo source-package listing excludes the tooling subtree, and
-`Cargo.lock` plus dependency declarations are unchanged. PR #1 remains open and
-draft. The latest fork head `4bd978b2e7d0bc882c2e7712db6604321a7efd94` has no
-workflow run or combined status in the available exact-SHA queries, and no
-workflow-dispatch action is exposed here, so hosted CI for this head is pending.
-Task/memory MCP tools and `neurostrata-mcp` are unavailable here, so no task was
-claimed or invented. Earlier CI on `3db8372` does not validate the later commits.
+**Current candidate evidence.** Rust source commit
+`052cde88001e46d8fb3a9394c431ce3b05d9b57c` passed the full serial binary suite,
+799/799 in 93.60 seconds, using temporary `fastembed/ort-load-dynamic` and
+source-built LadybugDB. The most relevant focused regressions also passed:
+chained marker aliases, retarget-during-preflight refusal, parent-alias recovery,
+active-stage public rejection followed by successful publication, and direct
+reserved-destination rejection with exact row/vector/edge/catalog preservation.
+Two independent source reviewers found no actionable issue. Relocated Python
+runner tests pass 5/5; changed Rust files pass `rustfmt --check`, and
+`git diff --check` passes. The toolchain used Cargo/Rustup from `/tmp`, the
+already-present CMake executable at `/tmp/neuro-python-cmake/cmake/data/bin/cmake`,
+and `LBUG_BUILD_FROM_SOURCE=1`. Cargo package listing excludes
+`tools/runtime-validation/`; `Cargo.lock` and dependencies are unchanged. These
+are local alternative-build results, not default-feature verification or hosted
+CI. The default ONNX prebuilt download returned proxy HTTP 403; no retry or
+alternate route was used. PR #1 remains open and draft. Run `40070792229` covers
+the preceding head `6bc82e7`, not this tested source; exact-head CI for
+`052cde8` remains pending. Task/memory MCP tools and `neurostrata-mcp` are
+unavailable here, so no task was claimed or invented.
 
 ---
 
@@ -235,9 +233,9 @@ claimed or invented. Earlier CI on `3db8372` does not validate the later commits
 |---|---|
 | Source changes | Implemented; changed Rust files formatted; `git diff --check` passes |
 | Type-check | Full locked Cargo test build compiled the current test binary with temporary `ort-load-dynamic` override and source-built LadybugDB |
-| Binary test suite | Rust source commit `442a509374e2f45b3c46132f8e23b3206304aa96`: 782/782 in 97.16 seconds under the alternative local build; latest tooling-only head `4bd978b2e7d0bc882c2e7712db6604321a7efd94`: locked test binary compiled with the same feature override. Actual local inference was not exercised |
+| Binary test suite | Rust source commit `052cde88001e46d8fb3a9394c431ce3b05d9b57c`: 799/799 in 93.60 seconds under the alternative local build. Actual local inference was not exercised |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; the installed system ONNX Runtime 1.21 is incompatible with the ort API-24 requirement. No download bypass was attempted |
-| Exact-head PR CI | Earlier head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). Current pushed head `4bd978b2e7d0bc882c2e7712db6604321a7efd94` has no hosted run/status yet; the available GitHub tools expose no workflow-dispatch action |
+| Exact-head PR CI | Earlier head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). Run `40070792229` covers `6bc82e7`, not `052cde8`; exact-head status for `052cde8` is pending |
 | Runtime harness | Relocated runner tests pass 5/5; preparation validates the 1,977-byte four-file checked-in fixture without rewriting its source or metadata. Cargo package listing excludes the tooling subtree. No real CLI inference run. It uses an 8 GiB per-process address-space limit and 120s per-command timeouts. The 20m wall-time window is an acceptance deadline checked after synchronous setup copies and before/after CLI phases; a single copy call cannot be interrupted. RSS 4 GiB and DB/WAL 1 GiB are post-command acceptance thresholds, not live enforcement; independent memory and temporary-disk quotas are required around actual runs |
 | Runtime memory comparison | Not executed: no matched base/candidate runs, no real inference, no raw measurement logs, and no empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
