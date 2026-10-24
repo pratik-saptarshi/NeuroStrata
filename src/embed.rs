@@ -540,8 +540,13 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
-        let target_model = configured_model()?;
+        Self::with_model(configured_model()?)
+    }
 
+    /// Construct from an already-resolved model, without re-running
+    /// resolution: startup paths that resolved the model once (and
+    /// reported its provenance) build from that same model.
+    fn with_model(target_model: AcceptableEmbedder) -> Result<Self> {
         let (model_enum, dimensions) = local_model_details(&target_model)?;
 
         let cache_dir = find_existing_cache_dir();
@@ -727,8 +732,13 @@ impl Embedder for RemoteEmbedder {
 }
 
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
-    let target_model = configured_model()?;
+    build_embedder_for(&configured_model()?)
+}
 
+/// Build the embedder for an already-resolved model. Resolution is not
+/// re-run: the model the caller resolved (and, at startup, reported the
+/// provenance of) is the model that gets constructed, by construction.
+pub(crate) fn build_embedder_for(target_model: &AcceptableEmbedder) -> Result<Arc<dyn Embedder>> {
     if let (Some(base_url), Some(api_key_env)) = (&target_model.base_url, &target_model.api_key_env)
     {
         let api_key = std::env::var(api_key_env)
@@ -749,7 +759,7 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
             target_model.dimensions,
         )?))
     } else {
-        Ok(Arc::new(FastEmbedder::new()?))
+        Ok(Arc::new(FastEmbedder::with_model(target_model.clone())?))
     }
 }
 
@@ -1225,6 +1235,31 @@ mod tests {
             Some("low"),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn build_embedder_for_constructs_from_the_carried_model() {
+        // Fix round 1 (Finding 2): startup builds the embedder from the
+        // model resolve_startup carried, never from a second resolution.
+        // This remote model appears in no embedders list and is named by
+        // no env var, so only construction from the carried value can
+        // produce it -- a re-resolution would fail or pick another model.
+        std::env::set_var("NS_TASK2_CARRIED_KEY", "test-key");
+        let carried = AcceptableEmbedder {
+            model_name: "carried-remote".into(),
+            dimensions: 768,
+            base_url: Some("https://embeddings.example.test/v1".into()),
+            api_key_env: Some("NS_TASK2_CARRIED_KEY".into()),
+            api_model: Some("carried-model".into()),
+            generated_by: None,
+        };
+        let embedder = build_embedder_for(&carried).unwrap();
+        assert_eq!(
+            embedder.embedder_id(),
+            remote_embedder_id("https://embeddings.example.test/v1", "carried-model")
+        );
+        assert_eq!(embedder.dimensions(), 768);
+        std::env::remove_var("NS_TASK2_CARRIED_KEY");
     }
 
     #[test]

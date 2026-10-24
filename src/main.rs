@@ -412,8 +412,13 @@ fn format_startup_summary(
 }
 
 /// The outcome of startup resolution: everything a startup path needs to
-/// open its store consistently with what the summary line reported.
+/// open its store consistently with what the summary line reported. The
+/// resolved model is carried, not discarded: the embedder is built from
+/// it (`embed::build_embedder_for`), so the printed provenance describes
+/// the constructed embedder by construction and resolution runs exactly
+/// once at startup.
 struct StartupResolution {
+    resolution: embed::ResolvedModel,
     limits: crate::store::StoreLimits,
 }
 
@@ -434,7 +439,10 @@ fn resolve_startup(config: &Config) -> anyhow::Result<StartupResolution> {
     if let Some(disagreement) = embed::profile_disagreement(&resolution, profile) {
         eprintln!("{}", embed::format_disagreement_warning(&disagreement));
     }
-    Ok(StartupResolution { limits })
+    Ok(StartupResolution {
+        resolution,
+        limits,
+    })
 }
 
 /// Store limits for a store-opening surface that is not a startup path:
@@ -743,8 +751,7 @@ async fn direct_report(
             config.db_path.to_string_lossy().to_string(),
             dimensions,
             embedder_id,
-            config
-                .store_limits()
+            profiled_store_limits(config)
                 .map_err(|e| format!("store limits are invalid: {}", e))?,
         )
         .map_err(|e| format!("the database could not be opened: {}", e))?,
@@ -1164,6 +1171,65 @@ mod tests {
         assert!(
             !status_arm.contains("store_limits_with_profile"),
             "the Status arm must not apply the profile to store limits"
+        );
+    }
+
+    /// Extract one top-level fn's body from this file's source, for the
+    /// structural routing pins below.
+    fn source_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        // Anchored to a line start so a signature named inside another
+        // test's string literals is not matched instead of the definition.
+        let anchored = format!("\n{signature}");
+        let start = source
+            .find(&anchored)
+            .unwrap_or_else(|| panic!("{signature} must exist"))
+            + 1;
+        let rest = &source[start + signature.len()..];
+        let end = [rest.find("\nfn "), rest.find("\nasync fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Fix round 1 (Finding 1): the gate report and snapshot restore are
+    /// store-opening surfaces whose model resolution already goes through
+    /// the profile; their store limits must come from the profiled
+    /// resolution too, not plain `store_limits()`.
+    #[test]
+    fn gate_and_restore_store_opens_route_through_profiled_limits() {
+        let source = include_str!("main.rs");
+        for signature in ["async fn direct_report(", "async fn restore_snapshot_bundle("] {
+            let body = source_fn_body(source, signature);
+            assert!(
+                body.contains("profiled_store_limits(config)"),
+                "{signature} must resolve store limits through the profile"
+            );
+            assert!(
+                !body.contains(".store_limits()"),
+                "{signature} must not use plain store_limits()"
+            );
+        }
+    }
+
+    /// Fix round 1 (Finding 2): resolution runs once at startup -- the
+    /// `StartupResolution` carries the resolved model and both startup
+    /// arms build the embedder from that carried model, so the printed
+    /// summary describes the constructed embedder by construction.
+    #[test]
+    fn startup_paths_build_the_embedder_from_the_carried_resolution() {
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains("resolution: embed::ResolvedModel,"),
+            "StartupResolution must carry the resolved model"
+        );
+        // Assembled from fragments so this test's own text is not counted.
+        let needle = ["build_embedder_for(&startup", ".resolution.model)"].concat();
+        assert_eq!(
+            source.matches(&needle).count(),
+            2,
+            "both startup arms must build from the carried resolution"
         );
     }
 
@@ -2821,7 +2887,7 @@ async fn restore_snapshot_bundle(
 
     let dimensions = embed::configured_dimensions()?;
     let embedder_id = embed::configured_embedder_id()?;
-    let limits = config.store_limits()?;
+    let limits = profiled_store_limits(config)?;
     let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
     let writer_target = target.to_path_buf();
@@ -3144,7 +3210,7 @@ async fn run() -> anyhow::Result<()> {
                 // to be released rather than for the port to close.
                 let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
                 let startup = resolve_startup(&config)?;
-                let embedder = build_embedder()?;
+                let embedder = embed::build_embedder_for(&startup.resolution.model)?;
                 let vector_store: Arc<dyn VectorStore> =
                     Arc::new(LadybugStore::new_with_identity_limits(
                         config.db_path.to_string_lossy().to_string(),
@@ -3900,7 +3966,7 @@ async fn run() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 let startup = resolve_startup(&config)?;
-                let embedder = build_embedder()?;
+                let embedder = embed::build_embedder_for(&startup.resolution.model)?;
                 let vector_store: Arc<dyn VectorStore> =
                     Arc::new(LadybugStore::new_with_identity_limits(
                         config.db_path.to_string_lossy().to_string(),

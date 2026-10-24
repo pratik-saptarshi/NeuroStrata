@@ -5782,10 +5782,27 @@ mod tests {
         let refusal = refusal.expect(
             "a store pre-grown to the profile-low max-DB cap must refuse further growth",
         );
+        // The refusal must be the engine's size-cap error, not any loud
+        // error: an identity, marker, schema, or WAL failure along the way
+        // must fail this test, not satisfy it. The engine surfaces its
+        // max-DB-size refusal as a database-size message (the VM region
+        // the store is mapped into is full); the full text is printed on
+        // failure so a phrasing change is a one-line correction here.
+        let message = format!("{refusal:#}");
+        let lowered = message.to_lowercase();
         assert!(
-            !refusal.to_string().is_empty(),
-            "the cap refusal must be a loud error, got an empty message"
+            lowered.contains("size")
+                && (lowered.contains("maximum")
+                    || lowered.contains("exceed")
+                    || lowered.contains("vm region")),
+            "the refusal must be the engine's max-DB-size error, got: {message}"
         );
+        for other_path in ["model identity", "marker", "checksum", "width"] {
+            assert!(
+                !lowered.contains(other_path),
+                "the refusal came from the {other_path} path, not the size cap: {message}"
+            );
+        }
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
