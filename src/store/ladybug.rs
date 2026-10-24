@@ -5826,8 +5826,12 @@ mod tests {
     /// Spec Feature 1 AC7: a real store driven to the profile-low max-DB
     /// cap refuses further growth with the engine's loud error. Writing
     /// 2 GiB of genuine content is not the mechanism: the store file is
-    /// pre-grown to just under the cap (the engine's cap is on database
-    /// file size), then inserts run until the engine refuses.
+    /// pre-grown to just under the cap (on open the engine derives its
+    /// page count from the file length, so the pre-grown file sits one
+    /// page under the frame-group ceiling the cap imposes), then inserts
+    /// run — each followed by a checkpoint, because a transaction's rows
+    /// only reach the data file, and the capped page accounting, when a
+    /// checkpoint merges the WAL — until the engine refuses.
     #[tokio::test]
     async fn profile_low_max_db_cap_refuses_further_growth() {
         let profile = crate::config::CapacityProfile::Low;
@@ -5885,16 +5889,25 @@ mod tests {
         let filler = "x".repeat(16 * 1024);
         let mut refusal = None;
         for i in 0..512 {
-            match store
+            let inserted = store
                 .upsert(
                     "profile-cap",
                     &format!("profile-cap::row-{i}"),
                     vec![0.11, 0.22, 0.33, 0.44],
                     payload(filler.clone()),
                 )
-                .await
-            {
-                Ok(_) => continue,
+                .await;
+            // The checkpoint is part of the growth mechanism, not an
+            // afterthought: upserts only mark the store dirty, and the
+            // merge is what allocates data-file pages against the cap.
+            // The first merge that needs a second new page claims a frame
+            // group past the ceiling and the engine refuses.
+            let step = match inserted {
+                Ok(_) => store.checkpoint().await,
+                Err(error) => Err(error),
+            };
+            match step {
+                Ok(()) => continue,
                 Err(error) => {
                     refusal = Some(error);
                     break;
