@@ -7,8 +7,9 @@ use sha2::Digest;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// An HTTP failure from the embedding endpoint, carrying the status so the
 /// retry loop can recognise it.
@@ -540,8 +541,166 @@ pub fn configured_dimensions() -> Result<usize> {
 /// at ~3.5 characters per token, with headroom for the header lines.
 const MAX_EMBED_TOKENS: usize = 2048;
 
+/// The opt-in idle-unload setting (Task 4), env-only:
+/// `NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS`. Unset or `0` disables the
+/// feature (pinned no-change behavior); a positive integer is the idle
+/// threshold in seconds. Anything else is a hard error on the surfaces
+/// that read it (embedder construction and the startup summary) -- the
+/// Status arms never read it.
+pub(crate) fn idle_unload_threshold_from_value(raw: Option<&str>) -> Result<Option<Duration>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let secs: u64 = raw.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS must be a non-negative integer number of seconds, got {raw:?}"
+        )
+    })?;
+    Ok(if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    })
+}
+
+/// The idle-unload threshold from the process environment.
+pub(crate) fn idle_unload_threshold() -> Result<Option<Duration>> {
+    let raw = std::env::var("NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS").ok();
+    idle_unload_threshold_from_value(raw.as_deref())
+}
+
+/// The startup-summary segment for the idle-unload setting (Spec
+/// Feature 2): exactly `idle unload: on (threshold Ns)` or
+/// `idle unload: off`.
+pub(crate) fn format_idle_unload_segment(threshold: Option<Duration>) -> String {
+    match threshold {
+        Some(threshold) => format!("idle unload: on (threshold {}s)", threshold.as_secs()),
+        None => "idle unload: off".to_string(),
+    }
+}
+
+/// Builds one session plus the identity it serves. The factory is the
+/// reload contract in one type: it owns ONLY the values captured at
+/// startup (identity, canonical name, cache dir, max length) and
+/// rebuilds a session from them -- it never re-runs model resolution
+/// and never re-reads the environment or the embedders file.
+type SessionFactory<T> = Box<dyn Fn() -> Result<(T, String)> + Send + Sync>;
+
+struct IdleSessionState<T> {
+    session: Option<T>,
+    last_used: Instant,
+}
+
+/// A lazily unloaded embedding session (Task 4, Spec Feature 2).
+///
+/// The first load is eager: construction runs the factory once and
+/// fails if it fails (startup stays fail-closed). Afterwards the
+/// staleness check lives in the access path itself -- no daemon ticker:
+/// an access that finds the session idle past the threshold drops it
+/// and rebuilds it from the factory's captured values before serving.
+/// A reload whose identity differs from the startup identity is a loud
+/// error and the mismatched session is never installed; a failed
+/// reload surfaces its error and the next access retries. Unset
+/// threshold (`None`) disables unloading entirely.
+///
+/// Status surfaces read `snapshot_loaded` only: an atomic written on
+/// load/unload transitions. It never locks the session state, never
+/// calls the factory, and never touches the idle clock (Spec GT-7).
+pub(crate) struct IdleSession<T> {
+    factory: SessionFactory<T>,
+    startup_identity: String,
+    threshold: Option<Duration>,
+    state: Mutex<IdleSessionState<T>>,
+    loaded_snapshot: AtomicBool,
+}
+
+impl<T> IdleSession<T> {
+    fn new<F>(factory: F, threshold: Option<Duration>) -> Result<Self>
+    where
+        F: Fn() -> Result<(T, String)> + Send + Sync + 'static,
+    {
+        Self::new_at(factory, threshold, Instant::now())
+    }
+
+    fn new_at<F>(factory: F, threshold: Option<Duration>, now: Instant) -> Result<Self>
+    where
+        F: Fn() -> Result<(T, String)> + Send + Sync + 'static,
+    {
+        let factory: SessionFactory<T> = Box::new(factory);
+        // Eager first load: a factory that cannot build the startup
+        // session fails construction, exactly as startup did before
+        // idle unload existed.
+        let (session, identity) = factory()?;
+        Ok(Self {
+            factory,
+            startup_identity: identity,
+            threshold,
+            state: Mutex::new(IdleSessionState {
+                session: Some(session),
+                last_used: now,
+            }),
+            loaded_snapshot: AtomicBool::new(true),
+        })
+    }
+
+    /// The identity captured at startup. Reloads must reproduce it.
+    fn startup_identity(&self) -> &str {
+        &self.startup_identity
+    }
+
+    /// Lock-free snapshot of whether a session is currently installed.
+    /// The only session-state read status surfaces may make.
+    fn snapshot_loaded(&self) -> bool {
+        self.loaded_snapshot.load(Ordering::SeqCst)
+    }
+
+    /// Serve `f` with the session, dropping and rebuilding it first if
+    /// it has been idle past the threshold.
+    fn with_session<R>(&self, f: impl FnOnce(&mut T) -> Result<R>) -> Result<R> {
+        self.with_session_at(Instant::now(), f)
+    }
+
+    fn with_session_at<R>(
+        &self,
+        now: Instant,
+        f: impl FnOnce(&mut T) -> Result<R>,
+    ) -> Result<R> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session lock poisoned: {}", e))?;
+        if let (Some(threshold), Some(_)) = (self.threshold, &state.session) {
+            let idle = now.duration_since(state.last_used);
+            if idle >= threshold {
+                state.session = None;
+                self.loaded_snapshot.store(false, Ordering::SeqCst);
+                eprintln!("embedder session unloaded after {}s idle", idle.as_secs());
+            }
+        }
+        if state.session.is_none() {
+            let (session, identity) = (self.factory)()?;
+            if identity != self.startup_identity {
+                anyhow::bail!(
+                    "embedder session reload produced model identity {:?}, but the startup identity is {:?}; refusing to serve a different model than startup resolved",
+                    identity,
+                    self.startup_identity
+                );
+            }
+            eprintln!("embedder session reloaded (model: {})", identity);
+            state.session = Some(session);
+            self.loaded_snapshot.store(true, Ordering::SeqCst);
+        }
+        state.last_used = now;
+        let session = state
+            .session
+            .as_mut()
+            .expect("the session is installed by the reload branch above");
+        f(session)
+    }
+}
+
 pub struct FastEmbedder {
-    model: Arc<Mutex<TextEmbedding>>,
+    session: Arc<IdleSession<TextEmbedding>>,
     model_name: String,
     dimensions: usize,
 }
@@ -556,7 +715,6 @@ impl FastEmbedder {
     /// reported its provenance) build from that same model.
     fn with_model(target_model: AcceptableEmbedder) -> Result<Self> {
         let (model_enum, dimensions) = local_model_details(&target_model)?;
-
         let cache_dir = find_existing_cache_dir();
 
         if !cache_dir.exists() {
@@ -569,20 +727,40 @@ impl FastEmbedder {
             target_model.model_name, cache_dir
         );
 
-        // fastembed defaults to 512 tokens regardless of what the model supports
-        // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
-        // what ingestion actually stores per symbol is wasted, so this is set to
-        // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
+        // The values the startup session is constructed with, captured
+        // once here: identity, canonical model name, cache dir, and the
+        // max length below. The idle-unload factory rebuilds ONLY the
+        // ONNX session from these captured values; it never re-resolves
+        // the configured model and never re-reads any configuration
+        // source, so a reload can only ever reproduce the startup
+        // session (the P1-2 contract).
         let model_name = format!("fastembed:{model_enum}");
-        let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_enum)
-                .with_cache_dir(cache_dir)
-                .with_max_length(MAX_EMBED_TOKENS)
-                .with_show_download_progress(true),
-        )?;
+        let captured_identity = model_name.clone();
+        let captured_model_name = model_enum.to_string();
+        let captured_max_length = MAX_EMBED_TOKENS;
+        let factory = move || -> Result<(TextEmbedding, String)> {
+            let model_enum = EmbeddingModel::from_str(&captured_model_name).map_err(|_| {
+                anyhow::anyhow!(
+                    "captured local embedding model {:?} no longer parses",
+                    captured_model_name
+                )
+            })?;
+            // fastembed defaults to 512 tokens regardless of what the model supports
+            // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
+            // what ingestion actually stores per symbol is wasted, so this is set to
+            // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
+            let model = TextEmbedding::try_new(
+                TextInitOptions::new(model_enum)
+                    .with_cache_dir(cache_dir.clone())
+                    .with_max_length(captured_max_length)
+                    .with_show_download_progress(true),
+            )?;
+            Ok((model, captured_identity.clone()))
+        };
+        let session = IdleSession::new(factory, idle_unload_threshold()?)?;
 
         Ok(Self {
-            model: Arc::new(Mutex::new(model)),
+            session: Arc::new(session),
             model_name,
             dimensions,
         })
@@ -594,15 +772,17 @@ impl Embedder for FastEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         // Model inference is CPU-bound and can stall the async runtime when
         // called from a Tokio task. Isolate it on the blocking thread pool.
-        let model = Arc::clone(&self.model);
+        // The idle-unload staleness check lives inside `with_session`:
+        // a session idle past the threshold is dropped and rebuilt from
+        // the startup-captured values before this call is served.
+        let session = Arc::clone(&self.session);
         let text = text.to_owned();
         let mut embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
-            let mut guard = model
-                .lock()
-                .map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
-            guard
-                .embed(vec![&*text], None)
-                .context("fastembed embed call failed")
+            session.with_session(|model| {
+                model
+                    .embed(vec![&*text], None)
+                    .context("fastembed embed call failed")
+            })
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
@@ -626,6 +806,10 @@ impl Embedder for FastEmbedder {
 
     fn embedder_id(&self) -> &str {
         &self.model_name
+    }
+
+    fn session_loaded_snapshot(&self) -> Option<bool> {
+        Some(self.session.snapshot_loaded())
     }
 }
 
@@ -1338,5 +1522,408 @@ mod tests {
         exercise_retry(&[400, 200], 1, false, 2).await;
         exercise_retry(&[401, 200], 1, false, 2).await;
         exercise_retry(&[200], 1, false, 3).await;
+    }
+
+    // ---- Task 4: IdleSession (opt-in idle unload of the local session) ----
+
+    /// Dummy session for container tests: `serial` identifies the exact
+    /// instance the factory built, `identity` is what the factory reports
+    /// alongside it.
+    struct DummySession {
+        serial: usize,
+        identity: String,
+    }
+
+    /// A counting factory that always succeeds, reporting `identity`.
+    fn counting_factory(
+        calls: Arc<AtomicUsize>,
+        identity: &str,
+    ) -> impl Fn() -> Result<(DummySession, String)> + Send + Sync {
+        let identity = identity.to_string();
+        move || {
+            let serial = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok((
+                DummySession {
+                    serial,
+                    identity: identity.clone(),
+                },
+                identity.clone(),
+            ))
+        }
+    }
+
+    #[test]
+    fn idle_session_loads_once_and_reuses() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = Instant::now();
+        let session = IdleSession::new_at(
+            counting_factory(calls.clone(), "fastembed:DummyModel"),
+            Some(Duration::from_secs(60)),
+            base,
+        )
+        .unwrap();
+        for offset in [0, 10, 59] {
+            let serial = session
+                .with_session_at(base + Duration::from_secs(offset), |s| Ok(s.serial))
+                .unwrap();
+            assert_eq!(
+                serial, 1,
+                "within the threshold the startup session is reused"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(session.snapshot_loaded());
+    }
+
+    #[test]
+    fn idle_session_drops_after_threshold_and_reloads_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = Instant::now();
+        let session = Arc::new(
+            IdleSession::new_at(
+                counting_factory(calls.clone(), "fastembed:DummyModel"),
+                Some(Duration::from_secs(30)),
+                base,
+            )
+            .unwrap(),
+        );
+        session.with_session_at(base, |s| Ok(s.serial)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Concurrent callers all arrive past the threshold: exactly one
+        // drop-and-rebuild may happen; the rest reuse the reloaded session.
+        let stale = base + Duration::from_secs(45);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let session = Arc::clone(&session);
+            handles.push(std::thread::spawn(move || {
+                session.with_session_at(stale, |s| Ok(s.serial)).unwrap()
+            }));
+        }
+        let serials: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            serials.iter().all(|&serial| serial == 2),
+            "every concurrent caller is served by the one reloaded session: {serials:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one reload under concurrency"
+        );
+        assert!(session.snapshot_loaded());
+    }
+
+    #[test]
+    fn idle_session_reload_failure_surfaces_and_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = Instant::now();
+        let factory_calls = calls.clone();
+        let session = IdleSession::new_at(
+            move || {
+                let n = factory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 2 {
+                    anyhow::bail!("reload exploded");
+                }
+                Ok((
+                    DummySession {
+                        serial: n,
+                        identity: "fastembed:DummyModel".into(),
+                    },
+                    "fastembed:DummyModel".to_string(),
+                ))
+            },
+            Some(Duration::from_secs(30)),
+            base,
+        )
+        .unwrap();
+        let stale = base + Duration::from_secs(60);
+        let error = session
+            .with_session_at(stale, |s| Ok(s.serial))
+            .unwrap_err();
+        assert!(error.to_string().contains("reload exploded"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !session.snapshot_loaded(),
+            "a failed reload leaves the session unloaded"
+        );
+
+        // The next embed retries the reload instead of serving a dead
+        // session or failing forever.
+        let serial = session.with_session_at(stale, |s| Ok(s.serial)).unwrap();
+        assert_eq!(serial, 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(session.snapshot_loaded());
+    }
+
+    #[test]
+    fn idle_session_reload_identity_mismatch_is_a_loud_error() {
+        // After any reload the embedder asserts its identity equals the
+        // startup identity; a mismatch is a loud embed error, never a
+        // silently served different model.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = Instant::now();
+        let factory_calls = calls.clone();
+        let session = IdleSession::new_at(
+            move || {
+                let n = factory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let identity = if n == 2 {
+                    "fastembed:MutatedModel"
+                } else {
+                    "fastembed:StartupModel"
+                };
+                Ok((
+                    DummySession {
+                        serial: n,
+                        identity: identity.to_string(),
+                    },
+                    identity.to_string(),
+                ))
+            },
+            Some(Duration::from_secs(30)),
+            base,
+        )
+        .unwrap();
+        let stale = base + Duration::from_secs(60);
+        let error = session
+            .with_session_at(stale, |s| Ok(s.serial))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("fastembed:MutatedModel"), "{message}");
+        assert!(message.contains("fastembed:StartupModel"), "{message}");
+        assert!(
+            !session.snapshot_loaded(),
+            "a mismatched session is never installed"
+        );
+        // Retried on the next embed, and the correct model serves.
+        let serial = session.with_session_at(stale, |s| Ok(s.serial)).unwrap();
+        assert_eq!(serial, 3);
+    }
+
+    #[test]
+    fn idle_session_reload_ignores_mutated_config() {
+        // The P1-2 pin: the factory rebuilds ONLY from values captured at
+        // startup. Between drop and reload, everything a naive reload
+        // would consult is mutated -- a shared "live config" cell, the
+        // process environment, and an embedders file on disk -- and the
+        // reloaded identity must still be the startup identity.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let live_config = Arc::new(Mutex::new("fastembed:StartupModel".to_string()));
+        let base = Instant::now();
+        let factory_calls = calls.clone();
+        let session = IdleSession::new_at(
+            move || {
+                let serial = factory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok((
+                    DummySession {
+                        serial,
+                        identity: "fastembed:StartupModel".to_string(),
+                    },
+                    "fastembed:StartupModel".to_string(),
+                ))
+            },
+            Some(Duration::from_secs(30)),
+            base,
+        )
+        .unwrap();
+        session.with_session_at(base, |s| Ok(s.serial)).unwrap();
+
+        *live_config.lock().unwrap() = "fastembed:MutatedModel".to_string();
+        std::env::set_var("NS_TASK4_MUTATED_MODEL", "MutatedModel");
+        let fake_dir =
+            std::env::temp_dir().join(format!("neurostrata-task4-{}", std::process::id()));
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        std::fs::write(
+            fake_dir.join("embedders.json"),
+            r#"[{"model_name":"MutatedModel","dimensions":384}]"#,
+        )
+        .unwrap();
+
+        let identity = session
+            .with_session_at(base + Duration::from_secs(60), |s| Ok(s.identity.clone()))
+            .unwrap();
+        assert_eq!(identity, "fastembed:StartupModel");
+        assert_eq!(session.startup_identity(), "fastembed:StartupModel");
+        std::env::remove_var("NS_TASK4_MUTATED_MODEL");
+        let _ = std::fs::remove_dir_all(&fake_dir);
+    }
+
+    #[test]
+    fn idle_session_first_load_is_eager() {
+        // Construction with an unloadable factory fails at construction:
+        // first load stays eager and startup stays fail-closed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = calls.clone();
+        let result = IdleSession::<DummySession>::new_at(
+            move || {
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("startup session cannot load")
+            },
+            Some(Duration::from_secs(30)),
+            Instant::now(),
+        );
+        assert!(
+            result.is_err(),
+            "construction fails when the first load fails"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the factory ran at construction, not on first use"
+        );
+    }
+
+    #[test]
+    fn idle_session_status_polling_never_loads_or_resets() {
+        // Status-equivalent reads are the lock-free snapshot only. The
+        // factory succeeds on calls 1-2 and fails on call 3 so the test
+        // can also observe the unloaded state.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = Instant::now();
+        let factory_calls = calls.clone();
+        let session = IdleSession::new_at(
+            move || {
+                let n = factory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 3 {
+                    anyhow::bail!("reload exploded");
+                }
+                Ok((
+                    DummySession {
+                        serial: n,
+                        identity: "fastembed:DummyModel".into(),
+                    },
+                    "fastembed:DummyModel".to_string(),
+                ))
+            },
+            Some(Duration::from_secs(30)),
+            base,
+        )
+        .unwrap();
+        session.with_session_at(base, |s| Ok(s.serial)).unwrap();
+
+        for _ in 0..5 {
+            assert!(session.snapshot_loaded());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "status reads never call the factory"
+        );
+
+        // The reads did not reset the idle clock either: this embed still
+        // measures idle from the last real embed (base), so it drops and
+        // reloads exactly once.
+        let serial = session
+            .with_session_at(base + Duration::from_secs(31), |s| Ok(s.serial))
+            .unwrap();
+        assert_eq!(serial, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Drive the session into the unloaded state (the reload at
+        // base+62 fails), then poll status repeatedly: the factory is
+        // never called and the session stays unloaded.
+        assert!(session
+            .with_session_at(base + Duration::from_secs(62), |s| Ok(s.serial))
+            .is_err());
+        assert!(!session.snapshot_loaded());
+        for _ in 0..5 {
+            assert!(!session.snapshot_loaded());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "status reads never reload an unloaded session"
+        );
+        assert!(!session.snapshot_loaded(), "the session is still unloaded");
+    }
+
+    #[test]
+    fn idle_session_disabled_never_unloads() {
+        // Unset/0 setting = disabled: pinned no-change behavior, the
+        // startup session serves forever.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = Instant::now();
+        let session = IdleSession::new_at(
+            counting_factory(calls.clone(), "fastembed:DummyModel"),
+            None,
+            base,
+        )
+        .unwrap();
+        let serial = session
+            .with_session_at(base + Duration::from_secs(86_400 * 365), |s| Ok(s.serial))
+            .unwrap();
+        assert_eq!(serial, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(session.snapshot_loaded());
+    }
+
+    #[test]
+    fn idle_unload_setting_parses_env_only_values() {
+        assert_eq!(idle_unload_threshold_from_value(None).unwrap(), None);
+        assert_eq!(idle_unload_threshold_from_value(Some("")).unwrap(), None);
+        assert_eq!(idle_unload_threshold_from_value(Some("0")).unwrap(), None);
+        assert_eq!(
+            idle_unload_threshold_from_value(Some("300")).unwrap(),
+            Some(Duration::from_secs(300))
+        );
+        assert!(idle_unload_threshold_from_value(Some("bogus")).is_err());
+        assert!(idle_unload_threshold_from_value(Some("-5")).is_err());
+    }
+
+    #[test]
+    fn idle_unload_summary_segment_is_exact() {
+        assert_eq!(format_idle_unload_segment(None), "idle unload: off");
+        assert_eq!(
+            format_idle_unload_segment(Some(Duration::from_secs(300))),
+            "idle unload: on (threshold 300s)"
+        );
+    }
+
+    #[test]
+    fn idle_unload_log_lines_are_exact() {
+        // Spec Feature 2, "What the user sees": exactly these two lines.
+        // Needles are assembled from fragments so this test's own
+        // literals do not satisfy the search.
+        let source = include_str!("embed.rs");
+        let unload = ["embedder session unloaded after ", "{}s idle"].concat();
+        let reload = ["embedder session reloaded (model: ", "{})"].concat();
+        assert!(source.contains(&unload), "the unload log line is exact");
+        assert!(source.contains(&reload), "the reload log line is exact");
+    }
+
+    #[test]
+    fn fastembedder_reload_factory_uses_only_captured_values() {
+        // Structural complement to idle_session_reload_ignores_mutated_config
+        // for the production path: the session factory inside
+        // FastEmbedder::with_model may only rebuild from the values it
+        // captured at construction. It must never re-run model
+        // resolution, re-read the environment, or re-read the embedders
+        // file. Needles are assembled from fragments so this test's own
+        // literals are not counted.
+        let source = include_str!("embed.rs");
+        let start = source
+            .find("\n    fn with_model(")
+            .expect("FastEmbedder::with_model exists");
+        let body = &source[start..];
+        let body = &body[..body
+            .find("\n#[async_trait]")
+            .expect("the impl block ends before the trait impl")];
+        assert!(
+            body.contains("IdleSession::new"),
+            "with_model must build an IdleSession"
+        );
+        for (label, needle) in [
+            ("model resolution", ["configured", "_model()"].concat()),
+            ("environment reads", ["env", "::var"].concat()),
+            ("the embedders file", ["embedders", ".json"].concat()),
+            (
+                "the acceptable-embedder loader",
+                ["load_acceptable", "_embedders"].concat(),
+            ),
+        ] {
+            assert!(
+                !body.contains(&needle),
+                "the reload factory must not re-run {label}"
+            );
+        }
     }
 }

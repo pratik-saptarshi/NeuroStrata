@@ -385,13 +385,14 @@ fn format_bytes_human(bytes: u64) -> String {
 /// The startup summary line (Spec Feature 1): the resolved embedder and
 /// both store limits, each with the layer that supplied it, so an
 /// operator can always answer "why this model, why these limits?".
-/// Kept as one small formatter so later features (idle unload) extend
-/// this surface rather than growing a second one.
+/// Task 4 extends this same surface with the idle-unload segment rather
+/// than growing a second summary mechanism.
 fn format_startup_summary(
     resolution: &embed::ResolvedModel,
     profile: Option<config::CapacityProfile>,
     limits: crate::store::StoreLimits,
     sources: &config::StoreLimitSources,
+    idle_unload: Option<std::time::Duration>,
 ) -> String {
     let embedder_source = match resolution.source {
         embed::ModelSource::Profile => match profile {
@@ -401,13 +402,14 @@ fn format_startup_summary(
         source => source.label().to_string(),
     };
     format!(
-        "embedder: {} (source: {}) \u{b7} store: pool {} (source: {}), max DB {} (source: {})",
+        "embedder: {} (source: {}) \u{b7} store: pool {} (source: {}), max DB {} (source: {}) \u{b7} {}",
         resolution.model.model_name,
         embedder_source,
         format_bytes_human(limits.buffer_pool_bytes),
         sources.pool.label(),
         format_bytes_human(limits.max_db_bytes),
         sources.max_db.label(),
+        embed::format_idle_unload_segment(idle_unload),
     )
 }
 
@@ -432,9 +434,13 @@ fn resolve_startup(config: &Config) -> anyhow::Result<StartupResolution> {
     let profile = crate::config::CapacityProfile::from_env()?;
     let resolution = embed::configured_resolution()?;
     let (limits, sources) = config.store_limits_resolved(profile)?;
+    // Read here for the summary segment; embedder construction reads
+    // the same env-only setting through the same helper, so the line
+    // and the constructed embedder cannot disagree.
+    let idle_unload = embed::idle_unload_threshold()?;
     println!(
         "{}",
-        format_startup_summary(&resolution, profile, limits, &sources)
+        format_startup_summary(&resolution, profile, limits, &sources, idle_unload)
     );
     if let Some(disagreement) = embed::profile_disagreement(&resolution, profile) {
         eprintln!("{}", embed::format_disagreement_warning(&disagreement));
@@ -1101,8 +1107,9 @@ mod tests {
             pool: config::StoreLimitSource::Profile,
             max_db: config::StoreLimitSource::Profile,
         };
-        let line = format_startup_summary(&resolution, profile, limits, &sources);
+        let line = format_startup_summary(&resolution, profile, limits, &sources, None);
         assert!(line.contains("BGESmallENV15Q"), "{line}");
+        assert!(line.contains("idle unload: off"), "{line}");
         assert!(line.contains("profile=low"), "{line}");
         assert!(line.contains("64 MiB"), "{line}");
         assert!(line.contains("2 GiB"), "{line}");
@@ -1130,9 +1137,90 @@ mod tests {
             None,
             crate::store::StoreLimits::default(),
             &sources,
+            None,
         );
         assert!(line.contains("file (auto-generated)"), "{line}");
         assert!(line.contains("built-in default"), "{line}");
+        assert!(line.contains("idle unload: off"), "{line}");
+    }
+
+    /// Task 4 (idle unload): the summary line reports the opt-in idle
+    /// unload setting in the same surface as the embedder provenance.
+    #[test]
+    fn summary_line_reports_idle_unload_threshold() {
+        let resolution = embed::ResolvedModel {
+            model: embed::AcceptableEmbedder {
+                model_name: "BGESmallENV15Q".to_string(),
+                dimensions: 384,
+                base_url: None,
+                api_key_env: None,
+                api_model: None,
+                generated_by: None,
+            },
+            source: embed::ModelSource::Profile,
+        };
+        let limits = crate::store::StoreLimits {
+            buffer_pool_bytes: config::CapacityProfile::Low.buffer_pool_bytes(),
+            max_db_bytes: config::CapacityProfile::Low.max_db_bytes(),
+        };
+        let sources = config::StoreLimitSources {
+            pool: config::StoreLimitSource::Profile,
+            max_db: config::StoreLimitSource::Profile,
+        };
+        let line = format_startup_summary(
+            &resolution,
+            Some(config::CapacityProfile::Low),
+            limits,
+            &sources,
+            Some(std::time::Duration::from_secs(300)),
+        );
+        assert!(
+            line.contains("idle unload: on (threshold 300s)"),
+            "{line}"
+        );
+    }
+
+    /// Task 4 (idle unload), Spec GT-7: status never loads, reloads, or
+    /// touches the embedding session and never resets the idle clock.
+    /// The pin is structural, as with the profile pin above: neither
+    /// Status arm (dedicated or fallback) may gain a call into the
+    /// embedder, the session container, or the idle-unload setting.
+    /// Session state is reported, if at all, only from a lock-free
+    /// snapshot elsewhere -- never via the session.
+    #[test]
+    fn status_arms_never_touch_the_session() {
+        let source = include_str!("main.rs");
+        let dedicated_start = source
+            .find("\n            Commands::Status => {")
+            .expect("the dedicated Status arm exists");
+        let dedicated_end = source[dedicated_start..]
+            .find("Commands::Backup")
+            .map(|offset| dedicated_start + offset)
+            .expect("the Status arm is followed by the Backup arm");
+        let fallback_start = source
+            .find("\n                    Commands::Status => {")
+            .expect("the fallback Status arm exists");
+        let fallback_end = source[fallback_start..]
+            .find("Commands::Ingest")
+            .map(|offset| fallback_start + offset)
+            .expect("the fallback Status arm is followed by the Ingest arm");
+        for (label, arm) in [
+            ("dedicated", &source[dedicated_start..dedicated_end]),
+            ("fallback", &source[fallback_start..fallback_end]),
+        ] {
+            for needle in [
+                "session_loaded_snapshot",
+                "IdleSession",
+                "idle_unload",
+                "NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS",
+                "build_embedder",
+            ] {
+                assert!(
+                    !arm.contains(needle),
+                    "the {label} Status arm must not touch the embedding session ({needle})"
+                );
+            }
+        }
     }
 
     /// Spec AC6: the CLI Status path succeeds with an invalid
