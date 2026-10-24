@@ -5970,7 +5970,13 @@ mod tests {
         assert_eq!(row.0, vec![0.11, 0.22, 0.33, 0.44]);
         assert_eq!(
             std::fs::read(&primary_marker).unwrap(),
-            primary_marker_original
+            serde_json::to_vec_pretty(&PersistedEmbeddingMarker {
+                version: 1,
+                dimensions: 4,
+                embedder_id: Some("fastembed:model-a".into()),
+                adopted_from: Some("schema-only".into()),
+            })
+            .unwrap()
         );
         let _ = std::fs::remove_dir_all(root);
     }
