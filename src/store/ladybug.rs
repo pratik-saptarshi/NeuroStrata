@@ -1528,13 +1528,42 @@ fn persisted_embedding_width(db: &Database) -> Result<Option<usize>> {
     Ok(None)
 }
 
-fn check_embedding_width(db_path: &Path, recorded: usize, dimensions: usize) -> Result<()> {
+/// The canonicalized (saved, configured) identity pair for refusal
+/// messages, or `None` when either identity is absent or the saved
+/// legacy identity cannot be safely canonicalized against the
+/// configured one. Refusal text must only ever carry canonicalized
+/// identities (Refusal Standard element 6): a legacy remote identity
+/// can embed a credential-bearing URL, and one that cannot be matched
+/// to the configured identity must never be printed raw.
+fn canonical_identity_pair(
+    saved: Option<&str>,
+    configured: Option<&str>,
+) -> Option<(String, String)> {
+    let (saved, configured) = (saved?, configured?);
+    crate::embed::canonicalize_persisted_embedder_id(saved, configured)
+        .ok()
+        .map(|canonical| (canonical, configured.to_string()))
+}
+
+fn check_embedding_width(
+    db_path: &Path,
+    recorded: usize,
+    dimensions: usize,
+    identities: Option<(&str, &str)>,
+) -> Result<()> {
     if recorded != dimensions {
+        let identity_clause = match identities {
+            Some((saved, configured)) => format!(
+                " It was embedded with model identity {saved:?}, while the configured identity is {configured:?}."
+            ),
+            None => String::new(),
+        };
         return Err(anyhow::anyhow!(
-            "Refusing to open {}: its Memory.embedding column has width {} but the configured embedder produces {}. Keep this database intact and reopen it with a compatible embedder, or use a separate database path for the new model; no in-place re-embedding migration is available. Marker: {}",
+            "Refusing to open {}: its Memory.embedding column has width {} but the configured embedder produces {}.{} Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available. Marker: {}",
             db_path.display(),
             recorded,
             dimensions,
+            identity_clause,
             width_marker_path(db_path).display()
         ));
     }
@@ -2269,13 +2298,25 @@ impl LadybugStore {
         };
         ensure_database_path_unchanged(&resolved_path, &supplied_path)?;
         if let Some(marker) = &marker {
-            check_embedding_width(&resolved_path, marker.dimensions, dimensions)?;
+            let identities = canonical_identity_pair(
+                marker.embedder_id.as_deref(),
+                embedder_id.as_deref(),
+            );
+            check_embedding_width(
+                &resolved_path,
+                marker.dimensions,
+                dimensions,
+                identities.as_ref().map(|(saved, configured)| {
+                    (saved.as_str(), configured.as_str())
+                }),
+            )?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
                 let saved_canonical =
                     crate::embed::canonicalize_persisted_embedder_id(saved, current)?;
                 if saved_canonical != current.as_str() {
                     anyhow::bail!(
-                        "Refusing to open database path alias: it has a different embedding model identity. Preserve the database and all marker files; reopen through the original matching configuration or use a separate database path."
+                        "Refusing to open database path alias: it was embedded with model identity {:?}, while the configured identity is {:?}. The recorded embedding width is {} and the configured embedding width is {}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
+                        saved_canonical, current, marker.dimensions, dimensions
                     );
                 }
             }
@@ -2364,10 +2405,21 @@ impl LadybugStore {
         };
 
         let schema_width = persisted_embedding_width(&db)?;
+        let identities = marker.as_ref().and_then(|marker| {
+            canonical_identity_pair(marker.embedder_id.as_deref(), embedder_id.as_deref())
+        });
+        let identity_args = identities
+            .as_ref()
+            .map(|(saved, configured)| (saved.as_str(), configured.as_str()));
         if let Some(schema_width) = schema_width {
-            check_embedding_width(&resolved_path, schema_width, dimensions)?;
+            check_embedding_width(&resolved_path, schema_width, dimensions, identity_args)?;
             if let Some(marker) = &marker {
-                check_embedding_width(&resolved_path, marker.dimensions, schema_width)?;
+                check_embedding_width(
+                    &resolved_path,
+                    marker.dimensions,
+                    schema_width,
+                    identity_args,
+                )?;
             }
         } else if database_preexisted {
             // An existing DB without Memory is either a new empty catalog or a
@@ -2375,14 +2427,19 @@ impl LadybugStore {
         }
         let mut adopted_from: Option<&str> = None;
         if let Some(marker) = &marker {
-            check_embedding_width(&resolved_path, marker.dimensions, dimensions)?;
+            check_embedding_width(
+                &resolved_path,
+                marker.dimensions,
+                dimensions,
+                identity_args,
+            )?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
                 let saved_canonical =
                     crate::embed::canonicalize_persisted_embedder_id(saved, current)?;
                 if saved_canonical != current.as_str() {
                     return Err(anyhow::anyhow!(
-                        "Refusing to open {}: it was embedded with model identity {:?}, while the configured identity is {:?}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
-                        local_path.display(), saved_canonical, current
+                        "Refusing to open {}: it was embedded with model identity {:?}, while the configured identity is {:?}. The recorded embedding width is {} and the configured embedding width is {}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
+                        local_path.display(), saved_canonical, current, marker.dimensions, dimensions
                     ));
                 }
             } else if marker.embedder_id.is_none() && embedder_id.is_some() {
@@ -5495,8 +5552,56 @@ mod tests {
             message.contains("produces 4"),
             "names the configured width: {message}"
         );
+        // Refusal Standard elements 4-5, in the reference site's wording.
+        for element in [
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "remediation element {element:?} missing: {message}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Refusal Standard at the width site (Spec Feature 3 AC1): when
+    /// identities are in context, the width refusal — often the only
+    /// refusal that fires — names both canonicalized identities as well
+    /// as both widths and the reference remediation.
+    #[test]
+    fn width_refusal_names_both_identities_and_both_widths() {
+        let dir = std::env::temp_dir().join(format!("ladybug-width-id-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 8, "fastembed:model-a".into(), limits)
+                    .expect("open model A at width 8");
+        }
+        let error = match LadybugStore::new_with_identity_limits(
+            &dir,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        ) {
+            Ok(_) => panic!("a 4-wide embedder must not open an 8-wide database"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        for element in [
+            "fastembed:model-a",
+            "fastembed:model-b",
+            "width 8",
+            "produces 4",
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "width refusal element {element:?} missing: {message}");
+        }
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
     }
 
     #[tokio::test]
@@ -5551,7 +5656,24 @@ mod tests {
             Ok(_) => panic!("same-width model changes alter the vector space"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("model identity"));
+        let message = error.to_string();
+        assert!(message.contains("model identity"));
+        // Refusal Standard (Spec Feature 3 AC1): both canonicalized
+        // identities, both widths (equal at this site — the width check
+        // has already passed — stated for uniformity), and the reference
+        // remediation elements.
+        for element in [
+            "fastembed:model-a",
+            "fastembed:model-b",
+            "recorded embedding width is 4",
+            "configured embedding width is 4",
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "identity refusal element {element:?} missing: {message}");
+        }
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
@@ -5590,6 +5712,50 @@ mod tests {
             Some(&json!("width-only")),
             "the adoption is recorded in the marker itself"
         );
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+    /// Spec Feature 1 AC1 (store side, Ruling R1 placement): with an
+    /// auto-generated embedders file and `NEUROSTRATA_PROFILE=low`, the
+    /// resolved model is BGESmallENV15Q and a store created in that state
+    /// is minted with the BGE-small identity, not Nomic's.
+    #[tokio::test]
+    async fn profile_low_resolution_mints_bge_small_identity_on_a_new_store() {
+        let resolved = crate::embed::resolve_configured_model_from_inputs(
+            crate::embed::auto_generated_defaults(),
+            crate::embed::EmbeddersFileState::AutoGenerated,
+            None,
+            Some("low"),
+        )
+        .expect("profile resolution succeeds");
+        assert_eq!(resolved.model.model_name, "BGESmallENV15Q");
+        let identity = crate::embed::configured_identity_for(&resolved.model)
+            .expect("the profile model has a canonical identity");
+
+        let profile = crate::config::CapacityProfile::Low;
+        let limits = StoreLimits {
+            buffer_pool_bytes: profile.buffer_pool_bytes(),
+            max_db_bytes: profile.max_db_bytes(),
+        };
+        let dir = std::env::temp_dir()
+            .join(format!("ladybug-profile-mint-{}", uuid::Uuid::new_v4()));
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &dir,
+                resolved.model.dimensions,
+                identity,
+                limits,
+            )
+            .expect("open a new store with the profile-resolved identity");
+            store.init("profile-mint").await.expect("create schema");
+        }
+        let marker: EmbeddingMarker =
+            serde_json::from_slice(&std::fs::read(width_marker_path(&dir)).unwrap()).unwrap();
+        assert_eq!(
+            marker.embedder_id.as_deref(),
+            Some("fastembed:BGESmallENV15Q")
+        );
+        assert_eq!(marker.dimensions, 384);
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
@@ -5743,6 +5909,271 @@ mod tests {
         );
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
+    }
+    /// Child worker for `profile_cap_refusal_fires_at_reduced_cap`:
+    /// grows a store at an 8 MiB max-DB cap on incompressible rows,
+    /// checkpointing after each upsert — a
+    /// transaction's rows only reach the data file, and the capped page
+    /// accounting, when a checkpoint merges the WAL — until the engine
+    /// refuses. Asserts the refusal is the engine's max-DB-size error and
+    /// that the seeded row still reads back after it, prints the PASS
+    /// marker the parent asserts on, then exits directly: running the
+    /// store's destructor would run the checkpoint-on-close that
+    /// segfaults on lbug 0.20.4 after a cap refusal (see the parent
+    /// test's comment).
+    ///
+    /// Marked `#[ignore]`: the body ends in `std::process::exit`, so it
+    /// must never run as part of the suite proper — not even if the gate
+    /// variable leaks into the suite's own environment. The parent
+    /// spawns it by name with `--ignored`.
+    ///
+    /// Row math: at an 8 MiB cap the engine's VM region holds exactly
+    /// two frame groups — one shadow, one data — so the data file has
+    /// 1024 pages (4 MiB). Row WIDTH decides which engine limit fires
+    /// first (CI fix loop round 4, probed against the lbug 0.20.4 wheel
+    /// at this test's exact cadence): 32 KiB rows starved the buffer
+    /// pool during checkpoint merges — "the buffer pool is full and no
+    /// memory could be freed" at ~33 rows — because this repo's
+    /// `StoreLimits::validate` couples the pool to at most the cap, so
+    /// the pool cannot be given the headroom wide-row merges want; the
+    /// same starvation recurred at a 64 MiB cap/pool (~512 rows). With
+    /// 4 KiB incompressible rows the per-checkpoint merge working set
+    /// stays small enough that the frame-group accounting — the cap
+    /// itself — fires first: the engine's max-DB-size refusal was
+    /// observed at ~208 rows in a two-column probe table, and at 310
+    /// rows (2 KiB rows) and 122 rows (8 KiB rows), so the window is
+    /// wide, not a knife's edge. This table's rows are somewhat wider
+    /// than the probe's (vector + metadata alongside the content), so
+    /// the refusal is expected no later; the 1024-row bound is ~5x
+    /// headroom over the probe's 208 and is unreachable unless the cap
+    /// is not enforced at all.
+    #[tokio::test]
+    #[ignore = "child worker: spawned by profile_cap_refusal_fires_at_reduced_cap"]
+    async fn profile_cap_refusal_child_worker() {
+        let Ok(db) = std::env::var("NEUROSTRATA_TEST_PROFILE_CAP_DB") else {
+            return;
+        };
+        let db = PathBuf::from(db);
+        // The pool rides at the cap rather than at the profile's 64 MiB:
+        // this repo's StoreLimits::validate refuses a buffer pool larger
+        // than the max-DB ceiling ("the buffer-pool ceiling cannot
+        // exceed the database-size ceiling"), a coupling the engine
+        // itself does not impose — its verifySizeParams checks each
+        // value on its own. The pool size plays no part in the cap
+        // mechanism under test (frame-group accounting on the data
+        // file); the profile's pool pairs with the profile's 2 GiB cap,
+        // which satisfies the same validation.
+        let limits = StoreLimits {
+            buffer_pool_bytes: 8 * 1024 * 1024,
+            max_db_bytes: 8 * 1024 * 1024,
+        };
+        let payload = |content: String| MemoryPayload {
+            content,
+            user_id: "agent".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "fixture.json".into(),
+            location_lines: "1".into(),
+            metadata: json!({"evidence": "cap"}),
+        };
+        let store = LadybugStore::new_with_identity_limits(
+            &db,
+            4,
+            "fastembed:BGESmallENV15Q".into(),
+            limits,
+        )
+        .expect("open a new store at the reduced cap");
+        store.init("profile-cap").await.expect("create schema");
+        store
+            .upsert(
+                "profile-cap",
+                "profile-cap::seed",
+                vec![0.11, 0.22, 0.33, 0.44],
+                payload("seed row".into()),
+            )
+            .await
+            .expect("seed insert under the cap");
+        let mut refusal = None;
+        for i in 0..1024u64 {
+            let inserted = store
+                .upsert(
+                    "profile-cap",
+                    &format!("profile-cap::row-{i}"),
+                    vec![0.11, 0.22, 0.33, 0.44],
+                    payload(incompressible_filler(i)),
+                )
+                .await;
+            // The checkpoint is part of the growth mechanism, not an
+            // afterthought: upserts only mark the store dirty, and the
+            // merge is what allocates data-file pages against the cap.
+            let step = match inserted {
+                Ok(_) => store.checkpoint().await,
+                Err(error) => Err(error),
+            };
+            match step {
+                Ok(()) => continue,
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        let refusal = refusal.expect(
+            "a store grown to its max-DB cap must refuse further growth",
+        );
+        // The refusal must be the engine's size-cap error, not any loud
+        // error: an identity, marker, schema, or WAL failure along the
+        // way must fail this test, not satisfy it. Rounds 1–2 of the CI
+        // fix loop verified the engine's exact text ("Maximum database
+        // size of {} bytes has been reached. Reopen the database with a
+        // larger max_db_size to continue."), so the assertion names that
+        // family directly instead of the broader alternation the
+        // unverified text once required.
+        let message = format!("{refusal:#}");
+        let lowered = message.to_lowercase();
+        assert!(
+            lowered.contains("maximum database size") && lowered.contains("has been reached"),
+            "the refusal must be the engine's max-DB-size error, got: {message}"
+        );
+        for other_path in ["model identity", "marker", "checksum", "width"] {
+            assert!(
+                !lowered.contains(other_path),
+                "the refusal came from the {other_path} path, not the size cap: {message}"
+            );
+        }
+        // The refusal is clean: the store stays readable afterwards
+        // (round 2 probe — a post-refusal scan returned the row count).
+        let seed = store
+            .get("profile-cap", "profile-cap::seed")
+            .await
+            .expect("a read after the refusal must still succeed")
+            .expect("the seed row must survive the refusal");
+        assert_eq!(seed.1.content, "seed row");
+        println!("PROFILE_CAP_REFUSAL_PASS refusal: {message}");
+        {
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+        // Exit without unwinding: dropping the store would run the
+        // engine's checkpoint-on-close, which is exactly the path that
+        // segfaults after a cap refusal on lbug 0.20.4 (documented on
+        // the parent test, not exercised here).
+        std::process::exit(0);
+    }
+
+    /// Deterministic incompressible filler: xorshift64* output, hex
+    /// encoded — 256 words become a 4 KiB string. Hex of pseudo-random
+    /// bytes carries 4 bits of entropy per stored character, so even
+    /// ideal entropy coding could at best halve it — where
+    /// repeated-character filler compresses ~1000:1 and plateaus at
+    /// ~2.2 MB, never approaching any cap (CI fix loop round 2 probe).
+    /// The width is deliberately narrow: at 32 KiB per row the buffer
+    /// pool starved during checkpoint merges before the size cap could
+    /// fire (round 4 probe — see the child worker's row math). The
+    /// growth loop's row bound is sized to survive the halving.
+    fn incompressible_filler(seed: u64) -> String {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut out = String::with_capacity(4 * 1024);
+        for _ in 0..256 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let word = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            out.push_str(&format!("{word:016x}"));
+        }
+        out
+    }
+
+    /// Spec Feature 1 AC7, reduced-cap subprocess form (Pratik's
+    /// decision, 2026-10-24 — CI fix loop round 3). A real store opened
+    /// through the production path refuses further growth with the
+    /// engine's max-DB-size error once it reaches its configured cap.
+    /// The growth runs in a child process (the
+    /// `profile_cap_refusal_child_worker` test above, spawned the same
+    /// way the publication crash-recovery tests spawn theirs); this
+    /// parent asserts on the child's exit status and output.
+    ///
+    /// Why a reduced cap: the cap under test is 8 MiB, the smallest
+    /// value the engine admits — `BufferManager::verifySizeParams` (lbug
+    /// v0.20.4, src/storage/buffer_manager/buffer_manager.cpp) requires
+    /// at least two page groups, one for the main data file and one for
+    /// the shadow file: 2 * 4096 * 1024 = 8 MiB. The limit reaches the
+    /// engine through the same `StoreLimits` -> `SystemConfig::
+    /// max_db_size` flow as any other value (fix loop round 1 verified
+    /// that leg end to end), with one repo-level qualification:
+    /// `StoreLimits::validate` requires the buffer pool to be no larger
+    /// than the max-DB ceiling, so at this reduced cap the child's pool
+    /// rides at the cap instead of the profile's 64 MiB. The profile-low
+    /// value itself, 2 GiB, is pinned by
+    /// `profile_values_are_the_spec_starting_values` in src/config.rs.
+    ///
+    /// Why a subprocess, and why the 2 GiB end-to-end form is BLOCKED:
+    /// lbug 0.20.4 has a FileHandle exception-safety defect — a file
+    /// handle claims page capacity *before* allocating the frame group
+    /// that capacity describes, so when the allocation throws at the
+    /// cap the handle is left claiming a group that does not exist, and
+    /// the next checkpoint, or the checkpoint on database close, indexes
+    /// the missing group and segfaults the process (fix loop round 2,
+    /// reproduced against the engine in both growth modes). The refusal
+    /// itself is clean, and the refusal is what this test exercises; the
+    /// defect is documented here rather than exercised — the child
+    /// asserts the refusal, prints its marker, and exits via
+    /// `std::process::exit`, never running the destructor checkpoint
+    /// that would crash. A 2 GiB end-to-end variant cannot do that
+    /// inside the test harness: it would segfault in teardown and fail
+    /// the suite over an engine defect this repo does not own. It stays
+    /// blocked on an upstream engine fix.
+    ///
+    /// Growth is natural only — no file pre-grow (round 2: the pre-grow
+    /// was an accelerant, never the cause), and the filler is
+    /// incompressible (see `incompressible_filler`).
+    #[tokio::test]
+    async fn profile_cap_refusal_fires_at_reduced_cap() {
+        use std::io::Read as _;
+        let db =
+            std::env::temp_dir().join(format!("ladybug-profile-cap-{}", uuid::Uuid::new_v4()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::ladybug::tests::profile_cap_refusal_child_worker")
+            .arg("--nocapture")
+            .arg("--ignored")
+            .env("NEUROSTRATA_TEST_PROFILE_CAP_DB", &db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(120) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("profile cap child did not finish before the watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(
+            status.success(),
+            "profile cap child failed: {status}; child output:\n{output}"
+        );
+        assert!(
+            output.contains("PROFILE_CAP_REFUSAL_PASS"),
+            "child never reported the cap refusal; child output:\n{output}"
+        );
+        assert!(
+            output.contains("Maximum database size"),
+            "child's refusal was not the engine's max-DB-size error; child output:\n{output}"
+        );
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(width_marker_path(&db));
     }
 
     #[cfg(unix)]
@@ -5931,6 +6362,55 @@ mod tests {
             vector, vector_before,
             "rejected alias open preserves exact vector data"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Refusal Standard at the alias site (Spec Feature 3 AC1, the
+    /// substantive fix): the alias refusal names both canonicalized
+    /// identities, both widths (equal here — the width check has already
+    /// passed), and the reference remediation wording.
+    #[cfg(unix)]
+    #[test]
+    fn alias_identity_refusal_meets_the_refusal_standard() {
+        let root =
+            std::env::temp_dir().join(format!("ladybug-alias-standard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("primary.store");
+        let alias = root.join("alias.store");
+        let limits = StoreLimits::default();
+        {
+            let _store = LadybugStore::new_with_identity_limits(
+                &original,
+                4,
+                "fastembed:model-a".into(),
+                limits,
+            )
+            .expect("open model A");
+        }
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let error = match LadybugStore::new_with_identity_limits(
+            &alias,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        ) {
+            Ok(_) => panic!("opening an existing DB through a symlink must retain its model identity"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("database path alias"), "the alias site fired: {message}");
+        for element in [
+            "fastembed:model-a",
+            "fastembed:model-b",
+            "recorded embedding width is 4",
+            "configured embedding width is 4",
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "alias refusal element {element:?} missing: {message}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6852,6 +7332,140 @@ mod tests {
 
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(marker_path);
+    }
+
+    /// Refusal Standard element 6 (Spec Feature 3 AC2): a legacy persisted
+    /// identity embedding a credential-bearing URL must appear in NO
+    /// refusal string from any site — width, marker-identity, or alias.
+    /// Only canonicalized identities may enter message text; a legacy
+    /// identity that cannot be canonicalized against the configured one
+    /// is never printed raw.
+    #[tokio::test]
+    async fn credential_bearing_legacy_identity_never_appears() {
+        let legacy = "remote:https://user:top-secret@example.test/v1:embed-v2";
+        let other = crate::embed::remote_embedder_id(
+            "https://other:top-secret@example.test/v1",
+            "embed-v2",
+        );
+        let assert_redacted = |error: &anyhow::Error, site: &str| {
+            let message = format!("{error:#}");
+            for leaked in [legacy, "top-secret", "https://", "example.test"] {
+                assert!(
+                    !message.contains(leaked),
+                    "{site} refusal leaked {leaked:?}: {message}"
+                );
+            }
+        };
+
+        // Width site: the legacy identity canonicalizes to the configured
+        // (hashed) remote identity, so the width check is the refusal that
+        // fires; its message may carry only the canonicalized form.
+        let dir = std::env::temp_dir().join(format!("ladybug-cred-width-{}", uuid::Uuid::new_v4()));
+        let marker_path = width_marker_path(&dir);
+        let matching = crate::embed::remote_embedder_id(
+            "https://user:top-secret@example.test/v1",
+            "embed-v2",
+        );
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &dir,
+                4,
+                matching.clone(),
+                StoreLimits::default(),
+            )
+            .expect("create database using the matching runtime identity");
+            store.init("credential-width-fixture").await.unwrap();
+        }
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&EmbeddingMarker {
+                version: 1,
+                dimensions: 4,
+                embedder_id: Some(legacy.to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = LadybugStore::new_with_identity_limits(&dir, 8, matching.clone(), StoreLimits::default())
+            .err()
+            .expect("width mismatch with a legacy identity is refused");
+        assert_redacted(&error, "width");
+        assert!(
+            format!("{error:#}").contains(&matching),
+            "the width refusal names the canonicalized identity only: {error:#}"
+        );
+
+        // Marker-identity site: same width, mismatched configured endpoint.
+        // The refusal that surfaces is the canonicalization bail (via
+        // read_width_marker, which precedes the ladybug identity bails);
+        // pin its upgraded Refusal Standard content positively, not only
+        // its redaction.
+        let error = LadybugStore::new_with_identity_limits(&dir, 4, other.clone(), StoreLimits::default())
+            .err()
+            .expect("endpoint mismatch with a legacy identity is refused");
+        assert_redacted(&error, "marker-identity");
+        let message = format!("{error:#}");
+        for element in [
+            other.as_str(),
+            "Keep the database intact",
+            "original endpoint and model",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "canonicalization refusal element {element:?} missing: {message}");
+        }
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(&marker_path);
+
+        // Alias site: the legacy identity is reached through a symlink.
+        #[cfg(unix)]
+        {
+            let root = std::env::temp_dir()
+                .join(format!("ladybug-cred-alias-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let original = root.join("primary.store");
+            let alias = root.join("alias.store");
+            {
+                let _store = LadybugStore::new_with_identity_limits(
+                    &original,
+                    4,
+                    crate::embed::remote_embedder_id(
+                        "https://user:top-secret@example.test/v1",
+                        "embed-v2",
+                    ),
+                    StoreLimits::default(),
+                )
+                .expect("create database using the matching runtime identity");
+            }
+            std::fs::write(
+                width_marker_path(&original),
+                serde_json::to_vec(&EmbeddingMarker {
+                    version: 1,
+                    dimensions: 4,
+                    embedder_id: Some(legacy.to_string()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&original, &alias).unwrap();
+            let error = LadybugStore::new_with_identity_limits(
+                &alias,
+                4,
+                other.clone(),
+                StoreLimits::default(),
+            )
+            .err()
+            .expect("alias endpoint mismatch with a legacy identity is refused");
+            assert_redacted(&error, "alias");
+            let message = format!("{error:#}");
+            for element in [
+                other.as_str(),
+                "no in-place re-embedding migration is available",
+            ] {
+                assert!(message.contains(element), "alias canonicalization refusal element {element:?} missing: {message}");
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// The resolution rule as every caller now reaches it: build the index
