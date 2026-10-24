@@ -135,6 +135,167 @@ impl Default for DeduplicationConfig {
     }
 }
 
+/// A named statement of capacity intent (Spec Feature 1): `low` or
+/// `standard`. A profile fills only the configuration slots the operator
+/// left unset -- the embedder default in `crate::embed` and the store
+/// limits below -- and never overrides an explicit value.
+///
+/// The values are *starting values, not derived constants*: they are a
+/// coherent small-machine / workstation posture chosen by hand, and the
+/// two-model validation matrix is the instrument that can later derive
+/// them from measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityProfile {
+    Low,
+    Standard,
+}
+
+impl CapacityProfile {
+    /// Parse a profile name, case-insensitively (consistent with
+    /// `NEUROSTRATA_MODEL` matching). Anything else is a hard error at the
+    /// surfaces that consume the profile.
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "standard" => Ok(Self::Standard),
+            _ => anyhow::bail!(
+                "NEUROSTRATA_PROFILE must be \"low\" or \"standard\", got {raw:?}"
+            ),
+        }
+    }
+
+    /// Resolve an optional raw value: unset (or empty, matching the
+    /// `NEUROSTRATA_MODEL` convention) means no profile.
+    pub fn from_value(raw: Option<&str>) -> Result<Option<Self>> {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(None),
+            Some(value) => Ok(Some(Self::parse(value)?)),
+        }
+    }
+
+    /// Read `NEUROSTRATA_PROFILE` from the process environment. Only
+    /// profile-consuming callers (embedder construction, store opening,
+    /// startup resolution) may call this: an invalid value must never fail
+    /// a command that neither embeds nor opens a store (Spec AC6), so
+    /// `Config::store_limits()` deliberately never does.
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var("NEUROSTRATA_PROFILE") {
+            Ok(value) => Self::from_value(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => anyhow::bail!("could not read NEUROSTRATA_PROFILE: {error}"),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Standard => "standard",
+        }
+    }
+
+    /// The profile's model intent, resolved directly -- never looked up in
+    /// the acceptable-embedders list, so `low` can name BGESmallENV15Q
+    /// even when that model is not a list entry.
+    pub fn model_name(&self) -> &'static str {
+        match self {
+            Self::Low => "BGESmallENV15Q",
+            Self::Standard => "NomicEmbedTextV15",
+        }
+    }
+
+    pub fn embedder_dimensions(&self) -> usize {
+        match self {
+            Self::Low => 384,
+            Self::Standard => 768,
+        }
+    }
+
+    pub fn buffer_pool_bytes(&self) -> u64 {
+        match self {
+            Self::Low => 64 * 1024 * 1024,
+            Self::Standard => crate::store::StoreLimits::DEFAULT_BUFFER_POOL_BYTES,
+        }
+    }
+
+    pub fn max_db_bytes(&self) -> u64 {
+        match self {
+            Self::Low => 2 * 1024 * 1024 * 1024,
+            Self::Standard => crate::store::StoreLimits::DEFAULT_MAX_DB_BYTES,
+        }
+    }
+}
+
+/// Which layer supplied a resolved store limit, for the startup summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreLimitSource {
+    Environment,
+    ConfigFile,
+    Profile,
+    BuiltInDefault,
+}
+
+impl StoreLimitSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::ConfigFile => "config file",
+            Self::Profile => "profile",
+            Self::BuiltInDefault => "built-in default",
+        }
+    }
+}
+
+/// Per-limit provenance returned alongside resolved store limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreLimitSources {
+    pub pool: StoreLimitSource,
+    pub max_db: StoreLimitSource,
+}
+
+/// Store-limit resolution with the profile layer included: environment,
+/// then the config file, then the profile (filling only `None` slots),
+/// then the built-in defaults. Provenance is decided by which slot
+/// supplied the value, never by comparing values -- an explicit value
+/// equal to the profile's still came from the explicit layer.
+fn resolve_store_limits_with_profile(
+    configured_pool: Option<u64>,
+    configured_max_db: Option<u64>,
+    profile: Option<CapacityProfile>,
+    env: impl Fn(&str) -> Result<Option<u64>>,
+) -> Result<(crate::store::StoreLimits, StoreLimitSources)> {
+    let env_pool = env("NEUROSTRATA_BUFFER_POOL_BYTES")?;
+    let env_max_db = env("NEUROSTRATA_MAX_DB_BYTES")?;
+    let limits = resolve_store_limits(
+        configured_pool.or_else(|| profile.map(|p| p.buffer_pool_bytes())),
+        configured_max_db.or_else(|| profile.map(|p| p.max_db_bytes())),
+        |name| {
+            Ok(match name {
+                "NEUROSTRATA_BUFFER_POOL_BYTES" => env_pool,
+                "NEUROSTRATA_MAX_DB_BYTES" => env_max_db,
+                _ => None,
+            })
+        },
+    )?;
+    let source = |env_value: Option<u64>, configured: Option<u64>| {
+        if env_value.is_some() {
+            StoreLimitSource::Environment
+        } else if configured.is_some() {
+            StoreLimitSource::ConfigFile
+        } else if profile.is_some() {
+            StoreLimitSource::Profile
+        } else {
+            StoreLimitSource::BuiltInDefault
+        }
+    };
+    Ok((
+        limits,
+        StoreLimitSources {
+            pool: source(env_pool, configured_pool),
+            max_db: source(env_max_db, configured_max_db),
+        },
+    ))
+}
+
 /// Memory ceilings for the embedded graph store.
 ///
 /// Unset means "use the built-in ceiling", which is bounded on purpose: leaving
@@ -174,9 +335,32 @@ impl Config {
     /// JSON, and so a one-off run can be retried with a smaller ceiling without
     /// changing the installed configuration.
     pub fn store_limits(&self) -> Result<crate::store::StoreLimits> {
-        resolve_store_limits(
+        Ok(self.store_limits_resolved(None)?.0)
+    }
+
+    /// Store limits with a caller-supplied capacity profile applied to the
+    /// slots the config file left unset. The profile arrives as a value,
+    /// parsed once by the consuming caller: this method (like
+    /// `store_limits()`) never reads `NEUROSTRATA_PROFILE` itself, because
+    /// its callers include snapshot creation and the gate report, which
+    /// must not fail on an invalid profile value (Spec AC6).
+    pub fn store_limits_with_profile(
+        &self,
+        profile: Option<CapacityProfile>,
+    ) -> Result<crate::store::StoreLimits> {
+        Ok(self.store_limits_resolved(profile)?.0)
+    }
+
+    /// As `store_limits_with_profile`, but also reports which layer
+    /// supplied each limit, for the startup summary line.
+    pub fn store_limits_resolved(
+        &self,
+        profile: Option<CapacityProfile>,
+    ) -> Result<(crate::store::StoreLimits, StoreLimitSources)> {
+        resolve_store_limits_with_profile(
             self.store.buffer_pool_bytes,
             self.store.max_db_bytes,
+            profile,
             |name| match std::env::var(name) {
                 Ok(value) => parse_limit(name, Some(&value)),
                 Err(std::env::VarError::NotPresent) => Ok(None),
@@ -414,6 +598,118 @@ mod tests {
             partial.max_db_bytes, 200,
             "an unset override must fall through to the config, not to zero"
         );
+    }
+
+    // Task 2 (capacity profiles): the profile layer sits between the config
+    // file and the built-in defaults, fills only unset slots, and is parsed
+    // by the consuming caller -- never inside `store_limits()` itself.
+
+    #[test]
+    fn profile_parse_is_case_insensitive_and_rejects_unknown_values() {
+        assert_eq!(
+            CapacityProfile::parse("low").unwrap(),
+            CapacityProfile::Low
+        );
+        assert_eq!(
+            CapacityProfile::parse(" LoW ").unwrap(),
+            CapacityProfile::Low
+        );
+        assert_eq!(
+            CapacityProfile::parse("STANDARD").unwrap(),
+            CapacityProfile::Standard
+        );
+        assert!(CapacityProfile::parse("huge").is_err());
+        assert!(CapacityProfile::parse("").is_err());
+        assert_eq!(CapacityProfile::from_value(None).unwrap(), None);
+        assert_eq!(CapacityProfile::from_value(Some("")).unwrap(), None);
+        assert_eq!(
+            CapacityProfile::from_value(Some("low")).unwrap(),
+            Some(CapacityProfile::Low)
+        );
+        assert!(CapacityProfile::from_value(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn profile_values_are_the_spec_starting_values() {
+        // Starting values, not derived constants (Spec Feature 1).
+        let low = CapacityProfile::Low;
+        assert_eq!(low.model_name(), "BGESmallENV15Q");
+        assert_eq!(low.embedder_dimensions(), 384);
+        assert_eq!(low.buffer_pool_bytes(), 64 * 1024 * 1024);
+        assert_eq!(low.max_db_bytes(), 2 * 1024 * 1024 * 1024);
+
+        let standard = CapacityProfile::Standard;
+        assert_eq!(standard.model_name(), "NomicEmbedTextV15");
+        assert_eq!(standard.embedder_dimensions(), 768);
+        assert_eq!(
+            standard.buffer_pool_bytes(),
+            crate::store::StoreLimits::DEFAULT_BUFFER_POOL_BYTES
+        );
+        assert_eq!(
+            standard.max_db_bytes(),
+            crate::store::StoreLimits::DEFAULT_MAX_DB_BYTES
+        );
+    }
+
+    #[test]
+    fn standard_profile_is_a_noop() {
+        // Spec AC3: profile=standard with nothing explicit resolves to
+        // today's defaults exactly.
+        let (limits, _sources) = resolve_store_limits_with_profile(
+            None,
+            None,
+            Some(CapacityProfile::Standard),
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(limits, crate::store::StoreLimits::default());
+    }
+
+    #[test]
+    fn no_profile_no_change_in_store_resolution() {
+        // Spec AC4 (store side): no profile resolves exactly as before, and
+        // unset slots report the built-in layer as their source.
+        let (limits, sources) =
+            resolve_store_limits_with_profile(None, None, None, |_| Ok(None)).unwrap();
+        assert_eq!(limits, crate::store::StoreLimits::default());
+        assert_eq!(sources.pool, StoreLimitSource::BuiltInDefault);
+        assert_eq!(sources.max_db, StoreLimitSource::BuiltInDefault);
+    }
+
+    #[test]
+    fn store_matrix_env_then_config_then_profile_then_builtin() {
+        // Spec AC2: per-limit precedence, profile fills only unset slots.
+        let low = Some(CapacityProfile::Low);
+
+        // Nothing explicit: the profile supplies both limits.
+        let (limits, sources) =
+            resolve_store_limits_with_profile(None, None, low, |_| Ok(None)).unwrap();
+        assert_eq!(limits.buffer_pool_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_db_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(sources.pool, StoreLimitSource::Profile);
+        assert_eq!(sources.max_db, StoreLimitSource::Profile);
+
+        // Config values win over the profile, per limit independently.
+        let (limits, sources) =
+            resolve_store_limits_with_profile(Some(100), None, low, |_| Ok(None)).unwrap();
+        assert_eq!(limits.buffer_pool_bytes, 100);
+        assert_eq!(sources.pool, StoreLimitSource::ConfigFile);
+        assert_eq!(limits.max_db_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(sources.max_db, StoreLimitSource::Profile);
+
+        // Environment wins over config and profile, per limit independently.
+        let (limits, sources) =
+            resolve_store_limits_with_profile(Some(100), Some(200), low, |name| {
+                Ok(match name {
+                    "NEUROSTRATA_BUFFER_POOL_BYTES" => Some(7),
+                    _ => None,
+                })
+            })
+            .unwrap();
+        assert_eq!(limits.buffer_pool_bytes, 7);
+        assert_eq!(sources.pool, StoreLimitSource::Environment);
+        assert_eq!(limits.max_db_bytes, 200);
+        assert_eq!(sources.max_db, StoreLimitSource::ConfigFile);
     }
 
     #[test]

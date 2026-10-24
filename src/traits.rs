@@ -178,6 +178,19 @@ pub trait Embedder: Send + Sync {
     fn embedder_id(&self) -> &str {
         "unknown"
     }
+
+    /// Lock-free snapshot of whether this embedder's local session is
+    /// currently loaded, for status surfaces: `Some(true)`/`Some(false)`
+    /// when that is readable without touching the session, `None` when
+    /// there is no local session state to report. Implementations must
+    /// never load, reload, or touch the session to answer, and must
+    /// never reset any idle clock -- read a snapshot field only (Spec
+    /// GT-7). Defaults to `None`; `RemoteEmbedder` no-ops by inheriting
+    /// the default, and local embedders with an unloadable session
+    /// override it.
+    fn session_loaded_snapshot(&self) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
