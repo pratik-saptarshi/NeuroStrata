@@ -250,6 +250,51 @@ fn read_stage_provenance(conn: &Connection) -> Result<Vec<(String, String)>> {
     Ok(stages)
 }
 
+/// Returns cataloged stages plus pre-catalog stage rows whose exact reserved
+/// UUID namespace, generated sidecar, and auto-ingestor-qualified IDs prove
+/// staging ownership. This is only a visibility filter; it does not authorize
+/// deletion or migration of an active stage.
+fn read_hidden_stage_namespaces(conn: &Connection, db_path: &Path) -> Result<HashSet<String>> {
+    let mut hidden: HashSet<String> = read_stage_provenance(conn)?
+        .into_iter()
+        .map(|(namespace, _)| namespace)
+        .collect();
+    for (namespace, sidecar) in discover_stage_lease_sidecars(db_path)? {
+        if hidden.contains(&namespace) || !sidecar.is_file() {
+            continue;
+        }
+        if !is_internal_ingest_stage_namespace(&namespace) {
+            continue;
+        }
+        let safe = escape_ladybug_string(&namespace);
+        let mut rows = conn.query(&format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.user_id",
+            safe
+        ))?;
+        let mut found = false;
+        let mut owned = true;
+        while let Some(row) = rows.next() {
+            found = true;
+            let id = format!("{}", row[0]);
+            let user_id = format!("{}", row[1]);
+            if user_id != "auto-ingestor"
+                || !id.starts_with(&format!(
+                    "{}{}",
+                    namespace,
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                ))
+            {
+                owned = false;
+                break;
+            }
+        }
+        if found && owned {
+            hidden.insert(namespace);
+        }
+    }
+    Ok(hidden)
+}
+
 /// Register legacy stage rows at a snapshot cut while the caller owns the
 /// database writer lock. A valid UUID sidecar plus exclusively auto-ingestor,
 /// namespace-qualified rows is the legacy ownership evidence. This only writes
@@ -1513,6 +1558,15 @@ impl LadybugStore {
                 }
             }
             if unreadable {
+                drop(leases);
+                continue;
+            }
+            if active_lease {
+                // Without ownership of every legacy lease alias, do not
+                // convert a transient old-format stage into catalog provenance:
+                // later snapshot code would mistake that marker for proof the
+                // generation is stable. The strict namespace + sidecar + row
+                // check in read_hidden_stage_namespaces keeps it invisible.
                 drop(leases);
                 continue;
             }
@@ -3840,11 +3894,9 @@ impl VectorStore for LadybugStore {
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
+        let db_path = self.local_path.clone();
         self.with_conn(move |conn| {
-            let hidden_stages: HashSet<String> = read_stage_provenance(conn)?
-                .into_iter()
-                .map(|(namespace, _)| namespace)
-                .collect();
+            let hidden_stages = read_hidden_stage_namespaces(conn, &db_path)?;
             let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
             let mut result = conn.query(query)?;
 
@@ -3871,12 +3923,10 @@ impl VectorStore for LadybugStore {
     ) -> Result<serde_json::Value> {
         let project_contexts = project_contexts.clone();
         let anchor_override = anchor_override.cloned();
+        let db_path = self.local_path.clone();
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
-            let hidden_stage_namespaces: HashSet<String> = read_stage_provenance(conn)?
-                .into_iter()
-                .map(|(namespace, _)| namespace)
-                .collect();
+            let hidden_stage_namespaces = read_hidden_stage_namespaces(conn, &db_path)?;
 
             // 1. Fetch all nodes
             let mut nodes = Vec::new();
@@ -4305,6 +4355,7 @@ fn bump_access_count(metadata: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
 
     async fn wait_for_test_barrier(path: &Path) {
         let started = std::time::Instant::now();
@@ -4427,6 +4478,149 @@ mod tests {
             .unwrap();
         drop(lease);
         drop(store);
+    }
+
+    async fn assert_process_crash_generation(
+        store: &LadybugStore,
+        namespace: &str,
+        committed: bool,
+    ) {
+        let namespace = namespace.to_string();
+        let query_namespace = namespace.clone();
+        let (rows, edges) = store
+            .with_conn(move |conn| {
+                let safe_namespace = escape_ladybug_string(&query_namespace);
+                let mut result = conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata, m.embedding",
+                    safe_namespace
+                ))?;
+                let mut rows = HashMap::<String, (Vec<f32>, MemoryPayload)>::new();
+                while let Some(row) = result.next() {
+                    let id = format!("{}", row[0]);
+                    let mut embedding = Vec::new();
+                    if let lbug::Value::Array(_, values) | lbug::Value::List(_, values) = &row[6] {
+                        for value in values {
+                            match value {
+                                lbug::Value::Float(value) => embedding.push(*value),
+                                lbug::Value::Double(value) => embedding.push(*value as f32),
+                                other => anyhow::bail!("unexpected embedding value: {other:?}"),
+                            }
+                        }
+                    }
+                    let metadata_text = format!("{}", row[5]);
+                    let metadata = serde_json::from_str(&metadata_text)?;
+                    rows.insert(
+                        id,
+                        (
+                            embedding,
+                            MemoryPayload {
+                                content: format!("{}", row[1]),
+                                user_id: format!("{}", row[2]),
+                                memory_type: format!("{}", row[3]),
+                                agent_name: None,
+                                location: format!("{}", row[4]),
+                                location_lines: String::new(),
+                                metadata,
+                            },
+                        ),
+                    );
+                }
+                let mut result = conn.query(&format!(
+                    "MATCH (a:Memory)-[:GOVERNS]->(b:Memory) WHERE a.namespace = '{}' AND b.namespace = '{}' RETURN a.id, b.id",
+                    safe_namespace, safe_namespace
+                ))?;
+                let mut edges = HashSet::new();
+                while let Some(row) = result.next() {
+                    edges.insert((format!("{}", row[0]), format!("{}", row[1])));
+                }
+                Ok((rows, edges))
+            })
+            .await
+            .unwrap();
+
+        let old_id = format!(
+            "{namespace}{}old.rs",
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let manual_rule_id = format!(
+            "{namespace}{}manual-rule",
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let mut expected_ids = HashSet::from([old_id.clone(), manual_rule_id.clone()]);
+        let mut expected_edges = HashSet::from([(manual_rule_id.clone(), old_id.clone())]);
+        if committed {
+            for index in 1..130 {
+                let path = format!("file-{index}.rs");
+                expected_ids.insert(format!(
+                    "{namespace}{}{path}",
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                ));
+            }
+            let new_rule_id = format!(
+                "{namespace}{}new-rule",
+                crate::parser::ingest::NAMESPACE_SEPARATOR
+            );
+            expected_ids.insert(new_rule_id.clone());
+            expected_edges.insert((new_rule_id, old_id.clone()));
+        }
+        assert_eq!(
+            rows.keys().cloned().collect::<HashSet<_>>(),
+            expected_ids,
+            "crash recovery must expose exactly the old or committed generation"
+        );
+
+        let (vector, payload) = rows.get(&old_id).expect("old.rs row exists");
+        assert_eq!(vector, &vec![if committed { 0.3 } else { 0.1 }; 4]);
+        assert_eq!(
+            payload.content,
+            if committed {
+                "new-generation-0"
+            } else {
+                "old-generation"
+            }
+        );
+        assert_eq!(payload.user_id, "auto-ingestor");
+        assert_eq!(payload.memory_type, "file");
+        assert_eq!(payload.location, "old.rs");
+        assert_eq!(payload.metadata, json!({}));
+
+        let (vector, payload) = rows.get(&manual_rule_id).expect("manual rule exists");
+        assert_eq!(vector, &vec![0.2; 4]);
+        assert_eq!(payload.content, "manual rule");
+        assert_eq!(payload.user_id, "owner");
+        assert_eq!(payload.memory_type, "rule");
+        assert_eq!(payload.metadata, json!({"governs": [old_id.clone()]}));
+
+        if committed {
+            for index in 1..130 {
+                let path = format!("file-{index}.rs");
+                let id = format!(
+                    "{namespace}{}{path}",
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                );
+                let (vector, payload) = rows.get(&id).expect("committed file row exists");
+                assert_eq!(vector, &vec![0.3; 4], "vector for {id}");
+                assert_eq!(payload.content, format!("new-generation-{index}"));
+                assert_eq!(payload.user_id, "auto-ingestor");
+                assert_eq!(payload.memory_type, "file");
+                assert_eq!(payload.location, path);
+                assert_eq!(payload.metadata, json!({}));
+            }
+            let new_rule_id = format!(
+                "{namespace}{}new-rule",
+                crate::parser::ingest::NAMESPACE_SEPARATOR
+            );
+            let (vector, payload) = rows.get(&new_rule_id).expect("new rule exists");
+            assert_eq!(vector, &vec![0.4; 4]);
+            assert_eq!(payload.content, "new rule");
+            assert_eq!(payload.user_id, "auto-ingestor");
+            assert_eq!(payload.memory_type, "rule");
+            assert_eq!(payload.metadata, json!({"governs": [old_id]}));
+        }
+        assert_eq!(
+            edges, expected_edges,
+            "the exact declaration edge set survives"
+        );
     }
 
     #[tokio::test]
@@ -4588,52 +4782,23 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             child.kill().unwrap();
-            let _ = child.wait().unwrap();
+            let crash_status = child.wait().unwrap();
+            assert!(
+                !crash_status.success(),
+                "the writer must be killed without normal process unwinding"
+            );
 
             let reopened = LadybugStore::for_testing(&db, 4).unwrap();
             reopened.init("after-process-crash").await.unwrap();
+            let should_be_new = phase == "postcommit";
+            assert_process_crash_generation(&reopened, &namespace, should_be_new).await;
+
+            let followup = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
             let old_id = format!(
                 "{}{}old.rs",
                 namespace,
                 crate::parser::ingest::NAMESPACE_SEPARATOR
             );
-            let old = reopened.get(&namespace, &old_id).await.unwrap();
-            let should_be_new = phase == "postcommit";
-            if should_be_new {
-                let replacement = old.expect("post-commit crash must retain replacement");
-                assert_eq!(replacement.1.content, "new-generation-0");
-                assert_eq!(reopened.list(&namespace, None).await.unwrap().len(), 132);
-                assert_eq!(
-                    governs_edges_from(
-                        &reopened,
-                        &format!(
-                            "{}{}manual-rule",
-                            namespace,
-                            crate::parser::ingest::NAMESPACE_SEPARATOR
-                        )
-                    )
-                    .await,
-                    1
-                );
-            } else {
-                let old = old.expect("pre-commit crash must roll back to old generation");
-                assert_eq!(old.1.content, "old-generation");
-                assert_eq!(reopened.list(&namespace, None).await.unwrap().len(), 2);
-                assert_eq!(
-                    governs_edges_from(
-                        &reopened,
-                        &format!(
-                            "{}{}manual-rule",
-                            namespace,
-                            crate::parser::ingest::NAMESPACE_SEPARATOR
-                        )
-                    )
-                    .await,
-                    1
-                );
-            }
-
-            let followup = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
             let _lease = reopened.begin_ingest_stage(&followup).await.unwrap();
             assert!(
                 !ingest_stage_lease_path(&db, &stage).unwrap().exists(),
@@ -4735,6 +4900,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         caller.abort();
+        let cancellation = caller
+            .await
+            .expect_err("publication caller must be canceled")
+            .is_cancelled();
+        assert!(
+            cancellation,
+            "JoinHandle must confirm cancellation before release"
+        );
         let mut release_path = barrier.as_os_str().to_os_string();
         release_path.push(".release");
         std::fs::write(release_path, "continue").unwrap();
@@ -4757,19 +4930,7 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(store.list(namespace, None).await.unwrap().len(), 132);
-        assert_eq!(
-            governs_edges_from(
-                &store,
-                &format!(
-                    "{}{}manual-rule",
-                    namespace,
-                    crate::parser::ingest::NAMESPACE_SEPARATOR
-                )
-            )
-            .await,
-            1
-        );
+        assert_process_crash_generation(&store, namespace, true).await;
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6608,6 +6769,69 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         assert_eq!(governs_edges_from(&store, "rule").await, 1);
+    }
+
+    #[tokio::test]
+    async fn qualified_cli_root_id_relinks_same_namespace_governs_edge_exactly() {
+        let store = retired_test_store().await;
+        let root = std::env::temp_dir().join(format!("cli-id-contract-{}", uuid::Uuid::new_v4()));
+        let source_root = root.join("project");
+        std::fs::create_dir_all(source_root.join("src")).unwrap();
+        let file_path = source_root.join("src/core.rs");
+        std::fs::write(&file_path, "pub fn core() {}\n").unwrap();
+
+        let local_id = crate::parser::ingest::node_id_for(&source_root, &file_path);
+        assert_eq!(local_id, "src/core.rs");
+        let namespace = "synthetic-validation";
+        let target_id = crate::parser::ingest::qualified_id(namespace, &local_id);
+        let rule_id = crate::parser::ingest::qualified_id(namespace, "rule");
+        let stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let lease = store.begin_ingest_stage(&stage).await.unwrap();
+        store
+            .upsert(
+                &stage,
+                &format!("{stage}::src/core.rs"),
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                namespace,
+                &rule_id,
+                vec![0.0; 4],
+                retired_test_payload("rule", "owner", json!({"governs": [target_id.clone()]})),
+            )
+            .await
+            .unwrap();
+        drop(lease);
+        store.publish_ingested(namespace, &stage).await.unwrap();
+
+        let actual = store
+            .with_conn(|conn| {
+                let mut rows =
+                    conn.query("MATCH (a:Memory)-[:GOVERNS]->(b:Memory) RETURN a.id, b.id")?;
+                let mut edges = HashSet::new();
+                while let Some(row) = rows.next() {
+                    edges.insert((format!("{}", row[0]), format!("{}", row[1])));
+                }
+                Ok(edges)
+            })
+            .await
+            .unwrap();
+        assert_eq!(actual, HashSet::from([(rule_id, target_id)]));
+        assert_eq!(
+            store
+                .get(namespace, "synthetic-validation::src/core.rs")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "a file row"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Moving used to be "write to the target, delete from the source". upsert

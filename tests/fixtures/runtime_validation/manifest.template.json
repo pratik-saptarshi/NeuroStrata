@@ -6,7 +6,8 @@
     "db_wal_bundle_bytes": 1073741824,
     "fixture_bytes": 2097152,
     "peak_rss_kib": 4194304,
-    "wall_seconds": 1200
+    "setup_copy_timeout": "synchronous copy is not interruptible; acceptance deadline checked immediately afterward",
+    "wall_seconds_acceptance_window": 1200
   },
   "candidate_revision": "supplied to runner",
   "corpus_sha256": {
@@ -24,9 +25,9 @@
       "src/recovery.rs"
     ],
     "implemented_assertions": [
-      "preserved record content and types",
-      "manual rule GOVERNS edge points to ingested src/core.rs",
-      "database and WAL fit predeclared cap"
+      "exact seeded IDs, contents, namespaces, and types survive ingest",
+      "manual rule GOVERNS edge points to exact qualified ID synthetic-validation::src/core.rs",
+      "database and WAL fit post-command acceptance cap"
     ],
     "not_implemented_in_runner": [
       "old/new generation visibility at process-crash boundary",
@@ -65,17 +66,17 @@
       {
         "content": "synthetic rule: governs src/core.rs",
         "edge": {
-          "target": "src/core.rs",
+          "target": "synthetic-validation::src/core.rs",
           "type": "GOVERNS"
         },
-        "namespace": "validation-preservation",
+        "namespace": "synthetic-validation",
         "type": "rule"
       }
     ],
     "runner_cases": [
-      "one initial real CLI ingest",
+      "one initial real CLI ingest at the fixture project root using ./src",
       "preservation readback of five hand-written memory types",
-      "manual rule edge relinks to synthetic source"
+      "same-namespace GOVERNS edge targets synthetic-validation::src/core.rs exactly"
     ]
   },
   "host": {
@@ -84,7 +85,7 @@
     "cpu_count": 5,
     "os": "Linux-6.18.55-x86_64-with-glibc2.41",
     "python": "3.12.14",
-    "temporary_filesystem_free_bytes": 6844035072
+    "temporary_filesystem_free_bytes": 6657183744
   },
   "model": {
     "note": "official pinned file; runtime compatibility must be verified before loading",

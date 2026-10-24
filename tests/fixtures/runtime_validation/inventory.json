@@ -7,9 +7,9 @@
     "src/recovery.rs"
   ],
   "implemented_assertions": [
-    "preserved record content and types",
-    "manual rule GOVERNS edge points to ingested src/core.rs",
-    "database and WAL fit predeclared cap"
+    "exact seeded IDs, contents, namespaces, and types survive ingest",
+    "manual rule GOVERNS edge points to exact qualified ID synthetic-validation::src/core.rs",
+    "database and WAL fit post-command acceptance cap"
   ],
   "not_implemented_in_runner": [
     "old/new generation visibility at process-crash boundary",
@@ -48,16 +48,16 @@
     {
       "content": "synthetic rule: governs src/core.rs",
       "edge": {
-        "target": "src/core.rs",
+        "target": "synthetic-validation::src/core.rs",
         "type": "GOVERNS"
       },
-      "namespace": "validation-preservation",
+      "namespace": "synthetic-validation",
       "type": "rule"
     }
   ],
   "runner_cases": [
-    "one initial real CLI ingest",
+    "one initial real CLI ingest at the fixture project root using ./src",
     "preservation readback of five hand-written memory types",
-    "manual rule edge relinks to synthetic source"
+    "same-namespace GOVERNS edge targets synthetic-validation::src/core.rs exactly"
   ]
 }

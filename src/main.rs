@@ -954,6 +954,44 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    static STRICT_WAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct StrictWalTestEnvironment {
+        strict: Option<std::ffi::OsString>,
+        allow: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StrictWalTestEnvironment {
+        fn force_strict() -> Self {
+            let lock = STRICT_WAL_TEST_LOCK.lock().unwrap();
+            let strict = std::env::var_os("NEUROSTRATA_STRICT_WAL");
+            let allow = std::env::var_os("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
+            std::env::set_var("NEUROSTRATA_STRICT_WAL", "1");
+            std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
+            Self {
+                strict,
+                allow,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for StrictWalTestEnvironment {
+        fn drop(&mut self) {
+            if let Some(value) = &self.strict {
+                std::env::set_var("NEUROSTRATA_STRICT_WAL", value);
+            } else {
+                std::env::remove_var("NEUROSTRATA_STRICT_WAL");
+            }
+            if let Some(value) = &self.allow {
+                std::env::set_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL", value);
+            } else {
+                std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
+            }
+        }
+    }
+
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
@@ -1222,6 +1260,7 @@ mod tests {
     async fn snapshot_restore_preserves_stage_provenance_and_legacy_lookalikes() {
         use crate::traits::MemoryPayload;
         use serde_json::json;
+        let _strict_wal = StrictWalTestEnvironment::force_strict();
 
         let root = std::env::temp_dir().join(format!("snapshot-restore-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1387,6 +1426,68 @@ mod tests {
             )
             .await
             .unwrap();
+        drop(source_store);
+        let source_store = LadybugStore::new_with_identity_limits(
+            &source,
+            dimensions,
+            embed::configured_embedder_id().unwrap(),
+            crate::store::StoreLimits::default(),
+        )
+        .unwrap();
+        assert!(!source_store
+            .list_namespaces()
+            .await
+            .unwrap()
+            .contains(&legacy_stage));
+        let reopened_graph = source_store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(!reopened_graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["namespace"] == legacy_stage));
+        assert_eq!(
+            source_store
+                .get(&legacy_stage, &format!("{legacy_stage}::src/old.rs"))
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "pre-catalog active staged file",
+            "visibility filtering must not delete legacy data"
+        );
+        let recovery_trigger = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let recovery_lease = source_store
+            .begin_ingest_stage(&recovery_trigger)
+            .await
+            .unwrap();
+        assert!(!source_store
+            .ingest_stage_namespaces()
+            .await
+            .unwrap()
+            .contains(&legacy_stage));
+        assert!(!source_store
+            .list_namespaces()
+            .await
+            .unwrap()
+            .contains(&legacy_stage));
+        let graph_before_snapshot = source_store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(!graph_before_snapshot["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["namespace"] == legacy_stage));
+        drop(recovery_lease);
         let active_legacy_snapshot_error = source_store
             .export_database(&snapshot.to_string_lossy())
             .await
@@ -1419,7 +1520,17 @@ mod tests {
             source_wal.is_file() && std::fs::metadata(&source_wal).unwrap().len() > 0,
             "restore regression requires a nonempty source WAL"
         );
+        let source_wal_copy = std::fs::read(&source_wal).unwrap();
         std::fs::copy(&source_wal, &snapshot_wal).unwrap();
+        let mut corrupted_wal = std::fs::read(&snapshot_wal).unwrap();
+        assert!(
+            corrupted_wal.len() > 16,
+            "WAL fixture must have payload and framing"
+        );
+        let corrupt_offset = corrupted_wal.len() / 2;
+        corrupted_wal[corrupt_offset] ^= 0x80;
+        std::fs::write(&snapshot_wal, &corrupted_wal).unwrap();
+        assert_ne!(std::fs::read(&snapshot_wal).unwrap(), source_wal_copy);
         std::fs::copy(
             crate::store::ladybug::width_marker_path(&source),
             crate::store::ladybug::width_marker_path(&snapshot_db),
@@ -1498,6 +1609,219 @@ mod tests {
         )
         .await;
         drop(_active_stage_lease);
+        drop(source_store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn strict_restore_rejects_or_exactly_replays_unverified_wal_capture() {
+        use crate::traits::MemoryPayload;
+        use serde_json::json;
+
+        let _strict_wal = StrictWalTestEnvironment::force_strict();
+        let root = std::env::temp_dir().join(format!("live-wal-capture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.store");
+        let snapshot = root.join("snapshot");
+        let target = root.join("restored.store");
+        let config: Config = serde_json::from_value(json!({})).unwrap();
+        let dimensions = embed::configured_dimensions().unwrap();
+        let limits = config.store_limits().unwrap();
+        let source_store = LadybugStore::new_with_identity_limits(
+            &source,
+            dimensions,
+            embed::configured_embedder_id().unwrap(),
+            limits,
+        )
+        .unwrap();
+        source_store.init("live-wal-source").await.unwrap();
+
+        let fact_id = "wal-data::stable-fact";
+        source_store
+            .upsert(
+                "wal-data",
+                fact_id,
+                vec![0.125; dimensions],
+                MemoryPayload {
+                    content: "fact committed before unclean snapshot".into(),
+                    user_id: "owner".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: "facts/stable.json".into(),
+                    location_lines: "1".into(),
+                    metadata: json!({"stable": true}),
+                },
+            )
+            .await
+            .unwrap();
+        let rule_id = "wal-data::rule";
+        source_store
+            .upsert(
+                "wal-data",
+                rule_id,
+                vec![0.25; dimensions],
+                MemoryPayload {
+                    content: "rule declaration".into(),
+                    user_id: "owner".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"governs": [fact_id]}),
+                },
+            )
+            .await
+            .unwrap();
+        source_store.relink_edges("wal-data").await.unwrap();
+
+        let stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let _stage_lease = source_store.begin_ingest_stage(&stage).await.unwrap();
+        let stage_row_id = format!("{stage}::src/pending.rs");
+        source_store
+            .upsert(
+                &stage,
+                &stage_row_id,
+                vec![0.5; dimensions],
+                MemoryPayload {
+                    content: "staged row from unverified WAL capture".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "src/pending.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::fs::create_dir(&snapshot).unwrap();
+        let snapshot_db = snapshot.join("ladybug.store");
+        std::fs::copy(&source, &snapshot_db).unwrap();
+        let source_wal = appended_path(&source, ".wal");
+        let snapshot_wal = appended_path(&snapshot_db, ".wal");
+        assert!(source_wal.is_file());
+        assert!(
+            std::fs::metadata(&source_wal).unwrap().len() > 0,
+            "live WAL capture must contain uncheckpointed writes"
+        );
+        std::fs::copy(&source_wal, &snapshot_wal).unwrap();
+        let source_marker = crate::store::ladybug::width_marker_path(&source);
+        let snapshot_marker = crate::store::ladybug::width_marker_path(&snapshot_db);
+        std::fs::copy(&source_marker, &snapshot_marker).unwrap();
+        std::fs::write(
+            snapshot.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "format": "neurostrata-snapshot",
+                "version": 2,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "bytes": std::fs::metadata(&snapshot_db).unwrap().len(),
+                "stage_generations": [stage],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let source_db_before = std::fs::read(&source).unwrap();
+        let source_wal_before = std::fs::read(&source_wal).unwrap();
+        let source_marker_before = std::fs::read(&source_marker).unwrap();
+        let source_lease = crate::store::ladybug::ingest_stage_lease_path(&source, &stage).unwrap();
+        let source_lease_before = std::fs::read(&source_lease).unwrap();
+        let visible = match restore_snapshot_bundle(&snapshot, &target, &config).await {
+            Ok(visible) => visible,
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("write-ahead log did not verify"),
+                    "strict mode may reject an unverified active-copy WAL, got: {error:#}"
+                );
+                assert!(
+                    !target.exists(),
+                    "failed validation must not install a database"
+                );
+                assert!(!appended_path(&target, ".wal").exists());
+                assert!(!crate::store::ladybug::width_marker_path(&target).exists());
+                assert!(!crate::store::ladybug::restore_in_progress_path(&target).exists());
+                assert_eq!(std::fs::read(&source).unwrap(), source_db_before);
+                assert_eq!(std::fs::read(&source_wal).unwrap(), source_wal_before);
+                assert_eq!(std::fs::read(&source_marker).unwrap(), source_marker_before);
+                assert_eq!(std::fs::read(&source_lease).unwrap(), source_lease_before);
+                drop(source_store);
+                let _ = std::fs::remove_dir_all(root);
+                return;
+            }
+        };
+        assert_eq!(visible, vec!["wal-data".to_string()]);
+
+        let restored = LadybugStore::new_with_identity_limits(
+            &target,
+            dimensions,
+            embed::configured_embedder_id().unwrap(),
+            limits,
+        )
+        .unwrap();
+        restored.init("live-wal-restored").await.unwrap();
+        let (fact_vector, fact) = restored.get("wal-data", fact_id).await.unwrap().unwrap();
+        assert_eq!(fact_vector, vec![0.125; dimensions]);
+        assert_eq!(fact.content, "fact committed before unclean snapshot");
+        assert_eq!(fact.memory_type, "fact");
+        assert_eq!(fact.metadata, json!({"stable": true}));
+        let (rule_vector, rule) = restored.get("wal-data", rule_id).await.unwrap().unwrap();
+        assert_eq!(rule_vector, vec![0.25; dimensions]);
+        assert_eq!(rule.content, "rule declaration");
+        assert_eq!(rule.metadata, json!({"governs": [fact_id]}));
+        let graph = restored
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(graph["links"].as_array().unwrap().iter().any(|edge| {
+            edge["source"] == rule_id && edge["target"] == fact_id && edge["type"] == "GOVERNS"
+        }));
+        let (stage_vector, stage_payload) = restored
+            .get(&stage, &stage_row_id)
+            .await
+            .unwrap()
+            .expect("accepted WAL replay retains the staged file row");
+        assert_eq!(stage_vector, vec![0.5; dimensions]);
+        assert_eq!(
+            stage_payload.content,
+            "staged row from unverified WAL capture"
+        );
+        assert_eq!(stage_payload.user_id, "auto-ingestor");
+        assert_eq!(stage_payload.memory_type, "file");
+        assert_eq!(stage_payload.location, "src/pending.rs");
+        assert_eq!(stage_payload.metadata, json!({}));
+        assert!(!restored.list_namespaces().await.unwrap().contains(&stage));
+
+        let next_stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let _next_lease = restored.begin_ingest_stage(&next_stage).await.unwrap();
+        assert!(restored.get(&stage, &stage_row_id).await.unwrap().is_none());
+        assert_eq!(
+            restored
+                .get("wal-data", fact_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "fact committed before unclean snapshot"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            source_db_before,
+            "strict WAL handling must not mutate the source database"
+        );
+        assert_eq!(std::fs::read(&source_wal).unwrap(), source_wal_before);
+        assert_eq!(std::fs::read(&source_marker).unwrap(), source_marker_before);
+        assert_eq!(std::fs::read(&source_lease).unwrap(), source_lease_before);
+        drop(restored);
         drop(source_store);
         let _ = std::fs::remove_dir_all(root);
     }
