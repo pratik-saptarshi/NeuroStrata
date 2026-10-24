@@ -30,6 +30,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::Config;
 use embed::build_embedder;
+use std::collections::HashSet;
 use std::sync::Arc;
 use store::LadybugStore;
 
@@ -962,6 +963,305 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_restore_preserves_stage_provenance_and_legacy_lookalikes() {
+        use crate::traits::MemoryPayload;
+        use serde_json::json;
+
+        let root = std::env::temp_dir().join(format!("snapshot-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.store");
+        let snapshot = root.join("snapshot");
+        let target = root.join("restored.store");
+        let dimensions = embed::configured_dimensions().unwrap();
+        let source_store = LadybugStore::new_with_identity_limits(
+            &source,
+            dimensions,
+            embed::configured_embedder_id().unwrap(),
+            crate::store::StoreLimits::default(),
+        )
+        .unwrap();
+        source_store.init("snapshot-test").await.unwrap();
+
+        let stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let _active_stage_lease = source_store.begin_ingest_stage(&stage).await.unwrap();
+        let abandoned_stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let abandoned_lease = source_store
+            .begin_ingest_stage(&abandoned_stage)
+            .await
+            .unwrap();
+        let lookalike = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let malformed = format!("{}not-a-uuid", crate::traits::INTERNAL_INGEST_STAGE_PREFIX);
+        let ordinary = "ordinary".to_string();
+        for (namespace, id, content, user_id) in [
+            (
+                &stage,
+                "stage-row",
+                "active staged content",
+                "auto-ingestor",
+            ),
+            (
+                &abandoned_stage,
+                "abandoned-row",
+                "abandoned stage content",
+                "auto-ingestor",
+            ),
+            (&ordinary, "ordinary-row", "ordinary memory", "owner"),
+        ] {
+            source_store
+                .upsert(
+                    namespace,
+                    id,
+                    vec![0.25; dimensions],
+                    MemoryPayload {
+                        content: content.into(),
+                        user_id: user_id.into(),
+                        memory_type: "note".into(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for (id, memory_type, content) in [
+            ("saved-fact", "fact", "preserved fact"),
+            ("saved-task", "task", "preserved task"),
+            ("saved-procedure", "procedure", "preserved procedure"),
+            ("saved-history", "history", "preserved history"),
+        ] {
+            source_store
+                .upsert(
+                    "ordinary",
+                    id,
+                    vec![0.25; dimensions],
+                    MemoryPayload {
+                        content: content.into(),
+                        user_id: "owner".into(),
+                        memory_type: memory_type.into(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        source_store
+            .upsert(
+                "ordinary",
+                "ordinary-rule",
+                vec![0.25; dimensions],
+                MemoryPayload {
+                    content: "ordinary rule".into(),
+                    user_id: "owner".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"governs": ["ordinary-row"]}),
+                },
+            )
+            .await
+            .unwrap();
+        for (namespace, id, content) in [
+            (&lookalike, "legacy-row", "legacy user-owned lookalike"),
+            (&malformed, "malformed-row", "malformed prefix user content"),
+        ] {
+            source_store
+                .seed_legacy_memory_for_test(
+                    namespace,
+                    id,
+                    vec![0.5; dimensions],
+                    MemoryPayload {
+                        content: content.into(),
+                        user_id: "owner".into(),
+                        memory_type: "note".into(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        drop(abandoned_lease);
+        source_store
+            .export_database(&snapshot.to_string_lossy())
+            .await
+            .unwrap();
+        assert!(source_store
+            .export_database(&snapshot.to_string_lossy())
+            .await
+            .is_err());
+
+        let config: Config = serde_json::from_value(json!({})).unwrap();
+        let visible = restore_snapshot_bundle(&snapshot, &target, &config)
+            .await
+            .unwrap();
+        assert!(visible.contains(&"ordinary".to_string()));
+        assert!(visible.contains(&lookalike));
+        assert!(visible.contains(&malformed));
+        assert!(!visible.contains(&stage));
+        assert!(!visible.contains(&abandoned_stage));
+        assert!(
+            crate::store::ladybug::ingest_stage_lease_path(&target, &stage)
+                .unwrap()
+                .is_file()
+        );
+        assert!(
+            crate::store::ladybug::ingest_stage_lease_path(&target, &abandoned_stage)
+                .unwrap()
+                .is_file()
+        );
+
+        let restored = LadybugStore::new_with_identity_limits(
+            &target,
+            dimensions,
+            embed::configured_embedder_id().unwrap(),
+            config.store_limits().unwrap(),
+        )
+        .unwrap();
+        restored.init("restore-recovery-test").await.unwrap();
+        assert_eq!(
+            restored
+                .get(&lookalike, "legacy-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "legacy user-owned lookalike"
+        );
+        assert_eq!(
+            restored
+                .get(&malformed, "malformed-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "malformed prefix user content"
+        );
+        assert_eq!(
+            restored
+                .get("ordinary", "ordinary-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .content,
+            "ordinary memory"
+        );
+        for (id, expected) in [
+            ("saved-fact", "preserved fact"),
+            ("saved-task", "preserved task"),
+            ("saved-procedure", "preserved procedure"),
+            ("saved-history", "preserved history"),
+        ] {
+            assert_eq!(
+                restored
+                    .get("ordinary", id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .content,
+                expected
+            );
+        }
+        let graph = restored
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(graph["links"].as_array().unwrap().iter().any(|link| {
+            link["source"] == "ordinary-rule"
+                && link["target"] == "ordinary-row"
+                && link["type"] == "GOVERNS"
+        }));
+
+        let next_stage = format!(
+            "{}{}",
+            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let _next_stage_lease = restored.begin_ingest_stage(&next_stage).await.unwrap();
+        assert!(restored.get(&stage, "stage-row").await.unwrap().is_none());
+        assert!(restored
+            .get(&abandoned_stage, "abandoned-row")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(restored
+            .get(&lookalike, "legacy-row")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(restored
+            .get(&malformed, "malformed-row")
+            .await
+            .unwrap()
+            .is_some());
+
+        let corrupt_snapshot = root.join("corrupt-snapshot");
+        std::fs::create_dir(&corrupt_snapshot).unwrap();
+        std::fs::copy(
+            snapshot.join("ladybug.store"),
+            corrupt_snapshot.join("ladybug.store"),
+        )
+        .unwrap();
+        std::fs::copy(
+            snapshot.join("ladybug.store.embedding"),
+            corrupt_snapshot.join("ladybug.store.embedding"),
+        )
+        .unwrap();
+        let mut corrupt_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(snapshot.join("manifest.json")).unwrap())
+                .unwrap();
+        corrupt_manifest["stage_generations"] = json!(["../escape"]);
+        std::fs::write(
+            corrupt_snapshot.join("manifest.json"),
+            serde_json::to_vec(&corrupt_manifest).unwrap(),
+        )
+        .unwrap();
+        let rejected_target = root.join("rejected.store");
+        assert!(
+            restore_snapshot_bundle(&corrupt_snapshot, &rejected_target, &config)
+                .await
+                .is_err()
+        );
+        assert!(!rejected_target.exists());
+        assert!(!crate::store::ladybug::restore_in_progress_path(&rejected_target).exists());
+
+        let stale_sidecar_target = root.join("stale-sidecar.store");
+        std::fs::write(appended_path(&stale_sidecar_target, ".wal"), b"stale").unwrap();
+        assert!(
+            restore_snapshot_bundle(&snapshot, &stale_sidecar_target, &config)
+                .await
+                .is_err()
+        );
+        assert!(!stale_sidecar_target.exists());
+        std::fs::remove_file(appended_path(&stale_sidecar_target, ".wal")).unwrap();
+        drop(_active_stage_lease);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn source_id_option_parses_with_existing_export_flags() {
         let cli = Cli::try_parse_from([
@@ -1731,6 +2031,165 @@ async fn run_bus_metrics(
     Ok(0)
 }
 
+async fn restore_snapshot_bundle(
+    snapshot_dir: &std::path::Path,
+    target: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<Vec<String>> {
+    let snapshot = snapshot_dir.join("ladybug.store");
+    let manifest_path = snapshot_dir.join("manifest.json");
+    if !snapshot.is_file() || !manifest_path.is_file() {
+        anyhow::bail!("snapshot is incomplete: database or manifest is missing");
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    if manifest.get("format").and_then(|v| v.as_str()) != Some("neurostrata-snapshot") {
+        anyhow::bail!("snapshot manifest has an unsupported format");
+    }
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("snapshot manifest has no valid version"))?;
+    if version != 1 && version != 2 {
+        anyhow::bail!("snapshot manifest version {version} is unsupported");
+    }
+    if let Some(bytes) = manifest.get("bytes").and_then(|v| v.as_u64()) {
+        if std::fs::metadata(&snapshot)?.len() != bytes {
+            anyhow::bail!("snapshot database size does not match its manifest");
+        }
+    }
+    let manifest_stages = if version == 2 {
+        let entries = manifest
+            .get("stage_generations")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("snapshot stage provenance is missing"))?;
+        let mut names = Vec::with_capacity(entries.len());
+        let mut unique = HashSet::new();
+        for entry in entries {
+            let name = entry
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("snapshot stage identifier is not a string"))?;
+            if !crate::traits::is_internal_ingest_stage_namespace(name)
+                || !unique.insert(name.to_string())
+            {
+                anyhow::bail!("snapshot contains invalid or duplicate stage provenance");
+            }
+            names.push(name.to_string());
+        }
+        Some(names)
+    } else {
+        None
+    };
+
+    let dimensions = embed::configured_dimensions()?;
+    let embedder_id = embed::configured_embedder_id()?;
+    let limits = config.store_limits()?;
+    let target_wal = appended_path(target, ".wal");
+    let target_marker = crate::store::ladybug::width_marker_path(target);
+    let restore_marker = crate::store::ladybug::restore_in_progress_path(target);
+    if target.exists() || target_wal.exists() || target_marker.exists() || restore_marker.exists() {
+        anyhow::bail!("restore destination or a sibling sidecar already exists");
+    }
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("database");
+    let temp_dir = parent.join(format!(".{target_name}.restore-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&temp_dir)?;
+
+    let marker_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&restore_marker)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(error.into());
+        }
+    };
+    drop(marker_file);
+    let temp_db = temp_dir.join("ladybug.store");
+    let temp_wal = appended_path(&temp_db, ".wal");
+    let temp_marker = crate::store::ladybug::width_marker_path(&temp_db);
+    let snapshot_wal = appended_path(&snapshot, ".wal");
+    let snapshot_marker = crate::store::ladybug::width_marker_path(&snapshot);
+    let mut restored_leases = Vec::new();
+    let mut target_wal_installed = false;
+    let mut target_marker_installed = false;
+    let mut target_db_installed = false;
+
+    let outcome = async {
+        std::fs::copy(&snapshot, &temp_db)?;
+        if snapshot_wal.exists() {
+            std::fs::copy(&snapshot_wal, &temp_wal)?;
+        }
+        if snapshot_marker.exists() {
+            std::fs::copy(&snapshot_marker, &temp_marker)?;
+        }
+        let candidate = LadybugStore::new_with_identity_limits(
+            &temp_db,
+            dimensions,
+            embedder_id.clone(),
+            limits,
+        )?;
+        candidate.init("restore-validation").await?;
+        let mut db_stages = candidate.ingest_stage_namespaces().await?;
+        db_stages.sort();
+        if let Some(mut listed) = manifest_stages.clone() {
+            listed.sort();
+            if listed != db_stages {
+                anyhow::bail!("snapshot manifest and database stage provenance do not match");
+            }
+        }
+        drop(candidate);
+
+        restored_leases = crate::store::ladybug::create_restored_stage_leases(target, &db_stages)?;
+        if snapshot_wal.exists() {
+            std::fs::copy(&snapshot_wal, &target_wal)?;
+            target_wal_installed = true;
+        }
+        if temp_marker.exists() {
+            std::fs::copy(&temp_marker, &target_marker)?;
+            target_marker_installed = true;
+        }
+        std::fs::rename(&temp_db, target)?;
+        target_db_installed = true;
+        std::fs::remove_file(&restore_marker)?;
+
+        // The database plus all sibling provenance is now complete. Verify the
+        // installed copy after removing the interlock; a failure leaves a
+        // complete, inspectable restore rather than deleting the snapshot data.
+        let restored =
+            LadybugStore::new_with_identity_limits(target, dimensions, embedder_id, limits)?;
+        restored.init("restore-validation").await?;
+        restored.list_namespaces().await
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    if outcome.is_err() && !target_db_installed {
+        for path in restored_leases {
+            let _ = std::fs::remove_file(path);
+        }
+        if target_wal_installed {
+            let _ = std::fs::remove_file(&target_wal);
+        }
+        if target_marker_installed {
+            let _ = std::fs::remove_file(&target_marker);
+        }
+        let _ = std::fs::remove_file(&restore_marker);
+    }
+    outcome
+}
+
+fn appended_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    std::path::PathBuf::from(value)
+}
+
 /// The tokio runtime, built by hand rather than by `#[tokio::main]`.
 ///
 /// The only reason to build it by hand is the crash handler. `SA_ONSTACK`
@@ -2139,10 +2598,6 @@ async fn run() -> anyhow::Result<()> {
                 return Ok(());
             }
             Commands::Restore { dir, into } => {
-                // A snapshot is a file copy, so restoring means copying it into
-                // place BEFORE any engine opens it -- an open engine maps the
-                // file it was created with, and copying under a live handle is
-                // exactly the memory-unsafety class the backup bug came from.
                 let config = Config::from_default_path()?;
                 let target = into
                     .map(std::path::PathBuf::from)
@@ -2154,48 +2609,8 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("Then point db_path in ~/.config/neurostrata/config.json at it once you have checked it.");
                     std::process::exit(1);
                 }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                let snapshot = std::path::Path::new(&dir).join("ladybug.store");
-                if !snapshot.exists() {
-                    eprintln!(
-                        "{:?} does not look like a snapshot: no ladybug.store inside it.",
-                        dir
-                    );
-                    std::process::exit(1);
-                }
-                std::fs::copy(&snapshot, &target)?;
-                let mut wal = snapshot.clone().into_os_string();
-                wal.push(".wal");
-                let wal = std::path::PathBuf::from(wal);
-                if wal.exists() {
-                    let mut target_wal = target.clone().into_os_string();
-                    target_wal.push(".wal");
-                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
-                }
-                let snapshot_marker = crate::store::ladybug::width_marker_path(&snapshot);
-                let target_marker = crate::store::ladybug::width_marker_path(&target);
-                if snapshot_marker.exists() {
-                    std::fs::copy(&snapshot_marker, &target_marker)?;
-                } else if target_marker.exists() {
-                    // The database target was absent; this sibling is stale.
-                    // Remove only the orphan marker, never database contents.
-                    std::fs::remove_file(&target_marker)?;
-                }
-
-                // Opened only after the copy, to verify the restored store
-                // reads back and to report what it holds.
-                let vector_store: Arc<dyn VectorStore> =
-                    Arc::new(LadybugStore::new_with_identity_limits(
-                        target.to_string_lossy().to_string(),
-                        embed::configured_dimensions()?,
-                        embed::configured_embedder_id()?,
-                        config.store_limits()?,
-                    )?);
-
-                let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
+                let namespaces =
+                    restore_snapshot_bundle(std::path::Path::new(&dir), &target, &config).await?;
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
                     println!(

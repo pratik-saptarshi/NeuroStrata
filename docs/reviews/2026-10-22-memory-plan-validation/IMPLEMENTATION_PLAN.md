@@ -17,15 +17,15 @@ recovery now requires the exact generated UUID namespace plus its durable lease 
 legacy `-ingest-stage-<UUID>` names and reserved-prefix lookalikes without a sidecar remain
 visible and untouched. Malformed reserved identifiers do not block recovery of unrelated
 stages, and new writes cannot claim the reserved namespace. The
-binary test suite passes 765/765 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
-default locked build remains blocked because the `ort-sys` prebuilt download from
+binary test suite passes 774/774 with a temporary `ort-load-dynamic` override and LadybugDB built from source. The
+default locked local build was blocked because the `ort-sys` prebuilt download from
 `cdn.pyke.io` returned HTTP 403 through the environment proxy. That override is only a local
-verification path; it is not equivalent to the default-feature CI build. The reviewed PR
-head had workflow-dispatch run `39911946378`: its Ubuntu test job failed compilation on the
-stacked async test attributes in `src/learning/recorder.rs`; macOS, Ubuntu build, and Windows
-build jobs passed. The final changed SHA still requires CI. Runtime memory was not measured
-because no representative model, corpus, and workload were available; no empirical
-improvement is claimed.
+verification path; the previous pushed head was validated by hosted default CI:
+workflow-dispatch run `40036052762` for `bd5cdf75332badf8def9e19f5745316c2a82948e` passed all four jobs, including the Ubuntu 765-test job. The additional snapshot, restore, locking, and model-validation changes in the current candidate have not yet run on hosted CI.
+An earlier run (`39911946378`) failed Ubuntu test compilation on the stacked async test
+attributes in `src/learning/recorder.rs`; macOS, Ubuntu build, and Windows build jobs passed.
+Runtime memory was not measured because no pinned model artifact or representative corpus was present. The last environment inventory showed a 16 GiB cgroup, 4 CPU quota, about 11 GiB free workspace space and 6.7 GiB free in `/tmp`; the exact before/after workload and model revision were unavailable. I did not allocate a machine-specific measurement budget or start runs that could exhaust the workspace. No empirical improvement is claimed.
+The cooperating writer/snapshot sidecar lock resolves relative paths and symlinks to one canonical path. Hard-link aliases are not unified by that sidecar; the storage engine separately refuses concurrent opens of a database file.
 
 ## Scope decisions
 
@@ -178,12 +178,12 @@ Steps:
 
 | Gate | Status |
 |---|---|
-| Source changes | Implemented; formatting applied; `git diff --check` passes |
+| Source changes | Implemented; changed Rust files formatted; `git diff --check` passes |
 | Type-check | `cargo check --tests` passed with temporary `ort-load-dynamic` override and source-built LadybugDB |
-| Binary test suite | 764/764 passed with that same temporary override; remote embedder identity and failure handling are tested, but actual local model loading/inference was not exercised because model weights are absent. The backend-selection test checks config selection only; factory/model initialization remains an integration gate |
+| Binary test suite | 774/774 passed with temporary `ort-load-dynamic` and source-built LadybugDB; includes subprocess process-kill, cancellation, snapshot/restore, symlink alias, and cross-process writer-lock regressions. Actual local model loading/inference was not exercised because model weights are absent; backend-selection tests do not substitute for model inference |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no download bypass was attempted |
-| Exact-head PR CI | Reviewed head `b904541f78e0f5840b77bcc431334dd5ad234eed` had workflow-dispatch run `39911946378`; Ubuntu test compilation failed on stacked async test attributes, while all three platform build jobs passed. Final changed SHA CI remains pending push and GitHub Actions execution |
-| Runtime memory comparison | Not measured: no matching model, corpus, and workload were available. Startup, inference, ingest peak, idle RSS, latency/throughput, and DB size remain unmeasured; no empirical improvement is claimed |
+| Exact-head PR CI | Previous pushed head `bd5cdf75332badf8def9e19f5745316c2a82948e` passed workflow-dispatch run `40036052762`: macOS, Ubuntu, Windows builds and Ubuntu tests all succeeded (765 tests). Current candidate still needs CI on its exact pushed SHA |
+| Runtime memory comparison | Not executed: no pinned model artifacts or corpus; last observed limits were 16 GiB cgroup, 4 CPU quota, 11 GiB workspace free and 6.7 GiB `/tmp` free. No matched base/candidate runs, raw measurement logs, or empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
 | NeuroStrata task/memory gate | Unavailable: task/memory MCP tools and the `neurostrata-mcp` CLI are not installed |
 

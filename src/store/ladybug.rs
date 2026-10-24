@@ -30,7 +30,7 @@ impl Drop for IngestStageLease {
     }
 }
 
-fn ingest_stage_lease_path(db_path: &Path, namespace: &str) -> Result<PathBuf> {
+pub(crate) fn ingest_stage_lease_path(db_path: &Path, namespace: &str) -> Result<PathBuf> {
     let generation = namespace
         .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
         .ok_or_else(|| anyhow::anyhow!("invalid internal ingest generation namespace"))?;
@@ -39,14 +39,128 @@ fn ingest_stage_lease_path(db_path: &Path, namespace: &str) -> Result<PathBuf> {
     if parsed.to_string() != generation {
         anyhow::bail!("invalid internal ingest generation identifier");
     }
-    let mut path = db_path.as_os_str().to_os_string();
-    path.push(format!(".stage-{generation}.lock"));
-    Ok(PathBuf::from(path))
+    let canonical_database = canonical_database_path(db_path);
+    let canonical_lease =
+        raw_database_sibling(&canonical_database, &format!(".stage-{generation}.lock"));
+    let legacy_lease = raw_database_sibling(db_path, &format!(".stage-{generation}.lock"));
+    if legacy_lease != canonical_lease && legacy_lease.is_file() {
+        return Ok(legacy_lease);
+    }
+    Ok(canonical_lease)
 }
 
-fn has_ingest_stage_provenance(db_path: &Path, namespace: &str) -> bool {
+fn canonical_database_path(db_path: &Path) -> PathBuf {
+    std::fs::canonicalize(db_path)
+        .ok()
+        .or_else(|| {
+            let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+            let name = db_path.file_name()?;
+            std::fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name))
+        })
+        .unwrap_or_else(|| db_path.to_path_buf())
+}
+
+fn raw_database_sibling(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn database_writer_lock_path(db_path: &Path) -> PathBuf {
+    raw_database_sibling(&canonical_database_path(db_path), ".writer.lock")
+}
+
+fn acquire_database_writer_lock(db_path: &Path) -> Result<File> {
+    let path = database_writer_lock_path(db_path);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not open database writer lock {}: {}",
+                path.display(),
+                error
+            )
+        })?;
+    file.lock().map_err(|error| {
+        anyhow::anyhow!(
+            "could not lock database writer lock {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    Ok(file)
+}
+
+pub(crate) fn restore_in_progress_path(db_path: &Path) -> PathBuf {
+    let mut marker = db_path.as_os_str().to_os_string();
+    marker.push(".restore-in-progress");
+    PathBuf::from(marker)
+}
+
+pub(crate) fn create_restored_stage_leases(
+    db_path: &Path,
+    namespaces: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    for namespace in namespaces {
+        if !is_internal_ingest_stage_namespace(namespace) {
+            for path in &created {
+                let _ = std::fs::remove_file(path);
+            }
+            anyhow::bail!("snapshot contains an invalid staging namespace identifier");
+        }
+        let path = ingest_stage_lease_path(db_path, namespace)?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                drop(file);
+                created.push(path);
+            }
+            Err(error) => {
+                for path in &created {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(anyhow::anyhow!(
+                    "cannot install fresh staging provenance beside restored database: {}",
+                    error
+                ));
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn has_ingest_stage_lease(db_path: &Path, namespace: &str) -> bool {
     is_internal_ingest_stage_namespace(namespace)
         && ingest_stage_lease_path(db_path, namespace).is_ok_and(|path| path.is_file())
+}
+
+fn read_stage_provenance(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut rows = match conn
+        .query("MATCH (s:IngestStage) RETURN s.namespace, s.generation ORDER BY s.namespace")
+    {
+        Ok(rows) => rows,
+        Err(error) if error.to_string().contains("does not exist in catalog") => {
+            return Ok(Vec::new())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut stages = Vec::new();
+    while let Some(row) = rows.next() {
+        let namespace = format!("{}", row[0]);
+        let generation = format!("{}", row[1]);
+        let valid = namespace
+            .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+            .is_some_and(|raw| raw == generation && is_internal_ingest_stage_namespace(&namespace));
+        if valid {
+            stages.push((namespace, generation));
+        }
+    }
+    Ok(stages)
 }
 
 fn cleanup_ingest_stage_lease_after_commit(path: &Path) -> Option<String> {
@@ -57,6 +171,51 @@ fn cleanup_ingest_stage_lease_after_commit(path: &Path) -> Option<String> {
             "Ingest generation committed, but staging lease cleanup failed: {}. The empty generation is safe and can be cleaned up later.",
             error
         )),
+    }
+}
+
+#[cfg(test)]
+static TEST_PUBLISH_CRASH_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, PathBuf, PathBuf)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_test_publish_crash_barrier(phase: &str, db_path: PathBuf, barrier: PathBuf) {
+    *TEST_PUBLISH_CRASH_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap() = Some((phase.to_string(), db_path, barrier));
+}
+
+#[cfg(test)]
+fn test_publish_crash_barrier(db_path: &Path, phase: &str) {
+    let barrier = {
+        let mut state = TEST_PUBLISH_CRASH_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        match state.as_ref() {
+            Some((configured_phase, configured_db, _))
+                if configured_phase == phase
+                    && std::fs::canonicalize(configured_db).ok()
+                        == std::fs::canonicalize(db_path).ok() =>
+            {
+                state.take().unwrap().2
+            }
+            _ => return,
+        }
+    };
+    std::fs::write(&barrier, phase).expect("publish crash barrier is writable");
+    let mut release_path = barrier.as_os_str().to_os_string();
+    release_path.push(".release");
+    let release = PathBuf::from(release_path);
+    let started = std::time::Instant::now();
+    while !release.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "publish crash barrier watchdog expired at {phase}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -785,6 +944,10 @@ pub struct LadybugStore {
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
+    /// Serializes checkpointing and snapshot copies. The write lock is also
+    /// held during a snapshot so the database and provenance manifest share a
+    /// single application-level cut.
+    snapshot_lock: Arc<tokio::sync::Mutex<()>>,
     /// LadybugDB allows exactly one write transaction and REFUSES a second
     /// rather than queueing it, so two writers that overlap produce "Cannot
     /// start a new write transaction in the system" for whichever arrives
@@ -913,52 +1076,105 @@ fn preserve_unclean_wal(local_path: &std::path::Path) {
 }
 
 impl LadybugStore {
-    async fn clear_internal_ingest_stage(&self, namespace: &str) -> Result<()> {
-        if !is_internal_ingest_stage_namespace(namespace) {
-            anyhow::bail!("refusing to clear a non-staging namespace as an ingest generation");
-        }
-        let lease_path = ingest_stage_lease_path(&self.local_path, namespace)?;
-        if !lease_path.is_file() {
-            anyhow::bail!("refusing to clear an ingest generation without its lease provenance");
-        }
-        let namespace = namespace.to_string();
-        self.write_with_deadline("recovering an interrupted ingest generation", move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
+    #[cfg(test)]
+    pub(crate) async fn seed_legacy_memory_for_test(
+        &self,
+        namespace: &str,
+        id: &str,
+        vector: Vec<f32>,
+        payload: MemoryPayload,
+    ) -> Result<()> {
+        let (namespace, id) = (namespace.to_string(), id.to_string());
+        self.write_with_deadline("seeding a legacy memory fixture", move |conn| {
+            let vector = format!(
+                "[{}]",
+                vector
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             conn.query(&format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{}' DETACH DELETE m",
-                safe_ns
+                "CREATE (m:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '{}', location: '{}', location_lines: '{}', metadata: '{}', embedding: {}}})",
+                escape_ladybug_string(&id),
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&payload.content),
+                escape_ladybug_string(&payload.user_id),
+                escape_ladybug_string(&payload.memory_type),
+                escape_ladybug_string(payload.agent_name.as_deref().unwrap_or("unknown")),
+                escape_ladybug_string(&payload.location),
+                escape_ladybug_string(&payload.location_lines),
+                escape_ladybug_string(&serde_json::to_string(&payload.metadata)?),
+                vector
             ))?;
             Ok(())
         })
         .await
     }
 
-    async fn recover_interrupted_ingest_stages(&self) -> Result<()> {
-        let namespaces = self
-            .with_conn(|conn| {
-                let mut rows = match conn.query("MATCH (m:Memory) RETURN DISTINCT m.namespace") {
-                    Ok(rows) => rows,
-                    Err(error) if error.to_string().contains("does not exist in catalog") => {
-                        return Ok(Vec::new())
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                let mut namespaces = Vec::new();
-                while let Some(row) = rows.next() {
-                    let namespace = format!("{}", row[0]);
-                    if is_internal_ingest_stage_namespace(&namespace) {
-                        namespaces.push(namespace);
+    async fn clear_internal_ingest_stage(&self, namespace: &str) -> Result<()> {
+        if !is_internal_ingest_stage_namespace(namespace) {
+            anyhow::bail!("refusing to clear a non-staging namespace as an ingest generation");
+        }
+        let namespace = namespace.to_string();
+        self.write_with_deadline("recovering an interrupted ingest generation", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let generation = namespace
+                .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+                .ok_or_else(|| anyhow::anyhow!("invalid ingest generation"))?
+                .to_string();
+            conn.query("BEGIN TRANSACTION")?;
+            let result = (|| -> Result<()> {
+                let has_provenance = conn
+                    .query(&format!(
+                        "MATCH (s:IngestStage) WHERE s.namespace = '{}' AND s.generation = '{}' RETURN s.namespace LIMIT 1",
+                        safe_ns,
+                        escape_ladybug_string(&generation)
+                    ))?
+                    .next()
+                    .is_some();
+                if !has_provenance {
+                    anyhow::bail!("refusing to clear an ingest generation without database provenance");
+                }
+                conn.query(&format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' DETACH DELETE m",
+                    safe_ns
+                ))?;
+                conn.query(&format!(
+                    "MATCH (s:IngestStage) WHERE s.namespace = '{}' AND s.generation = '{}' DELETE s",
+                    safe_ns,
+                    escape_ladybug_string(&generation)
+                ))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.query("COMMIT")?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let rollback = conn.query("ROLLBACK");
+                    match rollback {
+                        Ok(_) => Err(error),
+                        Err(rollback) => Err(anyhow::anyhow!(
+                            "stage recovery failed: {}; rollback failed: {}",
+                            error,
+                            rollback
+                        )),
                     }
                 }
-                Ok(namespaces)
-            })
-            .await?;
+            }
+        })
+        .await
+    }
 
-        for namespace in namespaces {
+    async fn recover_interrupted_ingest_stages(&self) -> Result<()> {
+        let stages = self.with_conn(read_stage_provenance).await?;
+
+        for (namespace, _generation) in stages {
             let lease_path = ingest_stage_lease_path(&self.local_path, &namespace)?;
-            // A reserved-looking namespace is not proof that NeuroStrata owns
-            // its rows. Only the durable sidecar created with the stage lease
-            // authorizes recovery; absent provenance means preserve it.
+            // The DB record is ownership provenance. Restored snapshots get a
+            // new unlocked sidecar; old crash states retain their original.
             let lease = match OpenOptions::new().read(true).write(true).open(&lease_path) {
                 Ok(file) => match file.try_lock() {
                     Ok(()) => Some(file),
@@ -971,7 +1187,20 @@ impl LadybugStore {
                         continue;
                     }
                 },
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    match OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&lease_path)
+                    {
+                        Ok(file) => match file.try_lock() {
+                            Ok(()) => Some(file),
+                            Err(_) => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
                 Err(error) => {
                     eprintln!(
                         "Could not inspect hidden ingest generation {}: {}. Leaving it intact.",
@@ -997,7 +1226,85 @@ impl LadybugStore {
                 }
             }
         }
+        self.remove_orphan_stage_lease_sidecars().await?;
         Ok(())
+    }
+
+    async fn remove_orphan_stage_lease_sidecars(&self) -> Result<()> {
+        let _write_turn = self.write_lock.lock().await;
+        let db_path = self.local_path.clone();
+        let _cross_process_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&db_path)).await??;
+        let live_stages: HashSet<String> = self
+            .with_conn(read_stage_provenance)
+            .await?
+            .into_iter()
+            .map(|(namespace, _)| namespace)
+            .collect();
+        let database_path =
+            std::fs::canonicalize(&self.local_path).unwrap_or_else(|_| self.local_path.clone());
+        let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+        let database_name = database_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("database path has no valid file name"))?;
+        let prefix = format!("{database_name}.stage-");
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let Some(filename) = filename.to_str() else {
+                continue;
+            };
+            let Some(generation) = filename
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".lock"))
+            else {
+                continue;
+            };
+            let Ok(parsed) = uuid::Uuid::parse_str(generation) else {
+                continue;
+            };
+            if parsed.to_string() != generation {
+                continue;
+            }
+            let namespace = format!("{INTERNAL_INGEST_STAGE_PREFIX}{generation}");
+            if live_stages.contains(&namespace) {
+                continue;
+            }
+            let path = entry.path();
+            let lock = match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            match lock.try_lock() {
+                Ok(()) => {
+                    drop(lock);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        // Some platforms refuse to unlink a locked file. The
+                        // leftover is harmless and can be retried on a later
+                        // recovery pass.
+                        Err(error) if error.kind() == ErrorKind::PermissionDenied => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn ingest_stage_namespaces(&self) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            Ok(read_stage_provenance(conn)?
+                .into_iter()
+                .map(|(namespace, _)| namespace)
+                .collect())
+        })
+        .await
     }
 
     /// Construct a `LadybugStore` for tests with a small system footprint so
@@ -1083,6 +1390,12 @@ impl LadybugStore {
     ) -> Result<Self> {
         let local_path = local_path.into();
         limits.validate()?;
+        if restore_in_progress_path(&local_path).exists() {
+            anyhow::bail!(
+                "database restore at {} is incomplete; finish or recover it before opening",
+                local_path.display()
+            );
+        }
         if dimensions == 0 {
             anyhow::bail!("embedding dimensions must be positive");
         }
@@ -1229,6 +1542,7 @@ impl LadybugStore {
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
+            snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1258,6 +1572,7 @@ impl LadybugStore {
     {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
+        let db_path = self.local_path.clone();
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -1275,7 +1590,7 @@ impl LadybugStore {
             let mut attempt = 0;
             loop {
                 let (returned, result) =
-                    Self::write_owning_turn(db.clone(), turn, f.clone()).await?;
+                    Self::write_owning_turn(db.clone(), db_path.clone(), turn, f.clone()).await?;
                 turn = returned;
 
                 match result {
@@ -1326,12 +1641,13 @@ impl LadybugStore {
     {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
+        let db_path = self.local_path.clone();
         let mut worker = tokio::spawn(async move {
             let mut turn = write_lock.lock_owned().await;
             let mut attempt = 0;
             loop {
                 let (returned, result) =
-                    Self::write_owning_turn(db.clone(), turn, f.clone()).await?;
+                    Self::write_owning_turn(db.clone(), db_path.clone(), turn, f.clone()).await?;
                 turn = returned;
                 match result {
                     Err(error)
@@ -1374,6 +1690,7 @@ impl LadybugStore {
     /// should be allowed to start.
     async fn write_owning_turn<T, F>(
         db: Arc<Database>,
+        db_path: PathBuf,
         turn: tokio::sync::OwnedMutexGuard<()>,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
@@ -1391,6 +1708,7 @@ impl LadybugStore {
             // pool reusing this thread does not leak another stack.
             let _ = crate::crash::install_alt_stack();
             let outcome = (|| -> Result<T> {
+                let _cross_process_writer = acquire_database_writer_lock(&db_path)?;
                 let conn = Connection::new(&db)?;
                 f(&conn)
             })();
@@ -1933,6 +2251,9 @@ impl VectorStore for LadybugStore {
         let _namespace = _namespace.to_string();
         let dimensions = self.dimensions;
         let _turn = self.write_lock.lock().await;
+        let db_path = self.local_path.clone();
+        let _cross_process_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&db_path)).await??;
         let outcome = self.with_conn(move |conn| {
 
             let create_node_table = format!(
@@ -1942,6 +2263,13 @@ impl VectorStore for LadybugStore {
             if let Err(e) = conn.query(&create_node_table) {
                 if !e.to_string().contains("already exists") {
                     return Err(e.into());
+                }
+            }
+
+            let create_ingest_stage_table = "CREATE NODE TABLE IngestStage (namespace STRING, generation STRING, PRIMARY KEY (namespace))";
+            if let Err(error) = conn.query(create_ingest_stage_table) {
+                if !error.to_string().contains("already exists") {
+                    return Err(error.into());
                 }
             }
 
@@ -1981,16 +2309,32 @@ impl VectorStore for LadybugStore {
     ) -> Result<crate::traits::UpsertReport> {
         if namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX) {
             let authorized_stage_write = payload.user_id == "auto-ingestor"
-                && has_ingest_stage_provenance(&self.local_path, namespace);
+                && has_ingest_stage_lease(&self.local_path, namespace);
             if !authorized_stage_write {
                 anyhow::bail!("reserved ingest staging namespace is not available for this write");
             }
         }
+        let staged_generation = namespace
+            .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+            .filter(|_| namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX))
+            .map(ToOwned::to_owned);
         let namespace = namespace.to_string();
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
         self.write_with_deadline("writing a memory", move |conn| {
+
+            if let Some(generation) = &staged_generation {
+                let safe_ns = escape_ladybug_string(&namespace);
+                let mut rows = conn.query(&format!(
+                    "MATCH (s:IngestStage) WHERE s.namespace = '{}' AND s.generation = '{}' RETURN s.namespace LIMIT 1",
+                    safe_ns,
+                    escape_ladybug_string(generation)
+                ))?;
+                if rows.next().is_none() {
+                    anyhow::bail!("reserved ingest staging namespace has no database provenance");
+                }
+            }
 
             let safe_id = escape_ladybug_string(&id);
             let safe_ns = escape_ladybug_string(&namespace);
@@ -2491,58 +2835,91 @@ impl VectorStore for LadybugStore {
     }
 
     async fn export_database(&self, dir: &str) -> Result<()> {
-        let dir = std::path::PathBuf::from(dir);
+        self.init("snapshot").await?;
+        let dir = PathBuf::from(dir);
+        if dir.exists() {
+            anyhow::bail!("snapshot destination already exists; choose a new empty path");
+        }
+        let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let _snapshot_turn = self.snapshot_lock.lock().await;
+        let _write_turn = self.write_lock.lock().await;
         let source = self.local_path.clone();
-        self.with_conn(move |conn| {
-            // Checkpoint first so the snapshot cannot miss writes still in the
-            // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVs in
-            // lbug 0.20.4's planner on every store (planExportTableData ->
-            // std::__format on a dangling string_view).
-            conn.query("CHECKPOINT")?;
+        let source_for_lock = source.clone();
+        let _cross_process_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&source_for_lock))
+                .await??;
+        let stages = self
+            .with_conn(move |conn| {
+                // Checkpoint first so the snapshot cannot miss writes still in the
+                // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVs in
+                // lbug 0.20.4's planner on every store (planExportTableData ->
+                // std::__format on a dangling string_view).
+                conn.query("CHECKPOINT")?;
+                read_stage_provenance(conn)
+            })
+            .await?;
+        let dir_name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("snapshot");
+        let staging_dir = parent.join(format!(".{dir_name}.staging-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&staging_dir)?;
+        let outcome = (|| -> Result<()> {
+            let target = staging_dir.join("ladybug.store");
+            std::fs::copy(&source, &target).map_err(|e| {
+                anyhow::anyhow!("could not copy the database into the snapshot: {}", e)
+            })?;
+            let mut wal = source.clone().into_os_string();
+            wal.push(".wal");
+            let wal = PathBuf::from(wal);
+            if wal.exists() {
+                std::fs::copy(&wal, staging_dir.join("ladybug.store.wal")).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not copy the write-ahead log into the snapshot: {}",
+                        e
+                    )
+                })?;
+            }
+            let source_marker = width_marker_path(&source);
+            if source_marker.exists() {
+                std::fs::copy(&source_marker, width_marker_path(&target)).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not copy the embedding marker into the snapshot: {}",
+                        e
+                    )
+                })?;
+            }
+            let stage_namespaces: Vec<String> = stages
+                .iter()
+                .map(|(namespace, _)| namespace.clone())
+                .collect();
+            let manifest = serde_json::json!({
+                "format": "neurostrata-snapshot",
+                "version": 2,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "source": source.display().to_string(),
+                "bytes": std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
+                "stage_generations": stage_namespaces,
+            });
+            std::fs::write(
+                staging_dir.join("manifest.json"),
+                serde_json::to_string_pretty(&manifest)?,
+            )?;
+            std::fs::rename(&staging_dir, &dir)?;
             Ok(())
-        })
-        .await?;
-        std::fs::create_dir_all(&dir)?;
-        let target = dir.join("ladybug.store");
-        std::fs::copy(&source, &target)
-            .map_err(|e| anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e))?;
-        // A WAL left behind after the checkpoint rides along, so a restore
-        // replays it exactly as the engine would have.
-        let mut wal = source.clone().into_os_string();
-        wal.push(".wal");
-        let wal = std::path::PathBuf::from(wal);
-        if wal.exists() {
-            std::fs::copy(&wal, dir.join("ladybug.store.wal")).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not copy the write-ahead log into the snapshot: {}",
-                    e
-                )
-            })?;
+        })();
+        if outcome.is_err() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
         }
-        let source_marker = width_marker_path(&source);
-        if source_marker.exists() {
-            std::fs::copy(&source_marker, width_marker_path(&target)).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not copy the embedding marker into the snapshot: {}",
-                    e
-                )
-            })?;
-        }
-        let manifest = serde_json::json!({
-            "format": "neurostrata-snapshot",
-            "version": 1,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "source": source.display().to_string(),
-            "bytes": std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
-        });
-        std::fs::write(
-            dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
-        )?;
-        Ok(())
+        outcome
     }
 
     async fn checkpoint(&self) -> Result<()> {
+        let _snapshot_turn = self.snapshot_lock.lock().await;
+        let source = self.local_path.clone();
+        let _cross_process_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&source)).await??;
         // Cleared first: a write that lands while the engine is flushing must
         // survive, and clearing afterwards would drop its mark.
         let had_writes = self.dirty.take();
@@ -2694,6 +3071,27 @@ impl VectorStore for LadybugStore {
             let _ = std::fs::remove_file(&path);
             anyhow::anyhow!("could not lock the ingest generation lease: {}", error)
         })?;
+        let stage_namespace = namespace.to_string();
+        let generation = namespace
+            .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+            .expect("validated stage namespace")
+            .to_string();
+        if let Err(error) = self
+            .write_with_deadline("recording ingest stage provenance", move |conn| {
+                conn.query(&format!(
+                    "CREATE (s:IngestStage {{namespace: '{}', generation: '{}'}})",
+                    escape_ladybug_string(&stage_namespace),
+                    escape_ladybug_string(&generation)
+                ))?;
+                Ok(())
+            })
+            .await
+        {
+            let _ = file.unlock();
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
         Ok(Box::new(IngestStageLease { file: Some(file) }))
     }
 
@@ -2707,18 +3105,39 @@ impl VectorStore for LadybugStore {
         }
         let namespace = namespace.to_string();
         let staged_namespace = staged_namespace.to_string();
+        #[cfg(test)]
+        let hook_db_path = self.local_path.clone();
         let published = self.write_to_completion(
             "publishing an ingested generation",
             write_timeout(),
             move |conn| {
             conn.query("BEGIN TRANSACTION")?;
             let transaction = (|| -> Result<usize> {
+                #[cfg(test)]
+                test_publish_crash_barrier(&hook_db_path, "after-begin");
                 let safe_namespace = escape_ladybug_string(&namespace);
                 let safe_stage_namespace = escape_ladybug_string(&staged_namespace);
+                let generation = staged_namespace
+                    .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+                    .ok_or_else(|| anyhow::anyhow!("invalid staged generation"))?
+                    .to_string();
+                let has_stage_provenance = conn
+                    .query(&format!(
+                        "MATCH (s:IngestStage) WHERE s.namespace = '{}' AND s.generation = '{}' RETURN s.namespace LIMIT 1",
+                        safe_stage_namespace,
+                        escape_ladybug_string(&generation)
+                    ))?
+                    .next()
+                    .is_some();
+                if !has_stage_provenance {
+                    anyhow::bail!("ingest publication has no database stage provenance");
+                }
                 conn.query(&format!(
                     "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m",
                     safe_namespace
                 ))?;
+                #[cfg(test)]
+                test_publish_crash_barrier(&hook_db_path, "after-delete");
 
                 let staged_prefix = format!(
                     "{}{}",
@@ -2734,6 +3153,7 @@ impl VectorStore for LadybugStore {
                 // Promote in bounded pages. The vectors and text payloads
                 // remain in the database; only IDs and metadata cross into
                 // process memory for namespace-reference rewriting.
+                let mut first_page = true;
                 loop {
                     let mut staged = conn.query(&format!(
                         "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' RETURN m.id, m.metadata LIMIT 128",
@@ -2776,6 +3196,11 @@ impl VectorStore for LadybugStore {
                             safe_stage_namespace, safe_old_id
                         ))?;
                     }
+                    if first_page {
+                        first_page = false;
+                        #[cfg(test)]
+                        test_publish_crash_barrier(&hook_db_path, "after-first-page");
+                    }
                 }
                 // A generation is private state and must not survive a
                 // successful publication, even if an unexpected row type was
@@ -2783,6 +3208,11 @@ impl VectorStore for LadybugStore {
                 conn.query(&format!(
                     "MATCH (m:Memory) WHERE m.namespace = '{}' DETACH DELETE m",
                     safe_stage_namespace
+                ))?;
+                conn.query(&format!(
+                    "MATCH (s:IngestStage) WHERE s.namespace = '{}' AND s.generation = '{}' DELETE s",
+                    safe_stage_namespace,
+                    escape_ladybug_string(&generation)
                 ))?;
 
                 // Re-read declarations inside the transaction so the new nodes
@@ -2827,12 +3257,18 @@ impl VectorStore for LadybugStore {
                 for (rel_type, pairs) in &wanted {
                     created += create_missing_edges(conn, rel_type, pairs)?;
                 }
+                #[cfg(test)]
+                test_publish_crash_barrier(&hook_db_path, "precommit");
                 Ok(created)
             })();
 
             match transaction {
                 Ok(created) => match conn.query("COMMIT") {
-                    Ok(_) => Ok(created),
+                    Ok(_) => {
+                        #[cfg(test)]
+                        test_publish_crash_barrier(&hook_db_path, "postcommit");
+                        Ok(created)
+                    }
                     Err(commit) => match conn.query("ROLLBACK") {
                         Ok(_) => Err(commit.into()),
                         Err(rollback) => Err(anyhow::anyhow!(
@@ -2969,15 +3405,18 @@ impl VectorStore for LadybugStore {
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let db_path = self.local_path.clone();
         self.with_conn(move |conn| {
+            let hidden_stages: HashSet<String> = read_stage_provenance(conn)?
+                .into_iter()
+                .map(|(namespace, _)| namespace)
+                .collect();
             let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
             let mut result = conn.query(query)?;
 
             let mut namespaces = Vec::new();
             while let Some(row) = result.next() {
                 if let lbug::Value::String(ns) = row[0].clone() {
-                    if !has_ingest_stage_provenance(&db_path, &ns) {
+                    if !hidden_stages.contains(&ns) {
                         namespaces.push(ns);
                     }
                 }
@@ -2997,9 +3436,12 @@ impl VectorStore for LadybugStore {
     ) -> Result<serde_json::Value> {
         let project_contexts = project_contexts.clone();
         let anchor_override = anchor_override.cloned();
-        let db_path = self.local_path.clone();
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
+            let hidden_stage_namespaces: HashSet<String> = read_stage_provenance(conn)?
+                .into_iter()
+                .map(|(namespace, _)| namespace)
+                .collect();
 
             // 1. Fetch all nodes
             let mut nodes = Vec::new();
@@ -3011,7 +3453,7 @@ impl VectorStore for LadybugStore {
             while let Some(row) = result_nodes.next() {
                 let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
-                if has_ingest_stage_provenance(&db_path, &namespace) {
+                if hidden_stage_namespaces.contains(&namespace) {
                     hidden_stage_ids.insert(id);
                     continue;
                 }
@@ -3428,6 +3870,457 @@ fn bump_access_count(metadata: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn database_path_aliases_share_writer_and_stage_sidecars() {
+        let root = std::env::temp_dir().join(format!("db-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("database.store");
+        let alias = root.join("database-alias.store");
+        std::fs::write(&database, b"fixture").unwrap();
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+        let namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        assert_eq!(
+            database_writer_lock_path(&database),
+            database_writer_lock_path(&alias)
+        );
+        assert_eq!(
+            ingest_stage_lease_path(&database, &namespace).unwrap(),
+            ingest_stage_lease_path(&alias, &namespace).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn seed_process_crash_publication_fixture(db: &Path, namespace: &str, stage: &str) {
+        let store = LadybugStore::for_testing(db, 4).unwrap();
+        store.init("process-crash-fixture").await.unwrap();
+        let old_id = format!(
+            "{}{}old.rs",
+            namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        store
+            .upsert(
+                namespace,
+                &old_id,
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "old-generation".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "old.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let manual_rule_id = format!(
+            "{}{}manual-rule",
+            namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        store
+            .upsert(
+                namespace,
+                &manual_rule_id,
+                vec![0.2; 4],
+                MemoryPayload {
+                    content: "manual rule".into(),
+                    user_id: "owner".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"governs": [old_id]}),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(governs_edges_from(&store, &manual_rule_id).await, 1);
+
+        let lease = store.begin_ingest_stage(stage).await.unwrap();
+        let staged_namespace = stage.to_string();
+        let staged_prefix = format!("{}{}", stage, crate::parser::ingest::NAMESPACE_SEPARATOR);
+        store
+            .write_with_deadline("seeding a staged process-crash fixture", move |conn| {
+                for i in 0..130 {
+                    let location = if i == 0 {
+                        "old.rs".to_string()
+                    } else {
+                        format!("file-{i}.rs")
+                    };
+                    let id = format!("{staged_prefix}{location}");
+                    conn.query(&format!(
+                        "CREATE (m:Memory {{id: '{}', namespace: '{}', content: 'new-generation-{i}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: '', location: '{}', location_lines: '', metadata: '{{}}', embedding: [0.3, 0.3, 0.3, 0.3]}})",
+                        escape_ladybug_string(&id),
+                        escape_ladybug_string(&staged_namespace),
+                        escape_ladybug_string(&location)
+                    ))?;
+                }
+                let rule_id = format!("{staged_prefix}new-rule");
+                let target_id = format!("{staged_prefix}old.rs");
+                let metadata = serde_json::to_string(&json!({"governs": [target_id]}))?;
+                conn.query(&format!(
+                    "CREATE (m:Memory {{id: '{}', namespace: '{}', content: 'new rule', user_id: 'auto-ingestor', memory_type: 'rule', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.4, 0.4, 0.4, 0.4]}})",
+                    escape_ladybug_string(&rule_id),
+                    escape_ladybug_string(&staged_namespace),
+                    escape_ladybug_string(&metadata)
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(lease);
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn publish_process_crash_child_worker() {
+        let Ok(db) = std::env::var("NEUROSTRATA_TEST_PUBLISH_CRASH_DB") else {
+            return;
+        };
+        let phase = std::env::var("NEUROSTRATA_TEST_PUBLISH_CRASH_PHASE").unwrap();
+        let barrier =
+            PathBuf::from(std::env::var_os("NEUROSTRATA_TEST_PUBLISH_CRASH_BARRIER").unwrap());
+        set_test_publish_crash_barrier(&phase, PathBuf::from(&db), barrier);
+        let namespace = std::env::var("NEUROSTRATA_TEST_PUBLISH_CRASH_NAMESPACE").unwrap();
+        let stage = std::env::var("NEUROSTRATA_TEST_PUBLISH_CRASH_STAGE").unwrap();
+        let db_path = PathBuf::from(&db);
+        let store = LadybugStore::for_testing(db, 4).unwrap();
+        store.init("process-crash-child").await.unwrap();
+        test_publish_crash_barrier(&db_path, "staged");
+        store.publish_ingested(&namespace, &stage).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_writer_lock_child_worker() {
+        let Ok(db) = std::env::var("NEUROSTRATA_TEST_SNAPSHOT_WRITER_DB") else {
+            return;
+        };
+        let barrier =
+            PathBuf::from(std::env::var_os("NEUROSTRATA_TEST_SNAPSHOT_WRITER_BARRIER").unwrap());
+        let _lock = acquire_database_writer_lock(Path::new(&db)).unwrap();
+        std::fs::write(&barrier, "writer holds database lock").unwrap();
+        let mut release_path = barrier.as_os_str().to_os_string();
+        release_path.push(".release");
+        let release = PathBuf::from(release_path);
+        let started = std::time::Instant::now();
+        while !release.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "snapshot writer lock watchdog expired"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_waits_for_a_competing_process_writer() {
+        let root = std::env::temp_dir().join(format!("snapshot-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("fixture.store");
+        let snapshot = root.join("snapshot");
+        let store = std::sync::Arc::new(LadybugStore::for_testing(&db, 4).unwrap());
+        store.init("snapshot-lock").await.unwrap();
+        store
+            .upsert(
+                "snapshot-lock",
+                "snapshot-row",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "before-writer-lock".into(),
+                    user_id: "owner".into(),
+                    memory_type: "note".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let barrier = root.join("writer-barrier");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("store::ladybug::tests::snapshot_writer_lock_child_worker")
+            .arg("--nocapture")
+            .env("NEUROSTRATA_TEST_SNAPSHOT_WRITER_DB", &db)
+            .env("NEUROSTRATA_TEST_SNAPSHOT_WRITER_BARRIER", &barrier)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !barrier.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("snapshot writer child exited before holding lock: {status}");
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "snapshot writer child did not reach its barrier"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let store_for_export = store.clone();
+        let output = snapshot.clone();
+        let exporter = tokio::spawn(async move {
+            store_for_export
+                .export_database(&output.to_string_lossy())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !exporter.is_finished(),
+            "snapshot must wait while another process owns the database writer lock"
+        );
+        let mut release_path = barrier.as_os_str().to_os_string();
+        release_path.push(".release");
+        std::fs::write(release_path, "release").unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "snapshot writer child failed: {status}");
+        exporter.await.unwrap().unwrap();
+        drop(store);
+
+        let snapshot_db = snapshot.join("ladybug.store");
+        let restored = LadybugStore::for_testing(&snapshot_db, 4).unwrap();
+        restored.init("snapshot-cut-check").await.unwrap();
+        let row = restored
+            .get("snapshot-lock", "snapshot-row")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.1.content, "before-writer-lock");
+        drop(restored);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn process_crash_during_publication_recovers_old_or_committed_generation() {
+        for phase in [
+            "staged",
+            "after-delete",
+            "after-first-page",
+            "precommit",
+            "postcommit",
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("publish-crash-{phase}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let db = root.join("fixture.store");
+            let namespace = format!("crash-{phase}");
+            let stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+            seed_process_crash_publication_fixture(&db, &namespace, &stage).await;
+            let barrier = root.join("barrier");
+            let executable = std::env::current_exe().unwrap();
+            let mut child = std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("store::ladybug::tests::publish_process_crash_child_worker")
+                .arg("--nocapture")
+                .env("NEUROSTRATA_TEST_PUBLISH_CRASH_PHASE", phase)
+                .env("NEUROSTRATA_TEST_PUBLISH_CRASH_BARRIER", &barrier)
+                .env("NEUROSTRATA_TEST_PUBLISH_CRASH_DB", &db)
+                .env("NEUROSTRATA_TEST_PUBLISH_CRASH_NAMESPACE", &namespace)
+                .env("NEUROSTRATA_TEST_PUBLISH_CRASH_STAGE", &stage)
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            while !barrier.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("child exited before reaching {phase} barrier: {status}");
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(15),
+                    "child did not reach {phase} barrier before watchdog"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            let _ = child.wait().unwrap();
+
+            let reopened = LadybugStore::for_testing(&db, 4).unwrap();
+            reopened.init("after-process-crash").await.unwrap();
+            let old_id = format!(
+                "{}{}old.rs",
+                namespace,
+                crate::parser::ingest::NAMESPACE_SEPARATOR
+            );
+            let old = reopened.get(&namespace, &old_id).await.unwrap();
+            let should_be_new = phase == "postcommit";
+            if should_be_new {
+                let replacement = old.expect("post-commit crash must retain replacement");
+                assert_eq!(replacement.1.content, "new-generation-0");
+                assert_eq!(reopened.list(&namespace, None).await.unwrap().len(), 132);
+                assert_eq!(
+                    governs_edges_from(
+                        &reopened,
+                        &format!(
+                            "{}{}manual-rule",
+                            namespace,
+                            crate::parser::ingest::NAMESPACE_SEPARATOR
+                        )
+                    )
+                    .await,
+                    1
+                );
+            } else {
+                let old = old.expect("pre-commit crash must roll back to old generation");
+                assert_eq!(old.1.content, "old-generation");
+                assert_eq!(reopened.list(&namespace, None).await.unwrap().len(), 2);
+                assert_eq!(
+                    governs_edges_from(
+                        &reopened,
+                        &format!(
+                            "{}{}manual-rule",
+                            namespace,
+                            crate::parser::ingest::NAMESPACE_SEPARATOR
+                        )
+                    )
+                    .await,
+                    1
+                );
+            }
+
+            let followup = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+            let _lease = reopened.begin_ingest_stage(&followup).await.unwrap();
+            assert!(
+                !ingest_stage_lease_path(&db, &stage).unwrap().exists(),
+                "recovery removes orphan stage lease sidecars after a completed or rolled-back transaction"
+            );
+            if !should_be_new {
+                assert!(reopened
+                    .get(
+                        &stage,
+                        &format!(
+                            "{}{}old.rs",
+                            stage,
+                            crate::parser::ingest::NAMESPACE_SEPARATOR
+                        )
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+            let followup_id = format!(
+                "{}{}old.rs",
+                followup,
+                crate::parser::ingest::NAMESPACE_SEPARATOR
+            );
+            reopened
+                .upsert(
+                    &followup,
+                    &followup_id,
+                    vec![0.9; 4],
+                    MemoryPayload {
+                        content: "follow-up replacement".into(),
+                        user_id: "auto-ingestor".into(),
+                        memory_type: "file".into(),
+                        agent_name: None,
+                        location: "old.rs".into(),
+                        location_lines: String::new(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+            reopened
+                .publish_ingested(&namespace, &followup)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .get(&namespace, &old_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .content,
+                "follow-up replacement"
+            );
+            assert_eq!(
+                governs_edges_from(
+                    &reopened,
+                    &format!(
+                        "{}{}manual-rule",
+                        namespace,
+                        crate::parser::ingest::NAMESPACE_SEPARATOR
+                    )
+                )
+                .await,
+                1
+            );
+            drop(reopened);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_publication_caller_waits_for_definitive_commit() {
+        let root = std::env::temp_dir().join(format!("publish-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("fixture.store");
+        let namespace = "cancel-publication";
+        let stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        seed_process_crash_publication_fixture(&db, namespace, &stage).await;
+        let store = std::sync::Arc::new(LadybugStore::for_testing(&db, 4).unwrap());
+        store.init("cancel-publication").await.unwrap();
+        let barrier = root.join("barrier");
+        set_test_publish_crash_barrier("precommit", db.clone(), barrier.clone());
+        let writer_store = store.clone();
+        let namespace_owned = namespace.to_string();
+        let stage_owned = stage.clone();
+        let caller = tokio::spawn(async move {
+            writer_store
+                .publish_ingested(&namespace_owned, &stage_owned)
+                .await
+        });
+        let started = std::time::Instant::now();
+        while !barrier.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "publication did not reach precommit barrier"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        caller.abort();
+        let mut release_path = barrier.as_os_str().to_os_string();
+        release_path.push(".release");
+        std::fs::write(release_path, "continue").unwrap();
+
+        let new_id = format!(
+            "{}{}old.rs",
+            namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let started = std::time::Instant::now();
+        loop {
+            if let Some((_, payload)) = store.get(namespace, &new_id).await.unwrap() {
+                if payload.content == "new-generation-0" {
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "detached publication did not resolve after caller cancellation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(store.list(namespace, None).await.unwrap().len(), 132);
+        assert_eq!(
+            governs_edges_from(
+                &store,
+                &format!(
+                    "{}{}manual-rule",
+                    namespace,
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                )
+            )
+            .await,
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     async fn seed_raw_reserved_namespace_row(
         store: &LadybugStore,
@@ -4533,17 +5426,11 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        // A crash leaves the lease file behind, unlocked. Its exact generated
-        // identifier plus this durable sidecar proves the rows are staging.
+        // Model a process that wrote stage provenance and rows, then exited:
+        // the lease remains on disk but is unlocked.
         let orphan_namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let orphan_lease = store.begin_ingest_stage(&orphan_namespace).await.unwrap();
         let orphan_lease_path = ingest_stage_lease_path(&dir, &orphan_namespace).unwrap();
-        drop(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&orphan_lease_path)
-                .unwrap(),
-        );
         let orphan_id = format!(
             "{}{}orphan.rs",
             orphan_namespace,
@@ -4566,6 +5453,7 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
+        drop(orphan_lease);
         let legacy_namespace = format!("project-ingest-stage-{}", uuid::Uuid::new_v4());
         let legacy_id = format!(
             "{}{}legacy.rs",

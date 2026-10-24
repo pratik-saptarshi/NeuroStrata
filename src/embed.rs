@@ -133,16 +133,48 @@ fn find_existing_cache_dir() -> PathBuf {
     primary_neuro_cache
 }
 
-/// The model this process is configured to use: the one NEUROSTRATA_MODEL names
-/// when it is acceptable, otherwise the first acceptable entry.
+/// The model this process is configured to use. An absent selection chooses
+/// the first configured model; an explicit invalid selection fails closed.
 fn configured_model() -> Result<AcceptableEmbedder> {
     let acceptable_models = get_acceptable_embedders()?;
-    let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
-    Ok(acceptable_models
-        .iter()
-        .find(|m| m.model_name.eq_ignore_ascii_case(&env_model))
-        .unwrap_or(&acceptable_models[0])
-        .clone())
+    let requested = std::env::var("NEUROSTRATA_MODEL").ok();
+    select_configured_model(acceptable_models, requested.as_deref())
+}
+
+fn select_configured_model(
+    acceptable_models: Vec<AcceptableEmbedder>,
+    requested: Option<&str>,
+) -> Result<AcceptableEmbedder> {
+    match requested.filter(|name| !name.trim().is_empty()) {
+        Some(name) => acceptable_models
+            .into_iter()
+            .find(|model| model.model_name.eq_ignore_ascii_case(name.trim()))
+            .ok_or_else(|| anyhow::anyhow!("NEUROSTRATA_MODEL names no configured embedder")),
+        None => acceptable_models
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no embedding models are configured")),
+    }
+}
+
+fn local_model_details(model: &AcceptableEmbedder) -> Result<(EmbeddingModel, usize)> {
+    let parsed = EmbeddingModel::from_str(&model.model_name)
+        .map_err(|_| anyhow::anyhow!("unsupported local embedding model {:?}", model.model_name))?;
+    let info = TextEmbedding::get_model_info(&parsed)?;
+    let dimensions = info.dim;
+    if model.dimensions != dimensions {
+        anyhow::bail!(
+            "configured embedding width {} does not match model {:?} width {}",
+            model.dimensions,
+            parsed,
+            dimensions
+        );
+    }
+    Ok((parsed, dimensions))
+}
+
+fn is_remote_model(model: &AcceptableEmbedder) -> bool {
+    model.base_url.is_some() && model.api_key_env.is_some()
 }
 
 /// Canonical identity for a remote embedding space. The endpoint is hashed so
@@ -178,16 +210,24 @@ pub(crate) fn canonicalize_persisted_embedder_id(
     anyhow::bail!("legacy remote embedding model identity cannot be safely matched to the configured model; keep this database intact and reopen with its original endpoint and model, or use a separate database path")
 }
 
-fn configured_identity_for(model: &AcceptableEmbedder) -> String {
-    match (&model.base_url, &model.api_key_env) {
-        (Some(base_url), Some(_)) => remote_embedder_id(
+fn configured_identity_for(model: &AcceptableEmbedder) -> Result<String> {
+    if is_remote_model(model) {
+        if model.dimensions == 0 {
+            anyhow::bail!("configured embedding dimensions must be positive");
+        }
+        let (Some(base_url), Some(_)) = (&model.base_url, &model.api_key_env) else {
+            unreachable!();
+        };
+        Ok(remote_embedder_id(
             base_url,
             model
                 .api_model
                 .as_deref()
                 .unwrap_or("text-embedding-3-small"),
-        ),
-        _ => format!("fastembed:{}", model.model_name),
+        ))
+    } else {
+        let (canonical_model, _) = local_model_details(model)?;
+        Ok(format!("fastembed:{canonical_model}"))
     }
 }
 
@@ -196,7 +236,7 @@ fn configured_identity_for(model: &AcceptableEmbedder) -> String {
 /// reads can validate the same identity as the daemon.
 pub fn configured_embedder_id() -> Result<String> {
     let model = configured_model()?;
-    Ok(configured_identity_for(&model))
+    configured_identity_for(&model)
 }
 
 /// The embedding width of the configured model, without loading the model.
@@ -205,7 +245,15 @@ pub fn configured_embedder_id() -> Result<String> {
 /// can mean a 523 MB download, which is the wrong thing to require on the fresh
 /// or offline machine a restore is usually run on.
 pub fn configured_dimensions() -> Result<usize> {
-    Ok(configured_model()?.dimensions)
+    let model = configured_model()?;
+    if is_remote_model(&model) {
+        if model.dimensions == 0 {
+            anyhow::bail!("configured embedding dimensions must be positive");
+        }
+        Ok(model.dimensions)
+    } else {
+        Ok(local_model_details(&model)?.1)
+    }
 }
 
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
@@ -222,8 +270,7 @@ impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let target_model = configured_model()?;
 
-        let model_enum = EmbeddingModel::from_str(&target_model.model_name)
-            .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
+        let (model_enum, dimensions) = local_model_details(&target_model)?;
 
         let cache_dir = find_existing_cache_dir();
 
@@ -241,6 +288,7 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
+        let model_name = format!("fastembed:{model_enum}");
         let model = TextEmbedding::try_new(
             TextInitOptions::new(model_enum)
                 .with_cache_dir(cache_dir)
@@ -250,8 +298,8 @@ impl FastEmbedder {
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
-            model_name: format!("fastembed:{}", target_model.model_name),
-            dimensions: target_model.dimensions,
+            model_name,
+            dimensions,
         })
     }
 }
@@ -273,7 +321,18 @@ impl Embedder for FastEmbedder {
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
-        Ok(embeddings.pop().unwrap_or_default())
+        let embedding = embeddings
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("fastembed returned no embedding"))?;
+        if embedding.len() != self.dimensions {
+            anyhow::bail!(
+                "fastembed returned width {}, but configured model identity {} requires {}",
+                embedding.len(),
+                self.model_name,
+                self.dimensions
+            );
+        }
+        Ok(embedding)
     }
 
     fn dimensions(&self) -> usize {
@@ -301,6 +360,9 @@ impl RemoteEmbedder {
         api_model: String,
         dimensions: usize,
     ) -> Result<Self> {
+        if dimensions == 0 {
+            anyhow::bail!("remote embedding dimensions must be positive");
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -322,7 +384,15 @@ impl RemoteEmbedder {
         let mut attempts = 0;
         loop {
             match self.try_embed(text).await {
-                Ok(embedding) => return Ok(embedding),
+                Ok(embedding) if embedding.len() == self.dimensions => return Ok(embedding),
+                Ok(embedding) => {
+                    return Err(anyhow::anyhow!(
+                        "remote embedding returned width {}, but configured model identity {} requires {}",
+                        embedding.len(),
+                        self.model_name,
+                        self.dimensions
+                    ));
+                }
                 Err(e) => {
                     attempts += 1;
                     if attempts >= 2 {
@@ -440,7 +510,12 @@ mod tests {
         }
     }
 
-    async fn exercise_retry(statuses: &[u16], expected_requests: usize, succeeds: bool) {
+    async fn exercise_retry(
+        statuses: &[u16],
+        expected_requests: usize,
+        succeeds: bool,
+        dimensions: usize,
+    ) {
         let state = Arc::new(MockEndpoint {
             statuses: AsyncMutex::new(statuses.iter().copied().collect()),
             requests: AtomicUsize::new(0),
@@ -455,7 +530,7 @@ mod tests {
             format!("http://{address}"),
             "test-key".into(),
             "test-model".into(),
-            2,
+            dimensions,
         )
         .unwrap();
         let result = embedder.embed("test").await;
@@ -486,13 +561,6 @@ mod tests {
         assert!(embedder.is_ok());
     }
 
-    #[tokio::test]
-    async fn remote_embedder_retries_on_500() {
-        // Mock server returning 500 then 200
-        // This would require wiremock or similar
-        // Placeholder for integration test
-    }
-
     #[test]
     fn remote_embedder_dimensions_match() {
         let embedder = RemoteEmbedder::new(
@@ -513,6 +581,64 @@ mod tests {
         assert!(model.base_url.is_none());
         assert!(model.api_key_env.is_none());
         assert_eq!(model.model_name, "NomicEmbedTextV15");
+        assert_eq!(local_model_details(&model).unwrap().1, 768);
+    }
+
+    #[test]
+    fn explicitly_invalid_model_selection_fails_without_defaulting() {
+        let models = vec![AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15".into(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        }];
+        assert!(select_configured_model(models, Some("typo-model")).is_err());
+    }
+
+    #[test]
+    fn local_model_validation_rejects_unknown_names_and_wrong_widths() {
+        let mut model = AcceptableEmbedder {
+            model_name: "NotARealFastEmbedModel".into(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        };
+        assert!(local_model_details(&model).is_err());
+
+        model.model_name = "NomicEmbedTextV15".into();
+        model.dimensions = 384;
+        assert!(local_model_details(&model).is_err());
+
+        model.dimensions = 768;
+        let (variant, width) = local_model_details(&model).unwrap();
+        assert_eq!(width, 768);
+        assert_eq!(
+            configured_identity_for(&model).unwrap(),
+            format!("fastembed:{variant}")
+        );
+    }
+
+    #[test]
+    fn same_width_local_models_keep_distinct_canonical_identities() {
+        let model_a = AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15".into(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        };
+        let model_b = AcceptableEmbedder {
+            model_name: "BGEBaseENV15".into(),
+            ..model_a.clone()
+        };
+        assert_eq!(local_model_details(&model_a).unwrap().1, 768);
+        assert_eq!(local_model_details(&model_b).unwrap().1, 768);
+        assert_ne!(
+            configured_identity_for(&model_a).unwrap(),
+            configured_identity_for(&model_b).unwrap()
+        );
     }
 
     #[test]
@@ -525,7 +651,7 @@ mod tests {
             api_key_env: Some("REMOTE_API_KEY".into()),
             api_model: Some("embed-v2".into()),
         };
-        let configured = configured_identity_for(&model);
+        let configured = configured_identity_for(&model).unwrap();
         let runtime = RemoteEmbedder::new(
             endpoint.into(),
             "not-part-of-the-identity".into(),
@@ -540,7 +666,8 @@ mod tests {
             configured_identity_for(&AcceptableEmbedder {
                 base_url: Some("https://user:top-secret@example.test/v1".into()),
                 ..model.clone()
-            }),
+            })
+            .unwrap(),
             "trailing slashes do not change configured identity"
         );
         assert_ne!(
@@ -548,7 +675,8 @@ mod tests {
             configured_identity_for(&AcceptableEmbedder {
                 base_url: Some("https://user:top-secret@example.test/other".into()),
                 ..model.clone()
-            }),
+            })
+            .unwrap(),
             "changing the endpoint changes identity"
         );
         assert_eq!(
@@ -586,7 +714,8 @@ mod tests {
             configured_identity_for(&AcceptableEmbedder {
                 base_url: Some("https://other:top-secret@example.test/v1".into()),
                 ..model.clone()
-            }),
+            })
+            .unwrap(),
             "changing endpoint identity changes the hash"
         );
         assert_ne!(
@@ -594,7 +723,8 @@ mod tests {
             configured_identity_for(&AcceptableEmbedder {
                 api_model: Some("embed-v3".into()),
                 ..model
-            }),
+            })
+            .unwrap(),
             "changing the model changes identity"
         );
         for secret in ["user", "top-secret", "example.test", "https://"] {
@@ -668,10 +798,11 @@ mod tests {
 
     #[tokio::test]
     async fn remote_retry_policy_runs_against_a_local_http_server() {
-        exercise_retry(&[429, 200], 2, true).await;
-        exercise_retry(&[503, 200], 2, true).await;
-        exercise_retry(&[503, 503], 2, false).await;
-        exercise_retry(&[400, 200], 1, false).await;
-        exercise_retry(&[401, 200], 1, false).await;
+        exercise_retry(&[429, 200], 2, true, 2).await;
+        exercise_retry(&[503, 200], 2, true, 2).await;
+        exercise_retry(&[503, 503], 2, false, 2).await;
+        exercise_retry(&[400, 200], 1, false, 2).await;
+        exercise_retry(&[401, 200], 1, false, 2).await;
+        exercise_retry(&[200], 1, false, 3).await;
     }
 }
