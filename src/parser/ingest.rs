@@ -1,6 +1,9 @@
 use crate::parser::get_language;
 use crate::parser::schema::ParserSchema;
-use crate::traits::{Embedder, MemoryPayload, VectorStore};
+use crate::traits::{
+    is_reserved_ingest_destination, Embedder, MemoryPayload, VectorStore,
+    INTERNAL_INGEST_STAGE_PREFIX,
+};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
@@ -286,19 +289,19 @@ fn run_producer(
 
         let node_id = qualified_id(&namespace, &node_path);
 
-        // Apply backpressure: if the channel is full, block until space is
-        // available rather than silently dropping the item. If the consumer
-        // has dropped (e.g. it errored), propagate the failure instead of
-        // reporting success over a partial ingest.
-        if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
+        // `blocking_send` applies backpressure when the bounded queue is full.
+        // A closed receiver is an error: otherwise a partial walk looked like
+        // success when the consumer had failed.
+        tx.blocking_send(IngestItem::NodeUpsert {
             node_id,
             node_path: node_path.clone(),
             contained_by,
             mem_type: mem_type.to_string(),
             abs_path,
-        }) {
-            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-        }
+        })
+        .map_err(|_| {
+            anyhow::anyhow!("ingest consumer stopped before node {node_path} was queued")
+        })?;
 
         if !is_file {
             continue;
@@ -371,14 +374,18 @@ fn run_producer(
 
                     if !pending.is_empty() {
                         let path_display = path.display().to_string();
-                        if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
+                        tx.blocking_send(IngestItem::ParsedSymbols {
                             node_path,
                             lang_name: lang_name.clone(),
                             symbols: pending,
                             path_display,
-                        }) {
-                            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                        }
+                        })
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "ingest consumer stopped before parsed symbols from {} were queued",
+                                path.display()
+                            )
+                        })?;
                     }
                 }
             }
@@ -428,12 +435,12 @@ async fn run_consumer(
                     agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                 };
 
-                if let Err(e) = vector_store
+                vector_store
                     .upsert(namespace, &node_id, zero_vector.clone(), payload)
                     .await
-                {
-                    eprintln!("Failed to upsert graph node {}: {}", node_id, e);
-                }
+                    .map_err(|e| {
+                        anyhow::anyhow!("could not store structural node {}: {}", node_id, e)
+                    })?;
             }
             IngestItem::ParsedSymbols {
                 node_path,
@@ -484,25 +491,28 @@ async fn run_consumer(
                         agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                     };
 
-                    match embedder.embed(&summary).await {
-                        Ok(embedding) => {
-                            if let Err(e) = vector_store
-                                .upsert(namespace, &id, embedding, payload)
-                                .await
-                            {
-                                eprintln!(
-                                    "Failed to store symbol {} from {}: {}",
-                                    symbol.name, path_display, e
-                                );
-                            } else {
-                                symbols_stored += 1;
-                            }
-                        }
-                        Err(e) => eprintln!(
-                            "Failed to embed symbol {} from {}: {}",
-                            symbol.name, path_display, e
-                        ),
-                    }
+                    let embedding = embedder.embed(&summary).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "could not embed {} from {}: {}. The staged rebuild was discarded; the previous publication remains available.",
+                            symbol.name,
+                            path_display,
+                            e
+                        )
+                    })?;
+
+                    vector_store
+                        .upsert(namespace, &id, embedding, payload)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "could not store {} from {}: {}. The staged rebuild was discarded; the previous publication remains available.",
+                                symbol.name,
+                                path_display,
+                                e
+                            )
+                        })?;
+
+                    symbols_stored += 1;
                 }
 
                 if symbols_stored > 0 {
@@ -518,7 +528,7 @@ async fn run_consumer(
     Ok(())
 }
 
-pub async fn ingest_directory(
+async fn populate_staging_namespace(
     dir_path: &Path,
     schema: &ParserSchema,
     embedder: Arc<dyn Embedder>,
@@ -526,28 +536,6 @@ pub async fn ingest_directory(
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
-    // Prove the root is a readable directory before anything is deleted. A
-    // missing or mistyped path used to clear the namespace, walk nothing -- the
-    // walker's errors were skipped -- and report success over an emptied graph.
-    std::fs::read_dir(dir_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so nothing was cleared: {}",
-            dir_path,
-            namespace,
-            e
-        )
-    })?;
-
-    // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
-    // ingesting on top of a stale tree would leave rows for files that no longer exist.
-    vector_store.clear_ingested(namespace).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Refusing to ingest: could not clear the previous ingest of namespace {}: {}",
-            namespace,
-            e
-        )
-    })?;
-
     let ext_to_lang = build_ext_map(schema);
     let zero_vector = vec![0.0; embedder.dimensions()];
     let namespace_owned = namespace.to_string();
@@ -591,22 +579,74 @@ pub async fn ingest_directory(
         Err(e) => return Err(anyhow::anyhow!("ingest producer panicked: {}", e)),
     }
 
-    // Clearing the previous ingest took every edge attached to those nodes with
-    // it, including the GOVERNS edges rules had to them -- and a rule is not
-    // rewritten just because its file came back. Replay what the memories still
-    // declare, now that the nodes they point at exist again (bead
-    // neurostrata-sij).
-    //
-    // A failure here fails the ingest rather than warning about it. The clear
-    // above already took every GOVERNS edge, so reporting success would hand
-    // back a graph whose rules reach none of their code.
-    let linked = vector_store.relink_edges(namespace).await.map_err(|e| {
+    Ok(())
+}
+
+async fn failed_staging(
+    store: &Arc<dyn VectorStore>,
+    stage_namespace: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match store.clear_ingested(stage_namespace).await {
+        Ok(()) => error,
+        Err(cleanup_error) => anyhow::anyhow!(
+            "{}; could not remove staging namespace {}: {}",
+            error,
+            stage_namespace,
+            cleanup_error
+        ),
+    }
+}
+
+/// Rebuild under an internal database generation, then atomically promote its
+/// rows only after every producer, embed, and upsert step succeeds. Vectors stay
+/// in the database throughout; publication does not snapshot the corpus into
+/// process memory.
+pub async fn ingest_directory(
+    dir_path: &Path,
+    schema: &ParserSchema,
+    embedder: Arc<dyn Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+    namespace: &str,
+    observer: Option<Arc<dyn IngestObserver>>,
+) -> anyhow::Result<()> {
+    if is_reserved_ingest_destination(namespace) {
+        anyhow::bail!("ingest destination uses the reserved internal staging namespace");
+    }
+    std::fs::read_dir(dir_path).map_err(|e| {
         anyhow::anyhow!(
-            "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
+            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so the current graph remains intact: {}",
+            dir_path,
             namespace,
             e
         )
     })?;
+
+    let stage_namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+    let _stage_lease = vector_store.begin_ingest_stage(&stage_namespace).await?;
+    let stage_result = populate_staging_namespace(
+        dir_path,
+        schema,
+        embedder,
+        vector_store.clone(),
+        &stage_namespace,
+        observer.clone(),
+    )
+    .await;
+    if let Err(error) = stage_result {
+        return Err(failed_staging(&vector_store, &stage_namespace, error).await);
+    }
+
+    let linked = match vector_store
+        .publish_ingested(namespace, &stage_namespace)
+        .await
+    {
+        Ok(linked) => linked,
+        Err(error) => {
+            return Err(failed_staging(&vector_store, &stage_namespace, error).await);
+        }
+    };
+
     println!(
         "Relinked {} declared edges in namespace {}",
         linked, namespace
@@ -614,7 +654,6 @@ pub async fn ingest_directory(
     if let Some(observer) = &observer {
         observer.relinked(linked);
     }
-
     Ok(())
 }
 
@@ -864,6 +903,51 @@ mod tests {
         }
     }
 
+    /// Stands in for a remote embedder that is down or rate-limited.
+    struct FailingEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FailingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Err(anyhow::anyhow!("embedder unavailable"))
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    struct FailsOnSecondEmbed(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Embedder for FailsOnSecondEmbed {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                Err(anyhow::anyhow!("midstream embed failure"))
+            } else {
+                Ok(vec![0.0; 4])
+            }
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    struct CountingEmbedder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0; 4])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
     #[tokio::test]
     async fn a_missing_root_is_refused_before_anything_is_cleared() {
         let db = std::env::temp_dir().join(format!("ns-missing-root-{}", uuid::Uuid::new_v4()));
@@ -914,6 +998,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_ingest_destinations_are_rejected_before_staging_or_embedding() {
+        let root = std::env::temp_dir().join(format!("reserved-ingest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+        let db = std::env::temp_dir().join(format!("reserved-ingest-db-{}", uuid::Uuid::new_v4()));
+        let concrete =
+            std::sync::Arc::new(crate::store::LadybugStore::for_testing(&db, 4).unwrap());
+        concrete.init("reserved-ingest").await.unwrap();
+        let store: Arc<dyn VectorStore> = concrete.clone();
+        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
+        let embeds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let _active_lease = concrete.begin_ingest_stage(&active_stage).await.unwrap();
+        let active_id = format!("{active_stage}{NAMESPACE_SEPARATOR}active.rs");
+        store
+            .upsert(
+                &active_stage,
+                &active_id,
+                vec![0.13, 0.24, 0.35, 0.46],
+                MemoryPayload {
+                    content: "held active generation".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: Some("active-fixture".into()),
+                    location: "active.rs".into(),
+                    location_lines: "3".into(),
+                    metadata: serde_json::json!({"generation": "keep"}),
+                },
+            )
+            .await
+            .unwrap();
+        let active_before = store.get(&active_stage, &active_id).await.unwrap().unwrap();
+        let stages_before = concrete.ingest_stage_namespaces().await.unwrap();
+        assert_eq!(stages_before, vec![active_stage.clone()]);
+        let stage_files_before = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("reserved-ingest-db-")
+                    && entry.file_name().to_string_lossy().contains(".stage-")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+
+        let fresh_reserved = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        for namespace in [
+            active_stage.clone(),
+            fresh_reserved,
+            format!("{}malformed", INTERNAL_INGEST_STAGE_PREFIX),
+            INTERNAL_INGEST_STAGE_PREFIX.to_string(),
+        ] {
+            let result = ingest_directory(
+                &root,
+                &schema,
+                Arc::new(CountingEmbedder(embeds.clone())),
+                store.clone(),
+                &namespace,
+                None,
+            )
+            .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("reserved internal staging namespace"));
+        }
+        assert_eq!(embeds.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            concrete.ingest_stage_namespaces().await.unwrap(),
+            stages_before
+        );
+        let active_after = store.get(&active_stage, &active_id).await.unwrap().unwrap();
+        assert_eq!(active_after.0, active_before.0);
+        assert_eq!(active_after.1.content, active_before.1.content);
+        assert_eq!(active_after.1.user_id, active_before.1.user_id);
+        assert_eq!(active_after.1.memory_type, active_before.1.memory_type);
+        assert_eq!(active_after.1.agent_name, active_before.1.agent_name);
+        assert_eq!(active_after.1.location, active_before.1.location);
+        assert_eq!(
+            active_after.1.location_lines,
+            active_before.1.location_lines
+        );
+        assert_eq!(active_after.1.metadata, active_before.1.metadata);
+        let stage_files_after = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("reserved-ingest-db-")
+                    && entry.file_name().to_string_lossy().contains(".stage-")
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stage_files_after, stage_files_before,
+            "rejected public destinations create no stage lease"
+        );
+        concrete
+            .publish_ingested("active-stage-published", &active_stage)
+            .await
+            .expect("the pre-existing active stage remains publishable");
+        let published = store
+            .get(
+                "active-stage-published",
+                "active-stage-published::active.rs",
+            )
+            .await
+            .unwrap()
+            .expect("the held generation publishes after rejected requests");
+        assert_eq!(published.0, active_before.0);
+        assert_eq!(published.1.content, "held active generation");
+        assert_eq!(
+            published.1.metadata,
+            serde_json::json!({"generation": "keep"})
+        );
+        assert!(concrete.ingest_stage_namespaces().await.unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
     async fn producer_consumer_streams_items_to_store() {
         // Create a temp directory with a parseable file.
         let tmp =
@@ -926,6 +1135,23 @@ mod tests {
         let store: Arc<dyn VectorStore> =
             Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
         store.init("test-ns").await.expect("create the schema");
+        store
+            .upsert(
+                "test-ns",
+                "rule-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "governs hello.rs".into(),
+                    user_id: "agent".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"governs": ["hello.rs"]}),
+                },
+            )
+            .await
+            .expect("seed rule before its target exists");
 
         let schema =
             ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
@@ -951,8 +1177,331 @@ mod tests {
         let sym_entry = store.get("test-ns", &sym_id).await.expect("read back");
         assert!(sym_entry.is_some(), "symbol node was stored");
 
+        let graph = store
+            .export_graph(false, false, &HashMap::new(), None)
+            .await
+            .expect("export graph after first publish");
+        assert!(
+            graph["links"].as_array().unwrap().iter().any(|link| {
+                link["source"] == "rule-1" && link["target"] == file_id && link["type"] == "GOVERNS"
+            }),
+            "successful publication relinks the existing rule edge"
+        );
+
+        std::fs::remove_file(tmp.join("hello.rs")).expect("remove stale source");
+        std::fs::write(tmp.join("world.rs"), "fn world() {}").expect("write replacement");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+        )
+        .await
+        .expect("publish replacement");
+        assert!(store.get("test-ns", &file_id).await.unwrap().is_none());
+        assert!(store.get("test-ns", &sym_id).await.unwrap().is_none());
+        let world_id = qualified_id("test-ns", "world.rs");
+        assert!(store.get("test-ns", &world_id).await.unwrap().is_some());
+        let graph = store
+            .export_graph(false, false, &HashMap::new(), None)
+            .await
+            .expect("export graph after replacement");
+        assert!(
+            !graph["links"].as_array().unwrap().iter().any(|link| {
+                link["source"] == "rule-1" && link["target"] == file_id && link["type"] == "GOVERNS"
+            }),
+            "removed targets lose their stale rule edges"
+        );
+
         // Clean up.
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Ingestion clears the namespace before it walks. If every symbol then
+    /// fails to embed, reporting success hands back an emptied graph with no
+    /// indication anything went wrong -- so a failure has to fail the walk.
+    #[tokio::test]
+    async fn a_failed_embed_fails_the_walk_instead_of_reporting_success() {
+        let tmp = std::env::temp_dir().join(format!("ns-embed-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write test file");
+
+        let db = std::env::temp_dir().join(format!("ns-embed-fail-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("fail-ns").await.expect("create the schema");
+        let old_id = qualified_id("fail-ns", "old.rs");
+        store
+            .upsert(
+                "fail-ns",
+                &old_id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "Path: old.rs".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "old.rs".into(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed previous graph");
+        store
+            .upsert(
+                "fail-ns",
+                "rule-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "rule".into(),
+                    user_id: "agent".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"governs": [old_id]}),
+                },
+            )
+            .await
+            .expect("seed governing rule");
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(FailingEmbedder),
+            store.clone(),
+            "fail-ns",
+            None,
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "an embed that fails for every symbol must fail the ingest, not be logged and skipped"
+        );
+        let message = format!("{}", outcome.expect_err("ingest failed"));
+        assert!(
+            message.contains("hello.rs"),
+            "the error should name the file being embedded: {message}"
+        );
+        assert!(
+            store
+                .get("fail-ns", &old_id)
+                .await
+                .expect("read prior node")
+                .is_some(),
+            "failed staged embedding must retain prior published nodes"
+        );
+        let graph = store
+            .export_graph(false, false, &HashMap::new(), None)
+            .await
+            .expect("export test graph");
+        assert!(
+            graph["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|link| { link["source"] == "rule-1" && link["target"] == old_id }),
+            "failed staged embedding must retain prior rule edges"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn a_midstream_embed_failure_keeps_the_previous_publication() {
+        let tmp = std::env::temp_dir().join(format!("ns-mid-embed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a.rs"), "fn first() {} fn second() {}").unwrap();
+
+        let db = std::env::temp_dir().join(format!("ns-mid-embed-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("mid-fail").await.expect("create the schema");
+        let old_id = qualified_id("mid-fail", "old.rs");
+        store
+            .upsert(
+                "mid-fail",
+                &old_id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "Path: old.rs".into(),
+                    user_id: "auto-ingestor".into(),
+                    memory_type: "file".into(),
+                    agent_name: None,
+                    location: "old.rs".into(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
+        let result = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(FailsOnSecondEmbed(std::sync::atomic::AtomicUsize::new(0))),
+            store.clone(),
+            "mid-fail",
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the second embed fails the staged rebuild");
+        assert!(store.get("mid-fail", &old_id).await.unwrap().is_some());
+        assert!(store
+            .get("mid-fail", &qualified_id("mid-fail", "a.rs"))
+            .await
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(tmp).ok();
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn structural_upsert_failure_returns_error_and_keeps_published_rows() {
+        let tmp = std::env::temp_dir().join(format!("ns-structural-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").unwrap();
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let previous = MemoryPayload {
+            content: "Path: old.rs".into(),
+            user_id: "auto-ingestor".into(),
+            memory_type: "file".into(),
+            agent_name: None,
+            location: "old.rs".into(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let old_id = qualified_id("structural-fail", "old.rs");
+        mock.upsert("structural-fail", &old_id, vec![0.0; 4], previous)
+            .await
+            .unwrap();
+        mock.fail_upsert_containing(Some("hello.rs".into()));
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
+        let result = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "structural-fail",
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "structural upsert errors fail the ingest");
+        assert!(
+            store
+                .get("structural-fail", &old_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "structural upsert failure leaves the old publication available"
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn midstream_symbol_upsert_failure_keeps_the_previous_publication() {
+        let tmp = std::env::temp_dir().join(format!("ns-mid-upsert-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("hello.rs"), "fn first() {} fn second() {}").unwrap();
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let old_id = qualified_id("mid-upsert", "old.rs");
+        mock.upsert(
+            "mid-upsert",
+            &old_id,
+            vec![0.0; 4],
+            MemoryPayload {
+                content: "Path: old.rs".into(),
+                user_id: "auto-ingestor".into(),
+                memory_type: "file".into(),
+                agent_name: None,
+                location: "old.rs".into(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        mock.fail_upsert_containing(Some("second".into()));
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
+        let result = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "mid-upsert",
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "the second symbol's upsert fails");
+        assert!(store.get("mid-upsert", &old_id).await.unwrap().is_some());
+        assert!(store
+            .get("mid-upsert", &qualified_id("mid-upsert", "hello.rs"))
+            .await
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_upsert_failure_restores_previous_ingest() {
+        let tmp =
+            std::env::temp_dir().join(format!("ns-publication-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").unwrap();
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let old_id = qualified_id("publish-fail", "old.rs");
+        mock.upsert(
+            "publish-fail",
+            &old_id,
+            vec![0.0; 4],
+            MemoryPayload {
+                content: "Path: old.rs".into(),
+                user_id: "auto-ingestor".into(),
+                memory_type: "file".into(),
+                agent_name: None,
+                location: "old.rs".into(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        mock.fail_next_upsert_in_namespace(Some("publish-fail".into()));
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
+        let result = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "publish-fail",
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "publication store failures remain failed status"
+        );
+        assert!(store.get("publish-fail", &old_id).await.unwrap().is_some());
+        assert!(store
+            .get("publish-fail", &qualified_id("publish-fail", "hello.rs"))
+            .await
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 }

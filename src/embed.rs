@@ -3,11 +3,41 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// An HTTP failure from the embedding endpoint, carrying the status so the
+/// retry loop can recognise it.
+///
+/// Formatting the status into an `anyhow!` string used to erase the type: the
+/// resulting error chain held no `StatusCode`, so the downcast in
+/// `embed_with_retry` never matched and the 429/5xx probe was dead code.
+#[derive(Debug)]
+struct EmbedApiStatus {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for EmbedApiStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "embedding API error {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for EmbedApiStatus {}
+
+/// Whether this failure is worth a second attempt. Kept separate from the loop
+/// so the classification can be tested without a server.
+fn should_retry(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<EmbedApiStatus>()
+        .map(|e| e.status == reqwest::StatusCode::TOO_MANY_REQUESTS || e.status.is_server_error())
+        .unwrap_or(false)
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
@@ -29,8 +59,11 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
         .map(|home| home.join(".config").join("neurostrata"))
         .unwrap_or_else(|| PathBuf::from(".neurostrata"));
 
+    // Configuration is optional: the built-in defaults remain usable when
+    // the home directory is read-only. Persisting those defaults is best
+    // effort, like the write below, rather than a prerequisite for startup.
     if !config_dir.exists() {
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
+        let _ = fs::create_dir_all(&config_dir);
     }
 
     let config_path = config_dir.join("embedders.json");
@@ -100,16 +133,110 @@ fn find_existing_cache_dir() -> PathBuf {
     primary_neuro_cache
 }
 
-/// The model this process is configured to use: the one NEUROSTRATA_MODEL names
-/// when it is acceptable, otherwise the first acceptable entry.
+/// The model this process is configured to use. An absent selection chooses
+/// the first configured model; an explicit invalid selection fails closed.
 fn configured_model() -> Result<AcceptableEmbedder> {
     let acceptable_models = get_acceptable_embedders()?;
-    let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
-    Ok(acceptable_models
-        .iter()
-        .find(|m| m.model_name.eq_ignore_ascii_case(&env_model))
-        .unwrap_or(&acceptable_models[0])
-        .clone())
+    let requested = std::env::var("NEUROSTRATA_MODEL").ok();
+    select_configured_model(acceptable_models, requested.as_deref())
+}
+
+fn select_configured_model(
+    acceptable_models: Vec<AcceptableEmbedder>,
+    requested: Option<&str>,
+) -> Result<AcceptableEmbedder> {
+    match requested.filter(|name| !name.trim().is_empty()) {
+        Some(name) => acceptable_models
+            .into_iter()
+            .find(|model| model.model_name.eq_ignore_ascii_case(name.trim()))
+            .ok_or_else(|| anyhow::anyhow!("NEUROSTRATA_MODEL names no configured embedder")),
+        None => acceptable_models
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no embedding models are configured")),
+    }
+}
+
+fn local_model_details(model: &AcceptableEmbedder) -> Result<(EmbeddingModel, usize)> {
+    let parsed = EmbeddingModel::from_str(&model.model_name)
+        .map_err(|_| anyhow::anyhow!("unsupported local embedding model {:?}", model.model_name))?;
+    let info = TextEmbedding::get_model_info(&parsed)?;
+    let dimensions = info.dim;
+    if model.dimensions != dimensions {
+        anyhow::bail!(
+            "configured embedding width {} does not match model {:?} width {}",
+            model.dimensions,
+            parsed,
+            dimensions
+        );
+    }
+    Ok((parsed, dimensions))
+}
+
+fn is_remote_model(model: &AcceptableEmbedder) -> bool {
+    model.base_url.is_some() && model.api_key_env.is_some()
+}
+
+/// Canonical identity for a remote embedding space. The endpoint is hashed so
+/// credentials embedded in a URL never enter the database marker or errors.
+/// Trailing slashes do not change the endpoint identity.
+pub(crate) fn remote_embedder_id(base_url: &str, api_model: &str) -> String {
+    let endpoint_hash = sha2::Sha256::digest(base_url.trim_end_matches('/').as_bytes());
+    format!("remote-sha256:{}:{}", hex::encode(endpoint_hash), api_model)
+}
+
+/// Upgrade a legacy runtime identity only when it can be matched exactly to
+/// the configured canonical identity. Both endpoint URLs and model names may
+/// contain colons, so the legacy string cannot be split safely in isolation.
+pub(crate) fn canonicalize_persisted_embedder_id(
+    identity: &str,
+    configured_identity: &str,
+) -> Result<String> {
+    if identity == configured_identity || !identity.starts_with("remote:") {
+        return Ok(identity.to_string());
+    }
+    let Some(legacy) = identity.strip_prefix("remote:") else {
+        unreachable!();
+    };
+    if configured_identity.starts_with("remote-sha256:") {
+        for (split, _) in legacy.match_indices(':') {
+            let endpoint = &legacy[..split];
+            let model = &legacy[split + 1..];
+            if remote_embedder_id(endpoint, model) == configured_identity {
+                return Ok(configured_identity.to_string());
+            }
+        }
+    }
+    anyhow::bail!("legacy remote embedding model identity cannot be safely matched to the configured model; keep this database intact and reopen with its original endpoint and model, or use a separate database path")
+}
+
+fn configured_identity_for(model: &AcceptableEmbedder) -> Result<String> {
+    if is_remote_model(model) {
+        if model.dimensions == 0 {
+            anyhow::bail!("configured embedding dimensions must be positive");
+        }
+        let (Some(base_url), Some(_)) = (&model.base_url, &model.api_key_env) else {
+            unreachable!();
+        };
+        Ok(remote_embedder_id(
+            base_url,
+            model
+                .api_model
+                .as_deref()
+                .unwrap_or("text-embedding-3-small"),
+        ))
+    } else {
+        let (canonical_model, _) = local_model_details(model)?;
+        Ok(format!("fastembed:{canonical_model}"))
+    }
+}
+
+/// Stable, non-secret identity for the configured embedding space. This is
+/// available without loading the local model, so backup, restore, and metadata
+/// reads can validate the same identity as the daemon.
+pub fn configured_embedder_id() -> Result<String> {
+    let model = configured_model()?;
+    configured_identity_for(&model)
 }
 
 /// The embedding width of the configured model, without loading the model.
@@ -118,7 +245,15 @@ fn configured_model() -> Result<AcceptableEmbedder> {
 /// can mean a 523 MB download, which is the wrong thing to require on the fresh
 /// or offline machine a restore is usually run on.
 pub fn configured_dimensions() -> Result<usize> {
-    Ok(configured_model()?.dimensions)
+    let model = configured_model()?;
+    if is_remote_model(&model) {
+        if model.dimensions == 0 {
+            anyhow::bail!("configured embedding dimensions must be positive");
+        }
+        Ok(model.dimensions)
+    } else {
+        Ok(local_model_details(&model)?.1)
+    }
 }
 
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
@@ -135,8 +270,7 @@ impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let target_model = configured_model()?;
 
-        let model_enum = EmbeddingModel::from_str(&target_model.model_name)
-            .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
+        let (model_enum, dimensions) = local_model_details(&target_model)?;
 
         let cache_dir = find_existing_cache_dir();
 
@@ -154,6 +288,7 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
+        let model_name = format!("fastembed:{model_enum}");
         let model = TextEmbedding::try_new(
             TextInitOptions::new(model_enum)
                 .with_cache_dir(cache_dir)
@@ -163,8 +298,8 @@ impl FastEmbedder {
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
-            model_name: target_model.model_name.clone(),
-            dimensions: target_model.dimensions,
+            model_name,
+            dimensions,
         })
     }
 }
@@ -186,7 +321,18 @@ impl Embedder for FastEmbedder {
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
-        Ok(embeddings.pop().unwrap_or_default())
+        let embedding = embeddings
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("fastembed returned no embedding"))?;
+        if embedding.len() != self.dimensions {
+            anyhow::bail!(
+                "fastembed returned width {}, but configured model identity {} requires {}",
+                embedding.len(),
+                self.model_name,
+                self.dimensions
+            );
+        }
+        Ok(embedding)
     }
 
     fn dimensions(&self) -> usize {
@@ -214,18 +360,23 @@ impl RemoteEmbedder {
         api_model: String,
         dimensions: usize,
     ) -> Result<Self> {
+        if dimensions == 0 {
+            anyhow::bail!("remote embedding dimensions must be positive");
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
+        let normalized_base_url = base_url.trim_end_matches('/').to_string();
+        let model_name = remote_embedder_id(&normalized_base_url, &api_model);
 
         Ok(Self {
             client,
-            base_url,
+            base_url: normalized_base_url,
             api_key,
             api_model: api_model.clone(),
             dimensions,
-            model_name: api_model,
+            model_name,
         })
     }
 
@@ -233,17 +384,23 @@ impl RemoteEmbedder {
         let mut attempts = 0;
         loop {
             match self.try_embed(text).await {
-                Ok(embedding) => return Ok(embedding),
+                Ok(embedding) if embedding.len() == self.dimensions => return Ok(embedding),
+                Ok(embedding) => {
+                    return Err(anyhow::anyhow!(
+                        "remote embedding returned width {}, but configured model identity {} requires {}",
+                        embedding.len(),
+                        self.model_name,
+                        self.dimensions
+                    ));
+                }
                 Err(e) => {
                     attempts += 1;
                     if attempts >= 2 {
                         return Err(e);
                     }
-                    if let Some(status) = e.downcast_ref::<reqwest::StatusCode>() {
-                        if *status == 429 || status.is_server_error() {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
+                    if should_retry(&e) {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
                     return Err(e);
                 }
@@ -262,12 +419,12 @@ impl RemoteEmbedder {
             }))
             .send()
             .await
-            .context("HTTP request failed")?;
+            .map_err(|error| anyhow::anyhow!("HTTP request failed: {}", error.without_url()))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("API error {}: {}", status, body));
+            return Err(anyhow::Error::new(EmbedApiStatus { status, body }));
         }
 
         let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
@@ -310,8 +467,8 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
             .unwrap_or_else(|| "text-embedding-3-small".to_string());
 
         eprintln!(
-            "Initializing RemoteEmbedder with model: {} at {}",
-            api_model, base_url
+            "Initializing RemoteEmbedder with configured model {}",
+            api_model
         );
         Ok(Arc::new(RemoteEmbedder::new(
             base_url.clone(),
@@ -327,6 +484,64 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    struct MockEndpoint {
+        statuses: AsyncMutex<VecDeque<u16>>,
+        requests: AtomicUsize,
+    }
+
+    async fn mock_embedding(State(state): State<Arc<MockEndpoint>>) -> impl IntoResponse {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        let status = state.statuses.lock().await.pop_front().unwrap_or(200);
+        let status = StatusCode::from_u16(status).unwrap();
+        if status.is_success() {
+            (status, Json(json!({"data": [{"embedding": [0.25, 0.5]}]}))).into_response()
+        } else {
+            (status, Json(json!({"error": "mock failure"}))).into_response()
+        }
+    }
+
+    async fn exercise_retry(
+        statuses: &[u16],
+        expected_requests: usize,
+        succeeds: bool,
+        dimensions: usize,
+    ) {
+        let state = Arc::new(MockEndpoint {
+            statuses: AsyncMutex::new(statuses.iter().copied().collect()),
+            requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/embeddings", post(mock_embedding))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{address}"),
+            "test-key".into(),
+            "test-model".into(),
+            dimensions,
+        )
+        .unwrap();
+        let result = embedder.embed("test").await;
+        assert_eq!(result.is_ok(), succeeds, "status sequence {statuses:?}");
+        assert_eq!(
+            state.requests.load(Ordering::SeqCst),
+            expected_requests,
+            "status sequence {statuses:?}"
+        );
+        server.abort();
+    }
 
     #[test]
     fn the_configured_width_is_known_without_loading_a_model() {
@@ -346,13 +561,6 @@ mod tests {
         assert!(embedder.is_ok());
     }
 
-    #[tokio::test]
-    async fn remote_embedder_retries_on_500() {
-        // Mock server returning 500 then 200
-        // This would require wiremock or similar
-        // Placeholder for integration test
-    }
-
     #[test]
     fn remote_embedder_dimensions_match() {
         let embedder = RemoteEmbedder::new(
@@ -366,10 +574,235 @@ mod tests {
     }
 
     #[test]
-    fn build_embedder_falls_back_to_local() {
-        // When no remote config, should use local
-        // This tests the factory logic
-        let embedder = build_embedder();
-        assert!(embedder.is_ok());
+    fn default_configuration_selects_local_embedding() {
+        // Verify backend selection without loading or downloading a model.
+        // Model availability is an installation concern, not a factory test.
+        let model = configured_model().expect("built-in embedding defaults resolve");
+        assert!(model.base_url.is_none());
+        assert!(model.api_key_env.is_none());
+        assert_eq!(model.model_name, "NomicEmbedTextV15");
+        assert_eq!(local_model_details(&model).unwrap().1, 768);
+    }
+
+    #[test]
+    fn explicitly_invalid_model_selection_fails_without_defaulting() {
+        let models = vec![AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15".into(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        }];
+        assert!(select_configured_model(models, Some("typo-model")).is_err());
+    }
+
+    #[test]
+    fn local_model_validation_rejects_unknown_names_and_wrong_widths() {
+        let mut model = AcceptableEmbedder {
+            model_name: "NotARealFastEmbedModel".into(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        };
+        assert!(local_model_details(&model).is_err());
+
+        model.model_name = "NomicEmbedTextV15".into();
+        model.dimensions = 384;
+        assert!(local_model_details(&model).is_err());
+
+        model.dimensions = 768;
+        let (variant, width) = local_model_details(&model).unwrap();
+        assert_eq!(width, 768);
+        assert_eq!(
+            configured_identity_for(&model).unwrap(),
+            format!("fastembed:{variant}")
+        );
+    }
+
+    #[test]
+    fn same_width_local_models_keep_distinct_canonical_identities() {
+        let model_a = AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15".into(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        };
+        let model_b = AcceptableEmbedder {
+            model_name: "BGEBaseENV15".into(),
+            ..model_a.clone()
+        };
+        assert_eq!(local_model_details(&model_a).unwrap().1, 768);
+        assert_eq!(local_model_details(&model_b).unwrap().1, 768);
+        assert_ne!(
+            configured_identity_for(&model_a).unwrap(),
+            configured_identity_for(&model_b).unwrap()
+        );
+    }
+
+    #[test]
+    fn configured_and_runtime_remote_identities_are_canonical_and_secret_free() {
+        let endpoint = "https://user:top-secret@example.test/v1///";
+        let model = AcceptableEmbedder {
+            model_name: "tenant-remote".into(),
+            dimensions: 768,
+            base_url: Some(endpoint.into()),
+            api_key_env: Some("REMOTE_API_KEY".into()),
+            api_model: Some("embed-v2".into()),
+        };
+        let configured = configured_identity_for(&model).unwrap();
+        let runtime = RemoteEmbedder::new(
+            endpoint.into(),
+            "not-part-of-the-identity".into(),
+            "embed-v2".into(),
+            768,
+        )
+        .unwrap();
+
+        assert_eq!(configured, runtime.embedder_id());
+        assert_eq!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                base_url: Some("https://user:top-secret@example.test/v1".into()),
+                ..model.clone()
+            })
+            .unwrap(),
+            "trailing slashes do not change configured identity"
+        );
+        assert_ne!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                base_url: Some("https://user:top-secret@example.test/other".into()),
+                ..model.clone()
+            })
+            .unwrap(),
+            "changing the endpoint changes identity"
+        );
+        assert_eq!(
+            configured,
+            canonicalize_persisted_embedder_id(
+                "remote:https://user:top-secret@example.test/v1:embed-v2",
+                &configured,
+            )
+            .unwrap(),
+            "older markers are normalized before comparison and rewritten safely"
+        );
+        let colon_model_identity = remote_embedder_id(
+            "https://user:top-secret@example.test/v1",
+            "nomic-embed-text:latest",
+        );
+        assert_eq!(
+            canonicalize_persisted_embedder_id(
+                "remote:https://user:top-secret@example.test/v1:nomic-embed-text:latest",
+                &colon_model_identity,
+            )
+            .unwrap(),
+            colon_model_identity,
+            "legacy model names with colons are matched against the full configured endpoint and model"
+        );
+        let mismatch = canonicalize_persisted_embedder_id(
+            "remote:https://other:secret@example.test/v1:nomic-embed-text:latest",
+            &colon_model_identity,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!mismatch.contains("secret"));
+        assert!(!mismatch.contains("https://"));
+        assert_ne!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                base_url: Some("https://other:top-secret@example.test/v1".into()),
+                ..model.clone()
+            })
+            .unwrap(),
+            "changing endpoint identity changes the hash"
+        );
+        assert_ne!(
+            configured,
+            configured_identity_for(&AcceptableEmbedder {
+                api_model: Some("embed-v3".into()),
+                ..model
+            })
+            .unwrap(),
+            "changing the model changes identity"
+        );
+        for secret in ["user", "top-secret", "example.test", "https://"] {
+            assert!(!configured.contains(secret), "identity leaked {secret}");
+            assert!(!runtime.embedder_id().contains(secret));
+        }
+        let marker = serde_json::json!({ "embedder_id": configured }).to_string();
+        assert!(!marker.contains("top-secret"));
+        assert!(!marker.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn remote_request_errors_do_not_format_url_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = RemoteEmbedder::new(
+            format!("http://user:top-secret@{address}"),
+            "secret-key".into(),
+            "embed-v2".into(),
+            2,
+        )
+        .unwrap()
+        .embed("test")
+        .await
+        .unwrap_err();
+        let safe = format!("{error:#}");
+        assert!(!safe.contains("top-secret"));
+        assert!(!safe.contains("user@"));
+    }
+
+    /// The retry used to probe `downcast_ref::<StatusCode>()` on a string that
+    /// held no status, so a 429 never retried. The status has to survive the
+    /// conversion into an error.
+    #[test]
+    fn api_status_survives_the_anyhow_chain() {
+        let error = anyhow::Error::new(EmbedApiStatus {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: "slow down".to_string(),
+        });
+
+        let recovered = error
+            .downcast_ref::<EmbedApiStatus>()
+            .expect("the status must be recoverable, or the retry never fires");
+        assert_eq!(recovered.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.to_string().contains("slow down"));
+    }
+
+    #[test]
+    fn rate_limits_and_server_errors_are_retried() {
+        let status = |code: u16| {
+            anyhow::Error::new(EmbedApiStatus {
+                status: reqwest::StatusCode::from_u16(code).expect("valid status"),
+                body: String::new(),
+            })
+        };
+
+        assert!(should_retry(&status(429)), "429 is a rate limit");
+        assert!(should_retry(&status(500)), "5xx is transient");
+        assert!(should_retry(&status(503)), "5xx is transient");
+        assert!(
+            !should_retry(&status(400)),
+            "a bad request will not improve"
+        );
+        assert!(!should_retry(&status(401)), "a bad key will not improve");
+        assert!(
+            !should_retry(&anyhow::anyhow!("connection reset")),
+            "an untyped error must not be retried as if it were a rate limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_retry_policy_runs_against_a_local_http_server() {
+        exercise_retry(&[429, 200], 2, true, 2).await;
+        exercise_retry(&[503, 200], 2, true, 2).await;
+        exercise_retry(&[503, 503], 2, false, 2).await;
+        exercise_retry(&[400, 200], 1, false, 2).await;
+        exercise_retry(&[401, 200], 1, false, 2).await;
+        exercise_retry(&[200], 1, false, 3).await;
     }
 }

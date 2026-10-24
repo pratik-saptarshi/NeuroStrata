@@ -1,4 +1,4 @@
-use crate::config::{DeduplicationConfig, DedupProviderMode};
+use crate::config::{DedupProviderMode, DeduplicationConfig};
 use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
@@ -1773,7 +1773,10 @@ impl crate::traits::AsAny for RecordingStore {
         // Wait for the listener to answer at all; a daemon that could not
         // bind fails its own join below rather than hanging here.
         let mut serving = false;
-        for _ in 0..500 {
+        // Startup fingerprints the executable before binding. The test binary
+        // can be very large when native dependencies are statically linked,
+        // so allow that initialization to finish in constrained CI containers.
+        for _ in 0..3000 {
             if client
                 .get(format!("{base}/health"))
                 .send()
@@ -1848,7 +1851,10 @@ impl crate::traits::AsAny for RecordingStore {
         // Wait for the listener to answer at all; a daemon that could not bind
         // fails its own join below rather than hanging here.
         let mut serving = false;
-        for _ in 0..500 {
+        // Keep the helper's readiness window consistent with the explicit
+        // startup-order test above; native test binaries may take longer to
+        // fingerprint than the production executable.
+        for _ in 0..3000 {
             if client
                 .get(format!("{base}/health"))
                 .send()

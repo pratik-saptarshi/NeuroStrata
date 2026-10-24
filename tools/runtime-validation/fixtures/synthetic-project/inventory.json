@@ -1,0 +1,63 @@
+{
+  "classification": "synthetic, small workflow fixture; not production representative",
+  "corpus_files": [
+    "docs/fixture.md",
+    "src/core.rs",
+    "src/long_symbol.rs",
+    "src/recovery.rs"
+  ],
+  "implemented_assertions": [
+    "exact seeded IDs, contents, namespaces, and types survive ingest",
+    "manual rule GOVERNS edge points to exact qualified ID synthetic-validation::src/core.rs",
+    "database and WAL fit post-command acceptance cap"
+  ],
+  "not_implemented_in_runner": [
+    "old/new generation visibility at process-crash boundary",
+    "no mixed IDs, vectors, or payloads",
+    "restore round-trip",
+    "source removal and reingest"
+  ],
+  "planned_but_not_run_here": [
+    "identical reingest",
+    "source removal/replacement",
+    "backup and restore",
+    "process crash boundaries",
+    "reader concurrency"
+  ],
+  "preservation_records": [
+    {
+      "content": "synthetic fact: keep exact text",
+      "namespace": "validation-preservation",
+      "type": "fact"
+    },
+    {
+      "content": "synthetic task: keep status",
+      "namespace": "validation-preservation",
+      "type": "task"
+    },
+    {
+      "content": "synthetic procedure: keep steps",
+      "namespace": "validation-preservation",
+      "type": "procedure"
+    },
+    {
+      "content": "synthetic history: keep provenance",
+      "namespace": "validation-preservation",
+      "type": "history"
+    },
+    {
+      "content": "synthetic rule: governs src/core.rs",
+      "edge": {
+        "target": "synthetic-validation::src/core.rs",
+        "type": "GOVERNS"
+      },
+      "namespace": "synthetic-validation",
+      "type": "rule"
+    }
+  ],
+  "runner_cases": [
+    "one initial real CLI ingest at the fixture project root using ./src",
+    "preservation readback of five hand-written memory types",
+    "same-namespace GOVERNS edge targets synthetic-validation::src/core.rs exactly"
+  ]
+}
