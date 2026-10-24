@@ -368,6 +368,83 @@ fn classify_probe(reached: bool, refused: bool) -> DaemonProbe {
     }
 }
 
+/// Human-readable byte count for the startup summary: whole GiB/MiB
+/// render as such, anything else falls back to raw bytes.
+fn format_bytes_human(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes % GIB == 0 {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// The startup summary line (Spec Feature 1): the resolved embedder and
+/// both store limits, each with the layer that supplied it, so an
+/// operator can always answer "why this model, why these limits?".
+/// Kept as one small formatter so later features (idle unload) extend
+/// this surface rather than growing a second one.
+fn format_startup_summary(
+    resolution: &embed::ResolvedModel,
+    profile: Option<config::CapacityProfile>,
+    limits: crate::store::StoreLimits,
+    sources: &config::StoreLimitSources,
+) -> String {
+    let embedder_source = match resolution.source {
+        embed::ModelSource::Profile => match profile {
+            Some(profile) => format!("profile={}", profile.name()),
+            None => embed::ModelSource::Profile.label().to_string(),
+        },
+        source => source.label().to_string(),
+    };
+    format!(
+        "embedder: {} (source: {}) \u{b7} store: pool {} (source: {}), max DB {} (source: {})",
+        resolution.model.model_name,
+        embedder_source,
+        format_bytes_human(limits.buffer_pool_bytes),
+        sources.pool.label(),
+        format_bytes_human(limits.max_db_bytes),
+        sources.max_db.label(),
+    )
+}
+
+/// The outcome of startup resolution: everything a startup path needs to
+/// open its store consistently with what the summary line reported.
+struct StartupResolution {
+    limits: crate::store::StoreLimits,
+}
+
+/// Resolve the capacity profile, the embedder, and the store limits once
+/// at startup; print the summary line (always, profile or not) and, on a
+/// profile/model disagreement, the single warning. This is a
+/// profile-consuming surface: an invalid `NEUROSTRATA_PROFILE` fails
+/// here, at embedder construction / store opening -- never on commands
+/// that do neither (Spec AC6).
+fn resolve_startup(config: &Config) -> anyhow::Result<StartupResolution> {
+    let profile = crate::config::CapacityProfile::from_env()?;
+    let resolution = embed::configured_resolution()?;
+    let (limits, sources) = config.store_limits_resolved(profile)?;
+    println!(
+        "{}",
+        format_startup_summary(&resolution, profile, limits, &sources)
+    );
+    if let Some(disagreement) = embed::profile_disagreement(&resolution, profile) {
+        eprintln!("{}", embed::format_disagreement_warning(&disagreement));
+    }
+    Ok(StartupResolution { limits })
+}
+
+/// Store limits for a store-opening surface that is not a startup path:
+/// the profile is parsed by this caller and passed in, so
+/// `Config::store_limits()` itself stays profile-free.
+fn profiled_store_limits(config: &Config) -> anyhow::Result<crate::store::StoreLimits> {
+    let profile = crate::config::CapacityProfile::from_env()?;
+    config.store_limits_with_profile(profile)
+}
+
 /// Whether the answering daemon runs the build the binary on disk holds.
 enum Skew {
     InSync(String),
@@ -990,6 +1067,104 @@ mod tests {
                 std::env::remove_var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL");
             }
         }
+    }
+
+    // Task 2 (capacity profiles): the startup summary line is the
+    // operator's answer to "why this model, why these limits" (Spec AC8).
+
+    #[test]
+    fn summary_line_reports_provenance() {
+        let resolution = embed::ResolvedModel {
+            model: embed::AcceptableEmbedder {
+                model_name: "BGESmallENV15Q".to_string(),
+                dimensions: 384,
+                base_url: None,
+                api_key_env: None,
+                api_model: None,
+                generated_by: None,
+            },
+            source: embed::ModelSource::Profile,
+        };
+        let profile = Some(config::CapacityProfile::Low);
+        let limits = crate::store::StoreLimits {
+            buffer_pool_bytes: config::CapacityProfile::Low.buffer_pool_bytes(),
+            max_db_bytes: config::CapacityProfile::Low.max_db_bytes(),
+        };
+        let sources = config::StoreLimitSources {
+            pool: config::StoreLimitSource::Profile,
+            max_db: config::StoreLimitSource::Profile,
+        };
+        let line = format_startup_summary(&resolution, profile, limits, &sources);
+        assert!(line.contains("BGESmallENV15Q"), "{line}");
+        assert!(line.contains("profile=low"), "{line}");
+        assert!(line.contains("64 MiB"), "{line}");
+        assert!(line.contains("2 GiB"), "{line}");
+        assert!(line.contains("source: profile"), "{line}");
+
+        // No profile, no explicit config: the sources name the
+        // auto-generated file and the built-in defaults.
+        let resolution = embed::ResolvedModel {
+            model: embed::AcceptableEmbedder {
+                model_name: "NomicEmbedTextV15".to_string(),
+                dimensions: 768,
+                base_url: None,
+                api_key_env: None,
+                api_model: None,
+                generated_by: None,
+            },
+            source: embed::ModelSource::AutoGeneratedFile,
+        };
+        let sources = config::StoreLimitSources {
+            pool: config::StoreLimitSource::BuiltInDefault,
+            max_db: config::StoreLimitSource::BuiltInDefault,
+        };
+        let line = format_startup_summary(
+            &resolution,
+            None,
+            crate::store::StoreLimits::default(),
+            &sources,
+        );
+        assert!(line.contains("file (auto-generated)"), "{line}");
+        assert!(line.contains("built-in default"), "{line}");
+    }
+
+    /// Spec AC6: the CLI Status path succeeds with an invalid
+    /// `NEUROSTRATA_PROFILE` set because it never consults the profile.
+    /// Status calls `std::process::exit`, so it cannot be exercised
+    /// in-process; the pin is structural -- the dedicated Status arm's
+    /// source must not reference the profile parser, the profile env var,
+    /// or embedder resolution. (A behavioral complement lives in
+    /// embed::tests::invalid_profile_scoped_error: the same invalid value
+    /// DOES fail the embedder-construction surface.)
+    #[test]
+    fn status_path_never_consults_the_profile_parser() {
+        let source = include_str!("main.rs");
+        // The leading newline + arm indentation keeps this search from
+        // matching this test's own literals.
+        let status_start = source
+            .find("\n            Commands::Status => {")
+            .expect("the dedicated Status arm exists");
+        let status_end = source[status_start..]
+            .find("Commands::Backup")
+            .map(|offset| status_start + offset)
+            .expect("the Status arm is followed by the Backup arm");
+        let status_arm = &source[status_start..status_end];
+        assert!(
+            !status_arm.contains("CapacityProfile"),
+            "the Status arm must not parse the capacity profile"
+        );
+        assert!(
+            !status_arm.contains("NEUROSTRATA_PROFILE"),
+            "the Status arm must not read NEUROSTRATA_PROFILE"
+        );
+        assert!(
+            !status_arm.contains("configured_resolution"),
+            "the Status arm must not resolve the embedder"
+        );
+        assert!(
+            !status_arm.contains("store_limits_with_profile"),
+            "the Status arm must not apply the profile to store limits"
+        );
     }
 
     fn release_test_barrier(path: &std::path::Path) {
@@ -2968,13 +3143,14 @@ async fn run() -> anyhow::Result<()> {
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
                 let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
+                let startup = resolve_startup(&config)?;
                 let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> =
                     Arc::new(LadybugStore::new_with_identity_limits(
                         config.db_path.to_string_lossy().to_string(),
                         embedder.dimensions(),
                         embedder.embedder_id().to_string(),
-                        config.store_limits()?,
+                        startup.limits,
                     )?);
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
@@ -3214,7 +3390,7 @@ async fn run() -> anyhow::Result<()> {
                         config.db_path.to_string_lossy().to_string(),
                         embed::configured_dimensions()?,
                         embed::configured_embedder_id()?,
-                        config.store_limits()?,
+                        profiled_store_limits(&config)?,
                     )?);
                 vector_store.export_database(&dir).await?;
                 println!("Backed up to {}", dir);
@@ -3504,7 +3680,7 @@ async fn run() -> anyhow::Result<()> {
                                 config.db_path.to_string_lossy().to_string(),
                                 embedder.dimensions(),
                                 embedder.embedder_id().to_string(),
-                                config.store_limits()?,
+                                profiled_store_limits(&config)?,
                             )?);
                         match crate::task::import_beads(
                             vector_store,
@@ -3723,13 +3899,14 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
+                let startup = resolve_startup(&config)?;
                 let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> =
                     Arc::new(LadybugStore::new_with_identity_limits(
                         config.db_path.to_string_lossy().to_string(),
                         embedder.dimensions(),
                         embedder.embedder_id().to_string(),
-                        config.store_limits()?,
+                        startup.limits,
                     )?);
                 let read = ReadSource::Direct(vector_store.clone());
 
