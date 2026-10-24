@@ -205,30 +205,27 @@ active stage preservation, full row/vector/edge equality, lease ownership, and
 subsequent successful publication.
 
 **Current candidate evidence.** Changed Rust files pass `rustfmt --check` and
-`git diff --check`; relocated Python runtime-harness tests pass 5/5. The complete locked
-serial Rust suite passes 796/796 on the current local working tree with the
-temporary `fastembed/ort-load-dynamic` feature and lbug built from cached source
-using `LBUG_BUILD_FROM_SOURCE=1` and the installed CMake executable at
-`/tmp/neuro-python-cmake/cmake/data/bin/cmake`. Fourteen focused marker-alias,
-lease-recovery, reserved-destination, and marker-write-failure regressions also
-pass. Marker write/replace failure now propagates from construction, and the
-failure regression verifies prior evidence and temporary-file cleanup. This is local
-alternative-build evidence, not default-feature verification or hosted CI. An
-initial lbug prebuilt fetch returned proxy HTTP 403 (one alternate artifact URL
-returned 404); no retry was made. The CMake distribution was already present in
-`/tmp`, but its wrapper referenced an unavailable Python interpreter, so the
-source build used the executable directly. The harness, tests, README, and
-immutable synthetic corpus now live under `tools/runtime-validation/`; Python
+`git diff --check`; relocated Python runtime-harness tests pass 5/5. The complete
+serial Rust suite for the latest Rust source commit
+`442a509374e2f45b3c46132f8e23b3206304aa96` passed 782/782 in 97.16 seconds
+with the temporary `fastembed/ort-load-dynamic` feature and source-built
+LadybugDB. The follow-up tooling-only commit `4bd978b2e7d0bc882c2e7712db6604321a7efd94`
+also compiled the locked Rust test binary with that feature, and package listing
+confirmed the Python subtree is excluded. These are local alternative-build
+results, not default-feature verification or hosted CI. The default ONNX
+prebuilt download was denied by the proxy with HTTP 403; no retry or alternate
+download route was used. The compatible CMake executable was already present in
+`/tmp` and used directly for source-built LadybugDB. The harness, tests, README,
+and immutable synthetic corpus live under `tools/runtime-validation/`; Python
 uses only the standard library. The fixture generator reads source/docs and
-metadata without rewriting checked-in files (verified by hashes and a regression).
-Cargo source-package listing excludes that entire tooling subtree; `Cargo.lock`
-and dependency declarations are unchanged. The tested Rust source was pushed as commit
-`6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` to the fork branch; PR #1 remains
-open and draft. Exact-head workflow and combined-status queries returned no
-run/status, and no workflow-dispatch action is available here, so default hosted
-CI is pending rather than passed. Task and memory MCP tools and `neurostrata-mcp`
-are unavailable here, so no task was claimed or invented. Earlier CI on
-`3db8372` does not validate these edits.
+metadata without rewriting checked-in files, verified by a byte-preservation
+regression. Cargo source-package listing excludes the tooling subtree, and
+`Cargo.lock` plus dependency declarations are unchanged. PR #1 remains open and
+draft. The latest fork head `4bd978b2e7d0bc882c2e7712db6604321a7efd94` has no
+workflow run or combined status in the available exact-SHA queries, and no
+workflow-dispatch action is exposed here, so hosted CI for this head is pending.
+Task/memory MCP tools and `neurostrata-mcp` are unavailable here, so no task was
+claimed or invented. Earlier CI on `3db8372` does not validate the later commits.
 
 ---
 
@@ -238,9 +235,9 @@ are unavailable here, so no task was claimed or invented. Earlier CI on
 |---|---|
 | Source changes | Implemented; changed Rust files formatted; `git diff --check` passes |
 | Type-check | Full locked Cargo test build compiled the current test binary with temporary `ort-load-dynamic` override and source-built LadybugDB |
-| Binary test suite | 796/796 passed in 93.66 seconds on the current local working tree; 14 focused safeguard regressions passed. This is alternative local verification, not default-feature verification. Actual local inference was not exercised |
+| Binary test suite | Rust source commit `442a509374e2f45b3c46132f8e23b3206304aa96`: 782/782 in 97.16 seconds under the alternative local build; latest tooling-only head `4bd978b2e7d0bc882c2e7712db6604321a7efd94`: locked test binary compiled with the same feature override. Actual local inference was not exercised |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; the installed system ONNX Runtime 1.21 is incompatible with the ort API-24 requirement. No download bypass was attempted |
-| Exact-head PR CI | Previously published head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). Current pushed head `6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` has no hosted run/status yet; the available GitHub tools expose no workflow-dispatch action |
+| Exact-head PR CI | Earlier head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). Current pushed head `4bd978b2e7d0bc882c2e7712db6604321a7efd94` has no hosted run/status yet; the available GitHub tools expose no workflow-dispatch action |
 | Runtime harness | Relocated runner tests pass 5/5; preparation validates the 1,977-byte four-file checked-in fixture without rewriting its source or metadata. Cargo package listing excludes the tooling subtree. No real CLI inference run. It uses an 8 GiB per-process address-space limit and 120s per-command timeouts. The 20m wall-time window is an acceptance deadline checked after synchronous setup copies and before/after CLI phases; a single copy call cannot be interrupted. RSS 4 GiB and DB/WAL 1 GiB are post-command acceptance thresholds, not live enforcement; independent memory and temporary-disk quotas are required around actual runs |
 | Runtime memory comparison | Not executed: no matched base/candidate runs, no real inference, no raw measurement logs, and no empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
