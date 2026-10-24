@@ -1541,6 +1541,17 @@ impl Dirty {
     }
 }
 
+/// Marks a write attempt dirty before its cross-process writer lock is
+/// released. Checkpoint acquires the same lock before taking this flag, so a
+/// canceled caller cannot hide a mutation from the checkpoint loop.
+struct MarkDirtyOnDrop(Dirty);
+
+impl Drop for MarkDirtyOnDrop {
+    fn drop(&mut self) {
+        self.0.mark();
+    }
+}
+
 /// Normal open: checksums on, and replay failures throw. The throw is the whole
 /// point -- with it off the engine swallows a failed verification, opens anyway
 /// and silently drops every record it could not authenticate, which is exactly
@@ -2319,6 +2330,7 @@ impl LadybugStore {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
         let db_path = self.local_path.clone();
+        let write_dirty = self.dirty.clone();
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -2335,8 +2347,14 @@ impl LadybugStore {
             // handing the caller a failure it can do nothing about.
             let mut attempt = 0;
             loop {
-                let (returned, result) =
-                    Self::write_owning_turn(db.clone(), db_path.clone(), turn, f.clone()).await?;
+                let (returned, result) = Self::write_owning_turn(
+                    db.clone(),
+                    db_path.clone(),
+                    turn,
+                    write_dirty.clone(),
+                    f.clone(),
+                )
+                .await?;
                 turn = returned;
 
                 match result {
@@ -2364,10 +2382,6 @@ impl LadybugStore {
             );
         }
 
-        // Marked whatever the outcome: a write that timed out may still land,
-        // and an unnecessary checkpoint attempt costs nothing next to a write
-        // that never reaches disk.
-        self.dirty.mark();
         outcome
     }
 
@@ -2388,12 +2402,19 @@ impl LadybugStore {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
         let db_path = self.local_path.clone();
+        let write_dirty = self.dirty.clone();
         let mut worker = tokio::spawn(async move {
             let mut turn = write_lock.lock_owned().await;
             let mut attempt = 0;
             loop {
-                let (returned, result) =
-                    Self::write_owning_turn(db.clone(), db_path.clone(), turn, f.clone()).await?;
+                let (returned, result) = Self::write_owning_turn(
+                    db.clone(),
+                    db_path.clone(),
+                    turn,
+                    write_dirty.clone(),
+                    f.clone(),
+                )
+                .await?;
                 turn = returned;
                 match result {
                     Err(error)
@@ -2423,7 +2444,6 @@ impl LadybugStore {
                 })?
             }
         };
-        self.dirty.mark();
         outcome
     }
 
@@ -2438,6 +2458,7 @@ impl LadybugStore {
         db: Arc<Database>,
         db_path: PathBuf,
         turn: tokio::sync::OwnedMutexGuard<()>,
+        dirty: Dirty,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
     where
@@ -2456,6 +2477,7 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let _cross_process_writer = acquire_database_writer_lock(&db_path)?;
                 let conn = Connection::new(&db)?;
+                let _mark_dirty = MarkDirtyOnDrop(dirty);
                 f(&conn)
             })();
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5182,6 +5204,14 @@ mod tests {
         seed_process_crash_publication_fixture(&db, namespace, &stage).await;
         let store = std::sync::Arc::new(LadybugStore::for_testing(&db, 4).unwrap());
         store.init("cancel-publication").await.unwrap();
+        store
+            .checkpoint()
+            .await
+            .expect("checkpoint staged generation before publication");
+        assert!(
+            !store.is_dirty(),
+            "publication starts with no pending checkpoint work"
+        );
         let barrier = root.join("barrier");
         set_test_publish_crash_barrier("precommit", db.clone(), barrier.clone());
         let writer_store = store.clone();
@@ -5213,25 +5243,26 @@ mod tests {
         release_path.push(".release");
         std::fs::write(release_path, "continue").unwrap();
 
-        let new_id = format!(
-            "{}{}old.rs",
-            namespace,
-            crate::parser::ingest::NAMESPACE_SEPARATOR
-        );
-        let started = std::time::Instant::now();
-        loop {
-            if let Some((_, payload)) = store.get(namespace, &new_id).await.unwrap() {
-                if payload.content == "new-generation-0" {
-                    break;
-                }
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(20),
-                "detached publication did not resolve after caller cancellation"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let lock_path = db.clone();
+        let drained_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&lock_path))
+                .await
+                .expect("writer-lock waiter completes")
+                .expect("detached publication releases its writer lock");
         assert_process_crash_generation(&store, namespace, true).await;
+        assert!(
+            store.is_dirty(),
+            "a committed publication must remain dirty after its caller is canceled"
+        );
+        drop(drained_writer);
+        store
+            .checkpoint()
+            .await
+            .expect("checkpoint the committed publication");
+        assert!(
+            !store.is_dirty(),
+            "checkpoint clears the publication dirty flag"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6856,6 +6887,297 @@ eurostrata\src\daemon.rs",
         assert!(err.contains("deleting a memory"), "{}", err);
         // The caller is released, not the query -- saying so is the point.
         assert!(err.contains("may still be running"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_write_does_not_dispatch_or_mark_dirty() {
+        use std::future::Future;
+
+        struct NoopWake;
+        impl std::task::Wake for NoopWake {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("queued-write-cancel-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("queued-write-cancel").await.unwrap();
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+
+        let held_turn = store.write_lock.clone().lock_owned().await;
+        let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dispatched_by_write = dispatched.clone();
+        let mut write = Box::pin(store.write_with_deadline("queued cancellation", move |_| {
+            dispatched_by_write.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }));
+        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWake));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            write.as_mut().poll(&mut context).is_pending(),
+            "write must be queued behind the held turn"
+        );
+        drop(write);
+        drop(held_turn);
+
+        assert!(
+            !dispatched.load(std::sync::atomic::Ordering::Acquire),
+            "cancellation before dispatch must not run the write closure"
+        );
+        assert!(!store.is_dirty(), "a queued cancellation is not a mutation");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_write_marks_dirty_after_its_caller_is_cancelled() {
+        let root =
+            std::env::temp_dir().join(format!("dispatched-write-cancel-{}", uuid::Uuid::new_v4()));
+        let db = root.join("fixture.store");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = std::sync::Arc::new(LadybugStore::for_testing(&db, 4).expect("open DB"));
+        store.init("dispatched-write-cancel").await.unwrap();
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            writer_store
+                .write_with_deadline("cancelled dispatched write", move |conn| {
+                    conn.query("BEGIN TRANSACTION")?;
+                    conn.query("CREATE (m:Memory {id: 'dispatched-write-cancel::row', namespace: 'dispatched-write-cancel', content: 'committed', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'fixture.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
+                    started_tx.send(()).expect("signal dispatched write");
+                    release_rx.lock().unwrap().recv().expect("release write");
+                    conn.query("COMMIT")?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("write dispatched"))
+            .await
+            .unwrap();
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        release_tx.send(()).expect("release detached engine write");
+
+        let lock_path = db.clone();
+        let drained_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&lock_path))
+                .await
+                .expect("writer-lock waiter completes")
+                .expect("dispatched write releases its writer lock");
+        assert!(store.is_dirty(), "the blocking write worker marks dirty");
+        drop(drained_writer);
+
+        let row: Option<String> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (m:Memory) WHERE m.id = 'dispatched-write-cancel::row' RETURN m.content",
+                )?;
+                Ok(rows.next().map(|row| format!("{}", row[0])))
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.as_deref(), Some("committed"));
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty(), "checkpoint clears the completed write");
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_dispatched_write_marks_dirty_when_it_finishes() {
+        let root =
+            std::env::temp_dir().join(format!("dispatched-write-timeout-{}", uuid::Uuid::new_v4()));
+        let db = root.join("fixture.store");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = std::sync::Arc::new(LadybugStore::for_testing(&db, 4).expect("open DB"));
+        store.init("dispatched-write-timeout").await.unwrap();
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            writer_store
+                .write_with_deadline("timed out dispatched write", move |conn| {
+                    conn.query("BEGIN TRANSACTION")?;
+                    conn.query("CREATE (m:Memory {id: 'dispatched-write-timeout::row', namespace: 'dispatched-write-timeout', content: 'committed', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'fixture.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
+                    started_tx.send(()).expect("signal dispatched write");
+                    release_rx.lock().unwrap().recv().expect("release write");
+                    conn.query("COMMIT")?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("write dispatched"))
+            .await
+            .unwrap();
+        let timeout = writer.await.expect("deadline returns to the caller");
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+        assert!(timeout
+            .unwrap_err()
+            .to_string()
+            .contains("may still be running"));
+        assert!(
+            !store.is_dirty(),
+            "the pending transaction has not finished"
+        );
+        release_tx.send(()).expect("release detached engine write");
+
+        let lock_path = db.clone();
+        let drained_writer =
+            tokio::task::spawn_blocking(move || acquire_database_writer_lock(&lock_path))
+                .await
+                .expect("writer-lock waiter completes")
+                .expect("timed-out write releases its writer lock");
+        assert!(store.is_dirty(), "the completed blocking write marks dirty");
+        drop(drained_writer);
+
+        let row: Option<String> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query("MATCH (m:Memory) WHERE m.id = 'dispatched-write-timeout::row' RETURN m.content")?;
+                Ok(rows.next().map(|row| format!("{}", row[0])))
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.as_deref(), Some("committed"));
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty(), "checkpoint clears the completed write");
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_write_error_after_mutation_keeps_the_store_dirty() {
+        let root =
+            std::env::temp_dir().join(format!("partial-write-dirty-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("partial-write-dirty").await.unwrap();
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+
+        let result: anyhow::Result<()> = store
+            .write_with_deadline("partial write fixture", move |conn| {
+                conn.query("CREATE (m:Memory {id: 'partial-write-dirty::row', namespace: 'partial-write-dirty', content: 'partially written', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'partial.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
+                anyhow::bail!("simulated failure after mutation")
+            })
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("simulated failure"));
+        assert!(
+            store.is_dirty(),
+            "an error after a possibly committed statement remains checkpoint-visible"
+        );
+        let row: Option<String> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (m:Memory) WHERE m.id = 'partial-write-dirty::row' RETURN m.content",
+                )?;
+                Ok(rows.next().map(|row| format!("{}", row[0])))
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.as_deref(), Some("partially written"));
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_write_queued_behind_checkpoint_marks_dirty_after_checkpoint_clears() {
+        let root =
+            std::env::temp_dir().join(format!("checkpoint-queued-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("fixture.store");
+        let store = std::sync::Arc::new(LadybugStore::for_testing(&db, 4).expect("open DB"));
+        store.init("checkpoint-queued-write").await.unwrap();
+        store
+            .upsert(
+                "checkpoint-queued-write",
+                "checkpoint-queued-write::seed",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "seed".into(),
+                    user_id: "owner".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: "seed.rs".into(),
+                    location_lines: "1".into(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty(), "staging work was checkpointed first");
+
+        let started_before_checkpoint =
+            ENGINE_CALLS_STARTED.load(std::sync::atomic::Ordering::Acquire);
+        let checkpoint_barrier = root.join("checkpoint-entered");
+        set_test_snapshot_operation_barrier("checkpoint", db.clone(), checkpoint_barrier.clone());
+        let checkpoint_store = store.clone();
+        let checkpoint = tokio::spawn(async move { checkpoint_store.checkpoint().await });
+        wait_for_test_barrier(&checkpoint_barrier).await;
+        assert!(!store.is_dirty(), "checkpoint took the previous dirty flag");
+
+        let write_store = store.clone();
+        let write = tokio::spawn(async move {
+            write_store
+                .upsert(
+                    "checkpoint-queued-write",
+                    "checkpoint-queued-write::queued",
+                    vec![0.4; 4],
+                    MemoryPayload {
+                        content: "queued behind checkpoint".into(),
+                        user_id: "owner".into(),
+                        memory_type: "fact".into(),
+                        agent_name: None,
+                        location: "queued.rs".into(),
+                        location_lines: "2".into(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while ENGINE_CALLS_STARTED.load(std::sync::atomic::Ordering::Acquire)
+                < started_before_checkpoint + 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued write is dispatched while checkpoint holds the lock");
+        assert!(
+            !write.is_finished(),
+            "the dispatched write cannot pass the checkpoint's writer lock"
+        );
+        release_test_barrier(&checkpoint_barrier);
+        checkpoint.await.unwrap().unwrap();
+        write.await.unwrap().unwrap();
+        assert!(
+            store.is_dirty(),
+            "the queued write marks dirty after checkpoint cleared the prior flag"
+        );
+        let row = store
+            .get("checkpoint-queued-write", "checkpoint-queued-write::queued")
+            .await
+            .unwrap();
+        assert_eq!(row.unwrap().1.content, "queued behind checkpoint");
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
