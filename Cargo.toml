@@ -2,6 +2,7 @@
 name = "neurostrata-mcp"
 version = "1.11.0"
 edition = "2021"
+exclude = ["tools/runtime-validation/**"]
 
 [[bin]]
 name = "neurostrata-mcp"

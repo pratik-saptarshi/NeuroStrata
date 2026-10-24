@@ -33,8 +33,7 @@ import time
 from pathlib import Path
 
 
-REPO = Path(__file__).resolve().parents[1]
-FIXTURE = REPO / "tests" / "fixtures" / "runtime_validation"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "synthetic-project"
 BASELINE = "219e47de604a283c6fb8d4249db77b9824e35188"
 MODEL_REPO = "nomic-ai/nomic-embed-text-v1.5"
 MODEL_REVISION = "0a3f1bfa99207a5448900a6daaaf6add10eaa058"
@@ -142,101 +141,59 @@ def _terminate_owned_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def make_fixtures() -> dict:
-    FIXTURE.mkdir(parents=True, exist_ok=True)
-    sources = {
-        "src/core.rs": """//! Synthetic multilingual fixture: привет, こんにちは, مرحبا, café.
-pub struct MemoryLedger { pub sequence: u64 }
-impl MemoryLedger {
-    /// Keep edge targets stable across replacement and restore.
-    pub fn publish_generation(&self, generation: &str) -> bool {
-        !generation.is_empty() && self.sequence > 0
-    }
-}
-pub fn stable_lookup(key: &str) -> Option<&'static str> {
-    match key { "alpha" => Some("first"), "beta" => Some("second"), _ => None }
-}
-""",
-        "src/recovery.rs": """//! Recovery cases: naïve café, 東京, Ελληνικά, and हिन्दी.
-pub fn retain_unowned_namespace(name: &str) -> bool {
-    !name.starts_with("__neurostrata_ingest_stage__")
-}
-pub fn checkpoint_after_commit(committed: bool) -> &'static str {
-    if committed { "new-generation" } else { "old-generation" }
-}
-""",
-        "src/long_symbol.rs": (
-            "//! Bounded long-symbol input, synthetic only.\n"
-            "pub fn long_identifier_"
-            + "x" * 768
-            + "(input: &str) -> usize {\n"
-            + "    input.chars().map(|ch| ch.len_utf8()).sum()\n}\n"
-        ),
-        "docs/fixture.md": """# Synthetic workload
+    """Validate checked-in fixture inputs and build an in-memory run manifest."""
+    if FIXTURE.is_symlink() or not FIXTURE.is_dir():
+        raise SystemExit(f"checked-in synthetic fixture directory is missing or unsafe: {FIXTURE}")
+    sources: dict[str, Path] = {}
+    for folder in ("src", "docs"):
+        root = FIXTURE / folder
+        if root.is_symlink() or not root.is_dir():
+            raise SystemExit(f"synthetic fixture folder is missing or unsafe: {root}")
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise SystemExit(f"synthetic fixture must not contain symlinks: {path}")
+            if path.is_file():
+                sources[path.relative_to(FIXTURE).as_posix()] = path
+    if not sources:
+        raise SystemExit(f"synthetic fixture contains no source files: {FIXTURE}")
+    try:
+        inventory = json.loads((FIXTURE / "inventory.json").read_text(encoding="utf-8"))
+        template = json.loads((FIXTURE / "manifest.template.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot read checked-in fixture metadata under {FIXTURE}: {error}")
+    if not isinstance(inventory, dict) or not isinstance(template, dict):
+        raise SystemExit(f"checked-in fixture metadata must be JSON objects under {FIXTURE}")
+    if inventory.get("corpus_files") != sorted(sources):
+        raise SystemExit("fixture inventory does not match checked-in source/docs files")
 
-This fixture contains deterministic source and documentation, no customer data.
-It covers multilingual text, a long symbol, stable path identifiers, and an
-ingestion replacement that can be repeated without changing unrelated memory.
-""",
+    manifest = dict(template)
+    manifest["baseline_revision"] = BASELINE
+    manifest["candidate_revision"] = "supplied to runner"
+    manifest["budget"] = {
+        "wall_seconds_acceptance_window": MAX_RUN_SECONDS,
+        "setup_copy_timeout": "synchronous copy is not interruptible; acceptance deadline checked immediately afterward",
+        "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
+        "address_space_bytes": MAX_ADDRESS_SPACE_BYTES,
+        "peak_rss_kib": MAX_RSS_KIB,
+        "db_wal_bundle_bytes": MAX_DB_BUNDLE_BYTES,
+        "fixture_bytes": MAX_FIXTURE_BYTES,
     }
-    for relative, content in sources.items():
-        target = FIXTURE / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", newline="\n")
-
-    inventory = {
-        "classification": "synthetic, small workflow fixture; not production representative",
-        "corpus_files": sorted(sources),
-        "preservation_records": [
-            {"namespace": "validation-preservation", "type": "fact", "content": "synthetic fact: keep exact text"},
-            {"namespace": "validation-preservation", "type": "task", "content": "synthetic task: keep status"},
-            {"namespace": "validation-preservation", "type": "procedure", "content": "synthetic procedure: keep steps"},
-            {"namespace": "validation-preservation", "type": "history", "content": "synthetic history: keep provenance"},
-            {"namespace": "synthetic-validation", "type": "rule", "content": "synthetic rule: governs src/core.rs", "edge": {"type": "GOVERNS", "target": "synthetic-validation::src/core.rs"}},
-        ],
-        "runner_cases": ["one initial real CLI ingest at the fixture project root using ./src", "preservation readback of five hand-written memory types", "same-namespace GOVERNS edge targets synthetic-validation::src/core.rs exactly"],
-        "planned_but_not_run_here": ["identical reingest", "source removal/replacement", "backup and restore", "process crash boundaries", "reader concurrency"],
-        "implemented_assertions": ["exact seeded IDs, contents, namespaces, and types survive ingest", "manual rule GOVERNS edge points to exact qualified ID synthetic-validation::src/core.rs", "database and WAL fit post-command acceptance cap"],
-        "not_implemented_in_runner": ["old/new generation visibility at process-crash boundary", "no mixed IDs, vectors, or payloads", "restore round-trip", "source removal and reingest"],
+    manifest["host"] = {
+        "os": platform.platform(),
+        "python": sys.version.split()[0],
+        "cpu_count": os.cpu_count(),
+        "cgroup_memory_limit": read_limit(Path("/sys/fs/cgroup/memory.max")),
+        "cgroup_cpu_quota": read_limit(Path("/sys/fs/cgroup/cpu.max")),
+        "temporary_filesystem_free_bytes": shutil.disk_usage(Path(tempfile.gettempdir())).free,
     }
-    manifest = {
-        "baseline_revision": BASELINE,
-        "candidate_revision": "supplied to runner",
-        "model": {
-            "repository": MODEL_REPO,
-            "revision": MODEL_REVISION,
-            "path": MODEL_PATH,
-            "sha256": MODEL_SHA256,
-            "note": "official pinned file; runtime compatibility must be verified before loading",
-        },
-        "budget": {
-            "wall_seconds_acceptance_window": MAX_RUN_SECONDS,
-            "setup_copy_timeout": "synchronous copy is not interruptible; acceptance deadline checked immediately afterward",
-            "command_timeout_seconds": COMMAND_TIMEOUT_SECONDS,
-            "address_space_bytes": MAX_ADDRESS_SPACE_BYTES,
-            "peak_rss_kib": MAX_RSS_KIB,
-            "db_wal_bundle_bytes": MAX_DB_BUNDLE_BYTES,
-            "fixture_bytes": MAX_FIXTURE_BYTES,
-        },
-        "host": {
-            "os": platform.platform(),
-            "python": sys.version.split()[0],
-            "cpu_count": os.cpu_count(),
-            "cgroup_memory_limit": read_limit(Path("/sys/fs/cgroup/memory.max")),
-            "cgroup_cpu_quota": read_limit(Path("/sys/fs/cgroup/cpu.max")),
-            "temporary_filesystem_free_bytes": shutil.disk_usage(Path(tempfile.gettempdir())).free,
-        },
-        "fixture": inventory,
-        "corpus_sha256": {},
-    }
+    manifest["fixture"] = inventory
+    manifest["corpus_sha256"] = {}
     total = 0
-    for relative in sorted(sources):
-        path = FIXTURE / relative
+    for relative, path in sorted(sources.items()):
         total += path.stat().st_size
         manifest["corpus_sha256"][relative] = sha256(path)
     if total > MAX_FIXTURE_BYTES:
         raise SystemExit(f"fixture exceeds {MAX_FIXTURE_BYTES} bytes")
-    (FIXTURE / "inventory.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (FIXTURE / "manifest.template.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
 
 
@@ -516,7 +473,7 @@ def main() -> None:
     args = parser.parse_args()
     if not args.baseline_bin and not args.candidate_bin:
         make_fixtures()
-        print(f"Synthetic fixtures prepared at {FIXTURE}")
+        print(f"Checked-in synthetic fixtures validated at {FIXTURE}")
         print("Preparation only; no inference or measurements were run.")
         return
     if not all((args.baseline_bin, args.candidate_bin, args.model_file, args.model_cache)):
@@ -535,7 +492,7 @@ def main() -> None:
         raise SystemExit(f"temporary filesystem needs {required_free} free bytes for isolated caches and DB budgets; no inference started")
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = make_fixtures()
-    print(f"Synthetic fixtures prepared at {FIXTURE}")
+    print(f"Checked-in synthetic fixtures validated at {FIXTURE}")
     started = time.monotonic()
     deadline = started + MAX_RUN_SECONDS
     results = []
@@ -572,7 +529,7 @@ def main() -> None:
                      "external_bounds": external_bounds,
                      "binary_sha256": {"baseline": sha256(args.baseline_bin.resolve()),
                                        "candidate": sha256(args.candidate_bin.resolve())},
-                     "commands": "scripts/runtime_validation.py; see per-binary run.log files",
+                     "commands": "tools/runtime-validation/runtime_validation.py; see per-binary run.log files",
                      "results": results,
                      "elapsed_seconds": round(time.monotonic() - started, 3),
                      "execution": "real production CLI with isolated copies of supplied local model cache; one synthetic run each",

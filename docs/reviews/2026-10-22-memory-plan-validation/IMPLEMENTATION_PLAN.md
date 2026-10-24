@@ -24,6 +24,13 @@ The copied open database plus active WAL is an unverified crash-state capture, n
 The default locked local build remains blocked because the `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; no retry or alternate download route was used. A temporary `ort-load-dynamic` override plus source-built LadybugDB is only a local alternative verification path, distinct from hosted default-feature CI. Earlier hosted run `40036052762` on `bd5cdf75332badf8def9e19f5745316c2a82948e` passed four jobs and 765 Ubuntu tests; run `40056891840` on `1abf0c3cd1313f2f272c378650c6e23da04b3bf0` was green on Ubuntu tests, macOS and Ubuntu builds. Run `40058139853` on SHA `9798742669e157b8c1cc0d0fa50c8c2a7d011f4e` reported 779 passed and one WAL-fixture failure. No run for the corrected source tree exists yet.
 
 Runtime memory was not measured. The deterministic synthetic corpus is 1,977 bytes across four files and is not production-representative. The runner sets an 8 GiB per-child address-space and CPU-time limit, kills timed-out/output-overflowing process groups, caps captured output at 4 MiB per stream, and checks RSS (4 GiB) and DB/WAL size (1 GiB) after every CLI command as acceptance thresholds. RSS and DB/WAL thresholds are not live caps; real runs require an independently bounded memory and temporary-disk environment. Its 20-minute wall-time window is checked after synchronous setup copies and before/after CLI phases; an individual copy call cannot be interrupted. It uses the fixture project root as `cwd`, ingests `./src`, and expects the full `synthetic-validation::src/core.rs` ID and same-namespace rule edge. Runner tests passed 4/4 and fixture generation completed; no real CLI inference was run. The pinned official Nomic artifact is absent, installed system ONNX Runtime 1.21 is incompatible with the build's ort API-24 requirement, and the allowed prebuilt download returned proxy 403. Matched baseline/candidate memory and performance measurements, model inference, idle RSS, throughput/latency comparison, and database-growth measurements remain unexecuted; no empirical improvement is claimed.
+
+The optional Python validation harness, its tests, and its synthetic project fixture
+are isolated under `tools/runtime-validation/`; the fixture source is in that
+subtree's `fixtures/synthetic-project/` directory. No Cargo dependency, Rust
+runtime import, application packaging path, or build-script reference depends on
+the harness or Python. `src-tauri/icons/make_icons.py` is an unrelated existing
+icon-generation tool and was not changed.
 The cooperating writer/snapshot sidecar lock resolves relative paths and symlinks to one canonical path. Hard-link aliases are not unified by that sidecar; the storage engine separately refuses concurrent opens of a database file.
 
 ## Scope decisions
@@ -198,7 +205,7 @@ active stage preservation, full row/vector/edge equality, lease ownership, and
 subsequent successful publication.
 
 **Current candidate evidence.** Changed Rust files pass `rustfmt --check` and
-`git diff --check`; Python runtime-harness tests pass 4/4. The complete locked
+`git diff --check`; relocated Python runtime-harness tests pass 5/5. The complete locked
 serial Rust suite passes 796/796 on the current local working tree with the
 temporary `fastembed/ort-load-dynamic` feature and lbug built from cached source
 using `LBUG_BUILD_FROM_SOURCE=1` and the installed CMake executable at
@@ -210,8 +217,12 @@ alternative-build evidence, not default-feature verification or hosted CI. An
 initial lbug prebuilt fetch returned proxy HTTP 403 (one alternate artifact URL
 returned 404); no retry was made. The CMake distribution was already present in
 `/tmp`, but its wrapper referenced an unavailable Python interpreter, so the
-source build used the executable directly. No Cargo manifest or lockfile change
-was made. The tested source was pushed as commit
+source build used the executable directly. The harness, tests, README, and
+immutable synthetic corpus now live under `tools/runtime-validation/`; Python
+uses only the standard library. The fixture generator reads source/docs and
+metadata without rewriting checked-in files (verified by hashes and a regression).
+Cargo source-package listing excludes that entire tooling subtree; `Cargo.lock`
+and dependency declarations are unchanged. The tested Rust source was pushed as commit
 `6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` to the fork branch; PR #1 remains
 open and draft. Exact-head workflow and combined-status queries returned no
 run/status, and no workflow-dispatch action is available here, so default hosted
@@ -230,7 +241,7 @@ are unavailable here, so no task was claimed or invented. Earlier CI on
 | Binary test suite | 796/796 passed in 93.66 seconds on the current local working tree; 14 focused safeguard regressions passed. This is alternative local verification, not default-feature verification. Actual local inference was not exercised |
 | Default locked build | Blocked: `ort-sys` prebuilt download from `cdn.pyke.io` returned proxy HTTP 403; the installed system ONNX Runtime 1.21 is incompatible with the ort API-24 requirement. No download bypass was attempted |
 | Exact-head PR CI | Previously published head `3db83724e6e2261d329b261f3e9e455079f7a6d6` passed run `40060049864` (all four jobs; 782 Ubuntu tests). Current pushed head `6e652abb1dd17c7cc35ec44ee13bb8749bbf6aab` has no hosted run/status yet; the available GitHub tools expose no workflow-dispatch action |
-| Runtime harness | Synthetic fixture generation passed; 1,977 bytes across four files. Runner process-group timeout, output-cap, fast-exit output-cap, and model-cache symlink tests passed 4/4. No real CLI inference run. It uses an 8 GiB per-process address-space limit and 120s per-command timeouts. The 20m wall-time window is an acceptance deadline checked after synchronous setup copies and before/after CLI phases; a single copy call cannot be interrupted. RSS 4 GiB and DB/WAL 1 GiB are post-command acceptance thresholds, not live enforcement; independent memory and temporary-disk quotas are required around actual runs |
+| Runtime harness | Relocated runner tests pass 5/5; preparation validates the 1,977-byte four-file checked-in fixture without rewriting its source or metadata. Cargo package listing excludes the tooling subtree. No real CLI inference run. It uses an 8 GiB per-process address-space limit and 120s per-command timeouts. The 20m wall-time window is an acceptance deadline checked after synchronous setup copies and before/after CLI phases; a single copy call cannot be interrupted. RSS 4 GiB and DB/WAL 1 GiB are post-command acceptance thresholds, not live enforcement; independent memory and temporary-disk quotas are required around actual runs |
 | Runtime memory comparison | Not executed: no matched base/candidate runs, no real inference, no raw measurement logs, and no empirical improvement claim |
 | Migration follow-up | No in-place migrator is supported by this change; separate database plus fresh ingest is the declared lifecycle. No task ID or owner acceptance is claimed; task/memory tracking CLI/MCP was unavailable |
 | NeuroStrata task/memory gate | Unavailable: task/memory MCP tools and the `neurostrata-mcp` CLI are not installed |
