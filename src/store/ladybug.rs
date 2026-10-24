@@ -1474,13 +1474,42 @@ fn persisted_embedding_width(db: &Database) -> Result<Option<usize>> {
     Ok(None)
 }
 
-fn check_embedding_width(db_path: &Path, recorded: usize, dimensions: usize) -> Result<()> {
+/// The canonicalized (saved, configured) identity pair for refusal
+/// messages, or `None` when either identity is absent or the saved
+/// legacy identity cannot be safely canonicalized against the
+/// configured one. Refusal text must only ever carry canonicalized
+/// identities (Refusal Standard element 6): a legacy remote identity
+/// can embed a credential-bearing URL, and one that cannot be matched
+/// to the configured identity must never be printed raw.
+fn canonical_identity_pair(
+    saved: Option<&str>,
+    configured: Option<&str>,
+) -> Option<(String, String)> {
+    let (saved, configured) = (saved?, configured?);
+    crate::embed::canonicalize_persisted_embedder_id(saved, configured)
+        .ok()
+        .map(|canonical| (canonical, configured.to_string()))
+}
+
+fn check_embedding_width(
+    db_path: &Path,
+    recorded: usize,
+    dimensions: usize,
+    identities: Option<(&str, &str)>,
+) -> Result<()> {
     if recorded != dimensions {
+        let identity_clause = match identities {
+            Some((saved, configured)) => format!(
+                " It was embedded with model identity {saved:?}, while the configured identity is {configured:?}."
+            ),
+            None => String::new(),
+        };
         return Err(anyhow::anyhow!(
-            "Refusing to open {}: its Memory.embedding column has width {} but the configured embedder produces {}. Keep this database intact and reopen it with a compatible embedder, or use a separate database path for the new model; no in-place re-embedding migration is available. Marker: {}",
+            "Refusing to open {}: its Memory.embedding column has width {} but the configured embedder produces {}.{} Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available. Marker: {}",
             db_path.display(),
             recorded,
             dimensions,
+            identity_clause,
             width_marker_path(db_path).display()
         ));
     }
@@ -2204,13 +2233,25 @@ impl LadybugStore {
         };
         ensure_database_path_unchanged(&resolved_path, &supplied_path)?;
         if let Some(marker) = &marker {
-            check_embedding_width(&resolved_path, marker.dimensions, dimensions)?;
+            let identities = canonical_identity_pair(
+                marker.embedder_id.as_deref(),
+                embedder_id.as_deref(),
+            );
+            check_embedding_width(
+                &resolved_path,
+                marker.dimensions,
+                dimensions,
+                identities.as_ref().map(|(saved, configured)| {
+                    (saved.as_str(), configured.as_str())
+                }),
+            )?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
                 let saved_canonical =
                     crate::embed::canonicalize_persisted_embedder_id(saved, current)?;
                 if saved_canonical != current.as_str() {
                     anyhow::bail!(
-                        "Refusing to open database path alias: it has a different embedding model identity. Preserve the database and all marker files; reopen through the original matching configuration or use a separate database path."
+                        "Refusing to open database path alias: it was embedded with model identity {:?}, while the configured identity is {:?}. The recorded embedding width is {} and the configured embedding width is {}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
+                        saved_canonical, current, marker.dimensions, dimensions
                     );
                 }
             }
@@ -2299,10 +2340,21 @@ impl LadybugStore {
         };
 
         let schema_width = persisted_embedding_width(&db)?;
+        let identities = marker.as_ref().and_then(|marker| {
+            canonical_identity_pair(marker.embedder_id.as_deref(), embedder_id.as_deref())
+        });
+        let identity_args = identities
+            .as_ref()
+            .map(|(saved, configured)| (saved.as_str(), configured.as_str()));
         if let Some(schema_width) = schema_width {
-            check_embedding_width(&resolved_path, schema_width, dimensions)?;
+            check_embedding_width(&resolved_path, schema_width, dimensions, identity_args)?;
             if let Some(marker) = &marker {
-                check_embedding_width(&resolved_path, marker.dimensions, schema_width)?;
+                check_embedding_width(
+                    &resolved_path,
+                    marker.dimensions,
+                    schema_width,
+                    identity_args,
+                )?;
             }
         } else if database_preexisted {
             // An existing DB without Memory is either a new empty catalog or a
@@ -2310,14 +2362,19 @@ impl LadybugStore {
         }
         let mut adopted_from: Option<&str> = None;
         if let Some(marker) = &marker {
-            check_embedding_width(&resolved_path, marker.dimensions, dimensions)?;
+            check_embedding_width(
+                &resolved_path,
+                marker.dimensions,
+                dimensions,
+                identity_args,
+            )?;
             if let (Some(saved), Some(current)) = (&marker.embedder_id, &embedder_id) {
                 let saved_canonical =
                     crate::embed::canonicalize_persisted_embedder_id(saved, current)?;
                 if saved_canonical != current.as_str() {
                     return Err(anyhow::anyhow!(
-                        "Refusing to open {}: it was embedded with model identity {:?}, while the configured identity is {:?}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
-                        local_path.display(), saved_canonical, current
+                        "Refusing to open {}: it was embedded with model identity {:?}, while the configured identity is {:?}. The recorded embedding width is {} and the configured embedding width is {}. Keep the database intact and reopen it with the original embedder, or use a separate database path for the new model; no in-place re-embedding migration is available.",
+                        local_path.display(), saved_canonical, current, marker.dimensions, dimensions
                     ));
                 }
             } else if marker.embedder_id.is_none() && embedder_id.is_some() {
@@ -5408,8 +5465,56 @@ mod tests {
             message.contains("produces 4"),
             "names the configured width: {message}"
         );
+        // Refusal Standard elements 4-5, in the reference site's wording.
+        for element in [
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "remediation element {element:?} missing: {message}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Refusal Standard at the width site (Spec Feature 3 AC1): when
+    /// identities are in context, the width refusal — often the only
+    /// refusal that fires — names both canonicalized identities as well
+    /// as both widths and the reference remediation.
+    #[test]
+    fn width_refusal_names_both_identities_and_both_widths() {
+        let dir = std::env::temp_dir().join(format!("ladybug-width-id-{}", uuid::Uuid::new_v4()));
+        let limits = StoreLimits::default();
+        {
+            let _store =
+                LadybugStore::new_with_identity_limits(&dir, 8, "fastembed:model-a".into(), limits)
+                    .expect("open model A at width 8");
+        }
+        let error = match LadybugStore::new_with_identity_limits(
+            &dir,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        ) {
+            Ok(_) => panic!("a 4-wide embedder must not open an 8-wide database"),
+            Err(error) => error,
+        };
+        let message = format!("{error}");
+        for element in [
+            "fastembed:model-a",
+            "fastembed:model-b",
+            "width 8",
+            "produces 4",
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "width refusal element {element:?} missing: {message}");
+        }
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(width_marker_path(&dir));
     }
 
     #[tokio::test]
@@ -5464,7 +5569,24 @@ mod tests {
             Ok(_) => panic!("same-width model changes alter the vector space"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("model identity"));
+        let message = error.to_string();
+        assert!(message.contains("model identity"));
+        // Refusal Standard (Spec Feature 3 AC1): both canonicalized
+        // identities, both widths (equal at this site — the width check
+        // has already passed — stated for uniformity), and the reference
+        // remediation elements.
+        for element in [
+            "fastembed:model-a",
+            "fastembed:model-b",
+            "recorded embedding width is 4",
+            "configured embedding width is 4",
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "identity refusal element {element:?} missing: {message}");
+        }
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
@@ -5993,6 +6115,55 @@ mod tests {
             vector, vector_before,
             "rejected alias open preserves exact vector data"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Refusal Standard at the alias site (Spec Feature 3 AC1, the
+    /// substantive fix): the alias refusal names both canonicalized
+    /// identities, both widths (equal here — the width check has already
+    /// passed), and the reference remediation wording.
+    #[cfg(unix)]
+    #[test]
+    fn alias_identity_refusal_meets_the_refusal_standard() {
+        let root =
+            std::env::temp_dir().join(format!("ladybug-alias-standard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("primary.store");
+        let alias = root.join("alias.store");
+        let limits = StoreLimits::default();
+        {
+            let _store = LadybugStore::new_with_identity_limits(
+                &original,
+                4,
+                "fastembed:model-a".into(),
+                limits,
+            )
+            .expect("open model A");
+        }
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let error = match LadybugStore::new_with_identity_limits(
+            &alias,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        ) {
+            Ok(_) => panic!("opening an existing DB through a symlink must retain its model identity"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("database path alias"), "the alias site fired: {message}");
+        for element in [
+            "fastembed:model-a",
+            "fastembed:model-b",
+            "recorded embedding width is 4",
+            "configured embedding width is 4",
+            "Keep the database intact",
+            "original embedder",
+            "separate database path",
+            "no in-place re-embedding migration is available",
+        ] {
+            assert!(message.contains(element), "alias refusal element {element:?} missing: {message}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6914,6 +7085,119 @@ mod tests {
 
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(marker_path);
+    }
+
+    /// Refusal Standard element 6 (Spec Feature 3 AC2): a legacy persisted
+    /// identity embedding a credential-bearing URL must appear in NO
+    /// refusal string from any site — width, marker-identity, or alias.
+    /// Only canonicalized identities may enter message text; a legacy
+    /// identity that cannot be canonicalized against the configured one
+    /// is never printed raw.
+    #[tokio::test]
+    async fn credential_bearing_legacy_identity_never_appears() {
+        let legacy = "remote:https://user:top-secret@example.test/v1:embed-v2";
+        let other = crate::embed::remote_embedder_id(
+            "https://other:top-secret@example.test/v1",
+            "embed-v2",
+        );
+        let assert_redacted = |error: &anyhow::Error, site: &str| {
+            let message = format!("{error:#}");
+            for leaked in [legacy, "top-secret", "https://", "example.test"] {
+                assert!(
+                    !message.contains(leaked),
+                    "{site} refusal leaked {leaked:?}: {message}"
+                );
+            }
+        };
+
+        // Width site: the legacy identity canonicalizes to the configured
+        // (hashed) remote identity, so the width check is the refusal that
+        // fires; its message may carry only the canonicalized form.
+        let dir = std::env::temp_dir().join(format!("ladybug-cred-width-{}", uuid::Uuid::new_v4()));
+        let marker_path = width_marker_path(&dir);
+        let matching = crate::embed::remote_embedder_id(
+            "https://user:top-secret@example.test/v1",
+            "embed-v2",
+        );
+        {
+            let store = LadybugStore::new_with_identity_limits(
+                &dir,
+                4,
+                matching.clone(),
+                StoreLimits::default(),
+            )
+            .expect("create database using the matching runtime identity");
+            store.init("credential-width-fixture").await.unwrap();
+        }
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&EmbeddingMarker {
+                version: 1,
+                dimensions: 4,
+                embedder_id: Some(legacy.to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = LadybugStore::new_with_identity_limits(&dir, 8, matching.clone(), StoreLimits::default())
+            .err()
+            .expect("width mismatch with a legacy identity is refused");
+        assert_redacted(&error, "width");
+        assert!(
+            format!("{error:#}").contains(&matching),
+            "the width refusal names the canonicalized identity only: {error:#}"
+        );
+
+        // Marker-identity site: same width, mismatched configured endpoint.
+        let error = LadybugStore::new_with_identity_limits(&dir, 4, other.clone(), StoreLimits::default())
+            .err()
+            .expect("endpoint mismatch with a legacy identity is refused");
+        assert_redacted(&error, "marker-identity");
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(&marker_path);
+
+        // Alias site: the legacy identity is reached through a symlink.
+        #[cfg(unix)]
+        {
+            let root = std::env::temp_dir()
+                .join(format!("ladybug-cred-alias-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let original = root.join("primary.store");
+            let alias = root.join("alias.store");
+            {
+                let _store = LadybugStore::new_with_identity_limits(
+                    &original,
+                    4,
+                    crate::embed::remote_embedder_id(
+                        "https://user:top-secret@example.test/v1",
+                        "embed-v2",
+                    ),
+                    StoreLimits::default(),
+                )
+                .expect("create database using the matching runtime identity");
+            }
+            std::fs::write(
+                width_marker_path(&original),
+                serde_json::to_vec(&EmbeddingMarker {
+                    version: 1,
+                    dimensions: 4,
+                    embedder_id: Some(legacy.to_string()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&original, &alias).unwrap();
+            let error = LadybugStore::new_with_identity_limits(
+                &alias,
+                4,
+                other.clone(),
+                StoreLimits::default(),
+            )
+            .err()
+            .expect("alias endpoint mismatch with a legacy identity is refused");
+            assert_redacted(&error, "alias");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// The resolution rule as every caller now reaches it: build the index
