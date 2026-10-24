@@ -115,6 +115,29 @@ def load_model_spec(path: Path) -> ModelSpec:
         values[field] = value
     return ModelSpec(**values)
 
+
+# Embedding widths for the models a spec can name, from the in-tree sources
+# of record: the generated embedders.json defaults (src/embed.rs
+# default_acceptable_embedders) and the capacity-profile table (src/config.rs
+# CapacityProfile::embedder_dimensions, where low names BGESmallENV15Q). A
+# spec naming any other model has no verified width in this tree.
+EMBEDDER_DIMENSIONS = {
+    "NomicEmbedTextV15": 768,
+    "BGEBaseENV15": 768,
+    "BGESmallENV15Q": 384,
+}
+
+
+def embedder_dimensions(model_name: str) -> int | None:
+    """The verified embedding width for a model name, or None when this
+    tree has no source for it. The binary matches embedder names
+    case-insensitively (src/embed.rs resolve_configured_model), so the
+    lookup does the same."""
+    for known, dimensions in EMBEDDER_DIMENSIONS.items():
+        if known.lower() == model_name.lower():
+            return dimensions
+    return None
+
 # Conservative machine-specific budgets. Address space and CPU time are
 # OS-limited per child. RSS and the combined DB/WAL size are post-command
 # acceptance thresholds; operators must also use an external memory/disk cap.
@@ -417,6 +440,24 @@ def run_binary(label: str, binary: Path, revision: str, root: Path, model: Path,
         json.dumps({"db_path": str(db),
                     "store": {"buffer_pool_bytes": 268435456,
                               "max_db_bytes": MAX_DB_BUNDLE_BYTES}}), encoding="utf-8")
+    # The binary resolves the NEUROSTRATA_MODEL selection set below only
+    # against the isolated home's embedders.json entries (src/embed.rs
+    # resolve_configured_model); without this file the home falls back to
+    # the generated defaults [NomicEmbedTextV15, BGEBaseENV15] and a leg
+    # naming any other model fails before inference. Materialize the leg's
+    # model as the home's configured embedder, in the bare-array object
+    # format src/embed.rs parses ({model_name, dimensions} per entry).
+    # No generated_by stamp: that provenance asserts the binary wrote the
+    # file itself, and it did not. A name with no verified width in this
+    # tree gets no file -- inventing a width would falsify the run -- and
+    # keeps the pre-fix behavior: a real binary refuses the selection
+    # itself for naming no configured embedder.
+    dimensions = embedder_dimensions(spec.name)
+    if dimensions is not None:
+        (home / ".config" / "neurostrata" / "embedders.json").write_text(
+            json.dumps([{"model_name": spec.name,
+                         "dimensions": dimensions}], indent=2),
+            encoding="utf-8")
     # Only reuse caller-provided artifacts. Offline flags reduce accidental
     # fetches; operators must also ensure network egress is disabled externally.
     cache = home / ".cache" / "neuro" / "models" / "fastembed"
