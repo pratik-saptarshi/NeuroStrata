@@ -10,10 +10,10 @@ This document compiles all the operational mandates, workflows, and behavioral c
   3. If the request is new, create it FIRST: `neurostrata_task_create` (`namespace`, `title`, optionally description/priority/labels/parent_id/blocked_by), then claim it.
 - **Claim exclusivity:** A task claimed by another live session (no update for <60 minutes) cannot be claimed again — duplicate work fails loudly at claim time. A stale claim is released and taken over automatically; re-claiming from the same session is idempotent.
 - **State Updates:** Use `neurostrata_task_update` for `open` / `in_progress` / `blocked` and to append `note` history entries (the Breath prompt lands here: pause, summarize state, record it on the task). **`status: "done"` is refused by `task_update`** — it points you at `neurostrata_task_complete`, because `done` requires memory extraction (Lock 2). There is no other path to `done`.
-- **No Alternatives:** Never use TodoWrite, TaskCreate, `bd` commands, or markdown TODO lists for tracking. Always use the task tools.
+- **No Alternatives:** When task tools are available, use them for tracking. Never use TodoWrite, TaskCreate, `bd` commands, or markdown TODO lists as substitutes.
 
 ## 2. Session Completion & Hand-off
-Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate passes, and `git push` succeeds.
+For a repository-changing task, work is NOT complete until `neurostrata_task_complete` succeeds, the task gate passes, and the authorized branch is pushed. Read-only questions do not require a push or task completion.
 - **Completion Steps:**
   1. **Extract Knowledge:** Run `neurostrata_add_memory` with `metadata.extracted_from: ["<task id>"]` to save facts, fixes, or constraints — or hand the extraction to the completion itself via `memory.content` (what did you learn? what rule does this task prove?) or `link_memory_id`.
   2. **Finish the task:** `neurostrata_task_complete`. With zero extracted memories it fails with a `BLOCKED (Lock 2)` JSON-RPC error naming both ways to comply; that error is the funnel working.
@@ -21,10 +21,16 @@ Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate 
   4. **Quality Gates:** Run tests, linters, builds. Mid-session, `neurostrata_task_validate` (or `neurostrata-mcp task validate <ns>`) is the advisory gate report — it never blocks.
   5. **Push to Remote (CRITICAL):**
      - `git pull --rebase`
-     - `git push` — the pre-push hook runs `neurostrata-mcp task gate <namespace> --strict`; violations (any `in_progress` task, `done` without an extracted memory, P0 open >24h) block the push.
-     - `git status` (Must show "up to date with origin")
+     - `git push` — when installed and `neurostrata-mcp` is available, the pre-push hook runs `neurostrata-mcp task gate <namespace> --strict`; violations (any `in_progress` task, `done` without an extracted memory, P0 open >24h) block the push.
+     - `git status` (Confirm branch is up to date with its intended push remote.)
   - Escape hatch for a wedged/unavailable database (an ops problem, not agent misconduct): `NEUROSTRATA_SKIP_GATE=1 git push`.
-- **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).
+
+### If task or memory tools are unavailable
+- Continue read-only discovery and report which required tools are unavailable.
+- Do not invent task IDs, use `bd` as a substitute, edit files, commit, push, or claim task/memory gates passed.
+- Stop before mutation unless the owner gives a one-time exception that names the bounded task and files/actions. An exception does not waive any other applicable safety, review, task-completion, or push gate; report unavailable gates honestly.
+- Never set `NEUROSTRATA_SKIP_GATE` to bypass missing tools, task state, review, or policy. Use it only for the documented temporary database-outage case, and disclose its use.
+- **Never Strand Authorized Changes:** For an authorized repository-changing task, complete the applicable gates and push the authorized branch. If a required gate cannot run, report that blocker; do not imply it passed. Never say "ready to push when you are" when the authorized push can be completed.
 
 ## 3. NeuroStrata Memory & The 3 Resilient Soft Locks
 Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions, and the `neurostrata_append_log` tool for conversational context.
@@ -42,8 +48,8 @@ NeuroStrata has two distinct work-related concepts:
 
 **Do not ask for `task_type: "recurring"`** — the enum is `task | bug | feature | epic`. The rejection error itself points at this section.
 - **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and record it on the Goal (`neurostrata_task_update` note — its Working Memory history) before proceeding.
-- **Continuous Backup Protocol:** Silently use `neurostrata_append_log` to maintain a running log of the conversation. Pass tags (e.g., "auth, database") when a topic switch occurs.
-- **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for task-tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
+- **Continuous Backup Protocol:** Use `neurostrata_append_log` for concise project context and pass tags when topics switch. Never log secrets or unrelated personal data.
+- **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** The first action on a new task is `neurostrata_get_snapshot` or `neurostrata_search_memory` using nouns/keywords from the user's prompt. Do not edit before that call succeeds. If the required tool is unavailable, follow **If task or memory tools are unavailable** above; do not imply the preflight succeeded. An explicit, bounded owner exception may cover only the named unavailable preflight prerequisite and does not waive other controls. Never assume the architectural rules are complete just because you read the code.
 - **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_search_memory` or grep `.NeuroStrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
 
 ## 3b. SynapticMesh (inter-instance memory — honesty rules)
@@ -82,6 +88,9 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 - **Libraries/Frameworks:** NEVER assume a library is available. Verify in configuration files first.
 - **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
 - **Paths:** Always use absolute paths when using file system tools.
+- **Remote safety:** Verify fetch and push URLs with `git remote -v` before publishing. Push only to the authorized destination; never push to an upstream repository unless the owner explicitly authorizes it.
+- **Optional Python validation:** Keep the Python harness, tests, and fixtures under `tools/runtime-validation/`, separate from Rust source. Use only the standard library; do not add a Python runtime/build dependency or import the harness from the Rust application. Cargo excludes this directory from source packages. The Rust application and build remain Rust-only.
+- **Validation claims:** Describe the checked-in default-feature CI at the exact commit under review. A local `ort-load-dynamic` override is a separate verification setup, not hosted CI evidence or a declared Cargo feature in this checkout. Do not claim real-model, performance, or migration results without a measured run and its artifacts.
 
 ## 9. No Deferrals (owner ruling, 2026-10-21)
 - **NEVER defer.** No spec, brief, plan, or task may contain a "deferred" bucket, an
