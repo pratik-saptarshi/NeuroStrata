@@ -5842,10 +5842,24 @@ mod tests {
     ///
     /// Row math: at an 8 MiB cap the engine's VM region holds exactly
     /// two frame groups — one shadow, one data — so the data file has
-    /// 1024 pages (4 MiB). Each row stores ~32 KiB of incompressible hex
-    /// (~8 pages) plus its node record, so the refusal must fire within
-    /// roughly 4 MiB / 32 KiB ≈ 128 rows; the 1024-row bound is ~8x
-    /// headroom and is unreachable unless the cap is not enforced at all.
+    /// 1024 pages (4 MiB). Row WIDTH decides which engine limit fires
+    /// first (CI fix loop round 4, probed against the lbug 0.20.4 wheel
+    /// at this test's exact cadence): 32 KiB rows starved the buffer
+    /// pool during checkpoint merges — "the buffer pool is full and no
+    /// memory could be freed" at ~33 rows — because this repo's
+    /// `StoreLimits::validate` couples the pool to at most the cap, so
+    /// the pool cannot be given the headroom wide-row merges want; the
+    /// same starvation recurred at a 64 MiB cap/pool (~512 rows). With
+    /// 4 KiB incompressible rows the per-checkpoint merge working set
+    /// stays small enough that the frame-group accounting — the cap
+    /// itself — fires first: the engine's max-DB-size refusal was
+    /// observed at ~208 rows in a two-column probe table, and at 310
+    /// rows (2 KiB rows) and 122 rows (8 KiB rows), so the window is
+    /// wide, not a knife's edge. This table's rows are somewhat wider
+    /// than the probe's (vector + metadata alongside the content), so
+    /// the refusal is expected no later; the 1024-row bound is ~5x
+    /// headroom over the probe's 208 and is unreachable unless the cap
+    /// is not enforced at all.
     #[tokio::test]
     #[ignore = "child worker: spawned by profile_cap_refusal_fires_at_reduced_cap"]
     async fn profile_cap_refusal_child_worker() {
@@ -5961,16 +5975,19 @@ mod tests {
     }
 
     /// Deterministic incompressible filler: xorshift64* output, hex
-    /// encoded — 2048 words become a 32 KiB string. Hex of pseudo-random
+    /// encoded — 256 words become a 4 KiB string. Hex of pseudo-random
     /// bytes carries 4 bits of entropy per stored character, so even
     /// ideal entropy coding could at best halve it — where
     /// repeated-character filler compresses ~1000:1 and plateaus at
     /// ~2.2 MB, never approaching any cap (CI fix loop round 2 probe).
-    /// The growth loop's row bound is sized to survive the halving.
+    /// The width is deliberately narrow: at 32 KiB per row the buffer
+    /// pool starved during checkpoint merges before the size cap could
+    /// fire (round 4 probe — see the child worker's row math). The
+    /// growth loop's row bound is sized to survive the halving.
     fn incompressible_filler(seed: u64) -> String {
         let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
-        let mut out = String::with_capacity(32 * 1024);
-        for _ in 0..2048 {
+        let mut out = String::with_capacity(4 * 1024);
+        for _ in 0..256 {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
