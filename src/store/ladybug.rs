@@ -166,29 +166,19 @@ fn anchor_path_spelling(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    lexical_absolute_path(&anchored)
+    absolute_path_spelling(&anchored)
 }
 
-fn lexical_absolute_path(path: &Path) -> Result<PathBuf> {
+fn absolute_path_spelling(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    if !normalized.is_absolute() {
+    if !absolute.is_absolute() {
         anyhow::bail!("database path {} is not absolute", path.display());
     }
-    Ok(normalized)
+    Ok(absolute)
 }
 
 fn freeze_path_parent(path: &Path) -> Result<PathBuf> {
@@ -206,7 +196,7 @@ fn freeze_path_parent(path: &Path) -> Result<PathBuf> {
 /// symlink chains in file and parent components so every known sibling marker
 /// is inspected before the engine opens.
 fn discover_database_path_aliases(resolved: &Path, supplied: &Path) -> Result<Vec<PathBuf>> {
-    let supplied = lexical_absolute_path(supplied)?;
+    let supplied = absolute_path_spelling(supplied)?;
     ensure_database_path_unchanged(resolved, &supplied)?;
     let mut pending = vec![supplied];
     let mut seen = HashSet::new();
@@ -232,13 +222,11 @@ fn discover_database_path_aliases(resolved: &Path, supplied: &Path) -> Result<Ve
 
         let mut prefix = PathBuf::new();
         for component in candidate.components() {
-            if matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            ) {
-                continue;
+            match component {
+                std::path::Component::CurDir => prefix.push("."),
+                std::path::Component::ParentDir => prefix.push(".."),
+                _ => prefix.push(component.as_os_str()),
             }
-            prefix.push(component.as_os_str());
             match std::fs::symlink_metadata(&prefix) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     let target = std::fs::read_link(&prefix).map_err(|error| {
@@ -259,7 +247,12 @@ fn discover_database_path_aliases(resolved: &Path, supplied: &Path) -> Result<Ve
                     let remainder = candidate.strip_prefix(&prefix).map_err(|error| {
                         anyhow::anyhow!("cannot expand database alias: {}", error)
                     })?;
-                    pending.push(lexical_absolute_path(&target.join(remainder))?);
+                    let expanded = if remainder.as_os_str().is_empty() {
+                        target
+                    } else {
+                        target.join(remainder)
+                    };
+                    pending.push(absolute_path_spelling(&expanded)?);
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -5717,6 +5710,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_path_keeps_parent_components_after_symlink_resolution() {
+        let root = std::env::temp_dir().join(format!(
+            "ladybug-symlink-parent-component-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let real_subdir = root.join("real/subdir");
+        let entry = root.join("entry");
+        std::fs::create_dir_all(&real_subdir).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        let primary_a = root.join("real/db.store");
+        let lexical_b = entry.join("db.store");
+        let link = entry.join("link");
+        std::os::unix::fs::symlink("../real/subdir", &link).unwrap();
+        let requested = entry.join("link/../db.store");
+        let limits = StoreLimits::default();
+        for (path, model, namespace, content, vector) in [
+            (
+                &primary_a,
+                "fastembed:model-a",
+                "symlink-parent-a",
+                "database reached through symlink then parent traversal",
+                vec![0.1, 0.2, 0.3, 0.4],
+            ),
+            (
+                &lexical_b,
+                "fastembed:model-b",
+                "lexical-parent-b",
+                "database reached by lexical collapse only",
+                vec![0.4, 0.3, 0.2, 0.1],
+            ),
+        ] {
+            let store =
+                LadybugStore::new_with_identity_limits(path, 4, model.into(), limits).unwrap();
+            store.init(namespace).await.unwrap();
+            store
+                .upsert(
+                    namespace,
+                    &format!("{namespace}::sentinel"),
+                    vector,
+                    MemoryPayload {
+                        content: content.into(),
+                        user_id: "agent".into(),
+                        memory_type: "fact".into(),
+                        agent_name: None,
+                        location: "sentinel.json".into(),
+                        location_lines: "1".into(),
+                        metadata: json!({"database": namespace}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let marker_a = raw_database_sibling(&primary_a, ".embedding");
+        let marker_b = raw_database_sibling(&lexical_b, ".embedding");
+        let marker_a_before = std::fs::read(&marker_a).unwrap();
+        let marker_b_before = std::fs::read(&marker_b).unwrap();
+        assert_eq!(
+            resolve_database_path(&requested).unwrap(),
+            std::fs::canonicalize(&primary_a).unwrap()
+        );
+
+        let error = LadybugStore::new_with_identity_limits(
+            &requested,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        )
+        .err()
+        .expect("the actual symlink-resolved database A must reject model B");
+        assert!(error.to_string().contains("model identity"));
+        assert_eq!(std::fs::read(&marker_a).unwrap(), marker_a_before);
+        assert_eq!(std::fs::read(&marker_b).unwrap(), marker_b_before);
+
+        let store_a = LadybugStore::new_with_identity_limits(
+            &primary_a,
+            4,
+            "fastembed:model-a".into(),
+            limits,
+        )
+        .unwrap();
+        let row_a = store_a
+            .get("symlink-parent-a", "symlink-parent-a::sentinel")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row_a.1.content,
+            "database reached through symlink then parent traversal"
+        );
+        assert_eq!(row_a.0, vec![0.1, 0.2, 0.3, 0.4]);
+        let store_b = LadybugStore::new_with_identity_limits(
+            &lexical_b,
+            4,
+            "fastembed:model-b".into(),
+            limits,
+        )
+        .unwrap();
+        let row_b = store_b
+            .get("lexical-parent-b", "lexical-parent-b::sentinel")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row_b.1.content, "database reached by lexical collapse only");
+        assert_eq!(row_b.0, vec![0.4, 0.3, 0.2, 0.1]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn marker_write_failure_is_returned_and_existing_evidence_is_preserved() {
         let root = std::env::temp_dir().join(format!(
@@ -6064,6 +6166,14 @@ mod tests {
         }
         std::os::unix::fs::symlink(&primary, &historical).unwrap();
         std::os::unix::fs::symlink(&historical, &outer).unwrap();
+        let resolved = resolve_database_path(&outer).unwrap();
+        let discovered = discover_database_path_aliases(&resolved, &outer).unwrap();
+        assert!(
+            discovered
+                .iter()
+                .any(|alias| alias.file_name() == historical.file_name()),
+            "historical alias missing from {discovered:?}"
+        );
         let canonical_marker = raw_database_sibling(&primary, ".embedding");
         let historical_marker = raw_database_sibling(&historical, ".embedding");
         let outer_marker = raw_database_sibling(&outer, ".embedding");
