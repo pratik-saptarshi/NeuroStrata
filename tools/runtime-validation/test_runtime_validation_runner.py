@@ -498,6 +498,79 @@ class MatrixModeTests(unittest.TestCase):
         self.assertIn("--model-spec", completed.stdout)
 
 
+class EmbeddersMaterializationTests(unittest.TestCase):
+    """run_binary must materialize the leg's model into the isolated
+    home's embedders.json. The binary resolves NEUROSTRATA_MODEL only
+    against that file's entries (src/embed.rs resolve_configured_model),
+    and a home without the file falls back to the generated defaults
+    [NomicEmbedTextV15, BGEBaseENV15] -- so a leg whose spec names any
+    other model (BGESmallENV15Q) fails before inference, however valid
+    its artifacts are."""
+
+    def run_stub_leg(self, root: Path, spec: "harness.ModelSpec") -> Path:
+        binary = write_stub_binary(root)
+        cache = root / "cache"
+        cache.mkdir()
+        artifact = cache / spec.model_path
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"stub artifact bytes")
+        run_root = root / "run"
+        harness.run_binary(
+            "candidate", binary, "stub-revision", run_root, artifact, cache,
+            time.monotonic() + 600, spec,
+        )
+        return run_root / "candidate" / "home" / ".config" / "neurostrata"
+
+    def test_nondefault_model_is_materialized_in_the_isolated_home(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-runner-embedders-") as temporary:
+            root = Path(temporary)
+            spec = make_spec("BGESmallENV15Q", b"stub artifact bytes", "model.onnx")
+            config_dir = self.run_stub_leg(root, spec)
+            embedders_path = config_dir / "embedders.json"
+            self.assertTrue(
+                embedders_path.is_file(),
+                "run_binary must write embedders.json into the isolated home "
+                "before invoking the binary",
+            )
+            self.assertEqual(
+                json.loads(embedders_path.read_text(encoding="utf-8")),
+                [{"model_name": "BGESmallENV15Q", "dimensions": 384}],
+                "the entry must name the leg's model at its in-tree width "
+                "(src/config.rs: BGESmallENV15Q is 384), in the bare-array "
+                "object format src/embed.rs parses, with no generated_by "
+                "stamp -- that provenance asserts the binary wrote the "
+                "file, and it did not",
+            )
+
+    def test_default_model_is_materialized_at_its_default_width(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="runtime-runner-embedders-") as temporary:
+            root = Path(temporary)
+            spec = make_spec("NomicEmbedTextV15", b"stub artifact bytes", "model.onnx")
+            config_dir = self.run_stub_leg(root, spec)
+            embedders_path = config_dir / "embedders.json"
+            self.assertTrue(
+                embedders_path.is_file(),
+                "run_binary must write embedders.json into the isolated home "
+                "before invoking the binary",
+            )
+            self.assertEqual(
+                json.loads(embedders_path.read_text(encoding="utf-8")),
+                [{"model_name": "NomicEmbedTextV15", "dimensions": 768}],
+            )
+
+    def test_model_without_a_verified_width_gets_no_invented_file(self) -> None:
+        # A spec naming a model with no in-tree width source (the matrix
+        # stub legs' invented names are the standing example) must not get
+        # an embedders.json with a fabricated width; the home is left
+        # exactly as it was before materialization existed, and a real
+        # binary refuses such a selection itself.
+        with tempfile.TemporaryDirectory(prefix="runtime-runner-embedders-") as temporary:
+            root = Path(temporary)
+            spec = make_spec("StubModelZ", b"stub artifact bytes", "model.onnx")
+            config_dir = self.run_stub_leg(root, spec)
+            self.assertFalse((config_dir / "embedders.json").exists())
+
+
 class EnvironmentBlockHonestyTests(unittest.TestCase):
     def test_importable_harness_onnxruntime_is_not_asserted_as_binary_version(self) -> None:
         # A version importable by the harness interpreter belongs to the
