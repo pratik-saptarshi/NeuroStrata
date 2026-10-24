@@ -39,16 +39,83 @@ pub struct DeduplicationConfig {
     pub cb_backoff_max_seconds: u64,
 }
 
-fn default_timeout() -> u64 { 5 }
-fn default_similarity_threshold() -> f32 { 0.85 }
-fn default_confidence_threshold() -> f32 { 0.8 }
-fn default_max_candidates() -> usize { 5 }
-fn default_cb_failure_threshold() -> u32 { 3 }
-fn default_cb_backoff_initial() -> u64 { 30 }
-fn default_cb_backoff_max() -> u64 { 3600 }
+fn default_timeout() -> u64 {
+    5
+}
+fn default_similarity_threshold() -> f32 {
+    0.85
+}
+fn default_confidence_threshold() -> f32 {
+    0.8
+}
+fn default_max_candidates() -> usize {
+    5
+}
+fn default_cb_failure_threshold() -> u32 {
+    3
+}
+fn default_cb_backoff_initial() -> u64 {
+    30
+}
+fn default_cb_backoff_max() -> u64 {
+    3600
+}
+
+/// Pure resolution of the store ceilings, so the precedence order can be tested
+/// without mutating the process environment.
+///
+/// Precedence: environment, then the config file, then the built-in default.
+fn parse_limit(name: &str, raw: Option<&str>) -> Result<Option<u64>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive bounded byte count, got {raw:?}"))?;
+    validate_limit(name, value)?;
+    Ok(Some(value))
+}
+
+fn validate_limit(name: &str, value: u64) -> Result<()> {
+    if value == 0 || value == u32::MAX as u64 {
+        anyhow::bail!(
+            "{name}={value} is an engine sentinel, not a bounded byte limit; use a positive byte count other than 0 or {}",
+            u32::MAX
+        );
+    }
+    Ok(())
+}
+
+fn resolve_store_limits(
+    configured_pool: Option<u64>,
+    configured_max_db: Option<u64>,
+    env: impl Fn(&str) -> Result<Option<u64>>,
+) -> Result<crate::store::StoreLimits> {
+    let pool = env("NEUROSTRATA_BUFFER_POOL_BYTES")?.or(configured_pool);
+    let max_db = env("NEUROSTRATA_MAX_DB_BYTES")?.or(configured_max_db);
+    if let Some(value) = pool {
+        validate_limit("store.buffer_pool_bytes", value)?;
+    }
+    if let Some(value) = max_db {
+        validate_limit("store.max_db_bytes", value)?;
+    }
+    let limits = crate::store::StoreLimits {
+        buffer_pool_bytes: pool.unwrap_or(crate::store::StoreLimits::DEFAULT_BUFFER_POOL_BYTES),
+        max_db_bytes: max_db.unwrap_or(crate::store::StoreLimits::DEFAULT_MAX_DB_BYTES),
+    };
+    if limits.buffer_pool_bytes > limits.max_db_bytes {
+        anyhow::bail!(
+            "NEUROSTRATA_BUFFER_POOL_BYTES ({}) cannot exceed NEUROSTRATA_MAX_DB_BYTES ({})",
+            limits.buffer_pool_bytes,
+            limits.max_db_bytes
+        );
+    }
+    Ok(limits)
+}
 
 impl Default for DedupProviderMode {
-    fn default() -> Self { Self::Auto }
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl Default for DeduplicationConfig {
@@ -68,6 +135,19 @@ impl Default for DeduplicationConfig {
     }
 }
 
+/// Memory ceilings for the embedded graph store.
+///
+/// Unset means "use the built-in ceiling", which is bounded on purpose: leaving
+/// the engine's own defaults in place lets the buffer pool grow to 80% of
+/// physical memory.
+#[derive(Debug, Default, Deserialize, serde::Serialize, Clone)]
+pub struct StoreConfig {
+    #[serde(default)]
+    pub buffer_pool_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_db_bytes: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -79,11 +159,32 @@ pub struct Config {
     #[serde(default)]
     pub project_contexts: HashMap<String, PathBuf>,
 
+    #[serde(default)]
+    pub store: StoreConfig,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl Config {
+    /// Resolve the store's memory ceilings: environment overrides win over the
+    /// config file, and the file wins over the built-in defaults.
+    ///
+    /// The environment exists so an operator can bound the pool without editing
+    /// JSON, and so a one-off run can be retried with a smaller ceiling without
+    /// changing the installed configuration.
+    pub fn store_limits(&self) -> Result<crate::store::StoreLimits> {
+        resolve_store_limits(
+            self.store.buffer_pool_bytes,
+            self.store.max_db_bytes,
+            |name| match std::env::var(name) {
+                Ok(value) => parse_limit(name, Some(&value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(error) => anyhow::bail!("could not read {name}: {error}"),
+            },
+        )
+    }
+
     pub fn default_path() -> Result<PathBuf> {
         let home_dir = dirs::home_dir().context("Could not find home directory")?;
         Ok(home_dir
@@ -106,6 +207,7 @@ impl Config {
                     .join("ladybug.db"),
                 deduplication: DeduplicationConfig::default(),
                 project_contexts: HashMap::new(),
+                store: StoreConfig::default(),
                 extra: HashMap::new(),
             };
 
@@ -181,7 +283,10 @@ impl Config {
             file.write_all(b"\n")?;
             if let Some(permissions) = existing_permissions {
                 file.set_permissions(permissions).with_context(|| {
-                    format!("Could not preserve config permissions at {}", path.display())
+                    format!(
+                        "Could not preserve config permissions at {}",
+                        path.display()
+                    )
                 })?;
             }
             file.sync_all()?;
@@ -259,6 +364,76 @@ mod tests {
         assert!(config.project_contexts.is_empty());
     }
 
+    /// A store section is optional, and omitting it must not mean "let the
+    /// engine decide" -- it must mean the bounded default.
+    #[test]
+    fn a_config_without_a_store_section_resolves_to_the_bounded_default() {
+        let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
+        assert!(config.store.buffer_pool_bytes.is_none());
+
+        let limits = resolve_store_limits(None, None, |_| Ok(None)).unwrap();
+        assert_eq!(
+            limits.buffer_pool_bytes,
+            crate::store::StoreLimits::DEFAULT_BUFFER_POOL_BYTES
+        );
+        assert_eq!(
+            limits.max_db_bytes,
+            crate::store::StoreLimits::DEFAULT_MAX_DB_BYTES
+        );
+    }
+
+    #[test]
+    fn store_limit_precedence_is_environment_then_config_then_default() {
+        let from_config = resolve_store_limits(Some(100), Some(200), |_| Ok(None)).unwrap();
+        assert_eq!(from_config.buffer_pool_bytes, 100);
+        assert_eq!(from_config.max_db_bytes, 200);
+
+        let from_environment = resolve_store_limits(Some(100), Some(200), |name| {
+            Ok(match name {
+                "NEUROSTRATA_BUFFER_POOL_BYTES" => Some(7),
+                "NEUROSTRATA_MAX_DB_BYTES" => Some(9),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            from_environment.buffer_pool_bytes, 7,
+            "the environment must win over the config file"
+        );
+        assert_eq!(from_environment.max_db_bytes, 9);
+
+        let partial = resolve_store_limits(None, Some(200), |name| {
+            Ok(match name {
+                "NEUROSTRATA_BUFFER_POOL_BYTES" => Some(7),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(partial.buffer_pool_bytes, 7);
+        assert_eq!(
+            partial.max_db_bytes, 200,
+            "an unset override must fall through to the config, not to zero"
+        );
+    }
+
+    #[test]
+    fn invalid_store_limit_environment_values_are_rejected() {
+        for raw in ["0", "", "abc", "-1", "18446744073709551616", "4294967295"] {
+            let outcome = parse_limit("NEUROSTRATA_BUFFER_POOL_BYTES", Some(raw));
+            assert!(outcome.is_err(), "accepted invalid value {raw:?}");
+        }
+        assert_eq!(parse_limit("X", Some("4096")).unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn zero_and_engine_sentinel_config_limits_are_rejected() {
+        for value in [0, u32::MAX as u64] {
+            assert!(resolve_store_limits(Some(value), None, |_| Ok(None)).is_err());
+            assert!(resolve_store_limits(None, Some(value), |_| Ok(None)).is_err());
+        }
+        assert!(resolve_store_limits(Some(20), Some(10), |_| Ok(None)).is_err());
+    }
+
     #[test]
     fn bind_project_context_requires_nonempty_id_and_existing_marker() {
         let root = temp_dir("validation");
@@ -334,7 +509,9 @@ mod tests {
         fs::create_dir(&marker).unwrap();
 
         let mut config = Config::load_from(&config_path).unwrap();
-        assert!(config.bind_project_context("bad", &marker).is_err());
+        // Any nonempty source ID is valid; use a path with the wrong marker
+        // name to exercise a genuinely invalid bind.
+        assert!(config.bind_project_context("bad", &root).is_err());
         assert!(config.unbind_project_context("unknown").is_err());
 
         assert_eq!(fs::read(&config_path).unwrap(), original);
@@ -388,6 +565,7 @@ mod tests {
             db_path: PathBuf::from("test.db"),
             deduplication: DeduplicationConfig::default(),
             project_contexts: HashMap::new(),
+            store: StoreConfig::default(),
             extra: HashMap::new(),
         };
 
@@ -459,10 +637,9 @@ mod tests {
     #[test]
     fn dedup_provider_config_jev_without_key_does_not_failover() {
         std::env::remove_var("TYPESAFE_API_KEY");
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#)
+                .unwrap();
         assert_eq!(config.deduplication.provider, DedupProviderMode::Jev);
         assert!(config.deduplication.judgment_api_key.is_none());
         assert!(config.deduplication.judgment_api_key_env.is_none());
@@ -471,10 +648,9 @@ mod tests {
     /// `none` disables dedup learning entirely.
     #[test]
     fn dedup_provider_config_none_disables_dedup_learning() {
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#)
+                .unwrap();
         assert_eq!(config.deduplication.provider, DedupProviderMode::None);
     }
 

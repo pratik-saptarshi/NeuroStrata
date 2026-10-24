@@ -1288,8 +1288,7 @@ pub async fn handle_task_complete(
         reply["registry_warning"] = json!(registry_warnings.join("; "));
     }
 
-    serde_json::to_string_pretty(&reply)
-        .map_err(|e| format!("Internal serialization error: {}", e))
+    serde_json::to_string_pretty(&reply).map_err(|e| format!("Internal serialization error: {}", e))
 }
 
 // ── tool: neurostrata_task_validate ────────────────────────────────────────
@@ -5327,8 +5326,14 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_creates_the_first_task_and_returns_the_instructions() {
         let store = temp_store().await;
+        // Keep the fixture isolated from sandbox-created mounts at `/tmp`;
+        // some environments expose a synthetic `/tmp/.git` directory.
+        let project_root = std::env::temp_dir().join(format!(
+            "neurostrata-bootstrap-non-git-{}",
+            uuid::Uuid::new_v4()
+        ));
         let reply = handle_bootstrap(
-            json!({ "namespace": "MyProj", "project_root": "/tmp" }),
+            json!({ "namespace": "MyProj", "project_root": project_root }),
             emb(),
             store.clone(),
         )

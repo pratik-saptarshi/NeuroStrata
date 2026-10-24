@@ -7,9 +7,9 @@
 
 use crate::domain::domain_key;
 use crate::traits::{
-    DedupCandidateScope, DomainMatchMode, DomainSearchOutcome, Embedder, ExactContentCandidate,
-    MemoryPayload, RawDistanceCandidate, RawDistanceQuery, RelocateOutcome, SearchResult,
-    UpsertReport, VectorStore,
+    is_internal_ingest_stage_namespace, DedupCandidateScope, DomainMatchMode, DomainSearchOutcome,
+    Embedder, ExactContentCandidate, MemoryPayload, RawDistanceCandidate, RawDistanceQuery,
+    RelocateOutcome, SearchResult, UpsertReport, VectorStore,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -32,6 +32,8 @@ struct Row {
 /// the tests need to decide which rules are candidates and in what order.
 pub struct MockStore {
     rows: Mutex<Vec<Row>>,
+    fail_upsert_containing: Mutex<Option<String>>,
+    fail_next_upsert_in_namespace: Mutex<Option<String>>,
     /// Toggle to make search/search_with_domain return an error.
     search_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
@@ -42,6 +44,8 @@ impl MockStore {
     pub fn new() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
+            fail_upsert_containing: Mutex::new(None),
+            fail_next_upsert_in_namespace: Mutex::new(None),
             search_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
         }
@@ -81,6 +85,17 @@ impl MockStore {
     pub(crate) fn set_search_fails(&self, fails: bool) {
         *self.search_fails.lock().expect("mock store lock") = fails;
     }
+
+    pub(crate) fn fail_upsert_containing(&self, needle: Option<String>) {
+        *self.fail_upsert_containing.lock().expect("mock store lock") = needle;
+    }
+
+    pub(crate) fn fail_next_upsert_in_namespace(&self, namespace: Option<String>) {
+        *self
+            .fail_next_upsert_in_namespace
+            .lock()
+            .expect("mock store lock") = namespace;
+    }
 }
 
 impl Default for MockStore {
@@ -102,6 +117,28 @@ impl VectorStore for MockStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<UpsertReport> {
+        let mut fail_namespace = self
+            .fail_next_upsert_in_namespace
+            .lock()
+            .expect("mock store lock");
+        if fail_namespace.as_deref() == Some(namespace) {
+            *fail_namespace = None;
+            return Err(anyhow::anyhow!(
+                "MockStore one-shot upsert failure in {namespace}"
+            ));
+        }
+        drop(fail_namespace);
+        if self
+            .fail_upsert_containing
+            .lock()
+            .expect("mock store lock")
+            .as_ref()
+            .is_some_and(|needle| id.contains(needle))
+        {
+            return Err(anyhow::anyhow!(
+                "MockStore upsert configured to fail for {id}"
+            ));
+        }
         let mut rows = self.rows.lock().expect("mock store lock");
         let row = Row {
             namespace: namespace.to_string(),
@@ -286,8 +323,57 @@ impl VectorStore for MockStore {
         Ok(())
     }
 
-    async fn clear_ingested(&self, _namespace: &str) -> Result<()> {
+    async fn clear_ingested(&self, namespace: &str) -> Result<()> {
+        self.rows
+            .lock()
+            .expect("mock store lock")
+            .retain(|row| row.namespace != namespace || row.payload.user_id != "auto-ingestor");
         Ok(())
+    }
+
+    async fn publish_ingested(&self, namespace: &str, staged_namespace: &str) -> Result<usize> {
+        let mut fail_namespace = self
+            .fail_next_upsert_in_namespace
+            .lock()
+            .expect("mock store lock");
+        if fail_namespace.as_deref() == Some(namespace) {
+            *fail_namespace = None;
+            return Err(anyhow::anyhow!(
+                "MockStore atomic publication failure in {namespace}"
+            ));
+        }
+        drop(fail_namespace);
+
+        let mut rows = self.rows.lock().expect("mock store lock");
+        rows.retain(|row| row.namespace != namespace || row.payload.user_id != "auto-ingestor");
+        let staged_prefix = format!(
+            "{}{}",
+            staged_namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let final_prefix = format!(
+            "{}{}",
+            namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+        let mut promoted = Vec::new();
+        for mut row in rows
+            .iter()
+            .filter(|row| {
+                row.namespace == staged_namespace && row.payload.user_id == "auto-ingestor"
+            })
+            .cloned()
+        {
+            if let Some(path) = row.id.strip_prefix(&staged_prefix) {
+                row.id = format!("{}{}", final_prefix, path);
+            }
+            replace_stage_prefix(&mut row.payload.metadata, &staged_prefix, &final_prefix);
+            row.namespace = namespace.to_string();
+            promoted.push(row);
+        }
+        rows.retain(|row| row.namespace != staged_namespace);
+        rows.extend(promoted);
+        Ok(0)
     }
 
     async fn relink_edges(&self, _namespace: &str) -> Result<usize> {
@@ -325,7 +411,7 @@ impl VectorStore for MockStore {
         let rows = self.rows.lock().expect("mock store lock");
         let mut names: Vec<String> = Vec::new();
         for r in rows.iter() {
-            if !names.contains(&r.namespace) {
+            if !is_internal_ingest_stage_namespace(&r.namespace) && !names.contains(&r.namespace) {
                 names.push(r.namespace.clone());
             }
         }
@@ -356,6 +442,27 @@ impl VectorStore for MockStore {
 
     async fn checkpoint(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+fn replace_stage_prefix(value: &mut serde_json::Value, from: &str, to: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(rest) = text.strip_prefix(from) {
+                *text = format!("{to}{rest}");
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_stage_prefix(item, from, to);
+            }
+        }
+        serde_json::Value::Object(items) => {
+            for item in items.values_mut() {
+                replace_stage_prefix(item, from, to);
+            }
+        }
+        _ => {}
     }
 }
 

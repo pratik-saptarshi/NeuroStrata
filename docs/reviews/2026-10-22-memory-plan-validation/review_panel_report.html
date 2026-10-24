@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Review Panel — Memory Plan Validation</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  details > summary { cursor: pointer; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  details[open] > summary .chev { transform: rotate(90deg); }
+  .chev { transition: transform .15s ease; display: inline-block; }
+  @media print {
+    details { display: block !important; }
+    details > *:not(summary) { display: block !important; }
+    .no-print { display: none !important; }
+    body { background: #fff !important; }
+  }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased">
+
+<div role="alert" class="bg-amber-50 border-2 border-amber-400 text-amber-900 px-5 py-4 m-4 rounded-lg">
+  <strong>⚠️ Reduced-isolation run.</strong>
+  <p class="mt-1 text-sm">Reviewer agents in this runtime could not be dispatched in an
+  adversarial role (the <code>oracle</code> and <code>fixer</code> agents refuse the role;
+  <code>explorer</code> is read-only), so Phases 4/5/7 — private reflection, debate rounds,
+  blind finals — were not run as independent rounds. Six independent Phase 3 reviews were
+  obtained and adjudicated by ground-truth verification instead. Consensus claims here carry
+  more risk than usual; the <em>verified defects</em> carry correspondingly less.</p>
+</div>
+
+<header class="px-5 pt-2 pb-4 max-w-6xl mx-auto">
+  <p class="text-xs uppercase tracking-widest text-slate-500">Overseer panel report</p>
+  <h1 class="text-3xl font-bold mt-1">Memory-Reduction Plan — Validation</h1>
+  <p class="text-slate-600 mt-2 text-sm">
+    NeuroStrata <code class="bg-slate-100 px-1 rounded">main@219e47d</code> ·
+    2026-10-22 · 6 reviewers + auditor + judge · Precise/Exhaustive mode
+  </p>
+</header>
+
+<main class="px-5 pb-16 max-w-6xl mx-auto space-y-8">
+
+  <!-- Verdict -->
+  <section class="grid gap-4 sm:grid-cols-4">
+    <div class="sm:col-span-2 bg-white rounded-xl border-l-4 border-red-500 border-y border-r border-slate-200 p-5">
+      <p class="text-xs uppercase tracking-widest text-slate-500">Verdict</p>
+      <p class="text-2xl font-bold text-red-600 mt-1">REJECT-AND-REWRITE</p>
+      <p class="text-sm text-slate-600 mt-2">Confidence: High · 6/6 reviewers concur on direction</p>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <p class="text-xs uppercase tracking-widest text-slate-500">Score</p>
+      <p class="text-4xl font-bold mt-1">3.2<span class="text-lg text-slate-400">/10</span></p>
+      <p class="text-xs text-slate-500 mt-1">mean, spread 2</p>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <p class="text-xs uppercase tracking-widest text-slate-500">Claims</p>
+      <p class="text-4xl font-bold mt-1">9<span class="text-lg text-slate-400">/16</span></p>
+      <p class="text-xs text-slate-500 mt-1">plan claims inaccurate</p>
+    </div>
+  </section>
+
+  <!-- Charts -->
+  <section class="grid gap-4 md:grid-cols-2">
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <h2 class="font-semibold mb-3 text-sm uppercase tracking-wide text-slate-500">Reviewer scores</h2>
+      <div style="position: relative; height: 220px; width: 100%;">
+        <canvas id="scores"></canvas>
+      </div>
+    </div>
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <h2 class="font-semibold mb-3 text-sm uppercase tracking-wide text-slate-500">Plan claim verification</h2>
+      <div style="position: relative; height: 220px; width: 100%;">
+        <canvas id="claims"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <!-- Score table -->
+  <section class="bg-white rounded-xl border border-slate-200 overflow-hidden">
+    <h2 class="font-semibold px-5 py-3 border-b border-slate-200 bg-slate-50">Panel composition</h2>
+    <table class="w-full text-sm">
+      <thead class="text-left text-xs uppercase tracking-wide text-slate-500 bg-slate-50">
+        <tr><th class="px-5 py-2">Reviewer</th><th class="px-2 py-2">Lens</th><th class="px-2 py-2">Intensity</th><th class="px-2 py-2">Score</th><th class="px-5 py-2">Verdict</th></tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100">
+        <tr><td class="px-5 py-2 font-medium">Feasibility Analyst</td><td class="px-2 py-2 text-slate-600">delivery realism</td><td class="px-2 py-2">60%</td><td class="px-2 py-2">4/10</td><td class="px-5 py-2 text-red-600">REJECT-AND-REWRITE</td></tr>
+        <tr><td class="px-5 py-2 font-medium">Code Quality Auditor</td><td class="px-2 py-2 text-slate-600">line accuracy</td><td class="px-2 py-2">40%</td><td class="px-2 py-2">3/10</td><td class="px-5 py-2 text-red-600">REJECT-AND-REWRITE</td></tr>
+        <tr><td class="px-5 py-2 font-medium">Risk Assessor</td><td class="px-2 py-2 text-slate-600">failure modes</td><td class="px-2 py-2">30%</td><td class="px-2 py-2">2/10</td><td class="px-5 py-2 text-red-600">REJECT-AND-REWRITE</td></tr>
+        <tr><td class="px-5 py-2 font-medium">Devil's Advocate</td><td class="px-2 py-2 text-slate-600">framing attack</td><td class="px-2 py-2">20%</td><td class="px-2 py-2">3/10</td><td class="px-5 py-2 text-red-600">REJECT-AND-REWRITE</td></tr>
+        <tr><td class="px-5 py-2 font-medium">Performance Specialist</td><td class="px-2 py-2 text-slate-600">memory mechanics</td><td class="px-2 py-2">50%</td><td class="px-2 py-2">3/10</td><td class="px-5 py-2 text-red-600">REJECT-AND-REWRITE</td></tr>
+        <tr><td class="px-5 py-2 font-medium">Rust Reviewer</td><td class="px-2 py-2 text-slate-600">tokio / ort / DB</td><td class="px-2 py-2">40%</td><td class="px-2 py-2">4/10</td><td class="px-5 py-2 text-red-600">REJECT-AND-REWRITE</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Filters -->
+  <section class="no-print flex flex-wrap gap-2 items-center">
+    <span class="text-xs uppercase tracking-wide text-slate-500 mr-1">Filter</span>
+    <button data-f="P0" class="filter px-3 py-1 rounded-full text-xs border border-slate-300 bg-white">P0</button>
+    <button data-f="P1" class="filter px-3 py-1 rounded-full text-xs border border-slate-300 bg-white">P1</button>
+    <button data-f="P2" class="filter px-3 py-1 rounded-full text-xs border border-slate-300 bg-white">P2</button>
+    <button data-f="all" class="filter px-3 py-1 rounded-full text-xs border border-slate-900 bg-slate-900 text-white">All</button>
+    <button id="expandAll" class="ml-auto px-3 py-1 rounded-full text-xs border border-slate-300 bg-white">Expand all</button>
+    <button id="collapseAll" class="px-3 py-1 rounded-full text-xs border border-slate-300 bg-white">Collapse all</button>
+  </section>
+
+  <!-- Issues -->
+  <section id="issues" class="space-y-3">
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P0" open>
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Bound the production buffer pool</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-red-100 text-red-800 px-2 py-0.5 rounded mr-1">P0</span>
+            <span class="inline-block bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded mr-1">VERIFIED</span>
+            <span class="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 rounded">CONSENSUS</span>
+            <span class="ml-2">src/store/ladybug.rs:605-607, 707-709 · lbug database.cpp:52-70</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Narrative</p>
+          <p>Production opens the store via <code>LadybugStore::new</code> →
+          <code>verifying_config()</code>, which sets only
+          <code>throw_on_wal_replay_failure(true)</code>. The underlying
+          <code>SystemConfig::default()</code> leaves
+          <code>buffer_pool_size: 0</code>, which the engine resolves to
+          <strong>80% of physical RAM</strong> (<code>DEFAULT_PHY_MEM_SIZE_RATIO_FOR_BM = 0.8</code>),
+          and <code>max_db_size: u32::MAX</code>, which resolves to an 8 TB virtual region.
+          The test path deliberately bounds both to 64 MiB / 512 MiB — its own doc comment
+          cites an "8 TiB" mmap reservation. Production does not.</p>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Code evidence</p>
+          <pre class="bg-slate-900 text-slate-100 text-xs p-3 rounded overflow-x-auto"><code>// lbug-0.20.4/lbug-src/src/main/database.cpp:52-70
+if (bufferPoolSize_ == -1u || bufferPoolSize_ == 0) {
+  auto systemMemSize = _SC_PHYS_PAGES * _SC_PAGESIZE;
+  bufferPoolSize_ = 0.8 * min(systemMemSize, UINTPTR_MAX);
+  bufferPoolSize_ = min(bufferPoolSize_,
+      DEFAULT_VM_REGION_MAX_SIZE * 0.8);
+}
+if (maxDBSize == -1u)
+  maxDBSize = DEFAULT_VM_REGION_MAX_SIZE;   // 1&lt;&lt;43 = 8TB</code></pre>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Judge ruling</p>
+          <p>The ceiling is not an allocation — the pool fills as pages are touched. But it
+          is unbounded by configuration and scales with installed RAM. Bound it and measure;
+          do not assume it is currently dominant. This is the highest-ceiling,
+          lowest-risk change in the set.</p>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Fix</p>
+          <p>Add a config field, plumb it into <code>SystemConfig</code> for both the verified
+          and unverified paths, keep <code>throw_on_wal_replay_failure(true)</code> on the
+          normal open, and add a production read path for the sizing (today only
+          <code>NEUROSTRATA_TEST_*</code> exists, read solely inside <code>for_testing()</code>).</p>
+        </div>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P0">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Ingest clears before embedding and swallows failures</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-red-100 text-red-800 px-2 py-0.5 rounded mr-1">P0</span>
+            <span class="inline-block bg-rose-100 text-rose-800 px-2 py-0.5 rounded mr-1">EXISTING_DEFECT</span>
+            <span class="ml-2">src/parser/ingest.rs:544-553, 490-507, 518</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Narrative</p>
+          <p><code>ingest_directory</code> calls <code>clear_ingested(namespace)</code> before
+          the walk begins. Per-symbol embed and upsert failures only <code>eprintln!</code>,
+          and the function returns <code>Ok(())</code>. The plan's headline recommendation —
+          make the remote embedder the default — converts an edge case into a routine one: a
+          network blip empties a namespace's code index and the command exits 0.</p>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Code evidence</p>
+          <pre class="bg-slate-900 text-slate-100 text-xs p-3 rounded overflow-x-auto"><code>vector_store.clear_ingested(namespace).await.map_err(...)?;   // :544
+...
+Err(e) =&gt; eprintln!("Failed to embed symbol {} ...", ...),     // :499
+...
+Ok(())                                                          // :518</code></pre>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Fix</p>
+          <p>Stage the ingest and swap on full success; propagate embed/upsert failures.
+          Must land <em>before</em> any change that increases embed failure rate.</p>
+        </div>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P0">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Establish a measured baseline first</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-red-100 text-red-800 px-2 py-0.5 rounded mr-1">P0</span>
+            <span class="inline-block bg-amber-100 text-amber-800 px-2 py-0.5 rounded mr-1">PLAN_RISK</span>
+            <span class="ml-2">src/main.rs:1747-49, 1874-85</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Narrative</p>
+          <p>The plan's "523 MB" evidence is a <em>model cache</em> comment, not resident
+          memory. <code>cargo bloat</code> measures binary size; <code>ps</code> is a
+          point-in-time snapshot that may include the proxy;
+          <code>ingest --help</code> exits during clap parsing before
+          <code>build_embedder()</code> is ever reached.</p>
+        </div>
+        <div>
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-1">Fix</p>
+          <p>Measure the <strong>daemon</strong> PID only. <code>/usr/bin/time -l</code> for
+          peak; <code>vmmap &lt;pid&gt;</code> (macOS) or
+          <code>/proc/&lt;pid&gt;/smaps_rollup</code> (Linux) for the resident/virtual split.
+          Sample after startup, after first inference, after a fixed ingest, and after idle —
+          so "high while idle" and "grows and never returns" can be told apart.</p>
+        </div>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P1">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Remote 429/5xx retry never fires</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-orange-100 text-orange-800 px-2 py-0.5 rounded mr-1">P1</span>
+            <span class="inline-block bg-rose-100 text-rose-800 px-2 py-0.5 rounded mr-1">EXISTING_DEFECT</span>
+            <span class="ml-2">src/embed.rs:242 vs 267-271</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p><code>try_embed</code> returns a plain <code>anyhow</code> string for HTTP errors, so
+        <code>e.downcast_ref::&lt;reqwest::StatusCode&gt;()</code> in
+        <code>embed_with_retry</code> can never match. The backoff branch is dead code.</p>
+        <p class="text-xs uppercase tracking-wide text-slate-500">Fix</p>
+        <p>Return a typed error carrying the status, or match on the response before
+        converting.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P1">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Any embedder change needs a schema + re-embed migration</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-orange-100 text-orange-800 px-2 py-0.5 rounded mr-1">P1</span>
+            <span class="inline-block bg-amber-100 text-amber-800 px-2 py-0.5 rounded mr-1">PLAN_RISK</span>
+            <span class="ml-2">src/store/ladybug.rs:1431-1437 · README.md:299,303</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p>The column is <code>embedding FLOAT[{dimensions}]</code>, fixed at table creation
+        and sized from the embedder's declared width. No embedder identity is persisted, and no
+        re-embed command exists. Switching 768 → 384 shatters the schema; switching to a
+        same-width model silently mixes incompatible vector spaces. The README already ships a
+        1536-dim remote example against 768-dim local defaults — one config edit from breaking.</p>
+        <p class="text-xs uppercase tracking-wide text-slate-500">Fix</p>
+        <p>Persist embedder identity + width, refuse startup on mismatch, and provide an
+        explicit re-embed path before any model change.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P1">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Keep remote embedding opt-in, not default</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-orange-100 text-orange-800 px-2 py-0.5 rounded mr-1">P1</span>
+            <span class="inline-block bg-amber-100 text-amber-800 px-2 py-0.5 rounded mr-1">PLAN_RISK</span>
+            <span class="ml-2">src/embed.rs:48-63, 303</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p>Defaults are local; remote needs both <code>base_url</code> and
+        <code>api_key_env</code>. Making it default exports every ingested symbol's source text
+        to a third party, adds a network dependency to startup, and — combined with the P0
+        ingest defect — turns a blip into data loss.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P1">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Proposed tokio feature list would not compile</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-orange-100 text-orange-800 px-2 py-0.5 rounded mr-1">P1</span>
+            <span class="inline-block bg-amber-100 text-amber-800 px-2 py-0.5 rounded mr-1">PLAN_RISK</span>
+            <span class="ml-2">Cargo.toml:11 · src/server.rs:5,1356-1364 · src/daemon.rs:601,1044-1068</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p><code>full</code> enables <code>fs, io-util, io-std, macros, net, parking_lot,
+        process, rt, rt-multi-thread, signal, sync, time</code>. The proposed subset omits
+        <code>fs</code>, <code>io-util</code>, <code>net</code> and <code>signal</code>, all
+        used. And it would not reduce memory even if it compiled: thread counts come from
+        <code>Builder::new_multi_thread()</code> at <code>main.rs:1733-1740</code>, not from
+        cargo features. If thread memory is implicated the lever is
+        <code>max_blocking_threads</code>.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P1">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Keep MAX_EMBED_TOKENS = 2048; do not lower to 512</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-orange-100 text-orange-800 px-2 py-0.5 rounded mr-1">P1</span>
+            <span class="inline-block bg-amber-100 text-amber-800 px-2 py-0.5 rounded mr-1">PLAN_RISK</span>
+            <span class="ml-2">src/embed.rs:124-126 · src/parser/ingest.rs:31</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p>The code's own ratio is ~3.5 chars/token, so 4000 chars needs ~1143 tokens.
+        512 covers ~1792 chars and would silently truncate the majority of a maximal symbol —
+        a recall regression, not a memory win. Token count does not change weight residency;
+        it only affects the activation peak when inputs exceed the cap.</p>
+        <p class="text-xs uppercase tracking-wide text-slate-500">If shrinking is required</p>
+        <p>Lower stored text and token cap together, and measure retrieval quality.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P1">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Drop BlobStore from the plan — no production caller</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-orange-100 text-orange-800 px-2 py-0.5 rounded mr-1">P1</span>
+            <span class="inline-block bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded mr-1">VERIFIED</span>
+            <span class="ml-2">src/learning/blob_store.rs:11,28 · mod.rs:15</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p>The <code>Mutex&lt;HashMap&lt;PayloadHash, Vec&lt;u8&gt;&gt;&gt;</code> is genuinely
+        unbounded, but the only uses are the definition, a re-export, and
+        <code>#[cfg(test)]</code> sites. Bounding it cannot reduce current daemon RSS.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P2">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Keep the Mutex; batching raises peak memory</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded mr-1">P2</span>
+            <span class="inline-block bg-amber-100 text-amber-800 px-2 py-0.5 rounded mr-1">PLAN_RISK</span>
+            <span class="ml-2">src/embed.rs:129,180</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p><code>TextEmbedding::embed</code> needs <code>&amp;mut self</code> (the code binds
+        <code>let mut guard</code>), and ORT sessions are not safe for concurrent
+        <code>run</code>. A read guard will not compile; a write guard serializes exactly like
+        the Mutex. Batching is a throughput change that raises peak: one
+        <code>[1,2048,768]</code> f32 tensor ≈ 6 MiB, so batch 32 ≈ 192 MiB.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P2">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">FETCH_MULTIPLIER is a query cost, not an RSS cost</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded mr-1">P2</span>
+            <span class="ml-2">src/store/ladybug.rs:46, 52-53, 86-89</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p>The stringified 768-float query vector is ~10 KB and transient. Reducing the
+        multiplier can return fewer than <code>limit</code> domain-matching rows — preserve
+        filter semantics and profile before changing.</p>
+      </div>
+    </details>
+
+    <details class="issue bg-white rounded-xl border border-slate-200" data-sev="P2">
+      <summary class="px-5 py-4 flex items-start gap-3">
+        <span class="chev mt-1 text-slate-400">▶</span>
+        <span class="flex-1">
+          <span class="font-semibold">Prune finished ingest jobs; fix lane numbering</span>
+          <span class="block text-xs text-slate-500 mt-1">
+            <span class="inline-block bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded mr-1">P2</span>
+            <span class="ml-2">src/ingest_jobs.rs:135,178 · PLAN.md:84-85</span>
+          </span>
+        </span>
+      </summary>
+      <div class="px-5 pb-5 space-y-3 text-sm">
+        <p>The <code>jobs</code> map inserts but never removes. Separately, the plan's
+        "lanes 1+2+3" names lane 4 and omits lane 3 — split the rollout into independently
+        measurable, revertible commits.</p>
+      </div>
+    </details>
+
+  </section>
+
+  <!-- Gaps -->
+  <section class="bg-white rounded-xl border border-slate-200 p-5 text-sm">
+    <h2 class="font-semibold mb-3 text-sm uppercase tracking-wide text-slate-500">Coverage gaps</h2>
+    <ul class="list-disc pl-5 space-y-1 text-slate-700">
+      <li>ORT arena high-water retention is never discussed — it decides whether this is a
+        "grows and never returns" problem or an "idle is high" problem.</li>
+      <li>Daemon lifecycle: periodic restart as a bounded-ceiling lever is not considered.</li>
+      <li>The <code>learning-laya</code> feature is decorative
+        (<code>Cargo.toml:63-65</code>); no <code>cfg(feature = …)</code> exists, so gating
+        it changes binary size, not RSS.</li>
+      <li>No target RSS and no rollback path were ever defined.</li>
+    </ul>
+  </section>
+
+</main>
+
+<footer class="border-t border-slate-200 py-6 px-5 text-center text-xs text-slate-500">
+  <p>Overseer v3.2.0 · reduced-isolation run · generated 2026-10-22</p>
+  <p class="mt-1">HTML loads Tailwind CSS and Chart.js from CDN; offline rendering degrades to plain readable output.</p>
+</footer>
+
+<script>
+document.querySelectorAll('.filter').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var f = b.dataset.f;
+    document.querySelectorAll('.filter').forEach(function (x) {
+      x.className = 'filter px-3 py-1 rounded-full text-xs border border-slate-300 bg-white';
+    });
+    b.className = 'filter px-3 py-1 rounded-full text-xs border border-slate-900 bg-slate-900 text-white';
+    document.querySelectorAll('.issue').forEach(function (el) {
+      el.style.display = (f === 'all' || el.dataset.sev === f) ? '' : 'none';
+    });
+  });
+});
+document.getElementById('expandAll').addEventListener('click', function () {
+  document.querySelectorAll('.issue').forEach(function (d) { d.open = true; });
+});
+document.getElementById('collapseAll').addEventListener('click', function () {
+  document.querySelectorAll('.issue').forEach(function (d) { d.open = false; });
+});
+
+function chart(id, cfg) {
+  try {
+    var el = document.getElementById(id);
+    if (el && window.Chart) new Chart(el, cfg);
+  } catch (e) { /* CDN unavailable — degrade silently */ }
+}
+
+chart('scores', {
+  type: 'bar',
+  data: {
+    labels: ['Feasibility', 'Quality', 'Risk', 'Advocate', 'Perf', 'Rust'],
+    datasets: [{
+      label: 'Score /10',
+      data: [4, 3, 2, 3, 3, 4],
+      backgroundColor: ['#ef4444', '#ef4444', '#dc2626', '#ef4444', '#ef4444', '#ef4444'],
+      borderRadius: 4
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: { y: { beginAtZero: true, max: 10, ticks: { stepSize: 2 } } },
+    plugins: { legend: { display: false } }
+  }
+});
+
+chart('claims', {
+  type: 'doughnut',
+  data: {
+    labels: ['Inaccurate / misattributed', 'Verified', 'Verified, low impact'],
+    datasets: [{
+      data: [9, 6, 1],
+      backgroundColor: ['#ef4444', '#10b981', '#94a3b8'],
+      borderWidth: 0
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    cutout: '62%',
+    plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 10 } } } }
+  }
+});
+</script>
+</body>
+</html>

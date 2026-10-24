@@ -6,6 +6,29 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// Namespace prefix reserved for unpublished ingestion generations.
+pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
+
+/// Reject every user-selected ingest destination in the internal namespace,
+/// including malformed or partial generation names.
+pub fn is_reserved_ingest_destination(namespace: &str) -> bool {
+    namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
+}
+
+/// Recognizes only the current UUID-shaped internal stage identifier. Older
+/// names based only on a `-ingest-stage-` suffix are ambiguous with user-owned
+/// namespaces and must never authorize hiding or deletion.
+pub fn is_internal_ingest_stage_namespace(namespace: &str) -> bool {
+    namespace
+        .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+        .and_then(|generation| uuid::Uuid::parse_str(generation).ok())
+        .is_some_and(|generation| {
+            namespace
+                .strip_prefix(INTERNAL_INGEST_STAGE_PREFIX)
+                .is_some_and(|raw| generation.to_string() == raw)
+        })
+}
+
 /// The shipped vocabulary schema, embedded at compile time. v2 adds the
 /// `task` memory type and the EXTRACTED_FROM relation that carries the
 /// extraction edge behind the completion gate (Lock 2).
@@ -99,8 +122,7 @@ pub struct SearchEvidence {
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
     evidence.as_ref().map_or(false, |evs| {
-        evs.iter()
-            .any(|e| e.kind == EvidenceKind::DirectMatch)
+        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
     })
 }
 
@@ -264,6 +286,20 @@ pub trait VectorStore: Send + Sync {
     /// Remove every row owned by the directory ingester in a namespace: the AST
     /// symbols and the directory/file nodes, which ingestion then rebuilds.
     async fn clear_ingested(&self, namespace: &str) -> Result<()>;
+
+    /// Start an unpublished generation and recover orphaned generations left
+    /// by prior interrupted ingests. The returned guard must be held until the
+    /// generation is either published or discarded.
+    async fn begin_ingest_stage(&self, _namespace: &str) -> Result<Box<dyn Send>> {
+        Ok(Box::new(()))
+    }
+
+    /// Atomically replace the namespace's ingested rows with a fully prepared
+    /// generation and restore all declared edges before it becomes visible.
+    /// Backends without transactional publication must reject the operation.
+    async fn publish_ingested(&self, _namespace: &str, _staged_namespace: &str) -> Result<usize> {
+        anyhow::bail!("this vector store does not support atomic ingest publication")
+    }
 
     /// Rebuilds the edges a namespace's memories declare, and reports how many
     /// were materialised.
