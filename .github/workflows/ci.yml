@@ -133,3 +133,33 @@ jobs:
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
+
+  # ONE-OFF (Task 19 — removed before the PR): regenerates Cargo.lock
+  # after Cargo.toml gains tracing-subscriber. CI builds --locked, and a
+  # package not yet in the lockfile cannot be added by `cargo update -p`
+  # (it errors instead of adding), so a resolving command on the task
+  # branch writes the new lock. The artifact is downloaded, its diff
+  # checked against the permitted tracing-subscriber subtree, and the
+  # accepted lock committed with the implementation.
+  generate-lockfile:
+    name: generate-lockfile (one-off, Task 19)
+    if: github.ref == 'refs/heads/program/task-19-tracing-init'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Resolution precedes compilation, so the lock is written even
+      # though the tree currently fails to compile (the Task 19 RED
+      # tests presume a seam that does not exist yet).
+      - name: Resolve dependencies (writes Cargo.lock)
+        shell: bash
+        run: cargo check || true
+
+      - name: Upload regenerated Cargo.lock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock-task19
+          path: Cargo.lock
+          if-no-files-found: error
