@@ -5,7 +5,7 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,11 @@ pub struct AcceptableEmbedder {
     /// so user-written entries serialize exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by: Option<String>,
+    /// Optional SHA-256 pin over the model's downloaded artifact set
+    /// (Task 9 / DR-7). Absent = unpinned: the computed pin is recorded
+    /// as a PIN-CANDIDATE at load instead of being enforced.
+    #[serde(default)]
+    pub artifact_pin: Option<String>,
 }
 
 /// The provenance value stamped on every entry when the binary writes
@@ -75,6 +80,7 @@ fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
             api_key_env: None,
             api_model: None,
             generated_by: None,
+            artifact_pin: None,
         },
         AcceptableEmbedder {
             model_name: "BGEBaseENV15".to_string(),
@@ -83,6 +89,7 @@ fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
             api_key_env: None,
             api_model: None,
             generated_by: None,
+            artifact_pin: None,
         },
     ]
 }
@@ -233,6 +240,7 @@ fn profile_model(profile: crate::config::CapacityProfile) -> AcceptableEmbedder 
         api_key_env: None,
         api_model: None,
         generated_by: None,
+        artifact_pin: None,
     }
 }
 
@@ -518,6 +526,31 @@ pub(crate) fn configured_identity_for(model: &AcceptableEmbedder) -> Result<Stri
 pub fn configured_embedder_id() -> Result<String> {
     let model = configured_model()?;
     configured_identity_for(&model)
+}
+
+/// Resolve an embedders.json model name to the fastembed model it names.
+///
+/// Extraction seam (Task 9): this preserves today's behavior exactly —
+/// an unrecognized name silently falls back to NomicEmbedTextV15. The
+/// unknown-name refusal is pinned by tests against this seam and lands
+/// on it; nothing else resolves model names.
+fn resolve_embedding_model(model_name: &str) -> Result<EmbeddingModel> {
+    Ok(EmbeddingModel::from_str(model_name).unwrap_or(EmbeddingModel::NomicEmbedTextV15))
+}
+
+/// The artifact-pin gate for one model's artifact directory (Task 9).
+///
+/// Placeholder seam: accepts everything today. The pin comparison —
+/// refuse when `recorded_pin` does not match the artifact set in
+/// `model_dir`, record a PIN-CANDIDATE when it is None — is pinned by
+/// tests against this seam and lands on it.
+#[allow(dead_code)]
+fn enforce_artifact_pin(
+    _model_dir: &Path,
+    _recorded_pin: Option<&str>,
+    _model_name: &str,
+) -> Result<()> {
+    Ok(())
 }
 
 /// The embedding width of the configured model, without loading the model.
@@ -1080,6 +1113,7 @@ mod tests {
             api_key_env: None,
             api_model: None,
             generated_by: None,
+            artifact_pin: None,
         }];
         assert!(select_configured_model(models, Some("typo-model")).is_err());
     }
@@ -1093,6 +1127,7 @@ mod tests {
             api_key_env: None,
             api_model: None,
             generated_by: None,
+            artifact_pin: None,
         };
         assert!(local_model_details(&model).is_err());
 
@@ -1118,6 +1153,7 @@ mod tests {
             api_key_env: None,
             api_model: None,
             generated_by: None,
+            artifact_pin: None,
         };
         let model_b = AcceptableEmbedder {
             model_name: "BGEBaseENV15".into(),
@@ -1141,6 +1177,7 @@ mod tests {
             api_key_env: Some("REMOTE_API_KEY".into()),
             api_model: Some("embed-v2".into()),
             generated_by: None,
+            artifact_pin: None,
         };
         let configured = configured_identity_for(&model).unwrap();
         let runtime = RemoteEmbedder::new(
@@ -1315,6 +1352,7 @@ mod tests {
             api_key_env: None,
             api_model: None,
             generated_by: None,
+            artifact_pin: None,
         }
     }
 
@@ -1474,6 +1512,7 @@ mod tests {
             api_key_env: Some("NS_TASK2_CARRIED_KEY".into()),
             api_model: Some("carried-model".into()),
             generated_by: None,
+            artifact_pin: None,
         };
         let embedder = build_embedder_for(&carried).unwrap();
         assert_eq!(
