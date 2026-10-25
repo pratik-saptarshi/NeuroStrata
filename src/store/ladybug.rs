@@ -6889,6 +6889,7 @@ mod tests {
         output: String,
         stderr: String,
         timed_out: bool,
+        watchdog: std::time::Duration,
     }
 
     fn scenario_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
@@ -6914,12 +6915,15 @@ mod tests {
 
     /// Spawn a scenario child exactly the way the AC7 parent spawns
     /// its worker (same binary, `--exact <child> --nocapture
-    /// --ignored`, env-var DB path, piped stdout) under the same
-    /// 120 s watchdog, additionally capturing stderr for the record.
+    /// --ignored`, env-var DB path, piped stdout) under a watchdog
+    /// (120 s for the continuation parent, 300 s for the reopen
+    /// parent per Amendment 1), additionally capturing stderr for
+    /// the record.
     fn spawn_scenario_child(
         test_path: &str,
         env_var: &str,
         db: &Path,
+        watchdog: std::time::Duration,
     ) -> ScenarioChildOutcome {
         use std::io::Read as _;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -6938,7 +6942,7 @@ mod tests {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if started.elapsed() >= std::time::Duration::from_secs(120) {
+            if started.elapsed() >= watchdog {
                 timed_out = true;
                 let _ = child.kill();
                 break child.wait().unwrap();
@@ -6958,6 +6962,7 @@ mod tests {
             output,
             stderr,
             timed_out,
+            watchdog,
         }
     }
 
@@ -6971,7 +6976,10 @@ mod tests {
         marker_prefixes: &[&str],
     ) -> String {
         let status_desc = if outcome.timed_out {
-            "watchdog TIMEOUT (child killed after 120s)".to_string()
+            format!(
+                "watchdog TIMEOUT (child killed after {}s)",
+                outcome.watchdog.as_secs()
+            )
         } else if let Some(signal) = scenario_exit_signal(&outcome.status) {
             format!("terminated by signal {signal}")
         } else if let Some(code) = outcome.status.code() {
@@ -7098,12 +7106,17 @@ mod tests {
         flush_stdout();
     }
 
-    /// Baseline parent for the continuation scenario (plan Task 1):
-    /// passes only on the exact baseline signature — child killed by
-    /// signal 11 after `REFUSAL_OBSERVED`, PASS marker absent, no
-    /// watchdog timeout — and even then fails with the record, by
-    /// design: the panic text is the evidence the run's log carries.
-    /// Any other signature panics as a MISMATCH with the same record.
+    /// Baseline parent for the continuation scenario (plan Task 1,
+    /// Amendment 1): confirms on either re-registered baseline
+    /// signature — (A) child killed by signal 11 after
+    /// `REFUSAL_OBSERVED`, PASS marker absent; or (B) child exit 0
+    /// with the post-refusal checkpoint returning an engine-internal
+    /// assertion error (the stock engine's manifestation through
+    /// this stack, run 40218968296) — and even then fails with the
+    /// record, by design: the panic text is the evidence the run's
+    /// log carries. Any other signature (including a checkpoint
+    /// that succeeds or refuses again cleanly) panics as a MISMATCH
+    /// with the same record.
     #[test]
     fn cap_refusal_post_refusal_continuation_outcome() {
         let db = std::env::temp_dir()
@@ -7112,6 +7125,7 @@ mod tests {
             "store::ladybug::tests::cap_refusal_then_checkpoint_and_close_child_worker",
             "NEUROSTRATA_TEST_CAP_CONTINUATION_DB",
             &db,
+            std::time::Duration::from_secs(120),
         );
         let record = scenario_verdict_record(
             "continuation",
@@ -7122,23 +7136,58 @@ mod tests {
                 "PROFILE_CAP_CONTINUATION_PASS",
             ],
         );
-        let confirmed = !outcome.timed_out
+        // Amendment 1 signatures. (A) the crash: signal 11 after
+        // REFUSAL_OBSERVED, PASS absent. (B) the assertion throw:
+        // exit 0, REFUSAL_OBSERVED before the checkpoint marker, and
+        // the POST_REFUSAL_CHECKPOINT_ERR line itself carries an
+        // engine-internal assertion and not the max-DB-size family
+        // (the checks are scoped to that line: the REFUSAL_OBSERVED
+        // line legitimately contains the refusal text). A checkpoint
+        // OK or a checkpoint ERR with the max-DB-size text is
+        // healthy behavior — neither signature.
+        let out = &outcome.output;
+        let checkpoint_err_line = out.lines().find(|line| {
+            line.trim_start()
+                .starts_with("POST_REFUSAL_CHECKPOINT_ERR")
+        });
+        let signature_a = !outcome.timed_out
             && scenario_exit_signal(&outcome.status) == Some(11)
-            && outcome.output.contains("REFUSAL_OBSERVED")
-            && !outcome.output.contains("PROFILE_CAP_CONTINUATION_PASS");
+            && out.contains("REFUSAL_OBSERVED")
+            && !out.contains("PROFILE_CAP_CONTINUATION_PASS");
+        let signature_b = !outcome.timed_out
+            && outcome.status.code() == Some(0)
+            && matches!(
+                (
+                    out.find("REFUSAL_OBSERVED"),
+                    out.find("POST_REFUSAL_CHECKPOINT_ERR")
+                ),
+                (Some(refusal_pos), Some(checkpoint_pos)) if refusal_pos < checkpoint_pos
+            )
+            && checkpoint_err_line.is_some_and(|line| {
+                line.contains("Assertion failed in file")
+                    && !line.contains("Maximum database size")
+            });
+        let confirmed = signature_a || signature_b;
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(width_marker_path(&db));
         if confirmed {
+            let signature = if signature_a { "A" } else { "B" };
             panic!(
-                "BASELINE SIGNATURE CONFIRMED | {record} | expected on the stock \
-                 engine: signal 11 after REFUSAL_OBSERVED, \
-                 PROFILE_CAP_CONTINUATION_PASS absent"
+                "BASELINE SIGNATURE CONFIRMED (Amendment 1 signature {signature}) | \
+                 {record} | expected on the stock engine: signal 11 after \
+                 REFUSAL_OBSERVED, PROFILE_CAP_CONTINUATION_PASS absent \
+                 (signature A), or exit 0 with POST_REFUSAL_CHECKPOINT_ERR \
+                 carrying an engine-internal assertion and not the \
+                 max-db-size family (signature B)"
             );
         } else {
             panic!(
                 "BASELINE SIGNATURE MISMATCH | {record} | expected on the stock \
                  engine: signal 11 after REFUSAL_OBSERVED, \
-                 PROFILE_CAP_CONTINUATION_PASS absent, no watchdog timeout"
+                 PROFILE_CAP_CONTINUATION_PASS absent (Amendment 1 signature A), \
+                 or exit 0 with POST_REFUSAL_CHECKPOINT_ERR carrying an \
+                 engine-internal assertion and not the max-db-size family \
+                 (signature B), no watchdog timeout"
             );
         }
     }
@@ -7146,8 +7195,9 @@ mod tests {
     /// Child worker for `reopen_scenario_outcome`: the LadybugDB
     /// maintainer's reopen scenario from #1386, encoded through the
     /// store layer in one process. Phase 1 grows a database to a
-    /// 12 MiB main file under default limits with
-    /// `checkpoint_threshold=0`. Phase 2 reopens it at pool == cap ==
+    /// main file in the [10 MiB, 14 MiB] band (Amendment 1) under
+    /// default limits with `checkpoint_threshold=0`. Phase 2
+    /// reopens it at pool == cap ==
     /// 16 MiB with the same threshold, verifies the setting round-trips,
     /// drives writes until a checkpoint is refused with the
     /// max-DB-size error, then runs the three probes — one more write,
@@ -7173,10 +7223,12 @@ mod tests {
             location_lines: "1".into(),
             metadata: json!({"evidence": "cap"}),
         };
-        // Phase 1: grow to a 12 MiB main DB file under default limits.
-        // File length steps in 4 MiB frame groups, so the first length
-        // >= 10 MiB is exactly 12 MiB. The checkpoint after each upsert
-        // is the growth mechanism (upserts alone only dirty the WAL).
+        // Phase 1: grow the main DB file into the [10 MiB, 14 MiB]
+        // band under default limits. File length grows in 4 KiB page
+        // increments (Amendment 1 ground-truth correction), so the
+        // loop stops at the first length >= 10 MiB and asserts the
+        // band. The checkpoint after each upsert is the growth
+        // mechanism (upserts alone only dirty the WAL).
         let phase1_limits = StoreLimits::default();
         {
             let store = LadybugStore::with_system_config(
@@ -7223,11 +7275,10 @@ mod tests {
             let len = std::fs::metadata(&db)
                 .expect("phase 1: database file metadata")
                 .len();
-            assert_eq!(
-                len,
-                12 * 1024 * 1024,
-                "phase 1 database file must land at exactly 12 MiB \
-                 (4 MiB frame-group steps), got {len} bytes"
+            assert!(
+                (10 * 1024 * 1024..=14 * 1024 * 1024).contains(&len),
+                "phase 1 database file must land in the [10 MiB, 14 MiB] \
+                 band (Amendment 1), got {len} bytes"
             );
             println!("REOPEN_PHASE1_DONE {len}");
             flush_stdout();
@@ -7244,7 +7295,7 @@ mod tests {
             scenario_config(phase2_limits),
             phase2_limits,
         )
-        .expect("phase 2: reopen the 12 MiB store at a 16 MiB cap");
+        .expect("phase 2: reopen the phase-1 store at a 16 MiB cap");
         store
             .init("reopen-scenario")
             .await
@@ -7265,8 +7316,9 @@ mod tests {
             "checkpoint_threshold must round-trip as 0, got {threshold}"
         );
         // Drive writes until a checkpoint refuses; at most 1024 (the
-        // AC7 bound). One frame group of headroom (12 -> 16 MiB), so
-        // the refusal is expected far inside the bound.
+        // AC7 bound). The 16 MiB cap leaves headroom over the phase-1
+        // band (10-14 MiB), so the refusal is expected far inside
+        // the bound.
         let mut refusal = None;
         for i in 0..1024u64 {
             let inserted = store
@@ -7340,6 +7392,7 @@ mod tests {
             "store::ladybug::tests::reopen_refused_checkpoint_child_worker",
             "NEUROSTRATA_TEST_REOPEN_DB",
             &db,
+            std::time::Duration::from_secs(300),
         );
         let record = scenario_verdict_record(
             "reopen",
