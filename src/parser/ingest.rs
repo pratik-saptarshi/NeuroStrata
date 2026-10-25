@@ -158,6 +158,10 @@ fn symbol_id(path: &str, kind: &str, name: &str, start_line: usize) -> String {
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
     fn relinked(&self, edges: usize);
+    /// A document the secret scanner refused at ingest: skipped whole and
+    /// reported here with the scanner's reason. The default ignores it, so
+    /// observers that only count progress are unchanged.
+    fn file_skipped(&self, _path: &str, _reason: &str) {}
 }
 
 /// An owned item streamed from the blocking producer to the async consumer.

@@ -41,6 +41,11 @@ pub struct IngestProgress {
     pub symbols_ingested: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_file: Option<String>,
+    /// Documents the secret scanner refused during this walk, as
+    /// "path: reason" entries. A skipped document contributes nothing to
+    /// the store; the rest of the walk proceeds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relinked_edges: Option<usize>,
     pub started_unix: u64,
@@ -58,6 +63,7 @@ impl IngestProgress {
             files_ingested: 0,
             symbols_ingested: 0,
             last_file: None,
+            skipped_files: Vec::new(),
             relinked_edges: None,
             started_unix: now_unix(),
             finished_unix: None,
@@ -89,6 +95,12 @@ impl IngestObserver for ProgressReporter {
     fn relinked(&self, edges: usize) {
         self.tx
             .send_modify(|progress| progress.relinked_edges = Some(edges));
+    }
+
+    fn file_skipped(&self, path: &str, reason: &str) {
+        self.tx.send_modify(|progress| {
+            progress.skipped_files.push(format!("{}: {}", path, reason));
+        });
     }
 }
 
