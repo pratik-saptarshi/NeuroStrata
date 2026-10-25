@@ -16,6 +16,7 @@ pub mod memory;
 pub mod mesh;
 pub mod system;
 pub mod tasks;
+pub mod tool_list;
 
 use crate::traits::{Embedder, VectorStore};
 use std::sync::Arc;
