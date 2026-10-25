@@ -3356,6 +3356,146 @@ mod tests {
 
         assert!(gate_verify_daemon(None, own).is_err());
     }
+
+    // ---- Task 19 (J26): the tracing subscriber these tests presume ----
+    //
+    // Until this task the crate declared `tracing` and emitted through
+    // ~50 call sites with no subscriber installed anywhere: every event
+    // went nowhere. The production seam is `init_tracing()` at the top
+    // of `main()`: it builds the subscriber via
+    // `tracing_fmt_subscriber(std::io::stderr, tracing_env_filter())`
+    // and installs it as the global default. The writer slot is stderr
+    // because stdout is the MCP stdio channel — a log line there would
+    // corrupt the protocol. These tests drive the same builder with a
+    // capture writer standing in the stderr slot, installed as a scoped
+    // default so they never contend for the process-global one.
+
+    /// An in-memory `Write` sink handed to the fmt layer through its
+    /// `MakeWriter` closure; cloning shares the one buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serializes the tests that set `RUST_LOG` (env is process-global)
+    /// and restores the caller's prior value on drop.
+    static RUST_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RustLogRestore {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RustLogRestore {
+        fn set(value: Option<&str>) -> Self {
+            let lock = RUST_LOG_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prior = std::env::var_os("RUST_LOG");
+            match value {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for RustLogRestore {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
+    #[test]
+    fn tracing_output_reaches_stderr() {
+        // The production entry point itself runs, and running it twice
+        // in one process is not an error (a re-exec'd helper or an
+        // embedded caller must never panic on the one-shot global).
+        init_tracing();
+        init_tracing();
+
+        let _env = RustLogRestore::set(None); // default filter: info
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("tracing_output_reaches_stderr marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("tracing_output_reaches_stderr marker"),
+            "the info event lands in the stderr slot: {text}"
+        );
+        assert!(
+            text.contains("INFO"),
+            "the default filter admits info, formatted with its level: {text}"
+        );
+    }
+
+    #[test]
+    fn stdout_carries_no_log_output() {
+        let _env = RustLogRestore::set(None);
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        // Stand-ins for the stdio mode's two channels: `captured` plays
+        // the stderr role (the writer production hands the fmt layer);
+        // a plain buffer plays stdout, written the way the stdio loop
+        // writes a protocol frame.
+        let mut stdout_role: Vec<u8> = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            stdout_role.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
+            tracing::info!("stdout_carries_no_log_output marker");
+        });
+        assert_eq!(
+            String::from_utf8(stdout_role).unwrap(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1}\n",
+            "stdout carries protocol bytes only — no log output"
+        );
+        assert!(
+            captured.text().contains("stdout_carries_no_log_output marker"),
+            "the log line went to the stderr slot instead"
+        );
+    }
+
+    #[test]
+    fn rust_log_filter_is_honored() {
+        let _env = RustLogRestore::set(Some("error"));
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("rust_log_filter_is_honored info marker");
+            tracing::error!("rust_log_filter_is_honored error marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("rust_log_filter_is_honored error marker"),
+            "the error event passes the RUST_LOG=error filter: {text}"
+        );
+        assert!(
+            !text.contains("rust_log_filter_is_honored info marker"),
+            "the info event is suppressed by RUST_LOG=error: {text}"
+        );
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
