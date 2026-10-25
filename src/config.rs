@@ -946,6 +946,9 @@ mod tests {
     /// Explicit `jev` with an env var reference.
     #[test]
     fn dedup_provider_config_explicit_jev_with_env_key() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TYPESAFE_API_KEY", "env-key-123");
         let config: Config = serde_json::from_str(
             r#"{"db_path":"test.db","deduplication":{"provider":"jev","judgment_api_key_env":"TYPESAFE_API_KEY"}}"#,
@@ -962,6 +965,9 @@ mod tests {
     /// Explicit `jev` without a key must NOT auto-failover.
     #[test]
     fn dedup_provider_config_jev_without_key_does_not_failover() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("TYPESAFE_API_KEY");
         let config: Config =
             serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#)

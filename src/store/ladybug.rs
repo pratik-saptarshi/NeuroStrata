@@ -9604,6 +9604,9 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn the_write_deadline_can_be_overridden() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "90");
         assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
 

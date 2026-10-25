@@ -1677,15 +1677,10 @@ async fn handle_tasks_gate(
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicPulse};
+    use crate::test_support::ENV_LOCK;
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
-
-    /// `std::env` is process-global, so tests that mutate `PROJECT_ROOT_ENV`
-    /// must not run concurrently: one test's `remove_var` strands another's
-    /// `expect`. Held for the full body of every env-mutating test; poisoning
-    /// (a panic while holding it) is tolerated so one failure cannot cascade.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn the_first_retry_comes_quickly() {
