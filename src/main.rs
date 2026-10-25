@@ -3865,6 +3865,50 @@ fn appended_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(value)
 }
 
+/// Install the process-wide `tracing` subscriber — until this existed,
+/// the crate's ~50 `tracing::` call sites emitted into the void (J26):
+/// `tracing` was declared, call sites assumed a subscriber, and none
+/// was ever installed. Called once at the top of `main()`, before the
+/// runtime and every mode dispatch, so the daemon, the stdio proxy,
+/// and every CLI command all log through the one subscriber.
+///
+/// The fmt layer writes to **stderr**: stdout is the MCP stdio channel,
+/// and a log line there would corrupt the protocol.
+fn init_tracing() {
+    let subscriber = tracing_fmt_subscriber(std::io::stderr, tracing_env_filter());
+    // The global default can be installed only once per process. A
+    // second call — an embedded caller, a re-exec'd helper — must
+    // never panic, so the already-installed error is dropped.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// The filter for the startup subscriber: `RUST_LOG` when it is set and
+/// parses, the `info` default otherwise. An unparsable `RUST_LOG`
+/// falls back to the default rather than bricking startup on a typo.
+fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// The fmt subscriber over an arbitrary writer: production passes
+/// `std::io::stderr`; the tests pass a capture buffer in the same
+/// slot. ANSI escapes are off — the readers are operators tailing a
+/// terminal, a log file, or the daemon's captured stderr, and plain
+/// text serves all three.
+fn tracing_fmt_subscriber<W>(
+    writer: W,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .finish()
+}
+
 /// The tokio runtime, built by hand rather than by `#[tokio::main]`.
 ///
 /// The only reason to build it by hand is the crash handler. `SA_ONSTACK`
@@ -3883,6 +3927,7 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> anyhow::Result<()> {
+    init_tracing();
     let runtime = runtime()?;
     runtime.block_on(run())
 }
