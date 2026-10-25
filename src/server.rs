@@ -1460,8 +1460,8 @@ async fn handle_add_memory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e;
     }
 
     if namespace != "global" {
@@ -3020,14 +3020,11 @@ async fn build_guard_validator(
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("global");
-    // Validate namespace shape the same way handle_get_memory does, so the
-    // guard surface inherits the same project-vs-path rejection contract.
-    if namespace.contains('/') || namespace.contains('\\') || namespace.is_empty() {
-        return Err(format!(
-            "ERROR [NAMESPACE]: '{}' is not a valid namespace for guard_{}. \
-             Namespaces are exact project names (e.g., 'NeuroStrata') or 'global'.",
-            namespace, what
-        ));
+    // Namespace shape is the shared validator's call (src/domain.rs, DR-1),
+    // so the guard surface inherits the same rejection contract as every
+    // other entry point.
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return Err(format!("{e} (guard_{what})"));
     }
     let validator = GuardValidator::new(store, embedder, namespace).await;
     Ok((validator, namespace.to_string()))
@@ -3246,8 +3243,8 @@ async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> Str
     };
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e;
     }
 
     match store.get(namespace, id).await {

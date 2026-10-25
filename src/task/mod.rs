@@ -54,16 +54,6 @@ fn string_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
 pub const DONE_FUNNEL_MESSAGE: &str =
     "ERROR: done is reachable only via neurostrata_task_complete, which requires memory extraction (Lock 2).";
 
-fn check_namespace(namespace: &str) -> Result<(), String> {
-    if namespace.contains('/') || namespace.contains('\\') {
-        return Err(
-            "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes."
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn encode(body: &Value) -> String {
     serde_json::to_string_pretty(body)
         .unwrap_or_else(|e| format!("ERROR: could not encode the response: {}", e))
@@ -403,7 +393,7 @@ pub async fn handle_task_create(
         }
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
 
@@ -562,7 +552,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
 
@@ -717,7 +707,7 @@ pub async fn handle_task_update(
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
 
@@ -898,7 +888,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
 
@@ -1032,7 +1022,7 @@ pub async fn handle_task_complete(
     let id = required_str(&args, "id")?.to_string();
     let namespace_arg = required_str(&args, "namespace")?;
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
-    check_namespace(&namespace)?;
+    crate::domain::validate_namespace(&namespace)?;
 
     let (task, vector) = load_task(&store, &namespace, &id).await?;
     // The clock the gate reads with: a lesson row that has been retired is
@@ -1500,7 +1490,7 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
     match gate::run(&store, &namespace).await {
@@ -1659,7 +1649,7 @@ pub async fn handle_bootstrap(
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
@@ -2433,7 +2423,7 @@ pub async fn handle_task_setup(
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
     let root = std::path::Path::new(project_root);
