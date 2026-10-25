@@ -6831,6 +6831,552 @@ mod tests {
         let _ = std::fs::remove_file(width_marker_path(&db));
     }
 
+    // ------------------------------------------------------------------
+    // LadybugDB #1386 validation scenarios (plan
+    // `2026-10-25-lbug-1386-validation.md`, Task 1 baseline). Two
+    // subprocess scenario pairs beside the AC7 pair above. Where the
+    // AC7 child documents the post-refusal segfault and steps around
+    // it (`std::process::exit` before the destructor checkpoint), these
+    // children walk into the step: a checkpoint and a normal close
+    // after the refusal (continuation), and the maintainer's reopen
+    // scenario (12 MiB database reopened at a 16 MiB cap with
+    // `checkpoint_threshold=0`). On the stock lbug 0.20.4 engine both
+    // children are expected to die by SIGSEGV after observing the
+    // refusal; the parents below fail with the full outcome record in
+    // the panic message either way (the CI test step has no
+    // `--show-output`, so a passing parent's captured evidence would
+    // be discarded — the record is the deliverable, and the baseline
+    // verdict is read from it).
+    // ------------------------------------------------------------------
+
+    /// `verifying_config`'s setter chain plus `checkpoint_threshold(0)`:
+    /// a checkpoint attempt after every WAL-growing statement (the
+    /// threshold is a WAL-size in bytes; 0 is exceeded by any write).
+    fn scenario_config(limits: StoreLimits) -> SystemConfig {
+        SystemConfig::default()
+            .buffer_pool_size(limits.buffer_pool_bytes)
+            .max_db_size(limits.max_db_bytes)
+            .throw_on_wal_replay_failure(true)
+            .checkpoint_threshold(0)
+    }
+
+    fn flush_stdout() {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+    }
+
+    /// The AC7 child's refusal-provenance assertions, shared by both
+    /// scenario children: the refusal must be the engine's max-DB-size
+    /// error family, not any other loud path. Returns the refusal text.
+    fn assert_max_db_size_refusal(error: &anyhow::Error) -> String {
+        let message = format!("{error:#}");
+        let lowered = message.to_lowercase();
+        assert!(
+            lowered.contains("maximum database size") && lowered.contains("has been reached"),
+            "the refusal must be the engine's max-DB-size error, got: {message}"
+        );
+        for other_path in ["model identity", "marker", "checksum", "width"] {
+            assert!(
+                !lowered.contains(other_path),
+                "the refusal came from the {other_path} path, not the size cap: {message}"
+            );
+        }
+        message
+    }
+
+    struct ScenarioChildOutcome {
+        status: std::process::ExitStatus,
+        output: String,
+        stderr: String,
+        timed_out: bool,
+    }
+
+    fn scenario_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            status.signal()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = status;
+            None
+        }
+    }
+
+    fn tail_str(text: &str, max_chars: usize) -> String {
+        let count = text.chars().count();
+        if count <= max_chars {
+            return text.to_string();
+        }
+        text.chars().skip(count - max_chars).collect()
+    }
+
+    /// Spawn a scenario child exactly the way the AC7 parent spawns
+    /// its worker (same binary, `--exact <child> --nocapture
+    /// --ignored`, env-var DB path, piped stdout) under the same
+    /// 120 s watchdog, additionally capturing stderr for the record.
+    fn spawn_scenario_child(
+        test_path: &str,
+        env_var: &str,
+        db: &Path,
+    ) -> ScenarioChildOutcome {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_path)
+            .arg("--nocapture")
+            .arg("--ignored")
+            .env(env_var, db)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(120) {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut output = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_string(&mut output);
+        }
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = err.read_to_string(&mut stderr);
+        }
+        ScenarioChildOutcome {
+            status,
+            output,
+            stderr,
+            timed_out,
+        }
+    }
+
+    /// The fail-with-record verdict text (plan Task 1): raw exit
+    /// status (signal or code, watchdog timeout named distinctly),
+    /// the last scenario marker the child printed, and both stream
+    /// tails — everything the results file needs, in the CI log.
+    fn scenario_verdict_record(
+        scenario: &str,
+        outcome: &ScenarioChildOutcome,
+        marker_prefixes: &[&str],
+    ) -> String {
+        let status_desc = if outcome.timed_out {
+            "watchdog TIMEOUT (child killed after 120s)".to_string()
+        } else if let Some(signal) = scenario_exit_signal(&outcome.status) {
+            format!("terminated by signal {signal}")
+        } else if let Some(code) = outcome.status.code() {
+            format!("exit code {code}")
+        } else {
+            format!("status {}", outcome.status)
+        };
+        let last_marker = outcome
+            .output
+            .lines()
+            .rev()
+            .find(|line| {
+                let line = line.trim_start();
+                marker_prefixes.iter().any(|prefix| line.starts_with(prefix))
+            })
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        format!(
+            "scenario={scenario} status={status_desc} last_marker={last_marker} \
+             stdout_tail={:?} stderr_tail={:?}",
+            tail_str(&outcome.output, 1600),
+            tail_str(&outcome.stderr, 800)
+        )
+    }
+
+    /// Child worker for `cap_refusal_post_refusal_continuation_outcome`:
+    /// the AC7 child, mirrored exactly through the refusal and the
+    /// post-refusal read, then — where the AC7 child exits to avoid
+    /// the crash — a further `checkpoint()` and a normal drop of the
+    /// store (whose destructor runs the checkpoint-on-close). On lbug
+    /// 0.20.4 the FileHandle defect (capacity claimed for a frame
+    /// group the refused allocation never recorded) makes the next
+    /// checkpoint, or the close, segfault; the parent asserts that
+    /// signature. Prints `PROFILE_CAP_CONTINUATION_PASS` only after
+    /// the checkpoint returns and the drop completes.
+    ///
+    /// Marked `#[ignore]` for the same reason as the AC7 child: it is
+    /// a worker, spawned by name with `--ignored`, never part of the
+    /// suite proper.
+    #[tokio::test]
+    #[ignore = "child worker: spawned by cap_refusal_post_refusal_continuation_outcome"]
+    async fn cap_refusal_then_checkpoint_and_close_child_worker() {
+        let Ok(db) = std::env::var("NEUROSTRATA_TEST_CAP_CONTINUATION_DB") else {
+            return;
+        };
+        let db = PathBuf::from(db);
+        // Identical construction to the AC7 child: pool rides at the
+        // 8 MiB cap (StoreLimits::validate refuses pool > cap), 4 KiB
+        // incompressible rows, checkpoint after each upsert.
+        let limits = StoreLimits {
+            buffer_pool_bytes: 8 * 1024 * 1024,
+            max_db_bytes: 8 * 1024 * 1024,
+        };
+        let payload = |content: String| MemoryPayload {
+            content,
+            user_id: "agent".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "fixture.json".into(),
+            location_lines: "1".into(),
+            metadata: json!({"evidence": "cap"}),
+        };
+        let store = LadybugStore::new_with_identity_limits(
+            &db,
+            4,
+            "fastembed:BGESmallENV15Q".into(),
+            limits,
+        )
+        .expect("open a new store at the reduced cap");
+        store.init("profile-cap").await.expect("create schema");
+        store
+            .upsert(
+                "profile-cap",
+                "profile-cap::seed",
+                vec![0.11, 0.22, 0.33, 0.44],
+                payload("seed row".into()),
+            )
+            .await
+            .expect("seed insert under the cap");
+        let mut refusal = None;
+        for i in 0..1024u64 {
+            let inserted = store
+                .upsert(
+                    "profile-cap",
+                    &format!("profile-cap::row-{i}"),
+                    vec![0.11, 0.22, 0.33, 0.44],
+                    payload(incompressible_filler(i)),
+                )
+                .await;
+            let step = match inserted {
+                Ok(_) => store.checkpoint().await,
+                Err(error) => Err(error),
+            };
+            match step {
+                Ok(()) => continue,
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        let refusal = refusal.expect(
+            "a store grown to its max-DB cap must refuse further growth",
+        );
+        let message = assert_max_db_size_refusal(&refusal);
+        let seed = store
+            .get("profile-cap", "profile-cap::seed")
+            .await
+            .expect("a read after the refusal must still succeed")
+            .expect("the seed row must survive the refusal");
+        assert_eq!(seed.1.content, "seed row");
+        println!("REFUSAL_OBSERVED refusal: {message}");
+        flush_stdout();
+        // The step the AC7 child steps around: one more checkpoint,
+        // then a normal close. On the stock engine the process is
+        // expected to die inside one of these two calls.
+        match store.checkpoint().await {
+            Ok(()) => println!("POST_REFUSAL_CHECKPOINT_OK"),
+            Err(error) => println!("POST_REFUSAL_CHECKPOINT_ERR {}", format!("{error:#}")),
+        }
+        flush_stdout();
+        drop(store);
+        println!("PROFILE_CAP_CONTINUATION_PASS");
+        flush_stdout();
+    }
+
+    /// Baseline parent for the continuation scenario (plan Task 1):
+    /// passes only on the exact baseline signature — child killed by
+    /// signal 11 after `REFUSAL_OBSERVED`, PASS marker absent, no
+    /// watchdog timeout — and even then fails with the record, by
+    /// design: the panic text is the evidence the run's log carries.
+    /// Any other signature panics as a MISMATCH with the same record.
+    #[test]
+    fn cap_refusal_post_refusal_continuation_outcome() {
+        let db = std::env::temp_dir()
+            .join(format!("ladybug-cap-continuation-{}", uuid::Uuid::new_v4()));
+        let outcome = spawn_scenario_child(
+            "store::ladybug::tests::cap_refusal_then_checkpoint_and_close_child_worker",
+            "NEUROSTRATA_TEST_CAP_CONTINUATION_DB",
+            &db,
+        );
+        let record = scenario_verdict_record(
+            "continuation",
+            &outcome,
+            &[
+                "REFUSAL_OBSERVED",
+                "POST_REFUSAL_CHECKPOINT",
+                "PROFILE_CAP_CONTINUATION_PASS",
+            ],
+        );
+        let confirmed = !outcome.timed_out
+            && scenario_exit_signal(&outcome.status) == Some(11)
+            && outcome.output.contains("REFUSAL_OBSERVED")
+            && !outcome.output.contains("PROFILE_CAP_CONTINUATION_PASS");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(width_marker_path(&db));
+        if confirmed {
+            panic!(
+                "BASELINE SIGNATURE CONFIRMED | {record} | expected on the stock \
+                 engine: signal 11 after REFUSAL_OBSERVED, \
+                 PROFILE_CAP_CONTINUATION_PASS absent"
+            );
+        } else {
+            panic!(
+                "BASELINE SIGNATURE MISMATCH | {record} | expected on the stock \
+                 engine: signal 11 after REFUSAL_OBSERVED, \
+                 PROFILE_CAP_CONTINUATION_PASS absent, no watchdog timeout"
+            );
+        }
+    }
+
+    /// Child worker for `reopen_scenario_outcome`: the LadybugDB
+    /// maintainer's reopen scenario from #1386, encoded through the
+    /// store layer in one process. Phase 1 grows a database to a
+    /// 12 MiB main file under default limits with
+    /// `checkpoint_threshold=0`. Phase 2 reopens it at pool == cap ==
+    /// 16 MiB with the same threshold, verifies the setting round-trips,
+    /// drives writes until a checkpoint is refused with the
+    /// max-DB-size error, then runs the three probes — one more write,
+    /// one read, one explicit checkpoint — printing a marker after
+    /// each. On the stock engine the maintainer's engine-level result
+    /// says the statement after the first refused checkpoint segfaults;
+    /// the parent asserts that signature here.
+    ///
+    /// Marked `#[ignore]`: a worker, spawned by name with `--ignored`.
+    #[tokio::test]
+    #[ignore = "child worker: spawned by reopen_scenario_outcome"]
+    async fn reopen_refused_checkpoint_child_worker() {
+        let Ok(db) = std::env::var("NEUROSTRATA_TEST_REOPEN_DB") else {
+            return;
+        };
+        let db = PathBuf::from(db);
+        let payload = |content: String| MemoryPayload {
+            content,
+            user_id: "agent".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "fixture.json".into(),
+            location_lines: "1".into(),
+            metadata: json!({"evidence": "cap"}),
+        };
+        // Phase 1: grow to a 12 MiB main DB file under default limits.
+        // File length steps in 4 MiB frame groups, so the first length
+        // >= 10 MiB is exactly 12 MiB. The checkpoint after each upsert
+        // is the growth mechanism (upserts alone only dirty the WAL).
+        let phase1_limits = StoreLimits::default();
+        {
+            let store = LadybugStore::with_system_config(
+                &db,
+                4,
+                scenario_config(phase1_limits),
+                phase1_limits,
+            )
+            .expect("phase 1: open a new store at default limits");
+            store.init("reopen-scenario").await.expect("phase 1: schema");
+            store
+                .upsert(
+                    "reopen-scenario",
+                    "reopen-scenario::seed",
+                    vec![0.11, 0.22, 0.33, 0.44],
+                    payload("seed row".into()),
+                )
+                .await
+                .expect("phase 1: seed insert");
+            let mut rows = 0u64;
+            loop {
+                let len = std::fs::metadata(&db)
+                    .expect("phase 1: database file metadata")
+                    .len();
+                if len >= 10 * 1024 * 1024 {
+                    break;
+                }
+                store
+                    .upsert(
+                        "reopen-scenario",
+                        &format!("reopen-scenario::row-{rows}"),
+                        vec![0.11, 0.22, 0.33, 0.44],
+                        payload(incompressible_filler(rows)),
+                    )
+                    .await
+                    .expect("phase 1: growth upsert");
+                store.checkpoint().await.expect("phase 1: checkpoint");
+                rows += 1;
+                assert!(
+                    rows <= 4096,
+                    "phase 1 growth ran away: file still {len} bytes after {rows} rows"
+                );
+            }
+            let len = std::fs::metadata(&db)
+                .expect("phase 1: database file metadata")
+                .len();
+            assert_eq!(
+                len,
+                12 * 1024 * 1024,
+                "phase 1 database file must land at exactly 12 MiB \
+                 (4 MiB frame-group steps), got {len} bytes"
+            );
+            println!("REOPEN_PHASE1_DONE {len}");
+            flush_stdout();
+        }
+        // Phase 2: reopen at pool == cap == 16 MiB (validate refuses
+        // pool > cap before the engine is reached), threshold still 0.
+        let phase2_limits = StoreLimits {
+            buffer_pool_bytes: 16 * 1024 * 1024,
+            max_db_bytes: 16 * 1024 * 1024,
+        };
+        let store = LadybugStore::with_system_config(
+            &db,
+            4,
+            scenario_config(phase2_limits),
+            phase2_limits,
+        )
+        .expect("phase 2: reopen the 12 MiB store at a 16 MiB cap");
+        store
+            .init("reopen-scenario")
+            .await
+            .expect("phase 2: schema (already exists is tolerated)");
+        let threshold = store
+            .with_conn(|conn| {
+                let mut rows =
+                    conn.query("CALL current_setting('checkpoint_threshold') RETURN *")?;
+                let row = rows
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("current_setting returned no row"))?;
+                Ok(format!("{}", row[0]))
+            })
+            .await
+            .expect("phase 2: current_setting round-trip query");
+        assert_eq!(
+            threshold, "0",
+            "checkpoint_threshold must round-trip as 0, got {threshold}"
+        );
+        // Drive writes until a checkpoint refuses; at most 1024 (the
+        // AC7 bound). One frame group of headroom (12 -> 16 MiB), so
+        // the refusal is expected far inside the bound.
+        let mut refusal = None;
+        for i in 0..1024u64 {
+            let inserted = store
+                .upsert(
+                    "reopen-scenario",
+                    &format!("reopen-scenario::p2-{i}"),
+                    vec![0.11, 0.22, 0.33, 0.44],
+                    payload(incompressible_filler(1_000_000 + i)),
+                )
+                .await;
+            let step = match inserted {
+                Ok(_) => store.checkpoint().await,
+                Err(error) => Err(error),
+            };
+            match step {
+                Ok(()) => continue,
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(refusal) = refusal else {
+            println!("REOPEN_NO_REFUSAL");
+            flush_stdout();
+            std::process::exit(1);
+        };
+        let message = assert_max_db_size_refusal(&refusal);
+        println!("REFUSAL_OBSERVED refusal: {message}");
+        flush_stdout();
+        // The three probes, in order. The maintainer's crash was on
+        // the statement after the first refused checkpoint.
+        match store
+            .upsert(
+                "reopen-scenario",
+                "reopen-scenario::probe-write",
+                vec![0.11, 0.22, 0.33, 0.44],
+                payload(incompressible_filler(2_000_000)),
+            )
+            .await
+        {
+            Ok(()) => println!("PROBE_WRITE_OK"),
+            Err(error) => println!("PROBE_WRITE_ERR {}", format!("{error:#}")),
+        }
+        flush_stdout();
+        match store.get("reopen-scenario", "reopen-scenario::seed").await {
+            Ok(Some(_)) => println!("PROBE_READ_OK"),
+            Ok(None) => println!("PROBE_READ_MISSING"),
+            Err(error) => println!("PROBE_READ_ERR {}", format!("{error:#}")),
+        }
+        flush_stdout();
+        match store.checkpoint().await {
+            Ok(()) => println!("PROBE_CHECKPOINT_OK"),
+            Err(error) => println!("PROBE_CHECKPOINT_ERR {}", format!("{error:#}")),
+        }
+        flush_stdout();
+        println!("REOPEN_SCENARIO_PASS");
+        flush_stdout();
+    }
+
+    /// Baseline parent for the reopen scenario (plan Task 1): passes
+    /// only on the exact baseline signature — child killed by signal
+    /// 11 after `REFUSAL_OBSERVED`, PASS marker absent, no
+    /// `REOPEN_NO_REFUSAL`, no watchdog timeout — and even then fails
+    /// with the record, by design (see the continuation parent).
+    #[test]
+    fn reopen_scenario_outcome() {
+        let db = std::env::temp_dir()
+            .join(format!("ladybug-reopen-scenario-{}", uuid::Uuid::new_v4()));
+        let outcome = spawn_scenario_child(
+            "store::ladybug::tests::reopen_refused_checkpoint_child_worker",
+            "NEUROSTRATA_TEST_REOPEN_DB",
+            &db,
+        );
+        let record = scenario_verdict_record(
+            "reopen",
+            &outcome,
+            &[
+                "REOPEN_PHASE1_DONE",
+                "REFUSAL_OBSERVED",
+                "REOPEN_NO_REFUSAL",
+                "PROBE_WRITE",
+                "PROBE_READ",
+                "PROBE_CHECKPOINT",
+                "REOPEN_SCENARIO_PASS",
+            ],
+        );
+        let confirmed = !outcome.timed_out
+            && scenario_exit_signal(&outcome.status) == Some(11)
+            && outcome.output.contains("REFUSAL_OBSERVED")
+            && !outcome.output.contains("REOPEN_NO_REFUSAL")
+            && !outcome.output.contains("REOPEN_SCENARIO_PASS");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(width_marker_path(&db));
+        if confirmed {
+            panic!(
+                "BASELINE SIGNATURE CONFIRMED | {record} | expected on the stock \
+                 engine: signal 11 at a phase-2 probe after REFUSAL_OBSERVED, \
+                 REOPEN_SCENARIO_PASS absent"
+            );
+        } else {
+            panic!(
+                "BASELINE SIGNATURE MISMATCH | {record} | expected on the stock \
+                 engine: signal 11 at a phase-2 probe after REFUSAL_OBSERVED, \
+                 REOPEN_SCENARIO_PASS absent, no REOPEN_NO_REFUSAL, \
+                 no watchdog timeout"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn database_file_symlink_cannot_bypass_embedding_identity_marker() {
