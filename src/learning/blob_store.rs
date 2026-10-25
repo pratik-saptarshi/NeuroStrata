@@ -54,4 +54,32 @@ mod tests {
         assert_eq!(hash1, hash2, "same payload should reuse blob");
         assert!(hash1.0.starts_with("sha256:"));
     }
+
+    #[test]
+    fn poisoned_lock_returns_error_not_panic() {
+        let store = BlobStore::new().expect("create store");
+        // Panic in a scoped thread while it holds the cache lock: the mutex
+        // is poisoned when the thread unwinds out of the guard.
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = store.cache.lock().unwrap();
+                    panic!("deliberate poison for the lock-policy test");
+                })
+                .join();
+        });
+        let payload = MemoryPayload {
+            content: "hello world".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "test".to_string(),
+            location_lines: "1-2".to_string(),
+            metadata: json!({}),
+        };
+        assert!(
+            store.put(&payload).is_err(),
+            "a poisoned cache lock fails the put with an error, not a panic"
+        );
+    }
 }

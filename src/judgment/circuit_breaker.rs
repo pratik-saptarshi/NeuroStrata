@@ -163,4 +163,43 @@ mod tests {
         assert_eq!(cb.failure_count(), 0);
         assert_eq!(cb.state(), "Closed");
     }
+
+    /// Panic in a scoped thread while it holds the state lock: the mutex is
+    /// poisoned when the thread unwinds out of the guard. The join swallows
+    /// the deliberate panic; the poison is the point.
+    fn poison_state(cb: &CircuitBreaker) {
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = cb.state.lock().unwrap();
+                    panic!("deliberate poison for the lock-policy test");
+                })
+                .join();
+        });
+    }
+
+    #[test]
+    fn poisoned_lock_fails_closed_not_panic() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            initial_backoff_ms: 1000,
+            max_backoff_ms: 60000,
+            backoff_multiplier: 2.0,
+        };
+        let cb = CircuitBreaker::new(config);
+        poison_state(&cb);
+
+        assert!(
+            !cb.allow_request(),
+            "a poisoned breaker denies: the guarded state is suspect, so the request fails closed"
+        );
+        // Fire-and-forget recorders degrade to a logged skip, not a panic.
+        cb.record_success();
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            "Poisoned",
+            "monitoring reports the poison instead of dying on it"
+        );
+    }
 }

@@ -1689,6 +1689,14 @@ impl crate::traits::AsAny for RecordingStore {
         }
     }
 
+    fn created_pulse() -> ThalamicPulse {
+        ThalamicPulse::Created {
+            id: "x".to_string(),
+            namespace: "ns".to_string(),
+            kind: "fact".to_string(),
+        }
+    }
+
     fn guarded(trace_id: &str, namespace: &str) -> ThalamicPulse {
         ThalamicPulse::GuardedActionFired {
             trace_id: trace_id.to_string(),
@@ -2303,5 +2311,95 @@ impl crate::traits::AsAny for RecordingStore {
             0,
             "nothing was durability-qualified, so the outbox stays empty"
         );
+    }
+
+    /// Panic in a scoped thread while it holds `mutex`: the mutex is
+    /// poisoned when the thread unwinds out of the guard. The join swallows
+    /// the deliberate panic; the poison is the point.
+    fn poison<T: Send + 'static>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = mutex.lock().unwrap();
+                    panic!("deliberate poison for the lock-policy test");
+                })
+                .join();
+        });
+    }
+
+    #[test]
+    fn poisoned_queue_degrades_not_panics() {
+        let queue = Queue {
+            items: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+        };
+        poison(&queue.items);
+        assert!(
+            queue.push(created_pulse(), Vec::new(), 4),
+            "a poisoned queue counts the unqueueable pulse as dropped"
+        );
+        assert!(queue.pop().is_none(), "a poisoned queue pops as empty");
+        assert_eq!(queue.len(), 0, "a poisoned queue reports depth 0");
+    }
+
+    #[test]
+    fn poisoned_registry_degrades_not_panics() {
+        // Outside a runtime the bus is headless (no dispatcher); register
+        // and metrics do not need one.
+        let bus = ThalamicBus::new(4);
+        poison(&bus.subs);
+        let id = bus.register(Box::new(SlowSubscriber {
+            log: Arc::new(Mutex::new(Vec::new())),
+            delay: Duration::from_millis(0),
+        }));
+        assert_eq!(
+            id,
+            SubscriberId::MAX,
+            "a poisoned registry returns the invalid id, logged, not a panic"
+        );
+        assert_eq!(
+            bus.metrics().subscribers,
+            0,
+            "a poisoned registry snapshots as zero subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_registry_snapshot_skips_one_pulse_not_the_dispatcher() {
+        let queue = Arc::new(Queue {
+            items: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+        });
+        let subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        poison(&subs);
+        let metrics = Arc::new(AtomicMetrics::default());
+        let (bp_tx, _) = watch::channel(BackpressureEvent::Idle);
+        let store = Arc::new(OnceLock::new());
+        let handle = tokio::spawn(dispatch(
+            queue.clone(),
+            subs,
+            metrics.clone(),
+            bp_tx,
+            store,
+            Arc::new(Mutex::new(None)),
+        ));
+        queue.push(created_pulse(), Vec::new(), 4);
+        for _ in 0..100 {
+            if metrics.dispatcher_handled.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            metrics.dispatcher_handled.load(Ordering::Relaxed),
+            1,
+            "the pulse is accounted for, its delivery skipped"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the dispatcher survives a poisoned registry"
+        );
+        handle.abort();
     }
 }
