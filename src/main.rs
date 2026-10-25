@@ -3496,6 +3496,31 @@ mod tests {
             "the info event is suppressed by RUST_LOG=error: {text}"
         );
     }
+
+    #[test]
+    fn unparsable_rust_log_falls_back_to_info() {
+        // `lolwut` is not a level, so the directive is invalid and
+        // `try_from_env` errors: the fallback must yield the `info`
+        // default — not a bricked startup, and not a permissive
+        // filter that lets everything through.
+        let _env = RustLogRestore::set(Some("neurostrata_mcp=lolwut"));
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("unparsable_rust_log_falls_back_to_info info marker");
+            tracing::debug!("unparsable_rust_log_falls_back_to_info debug marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("unparsable_rust_log_falls_back_to_info info marker"),
+            "the info event passes the fallback filter: {text}"
+        );
+        assert!(
+            !text.contains("unparsable_rust_log_falls_back_to_info debug marker"),
+            "the debug event is suppressed — the fallback is info, not trace: {text}"
+        );
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
