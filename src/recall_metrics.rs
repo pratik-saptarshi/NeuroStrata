@@ -9,6 +9,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::util::lock_or_err;
+
 #[cfg(test)]
 use std::sync::MutexGuard;
 
@@ -116,7 +118,16 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
         // An empty recall response does not count toward the rate.
         return;
     }
-    let mut guard = RECENTLY_RECALLED.lock().expect("recently-recalled lock poisoned");
+    // Poison disposition (this fn returns ()): these counters are
+    // best-effort telemetry, so the recording is skipped and the failure
+    // logged -- a suspect metrics lock must never fail the recall itself.
+    let mut guard = match lock_or_err(&RECENTLY_RECALLED) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::error!(error = %e, "recently-recalled lock poisoned; recall not recorded");
+            return;
+        }
+    };
     let map = guard.get_or_insert_with(HashMap::new);
     let deque = map.entry(namespace.to_string()).or_default();
     for id in ids {
@@ -132,7 +143,16 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
 pub fn record_promotion(namespace: &str, id: &str) -> bool {
     #[cfg(test)]
     let _lock = maybe_acquire();
-    let mut guard = RECENTLY_RECALLED.lock().expect("recently-recalled lock poisoned");
+    // Poison disposition (this fn returns bool, so the error cannot
+    // propagate): report no promotion -- the conservative answer -- with
+    // the failure logged.
+    let mut guard = match lock_or_err(&RECENTLY_RECALLED) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::error!(error = %e, "recently-recalled lock poisoned; promotion not recorded");
+            return false;
+        }
+    };
     let found = if let Some(map) = guard.as_mut() {
         if let Some(deque) = map.get_mut(namespace) {
             let before = deque.len();

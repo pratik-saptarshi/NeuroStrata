@@ -13,6 +13,7 @@ use super::{
     ThalamicPulse,
 };
 use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult, VectorStore};
+use crate::util::lock_or_err;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -193,7 +194,16 @@ impl Queue {
         appended_classes: Vec<EventClass>,
         capacity: usize,
     ) -> bool {
-        let mut items = self.items.lock().expect("queue lock poisoned");
+        // Poison disposition: the pulse cannot be queued, so it is
+        // reported as dropped (the caller's drop accounting stays honest)
+        // and the failure logged, never a panic.
+        let mut items = match lock_or_err(&self.items) {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::error!(error = %e, "bus queue lock poisoned; pulse dropped");
+                return true;
+            }
+        };
         items.push_back(QueuedPulse {
             event,
             appended_classes,
@@ -212,11 +222,26 @@ impl Queue {
     }
 
     fn pop(&self) -> Option<QueuedPulse> {
-        self.items.lock().expect("queue lock poisoned").pop_front()
+        // Poison disposition: pop reports empty (the dispatcher parks and
+        // retries on the next push), with the failure logged.
+        match lock_or_err(&self.items) {
+            Ok(mut items) => items.pop_front(),
+            Err(e) => {
+                tracing::error!(error = %e, "bus queue lock poisoned; pop reports empty");
+                None
+            }
+        }
     }
 
     fn len(&self) -> usize {
-        self.items.lock().expect("queue lock poisoned").len()
+        // Poison disposition: the snapshot reports depth 0, logged.
+        match lock_or_err(&self.items) {
+            Ok(items) => items.len(),
+            Err(e) => {
+                tracing::error!(error = %e, "bus queue lock poisoned; depth reports 0");
+                0
+            }
+        }
     }
 }
 
@@ -458,10 +483,21 @@ impl ThalamicBus {
     /// Register a subscriber. Returns its id for later introspection. The
     /// registry is append-only: ids are stable, and dispatch always sees the
     /// full list as of the pulse it is handling.
+    ///
+    /// Poison disposition: if the registry lock is poisoned the
+    /// registration is refused -- the failure is logged and
+    /// `SubscriberId::MAX`, never a live id, is returned.
     pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId {
-        let mut subs = self.subs.lock().expect("subscriber registry lock poisoned");
-        subs.push(Arc::from(sub));
-        subs.len() - 1
+        match lock_or_err(&self.subs) {
+            Ok(mut subs) => {
+                subs.push(Arc::from(sub));
+                subs.len() - 1
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "subscriber registry lock poisoned; registration refused");
+                SubscriberId::MAX
+            }
+        }
     }
 
     /// Publish one pulse. Never blocks and never fails the caller's storage
@@ -562,11 +598,15 @@ impl ThalamicBus {
         BusMetrics {
             events_emitted: self.metrics.events_emitted.load(Ordering::Relaxed),
             dispatcher_handled: self.metrics.dispatcher_handled.load(Ordering::Relaxed),
-            subscribers: self
-                .subs
-                .lock()
-                .expect("subscriber registry lock poisoned")
-                .len(),
+            // Poison disposition: the snapshot reports 0 subscribers,
+            // with the failure logged.
+            subscribers: match lock_or_err(&self.subs) {
+                Ok(subs) => subs.len(),
+                Err(e) => {
+                    tracing::error!(error = %e, "subscriber registry lock poisoned; snapshot reports 0 subscribers");
+                    0
+                }
+            },
             queue_depth: self.queue.len(),
             drops_oldest: self.metrics.drops_oldest.load(Ordering::Relaxed),
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
@@ -676,10 +716,16 @@ async fn dispatch(
             ts,
         };
 
-        let registered: Vec<Arc<dyn MemorySubscriber>> = subs
-            .lock()
-            .expect("subscriber registry lock poisoned")
-            .clone();
+        // Poison disposition: this pulse is delivered to no one (the
+        // dispatcher outlives the registry; killing it would silence every
+        // later pulse too), with the failure logged.
+        let registered: Vec<Arc<dyn MemorySubscriber>> = match lock_or_err(&subs) {
+            Ok(subs) => subs.clone(),
+            Err(e) => {
+                tracing::error!(error = %e, "subscriber registry lock poisoned; pulse delivered to no one");
+                Vec::new()
+            }
+        };
         // Task 12: with an outbox attached, a durability class's own
         // subscriber is *not* invoked here for a pulse its class is
         // interested in **when that pulse's append for the class

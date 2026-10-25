@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use crate::parser::ingest::IngestObserver;
 use crate::parser::schema::ParserSchema;
 use crate::traits::{is_reserved_ingest_destination, Embedder, VectorStore};
+use crate::util::lock_or_err;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,7 +185,7 @@ impl IngestJobs {
         };
 
         let mut rx = {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = lock_or_err(&self.jobs)?;
 
             if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
                 running
@@ -260,8 +261,16 @@ impl IngestJobs {
     /// and exited mid-walk, and the runtime dropped the walk after it had
     /// cleared the namespace but before it had rebuilt or relinked it.
     pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
-        let receivers: Vec<watch::Receiver<IngestProgress>> =
-            self.jobs.lock().unwrap().values().cloned().collect();
+        // Poison disposition (this fn returns bool, so the error cannot
+        // propagate): a suspect registry cannot confirm idle, so the
+        // answer is false, with the failure logged.
+        let receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
+            Ok(jobs) => jobs.values().cloned().collect(),
+            Err(e) => {
+                tracing::error!(error = %e, "ingest jobs lock poisoned; cannot confirm idle");
+                return false;
+            }
+        };
 
         let all_finished = async move {
             for mut rx in receivers {

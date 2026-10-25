@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::CircuitBreakerConfig;
+use crate::util::lock_or_err;
 
 /// Circuit breaker states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +40,16 @@ impl CircuitBreaker {
             .unwrap()
             .as_secs();
 
-        let state = self.state.lock().unwrap();
+        // Poison disposition (this fn returns bool, so the error cannot
+        // propagate): the guarded state is suspect, so the request fails
+        // closed -- denied, with the failure logged.
+        let state = match lock_or_err(&self.state) {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::error!(error = %e, "circuit breaker state lock poisoned; denying the request");
+                return false;
+            }
+        };
 
         match *state {
             CircuitState::Closed => true,
@@ -48,7 +58,13 @@ impl CircuitBreaker {
                 if now >= backoff_until {
                     // Time to try half-open
                     drop(state);
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = match lock_or_err(&self.state) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            tracing::error!(error = %e, "circuit breaker state lock poisoned; denying the request");
+                            return false;
+                        }
+                    };
                     *state = CircuitState::HalfOpen;
                     true
                 } else {
@@ -65,8 +81,14 @@ impl CircuitBreaker {
     /// Record a successful request.
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::SeqCst);
-        let mut state = self.state.lock().unwrap();
-        *state = CircuitState::Closed;
+        // Poison disposition (this fn returns ()): the state write is
+        // skipped and the failure logged, never a panic.
+        match lock_or_err(&self.state) {
+            Ok(mut state) => *state = CircuitState::Closed,
+            Err(e) => {
+                tracing::error!(error = %e, "circuit breaker state lock poisoned; success not recorded in the state")
+            }
+        }
     }
 
     /// Record a failed request.
@@ -86,8 +108,14 @@ impl CircuitBreaker {
 
             self.backoff_until.store(backoff_until, Ordering::SeqCst);
 
-            let mut state = self.state.lock().unwrap();
-            *state = CircuitState::Open;
+            // Poison disposition (this fn returns ()): the state write is
+            // skipped and the failure logged, never a panic.
+            match lock_or_err(&self.state) {
+                Ok(mut state) => *state = CircuitState::Open,
+                Err(e) => {
+                    tracing::error!(error = %e, "circuit breaker state lock poisoned; failure not recorded in the state")
+                }
+            }
 
             tracing::warn!(
                 failures = failures,
@@ -109,8 +137,15 @@ impl CircuitBreaker {
 
     /// Get current circuit state (for monitoring).
     pub fn state(&self) -> String {
-        let state = self.state.lock().unwrap();
-        format!("{:?}", *state)
+        // Poison disposition (this fn returns String): monitoring reports
+        // the poison itself rather than dying on it.
+        match lock_or_err(&self.state) {
+            Ok(state) => format!("{:?}", *state),
+            Err(e) => {
+                tracing::error!(error = %e, "circuit breaker state lock poisoned; reporting Poisoned");
+                "Poisoned".to_string()
+            }
+        }
     }
 
     /// Get failure count (for monitoring).

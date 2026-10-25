@@ -6,6 +6,7 @@ use sha2::Digest;
 
 use crate::learning::observation::PayloadHash;
 use crate::traits::MemoryPayload;
+use crate::util::lock_or_err;
 
 pub struct BlobStore {
     cache: Mutex<HashMap<PayloadHash, Vec<u8>>>,
@@ -25,7 +26,7 @@ impl BlobStore {
         hasher.update(payload.content.as_bytes());
         let result = hasher.finalize();
         let id = PayloadHash(format!("sha256:{}", hex::encode(result)));
-        self.cache.lock().expect("cache lock").insert(id.clone(), payload.content.as_bytes().to_vec());
+        lock_or_err(&self.cache)?.insert(id.clone(), payload.content.as_bytes().to_vec());
         eprintln!("BlobStore: stored hash {}", id.0);
         Ok(id)
     }
