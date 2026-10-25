@@ -5,7 +5,7 @@
   "agent_command": [
     "bash",
     "-c",
-      "cd /workspace && git init -b main >/dev/null 2>&1 && git config user.email 'test@example.com' && git config user.name 'Test Agent' && cp /project/RULES_TEST.md ./rules.txt 2>/dev/null || echo '' > ./rules.txt && OPENCODE_AUTO_CONFIRM=1 opencode run \"Read rules.txt. You are in a fresh environment. Perform the following tasks exactly: 1) Track your work using the neurostrata task tools. 2) Bootstrap the docs. 3) Write db_query.rs using ladybug. 4) Write build.sh using podman. 5) Use cp -f. 6) Use neurostrata_add_memory. 7) Test guard validation with a dangerous command. 8) Commit your code.\""
+      "cd /workspace && git init -b main >/dev/null 2>&1 && git config user.email 'test@example.com' && git config user.name 'Test Agent' && cp /project/docs/process/RULES_TEST.md ./rules.txt 2>/dev/null || echo '' > ./rules.txt && OPENCODE_AUTO_CONFIRM=1 opencode run \"Read rules.txt. You are in a fresh environment. Perform the following tasks exactly: 1) Track your work using the neurostrata task tools. 2) Bootstrap the docs. 3) Write db_query.rs using ladybug. 4) Write build.sh using podman. 5) Use cp -f. 6) Use neurostrata_add_memory. 7) Test guard validation with a dangerous command. 8) Commit your code.\""
   ],
   "sandbox": {
     "engine": "podman",
@@ -52,7 +52,7 @@
     ]
   },
   "optimization": {
-    "target_rules_file": "RULES_TEST.md",
+    "target_rules_file": "docs/process/RULES_TEST.md",
     "epochs": 1,
     "pass_threshold": 1.0,
     "meta_llm": {

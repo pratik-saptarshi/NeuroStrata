@@ -2,9 +2,9 @@
 
 ## Source findings
 
-- `GUINEA-PIG-FINDING-keywest.health-2026-10-16-governs-edge-materialization.md` — GOVERNS edges skipped silently on write; caller gets no deferred-edge info or memory ID.
-- `GUINEA-PIG-FINDING-keywest.health-2026-10-17-structural-absolute-path-supersede.md` — supersede_memory replaces locations/governs but leaves stale metadata.absolute_path.
-- `GUINEA-PIG-FINDING-keywest.health-2026-10-18-branch-aware-source-anchors.md` — branch-only governs targets fail CI export gate; exporting from a linked worktree rewrote 926/929 shared nodes' absolute_path to transient worktree root.
+- `docs/process/GUINEA-PIG-FINDING-keywest.health-2026-10-16-governs-edge-materialization.md` — GOVERNS edges skipped silently on write; caller gets no deferred-edge info or memory ID.
+- `docs/process/GUINEA-PIG-FINDING-keywest.health-2026-10-17-structural-absolute-path-supersede.md` — supersede_memory replaces locations/governs but leaves stale metadata.absolute_path.
+- `docs/process/GUINEA-PIG-FINDING-keywest.health-2026-10-18-branch-aware-source-anchors.md` — branch-only governs targets fail CI export gate; exporting from a linked worktree rewrote 926/929 shared nodes' absolute_path to transient worktree root.
 
 Root cause (verified at the time): the export computed `absolute_path` via `dunce::canonicalize(std::env::current_dir().join(location))` at export time — caller-CWD-dependent. *(That code is gone: the export now resolves the path through the source-anchor registry — `crate::source_context::export_absolute_path`, `src/source_context.rs:42-99` — and `dunce` is no longer called from any file in `src/`.)*
 
