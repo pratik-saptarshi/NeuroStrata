@@ -156,7 +156,9 @@ change that re-runs it green.
   only to the release job; every action in all three workflows pinned to
   a full commit SHA; build-provenance attestation over the published
   artifacts. **Verification status: the grep-level governance assertion
-  runs in CI (in the `fmt` job); the draft-release rehearsal that would
+  runs in CI as the hard-gated `release-governance` job in `ci.yml`
+  (no `continue-on-error`: a governance regression fails the run); the
+  draft-release rehearsal that would
   exercise `release.yml` end-to-end is NOT run — it awaits Pratik's
   authorization, and Task 15a parks on that leg rather than claiming
   inspection as verification.**
