@@ -7192,63 +7192,85 @@ mod tests {
         }
     }
 
+    /// Read one `current_setting` value as a string (the engine
+    /// returns settings as STRING values). Errors surface as the
+    /// engine's message text.
+    fn current_setting_string(conn: &lbug::Connection, name: &str) -> Result<String, String> {
+        let mut rows = conn
+            .query(&format!("CALL current_setting('{name}') RETURN *"))
+            .map_err(|error| format!("{error}"))?;
+        match rows.next() {
+            Some(row) => Ok(format!("{}", row[0])),
+            None => Err("current_setting returned no row".to_string()),
+        }
+    }
+
     /// Child worker for `reopen_scenario_outcome`: the LadybugDB
-    /// maintainer's reopen scenario from #1386, encoded through the
-    /// store layer in one process. Phase 1 grows a database to a
-    /// main file in the [10 MiB, 14 MiB] band (Amendment 1) under
-    /// default limits with `checkpoint_threshold=0`. Phase 2
-    /// reopens it at pool == cap ==
-    /// 16 MiB with the same threshold, verifies the setting round-trips,
-    /// drives writes until a checkpoint is refused with the
-    /// max-DB-size error, then runs the three probes — one more write,
-    /// one read, one explicit checkpoint — printing a marker after
-    /// each. On the stock engine the maintainer's engine-level result
-    /// says the statement after the first refused checkpoint segfaults;
+    /// maintainer's reopen scenario from #1386, encoded at the raw
+    /// `lbug` bindings level (Amendment 2). Phase 1 grows a database
+    /// to a main file in the [10 MiB, 14 MiB] band (Amendment 1)
+    /// under an 8 GiB cap with `checkpoint_threshold=0`. Phase 2
+    /// reopens it at a 16 MiB cap with the same threshold, drives
+    /// writes until a checkpoint is refused with the max-DB-size
+    /// error, then runs the three probes — one more write, one read,
+    /// one explicit checkpoint — printing a marker after each. On
+    /// the stock engine the maintainer's engine-level result says
+    /// the statement after the first refused checkpoint segfaults;
     /// the parent asserts that signature here.
     ///
+    /// Why bindings-level (Amendment 2): the store layer cannot
+    /// express this scenario's parameters. Every `LadybugStore`
+    /// open funnels through `limits.validate()`, which refuses a
+    /// buffer pool larger than the cap; the maintainer's scenario
+    /// leaves the pool at its default, so at a 16 MiB cap the
+    /// store-layer encoding must ride the pool at the cap — and its
+    /// phase-2 drive then starved the pool ("the buffer pool is
+    /// full") before any cap refusal (run 40223840254). Here the
+    /// buffer pool is never set: the binding default, the
+    /// maintainer's posture. The refusal-provenance classification
+    /// is unchanged in kind: the max-DB-size family, with the
+    /// buffer-pool family explicitly excluded.
+    ///
     /// Marked `#[ignore]`: a worker, spawned by name with `--ignored`.
-    #[tokio::test]
+    #[test]
     #[ignore = "child worker: spawned by reopen_scenario_outcome"]
-    async fn reopen_refused_checkpoint_child_worker() {
+    fn reopen_refused_checkpoint_child_worker() {
         let Ok(db) = std::env::var("NEUROSTRATA_TEST_REOPEN_DB") else {
             return;
         };
         let db = PathBuf::from(db);
-        let payload = |content: String| MemoryPayload {
-            content,
-            user_id: "agent".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "fixture.json".into(),
-            location_lines: "1".into(),
-            metadata: json!({"evidence": "cap"}),
+        // One inserted row per statement; the filler is lowercase
+        // hex (see `incompressible_filler`), safe in a Cypher string
+        // literal without escaping.
+        let insert = |conn: &lbug::Connection, id: u64| -> Result<(), lbug::Error> {
+            conn.query(&format!(
+                "CREATE (:ReopenRow {{id: {id}, filler: '{}'}});",
+                incompressible_filler(id)
+            ))?;
+            Ok(())
         };
+        let mut next_id = 0u64;
         // Phase 1: grow the main DB file into the [10 MiB, 14 MiB]
-        // band under default limits. File length grows in 4 KiB page
-        // increments (Amendment 1 ground-truth correction), so the
-        // loop stops at the first length >= 10 MiB and asserts the
-        // band. The checkpoint after each upsert is the growth
-        // mechanism (upserts alone only dirty the WAL).
-        let phase1_limits = StoreLimits::default();
+        // band under an 8 GiB cap, threshold 0. File length grows
+        // in 4 KiB page increments (Amendment 1), so the loop stops
+        // at the first length >= 10 MiB and asserts the band. The
+        // explicit CHECKPOINT after each insert is the growth
+        // mechanism (the store-layer encoding's proven shape);
+        // inserts alone only dirty the WAL.
         {
-            let store = LadybugStore::with_system_config(
+            let database = lbug::Database::new(
                 &db,
-                4,
-                scenario_config(phase1_limits),
-                phase1_limits,
+                SystemConfig::default()
+                    .max_db_size(8 * 1024 * 1024 * 1024)
+                    .checkpoint_threshold(0),
             )
-            .expect("phase 1: open a new store at default limits");
-            store.init("reopen-scenario").await.expect("phase 1: schema");
-            store
-                .upsert(
-                    "reopen-scenario",
-                    "reopen-scenario::seed",
-                    vec![0.11, 0.22, 0.33, 0.44],
-                    payload("seed row".into()),
-                )
-                .await
-                .expect("phase 1: seed insert");
-            let mut rows = 0u64;
+            .unwrap_or_else(|error| panic!("phase 1: open a new database: {error}"));
+            let conn = lbug::Connection::new(&database)
+                .unwrap_or_else(|error| panic!("phase 1: open a connection: {error}"));
+            conn.query(
+                "CREATE NODE TABLE ReopenRow(id INT64, filler STRING, PRIMARY KEY(id));",
+            )
+            .unwrap_or_else(|error| panic!("phase 1: create the row table: {error}"));
             loop {
                 let len = std::fs::metadata(&db)
                     .expect("phase 1: database file metadata")
@@ -7256,20 +7278,14 @@ mod tests {
                 if len >= 10 * 1024 * 1024 {
                     break;
                 }
-                store
-                    .upsert(
-                        "reopen-scenario",
-                        &format!("reopen-scenario::row-{rows}"),
-                        vec![0.11, 0.22, 0.33, 0.44],
-                        payload(incompressible_filler(rows)),
-                    )
-                    .await
-                    .expect("phase 1: growth upsert");
-                store.checkpoint().await.expect("phase 1: checkpoint");
-                rows += 1;
+                insert(&conn, next_id)
+                    .unwrap_or_else(|error| panic!("phase 1: growth insert: {error}"));
+                next_id += 1;
+                conn.query("CHECKPOINT")
+                    .unwrap_or_else(|error| panic!("phase 1: checkpoint: {error}"));
                 assert!(
-                    rows <= 4096,
-                    "phase 1 growth ran away: file still {len} bytes after {rows} rows"
+                    next_id <= 8192,
+                    "phase 1 growth ran away: file still {len} bytes after {next_id} rows"
                 );
             }
             let len = std::fs::metadata(&db)
@@ -7283,96 +7299,104 @@ mod tests {
             println!("REOPEN_PHASE1_DONE {len}");
             flush_stdout();
         }
-        // Phase 2: reopen at pool == cap == 16 MiB (validate refuses
-        // pool > cap before the engine is reached), threshold still 0.
-        let phase2_limits = StoreLimits {
-            buffer_pool_bytes: 16 * 1024 * 1024,
-            max_db_bytes: 16 * 1024 * 1024,
-        };
-        let store = LadybugStore::with_system_config(
+        // Phase 2: reopen at a 16 MiB cap, threshold still 0, the
+        // buffer pool at the binding default (never set).
+        let database = lbug::Database::new(
             &db,
-            4,
-            scenario_config(phase2_limits),
-            phase2_limits,
+            SystemConfig::default()
+                .max_db_size(16_777_216)
+                .checkpoint_threshold(0),
         )
-        .expect("phase 2: reopen the phase-1 store at a 16 MiB cap");
-        store
-            .init("reopen-scenario")
-            .await
-            .expect("phase 2: schema (already exists is tolerated)");
-        let threshold = store
-            .with_conn(|conn| {
-                let mut rows =
-                    conn.query("CALL current_setting('checkpoint_threshold') RETURN *")?;
-                let row = rows
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("current_setting returned no row"))?;
-                Ok(format!("{}", row[0]))
-            })
-            .await
-            .expect("phase 2: current_setting round-trip query");
+        .unwrap_or_else(|error| panic!("phase 2: reopen the phase-1 database: {error}"));
+        let conn = lbug::Connection::new(&database)
+            .unwrap_or_else(|error| panic!("phase 2: open a connection: {error}"));
+        let threshold = current_setting_string(&conn, "checkpoint_threshold")
+            .unwrap_or_else(|error| panic!("phase 2: checkpoint_threshold round-trip: {error}"));
         assert_eq!(
             threshold, "0",
             "checkpoint_threshold must round-trip as 0, got {threshold}"
         );
-        // Drive writes until a checkpoint refuses; at most 1024 (the
-        // AC7 bound). The 16 MiB cap leaves headroom over the phase-1
-        // band (10-14 MiB), so the refusal is expected far inside
-        // the bound.
+        // `max_db_size` is not a registered `current_setting` name
+        // in this engine (the built-in option registry carries the
+        // session settings only), so its round-trip query errors:
+        // print that, and verify the cap behaviorally instead — the
+        // drive's refusal text must name the configured cap bytes
+        // (asserted in the classification below). If the query ever
+        // succeeds, the value must read back exactly.
+        match current_setting_string(&conn, "max_db_size") {
+            Ok(value) => assert_eq!(
+                value, "16777216",
+                "max_db_size must round-trip as 16777216, got {value}"
+            ),
+            Err(error) => {
+                println!("MAX_DB_SIZE_SETTING_UNAVAILABLE {error}");
+                flush_stdout();
+            }
+        }
+        // Disclosure print only (never a verdict input): the buffer
+        // pool size this run reports, under the same registry
+        // limitation as `max_db_size`.
+        match current_setting_string(&conn, "buffer_pool_size") {
+            Ok(value) => println!("BUFFER_POOL_SIZE {value}"),
+            Err(_) => println!("BUFFER_POOL_SETTING_UNAVAILABLE"),
+        }
+        flush_stdout();
+        // Drive writes until a statement refuses; at most 1024 (the
+        // AC7 bound). The 16 MiB cap leaves headroom over the
+        // phase-1 band (10-14 MiB), so the refusal is expected far
+        // inside the bound. With threshold 0, each statement's
+        // post-commit auto-checkpoint is the refusal surface.
         let mut refusal = None;
-        for i in 0..1024u64 {
-            let inserted = store
-                .upsert(
-                    "reopen-scenario",
-                    &format!("reopen-scenario::p2-{i}"),
-                    vec![0.11, 0.22, 0.33, 0.44],
-                    payload(incompressible_filler(1_000_000 + i)),
-                )
-                .await;
-            let step = match inserted {
-                Ok(_) => store.checkpoint().await,
-                Err(error) => Err(error),
-            };
-            match step {
+        for _ in 0..1024u64 {
+            let id = next_id;
+            next_id += 1;
+            match insert(&conn, id) {
                 Ok(()) => continue,
                 Err(error) => {
-                    refusal = Some(error);
-                    break;
+                    let message = format!("{error}");
+                    let lowered = message.to_lowercase();
+                    let pool_family = lowered.contains("buffer pool is full")
+                        || lowered.contains("unable to allocate memory");
+                    let cap_family = lowered.contains("maximum database size")
+                        && lowered.contains("has been reached")
+                        && message.contains("16777216");
+                    if !pool_family && cap_family {
+                        refusal = Some(message);
+                        break;
+                    }
+                    println!("REOPEN_WRONG_FAMILY {message}");
+                    flush_stdout();
+                    std::process::exit(1);
                 }
             }
         }
-        let Some(refusal) = refusal else {
+        let Some(message) = refusal else {
             println!("REOPEN_NO_REFUSAL");
             flush_stdout();
             std::process::exit(1);
         };
-        let message = assert_max_db_size_refusal(&refusal);
         println!("REFUSAL_OBSERVED refusal: {message}");
         flush_stdout();
         // The three probes, in order. The maintainer's crash was on
         // the statement after the first refused checkpoint.
-        match store
-            .upsert(
-                "reopen-scenario",
-                "reopen-scenario::probe-write",
-                vec![0.11, 0.22, 0.33, 0.44],
-                payload(incompressible_filler(2_000_000)),
-            )
-            .await
-        {
-            Ok(_) => println!("PROBE_WRITE_OK"),
-            Err(error) => println!("PROBE_WRITE_ERR {}", format!("{error:#}")),
+        match insert(&conn, next_id) {
+            Ok(()) => println!("PROBE_WRITE_OK"),
+            Err(error) => println!("PROBE_WRITE_ERR {error}"),
         }
         flush_stdout();
-        match store.get("reopen-scenario", "reopen-scenario::seed").await {
-            Ok(Some(_)) => println!("PROBE_READ_OK"),
-            Ok(None) => println!("PROBE_READ_MISSING"),
-            Err(error) => println!("PROBE_READ_ERR {}", format!("{error:#}")),
+        match conn.query("MATCH (r:ReopenRow) WHERE r.id = 0 RETURN r.id;") {
+            Ok(mut rows) => match rows.next() {
+                Some(_) => println!("PROBE_READ_OK"),
+                None => println!("PROBE_READ_MISSING"),
+            },
+            Err(error) => println!("PROBE_READ_ERR {error}"),
         }
         flush_stdout();
-        match store.checkpoint().await {
-            Ok(()) => println!("PROBE_CHECKPOINT_OK"),
-            Err(error) => println!("PROBE_CHECKPOINT_ERR {}", format!("{error:#}")),
+        // The explicit checkpoint, issued exactly the way
+        // `LadybugStore::checkpoint` issues it: `conn.query("CHECKPOINT")`.
+        match conn.query("CHECKPOINT") {
+            Ok(_) => println!("PROBE_CHECKPOINT_OK"),
+            Err(error) => println!("PROBE_CHECKPOINT_ERR {error}"),
         }
         flush_stdout();
         println!("REOPEN_SCENARIO_PASS");
