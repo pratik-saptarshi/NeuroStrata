@@ -552,4 +552,196 @@ mod tests {
             "got: {push_err}"
         );
     }
+
+    // --- Task 13 (J12, DR-4): the git funnel is timed ---------------------
+
+    /// Restores PATH + the timeout env knob on drop, so a panicking hang
+    /// test can never leak the shim into the rest of the suite.
+    #[cfg(unix)]
+    struct EnvGuard {
+        path: Option<std::ffi::OsString>,
+        timeout: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvGuard {
+        fn install(shim_dir: &Path) -> Self {
+            let guard = Self {
+                path: std::env::var_os("PATH"),
+                timeout: std::env::var_os("NEUROSTRATA_GIT_TIMEOUT_SECS"),
+            };
+            let mut paths: Vec<PathBuf> = guard
+                .path
+                .as_ref()
+                .map(|p| std::env::split_paths(p).collect())
+                .unwrap_or_default();
+            paths.insert(0, shim_dir.to_path_buf());
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+            std::env::set_var("NEUROSTRATA_GIT_TIMEOUT_SECS", "1");
+            guard
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+            match &self.timeout {
+                Some(t) => std::env::set_var("NEUROSTRATA_GIT_TIMEOUT_SECS", t),
+                None => std::env::remove_var("NEUROSTRATA_GIT_TIMEOUT_SECS"),
+            }
+        }
+    }
+
+    /// A `git` that hangs must be cut off at the DR-4 timeout (here 1 s via
+    /// the env knob): `run` errors naming the subcommand + the timeout, in
+    /// ~1 s rather than the shim's 60 s, and the shim process is gone —
+    /// killed, not abandoned.
+    #[cfg(unix)]
+    #[test]
+    fn git_hang_times_out_and_kills() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shim_dir = scratch("git-shim");
+        let shim = shim_dir.join("git");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\necho $$ > \"$PWD/git-shim.pid\"\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let root = scratch("hang-root");
+        let _env = EnvGuard::install(&shim_dir);
+
+        let start = std::time::Instant::now();
+        let res = run(&root, &["fetch", "origin", "HEAD"]);
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("a hung git must error at the timeout, not run to completion");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fetch"),
+            "timeout error must name the subcommand, got: {msg}"
+        );
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout"),
+            "error must name the timeout, got: {msg}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the funnel must cut the hang at ~1 s (env override), took {elapsed:?}"
+        );
+
+        let pid: i32 = std::fs::read_to_string(root.join("git-shim.pid"))
+            .expect("the shim ran and recorded its pid")
+            .trim()
+            .parse()
+            .expect("shim pid parses");
+        if cfg!(target_os = "linux") {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "the timed-out git process (pid {pid}) must be killed, not left running"
+            );
+        }
+    }
+
+    /// Pin: the success path is unchanged — init/commit/push/pull round-trip
+    /// against a real bare remote moves the record exactly as before.
+    #[test]
+    fn git_success_path_unchanged() {
+        let base = scratch("pin-sync");
+        let remote = base.join("remote.git");
+        let out = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let a_dir = base.join("checkout-a");
+        let a = MeshStorage::init(
+            &a_dir,
+            "node-a",
+            "stripe-api-team",
+            &["stripe-api".to_string()],
+            Some(remote.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(a.commit_all("bootstrap", "node-a").unwrap());
+        a.push().unwrap();
+
+        let branch = git_out(a.root(), &["branch", "--show-current"]);
+        let out = Command::new("git")
+            .args(["--git-dir"])
+            .arg(&remote)
+            .args([
+                "symbolic-ref",
+                "HEAD",
+                format!("refs/heads/{}", branch).as_str(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let b_dir = base.join("checkout-b");
+        let out = Command::new("git")
+            .arg("clone")
+            .arg(&remote)
+            .arg(&b_dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let b = MeshStorage::open(&b_dir).unwrap();
+        let memories = b.root().join("stripe-api").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(memories.join("pin.json"), r#"{"id":"pin"}"#).unwrap();
+        assert!(b.commit_all("pin record", "node-b").unwrap());
+        b.push().unwrap();
+
+        a.pull().unwrap();
+        assert!(
+            a.root()
+                .join("stripe-api")
+                .join("memories")
+                .join("pin.json")
+                .is_file(),
+            "pull must fast-forward the pin record in"
+        );
+    }
+
+    /// Pin: a failing subcommand surfaces git's stderr in the error, in the
+    /// same shape as the synchronous funnel produced.
+    #[test]
+    fn git_failure_surfaces_stderr() {
+        let base = scratch("pin-failure");
+        let mesh = init_under(&base);
+
+        let err = run_ok(mesh.root(), &["rev-parse", "--verify", "refs/heads/no-such-ref"])
+            .expect_err("verifying a missing ref must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git rev-parse --verify refs/heads/no-such-ref failed"),
+            "error keeps the failing-invocation shape, got: {msg}"
+        );
+        assert!(
+            msg.contains("Needed a single revision"),
+            "error must carry git's stderr verbatim, got: {msg}"
+        );
+    }
 }
