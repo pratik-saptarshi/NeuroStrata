@@ -921,6 +921,10 @@ impl FastEmbedder {
         let captured_identity = model_name.clone();
         let captured_model_name = model_enum.to_string();
         let captured_max_length = MAX_EMBED_TOKENS;
+        // The factory owns a clone of the cache dir (Task 9): the outer
+        // cache_dir and model_enum stay borrowable after the session is
+        // built, which the post-load pin gate below depends on.
+        let captured_cache_dir = cache_dir.clone();
         let factory = move || -> Result<(TextEmbedding, String)> {
             let model_enum = EmbeddingModel::from_str(&captured_model_name).map_err(|_| {
                 anyhow::anyhow!(
@@ -934,7 +938,7 @@ impl FastEmbedder {
             // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
             let model = TextEmbedding::try_new(
                 TextInitOptions::new(model_enum)
-                    .with_cache_dir(cache_dir.clone())
+                    .with_cache_dir(captured_cache_dir.clone())
                     .with_max_length(captured_max_length)
                     .with_show_download_progress(true),
             )?;
