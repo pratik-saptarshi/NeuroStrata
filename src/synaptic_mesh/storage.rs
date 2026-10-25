@@ -705,8 +705,31 @@ mod tests {
             .parse()
             .expect("shim pid parses");
         if cfg!(target_os = "linux") {
+            // Killed means SIGKILL delivered: the pid is either reaped and
+            // gone or a zombie awaiting the runtime's reaper (tokio reaps
+            // orphans asynchronously, so poll briefly for either state).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let killed = loop {
+                match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Err(_) => break true,
+                    Ok(stat) => {
+                        let state = stat
+                            .rsplit(')')
+                            .next()
+                            .map(|rest| rest.trim_start())
+                            .unwrap_or("");
+                        if state.starts_with('Z') {
+                            break true;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            };
             assert!(
-                !Path::new(&format!("/proc/{pid}")).exists(),
+                killed,
                 "the timed-out git process (pid {pid}) must be killed, not left running"
             );
         }
