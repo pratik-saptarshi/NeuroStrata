@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Toolchain versions
         shell: bash
@@ -109,12 +109,19 @@ jobs:
   # The build job proves compilation; this proves behavior. Single test
   # thread because the suite's per-test temp databases exhaust the mmap
   # budget when run in parallel (intermittent "Mmap for size ... failed").
+  # The matrix matches the build job's (J16): tests are behavior, not
+  # backlog, so unlike the quality jobs below this one is a required gate
+  # on every OS it runs.
   test:
-    name: test (ubuntu)
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Toolchain versions
         shell: bash
@@ -129,6 +136,15 @@ jobs:
             echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
             exit 1
           }
+
+      # Same vendored-OpenSSL constraint as the build job: the test build
+      # compiles lbug too. (Same as the Configure step in the build job.)
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
 
       - name: Test
         shell: bash
@@ -147,6 +163,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Task 15a's scripted assertion for the release governance (J17),
+      # grep-level by design: release.yml must not grant contents: write at
+      # the top level (only its release job may), and every action in every
+      # workflow must be pinned to a full commit SHA. It rides in this job
+      # because the job already checks out the tree and needs no toolchain.
+      - name: Release governance assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          top="$(awk '/^permissions:/{f=1; next} /^jobs:/{f=0} f' .github/workflows/release.yml)"
+          if printf '%s\n' "$top" | grep -q 'contents: *write'; then
+            echo "::error::release.yml grants contents: write at the top level; only the release job may."
+            exit 1
+          fi
+          if ! printf '%s\n' "$top" | grep -q 'contents: *read'; then
+            echo "::error::release.yml top-level permissions must default to contents: read."
+            exit 1
+          fi
+          if grep -hE '^[[:space:]]*uses:' .github/workflows/*.yml | grep -vE '@[0-9a-f]{40}([[:space:]]|$)'; then
+            echo "::error::Every action in every workflow must be pinned to a full commit SHA (tag in a trailing comment)."
+            exit 1
+          fi
+          echo "release governance assertions passed"
 
       # The tree uses no toolchain action (the images provide Rust), so the
       # component is added the same way here.
@@ -212,3 +252,49 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
+
+  # The GUI compiles in CI for the first time (J16). src-tauri is a
+  # standalone crate (its own Cargo.lock, no workspace), and its build
+  # script expects the web-ui build output to already exist:
+  # tauri.conf.json sets frontendDist to ../web-ui/dist, and vite's default
+  # outDir is dist, so building web-ui in place lands the files exactly
+  # where the configured path points. This job is a required gate, not
+  # report-only: a GUI that does not compile is a bug, not style backlog.
+  gui:
+    name: gui (tauri build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      # Tauri v2's Linux prerequisites. Without them the webkit2gtk-sys
+      # build script fails on a stock ubuntu-latest runner before any Rust
+      # compiles.
+      - name: Install Tauri prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Build web-ui (frontendDist)
+        working-directory: web-ui
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      # --features custom-protocol because a plain cargo build otherwise
+      # produces the dev shape (see the feature's comment in
+      # src-tauri/Cargo.toml): the production shape is the one that embeds
+      # frontendDist, and it is the one worth compiling in CI.
+      - name: Build the Tauri app
+        working-directory: src-tauri
+        shell: bash
+        run: cargo build --locked --features custom-protocol
