@@ -162,3 +162,36 @@ change that re-runs it green.
   exercise `release.yml` end-to-end is NOT run — it awaits Pratik's
   authorization, and Task 15a parks on that leg rather than claiming
   inspection as verification.**
+
+## Task 15b slice plan (fmt/clippy burn-down)
+
+Ordered by the fmt slice map above (largest first), one slice per PR,
+upstream-only. A grouped slice absorbs every file of its module,
+including that module's 1–3-hunk tail files; the exact tail counts are
+read from the then-current `fmt` job log when the slice is cut (the
+sizing run named exact counts only for the 16 largest files: 171 of
+212 hunks; the remaining 41 hunks sit in 22 files of 1–3 hunks each).
+
+Clippy scope per slice: the diagnostics located in that slice's files,
+counted from the `clippy` job log at slice time (the sizing run
+recorded only the 210 total). Each landed slice updates the fmt and
+clippy counts in this file in the same PR and records the count it
+retired below.
+
+| # | Slice | fmt hunks at sizing |
+|---|---|---|
+| 1 | `src/server.rs` | 44 |
+| 2 | `src/daemon.rs` | 20 |
+| 3 | `src/buffer.rs` | 20 |
+| 4 | `src/task/` (`intake.rs` 15 + `mod.rs` 5) | 20 |
+| 5 | `src/synaptic_mesh/import.rs` | 13 |
+| 6 | `src/learning/` (`dataset.rs` 6 + `split.rs` 5 + module tail) | 11 + tail |
+| 7 | metrics + handlers (`src/recall_metrics.rs` 6 + `src/handlers/bus_metrics.rs` 5 + `src/handlers/memory.rs` tail) | 11 + tail |
+| 8 | `src/judgment/` (`mod.rs` 6 + `canonical.rs` 4 + `laya_onnx.rs` tail) | 10 + tail |
+| 9 | `src/store/ladybug.rs` | 9 |
+| 10 | `src/main.rs` | 5 |
+| 11 | `src/events/` (`subscribers/mesh_outbox.rs` 4 + `bus.rs` tail) | 4 + tail |
+| 12 | `src/config.rs` | 4 |
+| 13 | remainder tail (`src/guard/*`, `src/tools/procedure.rs`, `src/registry.rs`, `src/traits.rs`, `tests/*`, and any tail file not absorbed by slices 6–11) | remainder of 41 tail hunks |
+
+Slices retired: none yet.
