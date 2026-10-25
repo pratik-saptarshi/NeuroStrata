@@ -95,7 +95,7 @@ fn no_mesh_joined() -> &'static str {
 pub async fn handle_synaptic_mesh_command(
     cmd: &SynapticMeshCommands,
     ctx: &MeshContext,
-    store: &mut dyn StorageApi,
+    store: &mut (dyn StorageApi + Send),
 ) -> String {
     match cmd {
         SynapticMeshCommands::Init {

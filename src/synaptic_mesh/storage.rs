@@ -797,6 +797,7 @@ mod tests {
         let mesh = init_under(&base).await;
 
         let err = run_ok(mesh.root(), &["rev-parse", "--verify", "refs/heads/no-such-ref"])
+            .await
             .expect_err("verifying a missing ref must fail");
         let msg = format!("{err:#}");
         assert!(

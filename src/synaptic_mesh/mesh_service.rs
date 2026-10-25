@@ -458,7 +458,7 @@ fn wal_summary(mesh_dir: &Path) -> WalSummary {
 /// owns the shape a hook consumes. "No mesh joined" is a *quiet* nothing-
 /// to-do for hook purposes (spec §"Hooks": the mesh command itself never
 /// depends on a project-side hook), not an error.
-pub async fn sync_enqueue_line(store: &mut dyn StorageApi) -> String {
+pub async fn sync_enqueue_line(store: &mut (dyn StorageApi + Send)) -> String {
     let pull = match StorageApi::pull(store).await {
         Err(e) if e.starts_with("no mesh joined") => {
             return "mesh sync-enqueue: no mesh joined — nothing to do".to_string()
