@@ -1307,7 +1307,7 @@ const MAX_EVIDENCE_BYTES_PER_RESULT: usize = 512;
 const MAX_EVIDENCE_BYTES_PER_RESPONSE: usize = 2048;
 
 /// Render all search results with their evidence suffixes.
-fn render_search_results(results: &[SearchResult]) -> String {
+pub(crate) fn render_search_results(results: &[SearchResult]) -> String {
     let mut out = String::new();
     let mut remaining_budget = MAX_EVIDENCE_BYTES_PER_RESPONSE;
 
@@ -1327,7 +1327,7 @@ fn render_search_results(results: &[SearchResult]) -> String {
 
 /// Try to render one evidence path suffix for a result, within the byte budget.
 /// Enforces both the per-result cap (512) and the global remaining.
-fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Option<String> {
+pub(crate) fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Option<String> {
     let per_result_cap = remaining_bytes.min(MAX_EVIDENCE_BYTES_PER_RESULT);
     let evidence = result.evidence.as_ref()?;
     if evidence.is_empty() {
@@ -1431,7 +1431,7 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
 }
 
 /// Render the path string from originating primary toward result.
-fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
+pub(crate) fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
     // Walk edges from originating primary toward result.
     // For each edge, decide if it goes forward or reverse relative to our walk.
     let mut parts = Vec::new();
