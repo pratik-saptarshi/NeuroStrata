@@ -1512,4 +1512,121 @@ mod tests {
             .is_none());
         std::fs::remove_dir_all(tmp).unwrap();
     }
+
+    /// Records the documents the walk skipped, so a test asserts on the
+    /// report rather than on what the walk printed.
+    struct SkipRecorder {
+        skipped: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl IngestObserver for SkipRecorder {
+        fn file_ingested(&self, _path: &str, _symbols: usize) {}
+
+        fn relinked(&self, _edges: usize) {}
+
+        fn file_skipped(&self, path: &str, reason: &str) {
+            self.skipped
+                .lock()
+                .expect("recorder lock")
+                .push((path.to_string(), reason.to_string()));
+        }
+    }
+
+    /// Task 6 (J15): a document whose text trips the scanner is skipped
+    /// whole — no file node, no symbols — and reported with the scanner's
+    /// reason, while the rest of the walk proceeds.
+    #[tokio::test]
+    async fn secret_in_ingest_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        std::fs::write(
+            tmp.join("evil.rs"),
+            format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret),
+        )
+        .expect("write leaking file");
+
+        let db =
+            std::env::temp_dir().join(format!("ns-ingest-secret-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped document: {:?}",
+            outcome.err()
+        );
+
+        // The clean document landed whole.
+        let good_sym = qualified_id("test-ns", &symbol_id("good.rs", "functions", "clean", 1));
+        assert!(
+            store
+                .get("test-ns", &good_sym)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean symbol was stored"
+        );
+
+        // The tripping document contributed nothing: no file node, no symbol.
+        let evil_node = qualified_id("test-ns", "evil.rs");
+        assert!(
+            store
+                .get("test-ns", &evil_node)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's file node was not stored"
+        );
+        let evil_sym = qualified_id("test-ns", &symbol_id("evil.rs", "functions", "leak", 1));
+        assert!(
+            store
+                .get("test-ns", &evil_sym)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's symbol was not stored"
+        );
+
+        // And the skip was reported with the file and the scanner's reason.
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(skipped.len(), 1, "exactly one skip reported: {:?}", *skipped);
+        assert!(
+            skipped[0].0.ends_with("evil.rs"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            skipped[0].1.contains("github_pat"),
+            "skip carries the scanner category: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
 }

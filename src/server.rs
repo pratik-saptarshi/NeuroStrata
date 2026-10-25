@@ -5628,6 +5628,34 @@ mod tests {
         assert_eq!(before, after, "no memory should be stored after rejection");
     }
 
+    // ── Secret rejection on set_metadata prevents the write (Task 6) ──
+
+    #[tokio::test]
+    async fn secret_in_set_metadata_is_refused() {
+        let (store, id) = store_with_one_rule("probe").await;
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+
+        let err = set_metadata(
+            &*store,
+            "probe",
+            &id,
+            serde_json::json!({ "note": format!("the token is {}", secret) }),
+        )
+        .await
+        .expect_err("a secret in replacement metadata must be refused");
+        let refused = err.to_string();
+        assert!(refused.contains("ERROR [SECURITY]"), "got {}", refused);
+        assert!(refused.contains("github_pat"), "got {}", refused);
+
+        let (_, payload) = store.get("probe", &id).await.unwrap().unwrap();
+        assert_eq!(
+            payload.metadata,
+            serde_json::json!({}),
+            "the refused write left the stored metadata untouched"
+        );
+    }
+
     // ── Snapshot handler: fallible encoding (Task 2) ───────────────────
 
     #[tokio::test]

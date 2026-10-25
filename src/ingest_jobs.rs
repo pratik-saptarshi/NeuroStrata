@@ -335,6 +335,34 @@ mod tests {
         assert_eq!(progress.relinked_edges, Some(20));
     }
 
+    /// A skipped document is part of the job result a caller reads, so the
+    /// reporter accumulates skips into the progress alongside the counts.
+    /// (Pin for the Task 6 plumbing: passes before the producer learns to
+    /// skip, and guards the reporting leg afterwards.)
+    #[test]
+    fn progress_records_skipped_files() {
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        let reporter = ProgressReporter { tx };
+
+        reporter.file_skipped(
+            "src/evil.rs",
+            "ERROR [SECURITY]: Rejected ingest.content (github_pat). Do not store secrets.",
+        );
+
+        let progress = rx.borrow();
+        assert_eq!(progress.skipped_files.len(), 1);
+        assert!(
+            progress.skipped_files[0].starts_with("src/evil.rs"),
+            "{}",
+            progress.skipped_files[0]
+        );
+        assert!(
+            progress.skipped_files[0].contains("github_pat"),
+            "{}",
+            progress.skipped_files[0]
+        );
+    }
+
     #[tokio::test]
     async fn shutdown_waits_for_a_running_walk_but_not_past_its_limit() {
         let jobs = IngestJobs::new();
