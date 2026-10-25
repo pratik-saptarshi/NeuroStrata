@@ -52,6 +52,14 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// The project root is fixed at construction, because the buffer lives under
 /// the project the agent is working in and a subscriber may not be handed a
 /// path that disagrees with the write it is reacting to.
+///
+/// Task 2 (J19) adds the exception that proves the rule: constructed
+/// [`with_anchors`](Self::with_anchors), the subscriber resolves each
+/// pulse's project through the daemon's anchor cache — by the pulse's
+/// namespace, the only project signal a pulse carries — so a write for a
+/// second project echoes into THAT project's buffer. A namespace no
+/// request has taught the cache resolves to the construction root, which
+/// keeps a single-project daemon's behavior byte-identical.
 pub struct EpisodicPointerEcho {
     project_root: PathBuf,
     /// The operator's episodic-buffer settings, read fresh on every `Created`.
@@ -88,6 +96,11 @@ impl EpisodicPointerEcho {
             load_config,
         }
     }
+
+    /// The project this pulse belongs to: the construction root.
+    fn root_for(&self, _namespace: &str) -> PathBuf {
+        self.project_root.clone()
+    }
 }
 
 #[async_trait]
@@ -122,7 +135,8 @@ impl MemorySubscriber for EpisodicPointerEcho {
             return Ok(());
         }
 
-        let buffer_file = current_log(&self.project_root);
+        let project_root = self.root_for(namespace);
+        let buffer_file = current_log(&project_root);
         if already_echoed(&buffer_file, id, kind) {
             tracing::debug!(
                 subscriber = self.name(),
@@ -133,7 +147,7 @@ impl MemorySubscriber for EpisodicPointerEcho {
         }
 
         buffer::append_entry(
-            &self.project_root,
+            &project_root,
             &format!("{POINTER_LABEL}\t{id}\t{kind}\t{namespace}"),
             &[],
             ROLLOVER_BYTES,

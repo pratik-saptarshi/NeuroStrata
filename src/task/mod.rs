@@ -17,7 +17,7 @@ use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 // ── small helpers shared by every handler ──────────────────────────────────
 
@@ -139,7 +139,7 @@ async fn existing_ids(
     namespace: &str,
 ) -> Result<HashSet<String>, String> {
     store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map(|rows| rows.into_iter().map(|r| r.id).collect())
         .map_err(|e| format!("Failed to list memories for id allocation: {}", e))
@@ -519,6 +519,32 @@ pub async fn handle_task_create(
 
 // ── tool: neurostrata_task_claim ───────────────────────────────────────────
 
+/// Per-task claim locks: task id -> the lock serializing that task's claim
+/// sequence. Weak entries so a lock is dropped once no claim holds it; dead
+/// entries are pruned on each call, so the map tracks live claims, not every
+/// task ever claimed.
+static CLAIM_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+/// The lock `handle_task_claim` holds across its whole load -> decide ->
+/// upsert sequence. Claim's only production caller runs inside the daemon's
+/// MCP dispatch (`process_mcp_request`); stdio processes are pure proxies
+/// and never execute the handler, so this process-global registry serializes
+/// all claim traffic in the shipped topology. The store's upsert API has no
+/// conditional write to build a CAS on, so the process lock is the smallest
+/// honest atomicity mechanism.
+fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = CLAIM_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut map = registry.lock().expect("claim lock registry poisoned");
+    map.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = map.get(task_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(task_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -528,13 +554,24 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Ok(v) => v,
         Err(e) => return e,
     };
+    // A claim without a session has no holder identity to exclude others
+    // with: refuse before any state is read or written, and never persist
+    // an empty session_id.
+    let session = match required_str(&args, "session_id") {
+        Ok(v) => v.to_string(),
+        Err(e) => return e,
+    };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
     if let Err(e) = check_namespace(&namespace) {
         return e;
     }
 
     let assignee = arg_str(&args, "assignee").unwrap_or("unknown").to_string();
-    let session = arg_str(&args, "session_id").unwrap_or("").to_string();
+
+    // Serialize the whole load -> decide -> upsert sequence per task: two
+    // concurrent claims on one task can no longer both observe it unclaimed.
+    let lock = claim_lock(&id);
+    let _claim_guard = lock.lock().await;
 
     let (mut task, vector) = match load_task(&store, &namespace, &id).await {
         Ok(found) => found,
@@ -639,25 +676,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         obj.insert("session_id".to_string(), json!(session));
     }
 
-    // Atomicity guard: re-read the task before saving. If another session
-    // claimed it in the meantime (session_id changed), abort rather than
-    // overwriting their claim. Best-effort; true CAS needs store-level
-    // conditional writes (R7 follow-up).
-    let (fresh_task, _) = match load_task(&store, &namespace, &id).await {
-        Ok(found) => found,
-        Err(_) => (task.clone(), vector.clone()),
-    };
-    let fresh_holder = fresh_task
-        .task_field("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if !fresh_holder.is_empty() && fresh_holder != session && fresh_holder != holder {
-        return format!(
-            "ERROR: task {} was claimed by another session ('{}') while this claim was in progress. Retry the claim.",
-            id, fresh_holder
-        );
-    }
+    // No re-read guard here: the per-task claim lock above is held across
+    // this save, so no claim-path writer can interleave between the load
+    // and the upsert. (The R7 best-effort re-read this replaces could only
+    // ever fire for an out-of-process claim writer, and none exists — every
+    // claim enters through this handler in the daemon process.)
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
@@ -905,7 +928,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let memories = match store.list(&namespace, None).await {
+    let memories = match store.list(&namespace, None, None).await {
         Ok(m) => m,
         Err(e) => {
             return format!(
@@ -1104,7 +1127,7 @@ pub async fn handle_task_complete(
 
     let list_now = || async {
         store
-            .list(&namespace, None)
+            .list(&namespace, None, None)
             .await
             .map_err(|e| format!("Failed to list memories in '{}': {}", namespace, e))
     };
@@ -1257,6 +1280,11 @@ pub async fn handle_task_complete(
             }
             // The same lineage stamps add_memory gives every new row.
             crate::server::stamp_new_memory(&mut meta);
+            // A procedure minted by an extraction is locally authored,
+            // exactly as if add_memory had written it (Program Task 3).
+            if memory_type == "procedure" {
+                crate::tools::procedure::stamp_local_trust(&mut meta);
+            }
             // An extraction is an insertion: it meets the same scanner.
             if let Some(rejection) =
                 crate::secrets::scan_entry_point(&content, &meta, "task_complete")
@@ -1267,6 +1295,13 @@ pub async fn handle_task_complete(
             // is no top-level `domain` argument on this path, so
             // `register_domain` applies to that field and is a no-op when the
             // memory carries no domain. The decision precedes the write.
+            // Mirror handle_add_memory: normalize the domain to its slug before
+            // the registry check so canonical keys agree across the two paths.
+            if let Some(slug) = crate::domain::domain_key(&meta) {
+                if let Some(meta_obj) = meta.as_object_mut() {
+                    meta_obj.insert("domain".to_string(), Value::String(slug));
+                }
+            }
             if let Some(raw) = meta.get("domain").cloned() {
                 let register_domain = args
                     .get("register_domain")
@@ -1301,6 +1336,25 @@ pub async fn handle_task_complete(
                 dedup.as_ref(),
             )
             .await?;
+            // If the extraction was blocked by dedup rather than written, do
+            // not fall through to the generic Lock 2 refusal: name the
+            // candidate so the agent can retry with link_memory_id instead of
+            // looping on the same content.
+            if matches!(
+                report.decision,
+                crate::judgment::policy::DedupDecision::BlockedExact
+                    | crate::judgment::policy::DedupDecision::BlockedModel
+            ) {
+                let candidate = report
+                    .linked_existing_id
+                    .clone()
+                    .or_else(|| report.dedup_hint.as_ref().map(|h| h.candidate_id.clone()))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(format!(
+                    "ERROR: extraction was blocked by dedup ({:?}). The lesson matches an existing memory '{}'. Retry neurostrata_task_complete with link_memory_id: \"{}\" instead of memory.content, or pass a materially different content.",
+                    report.decision, candidate, candidate
+                ));
+            }
             // Only now, with the extraction durable: a cache failure is
             // reported and never undoes the acceptance.
             if let Some(domains) = pending_registry.take() {
@@ -1717,26 +1771,40 @@ pub async fn handle_bootstrap(
 /// runnable hook flips it — an agent extends this file instead of inventing a
 /// workflow. Both invocations are host-agnostic (GitHub, GitLab, Gitea, a bare
 /// repo over SSH), which is the whole reason the hook is the default.
-const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
+pub(crate) const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata task gate — scaffolded by neurostrata-bootstrap / task_setup.
 #
 # The hook IS the gate. It runs on every push on ANY git host, so it is the
 # required default; CI is vendor-specific and only a defense-in-depth extra.
 # Install once with:  bash scripts/install-hooks.sh
+# (`neurostrata-mcp hooks install` writes these exact bytes into the
+# directory git actually runs hooks from, core.hooksPath honored — one
+# hook text for both install paths, so they cannot drift.)
 
-command -v neurostrata-mcp >/dev/null || exit 0
-[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
+command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
+if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
+    echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
+    exit 0
+fi
 
 NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
-# --strict maps an unavailable database to a blocking exit too, so the exit
-# code below is the gate's verdict: a failed gate fails the push.
+# --strict maps an unavailable database to a blocking exit too, so a 1
+# below is always a verdict: violations, or a database that could not be
+# checked under --strict. The hook blocks on the verdict code only.
 neurostrata-mcp task gate "$NAMESPACE" --strict
 code=$?
-if [ $code -ne 0 ]; then
+if [ $code -eq 1 ]; then
     echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
     exit 1
+fi
+# A 2 here is never a verdict: under --strict the gate itself exits
+# only 0 or 1, so a 2 means the binary that answered was stale,
+# foreign, or died before it could report. Announced, never silent —
+# and it still does not block (0 and 2 pass, per the exit line below).
+if [ $code -eq 2 ]; then
+    echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
 fi
 
 # ── project guards (add yours here) ────────────────────────────────────────
@@ -1752,7 +1820,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
     done
 fi
 
-exit 0
+exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
 "#;
 
 /// The scaffolded `scripts/install-hooks.sh`: tracks the hook in the repo
@@ -1794,7 +1862,7 @@ echo "Verify: neurostrata_task_setup should report verified.hook_installed: true
 /// instead made the two disagree: a `core.hooksPath` in the global config made
 /// the installer write to the global path while this reported unhooked
 /// (FINDING-bootstrap-wiring-nudge fix round 1).
-fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
     let configured = std::process::Command::new("git")
         .args(["config", "--get", "core.hooksPath"])
         .current_dir(root)
@@ -2606,7 +2674,7 @@ pub async fn import_beads(
     let mut summary = ImportSummary::default();
 
     let rows = store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map_err(|e| format!("ERROR: could not list '{}': {}", namespace, e))?;
     let mut seen_bead_ids: HashSet<String> = rows
@@ -4016,8 +4084,99 @@ mod tests {
         assert_eq!(payload.metadata["task"]["session_id"], json!("ses_a"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_claims_exactly_one_wins() {
+        let real = store_with_namespace("MyProj").await;
+        let id = create_task(&real, "MyProj", "the work", 2).await;
+        // SlowGetStore widens the load -> decide -> upsert window so the two
+        // claims genuinely overlap; without a per-task claim lock both win.
+        let store: Arc<dyn VectorStore> = Arc::new(SlowGetStore {
+            inner: real.clone(),
+        });
+        let a = tokio::spawn(handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        ));
+        let b = tokio::spawn(handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-b", "session_id": "ses_b" }),
+            store.clone(),
+        ));
+        let replies = [a.await.unwrap(), b.await.unwrap()];
+        let wins = replies
+            .iter()
+            .filter(|r| r.contains("\"claimed\": true"))
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent claim may win: {:?}",
+            replies
+        );
+        let loser = replies
+            .iter()
+            .find(|r| !r.contains("\"claimed\": true"))
+            .expect("the loser replied");
+        assert!(loser.starts_with("ERROR: task"), "{}", loser);
+        assert!(
+            loser.contains("claimed by agent-"),
+            "the loser is told who holds the task: {}",
+            loser
+        );
+
+        let (_, payload) = real.get("MyProj", &id).await.unwrap().unwrap();
+        let holder = payload.metadata["task"]["session_id"].as_str().unwrap();
+        assert!(
+            holder == "ses_a" || holder == "ses_b",
+            "the persisted holder is the winner: {}",
+            holder
+        );
+        assert_eq!(
+            payload.metadata["task"]["history"].as_array().unwrap().len(),
+            1,
+            "only the winning claim is persisted"
+        );
+    }
+
     #[tokio::test]
-    async fn re_claiming_from_the_same_session_is_idempotent() {
+    async fn empty_session_claim_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        for args in [
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a" }),
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "" }),
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "   " }),
+        ] {
+            let reply = handle_task_claim(args, store.clone()).await;
+            assert!(reply.starts_with("ERROR:"), "{}", reply);
+            assert!(
+                reply.contains("session_id"),
+                "the refusal names the requirement: {}",
+                reply
+            );
+        }
+
+        assert_eq!(
+            status_of(&store, "MyProj", &id).await,
+            Status::Open,
+            "a refused claim changes nothing"
+        );
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert!(
+            payload.metadata["task"].get("session_id").is_none(),
+            "no empty session is persisted: {:?}",
+            payload.metadata["task"]
+        );
+        assert!(
+            payload.metadata["task"]["history"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "no transition is persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_session_reclaim_is_idempotent() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
@@ -4087,7 +4246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claiming_a_done_task_names_the_legal_transition_instead() {
+    async fn claim_after_completion_still_refused() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         // Hand-edit the status: the machine still refuses done -> in_progress.
@@ -4254,7 +4413,7 @@ mod tests {
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
 
-        let before = store.list("MyProj", None).await.unwrap().len();
+        let before = store.list("MyProj", None, None).await.unwrap().len();
         let reply = handle_task_complete(
             json!({
                 "namespace": "MyProj",
@@ -4275,7 +4434,7 @@ mod tests {
         let extracted = parsed["extracted_memory_ids"].as_array().unwrap();
         assert_eq!(extracted.len(), 1);
 
-        let after = store.list("MyProj", None).await.unwrap();
+        let after = store.list("MyProj", None, None).await.unwrap();
         assert_eq!(after.len(), before + 1, "one memory was written");
         let written = after
             .iter()
@@ -4369,7 +4528,7 @@ mod tests {
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
 
-        let before = store.list("MyProj", None).await.unwrap().len();
+        let before = store.list("MyProj", None, None).await.unwrap().len();
         let err = handle_task_complete(
             json!({
                 "namespace": "MyProj",
@@ -4393,7 +4552,7 @@ mod tests {
                 && err.contains("must be an array of task ids"),
             "the rejection must name the malformed key, not the generic Lock-2 block: {err}"
         );
-        let after = store.list("MyProj", None).await.unwrap();
+        let after = store.list("MyProj", None, None).await.unwrap();
         assert_eq!(after.len(), before, "the intended memory was NOT created");
         assert_eq!(
             status_of(&store, "MyProj", &id).await,
@@ -4609,6 +4768,117 @@ mod tests {
         }
     }
 
+    /// Wraps a real store and delays every task-row `get` briefly, widening
+    /// the claim handler's load -> decide -> upsert window so two spawned
+    /// claims overlap deterministically instead of racing by scheduler luck.
+    struct SlowGetStore {
+        inner: Arc<dyn VectorStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for SlowGetStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+        async fn relink_edges(&self, namespace: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace).await
+        }
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            let found = self.inner.get(namespace, id).await?;
+            if let Some((_, payload)) = &found {
+                if payload.metadata.get("task").is_some() {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+            }
+            Ok(found)
+        }
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl crate::traits::AsAny for SlowGetStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     /// Wraps a real store and hides every extraction-declaring row from
     /// `list`. `upsert` still lands, so the inline lesson really is written --
     /// the gate simply cannot see the edge it declared, which is the one
@@ -4657,8 +4927,9 @@ mod tests {
             &self,
             namespace: &str,
             user_id: Option<&str>,
+            memory_type: Option<&str>,
         ) -> anyhow::Result<Vec<SearchResult>> {
-            let rows = self.inner.list(namespace, user_id).await?;
+            let rows = self.inner.list(namespace, user_id, memory_type).await?;
             Ok(rows
                 .into_iter()
                 .filter(|r| r.payload.metadata.get("extracted_from").is_none())
@@ -4765,7 +5036,7 @@ impl crate::traits::AsAny for ListHidingStore {
         // The write itself did land -- this is the case the pulse would have
         // lied about, not a path that failed earlier.
         let lesson_count = real
-            .list("MyProj", None)
+            .list("MyProj", None, None)
             .await
             .unwrap()
             .iter()
@@ -4842,7 +5113,7 @@ impl crate::traits::AsAny for ListHidingStore {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
-        let before = store.list("MyProj", None).await.unwrap().len();
+        let before = store.list("MyProj", None, None).await.unwrap().len();
 
         let err = handle_task_complete(
             json!({
@@ -4858,7 +5129,7 @@ impl crate::traits::AsAny for ListHidingStore {
         .await
         .expect_err("a secret must not be stored as an extraction");
         assert!(err.contains("ERROR [SECURITY]"), "{}", err);
-        assert_eq!(store.list("MyProj", None).await.unwrap().len(), before);
+        assert_eq!(store.list("MyProj", None, None).await.unwrap().len(), before);
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
@@ -5721,7 +5992,7 @@ impl crate::traits::AsAny for ListHidingStore {
         );
 
         // The tasks really exist, in creation order.
-        let rows = store.list("proj", None).await.unwrap();
+        let rows = store.list("proj", None, None).await.unwrap();
         let tasks: Vec<_> = rows
             .iter()
             .filter(|r| r.payload.memory_type == "task")
@@ -5740,7 +6011,7 @@ impl crate::traits::AsAny for ListHidingStore {
     }
 
     #[tokio::test]
-    async fn setup_on_a_clean_project_suggests_the_plain_hook_and_no_conflicts() {
+    async fn setup_on_a_clean_project_suggests_the_plain_hook_and_flags_the_seeded_overlap() {
         let root = std::env::temp_dir().join(format!("ns-setup-clean-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         std::fs::write(root.join("package.json"), "{}").unwrap();
@@ -5754,7 +6025,19 @@ impl crate::traits::AsAny for ListHidingStore {
         .await;
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
 
-        assert_eq!(parsed["conflicts"], json!([]));
+        // R16 made ARRAY_DISTANCE bind whole-number vectors (the stub
+        // embedder's), so the setup search now finds the seeded rule and the
+        // overlap is reported -- the binder working as intended, not a
+        // conflict-free project. Pre-R16 the query errored and setup
+        // swallowed it, so this expectation read as no conflicts.
+        let conflicts = parsed["conflicts"].as_array().expect("conflicts list");
+        assert_eq!(conflicts.len(), 1, "conflicts: {:?}", parsed["conflicts"]);
+        assert_eq!(conflicts[0]["kind"], json!("suggested_rule_overlap"));
+        assert_eq!(conflicts[0]["existing"], json!("always use podman"));
+        assert_eq!(
+            conflicts[0]["suggestion"],
+            json!("JavaScript/TypeScript project: install from the lockfile and keep the package scripts (test, lint) green before pushing.")
+        );
         assert_eq!(parsed["tasks_created"], json!([]));
         assert_eq!(
             parsed["instructions"][0]["cmd"],
@@ -5794,7 +6077,7 @@ impl crate::traits::AsAny for ListHidingStore {
             "the broken line is counted, not fatal"
         );
 
-        let rows = store.list("proj", None).await.unwrap();
+        let rows = store.list("proj", None, None).await.unwrap();
         let tasks: Vec<_> = rows
             .iter()
             .filter(|r| r.payload.memory_type == "task")
@@ -5859,7 +6142,7 @@ impl crate::traits::AsAny for ListHidingStore {
         assert_eq!(second.created, 0, "re-runs skip everything");
         assert_eq!(second.skipped_existing, 2);
 
-        let rows = store.list("proj", None).await.unwrap();
+        let rows = store.list("proj", None, None).await.unwrap();
         let tasks: Vec<_> = rows
             .iter()
             .filter(|r| r.payload.memory_type == "task")

@@ -922,24 +922,20 @@ async fn answer_with_error(
     }
 }
 
-pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut writer = stdout;
-
+/// The proxy's HTTP client. It carries the daemon bearer token (read
+/// from the token file the daemon maintains) in its default headers:
+/// without it, every forwarded /mcp call is a 401 against the daemon's
+/// auth middleware -- the Task 1 F1 regression, in which the product's
+/// primary client surface went dark the moment the daemon learned to
+/// authenticate.
+fn proxy_client() -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
-    let home = dirs::home_dir().unwrap_or_default();
-    let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-    if let Ok(token) = std::fs::read_to_string(&token_path) {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                headers.insert(reqwest::header::AUTHORIZATION, val);
-            }
+    if let Some(token) = crate::daemon::read_token_file("daemon.token") {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
         }
     }
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         // Separate from the overall bound on purpose. A port with nothing behind
         // it hangs rather than refusing on this machine -- the same behaviour
         // DaemonProbe in main.rs exists to describe -- so without this, a daemon
@@ -949,7 +945,28 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(proxy_timeout())
         .build()
-        .unwrap();
+        .unwrap()
+}
+
+/// One forwarding attempt: POST the JSON-RPC request to the daemon's
+/// /mcp endpoint with the proxy client. The startup-wait loop in
+/// `start_mcp_proxy` retries this on connect errors while the daemon is
+/// still starting.
+async fn forward_mcp_request(
+    client: &reqwest::Client,
+    url: &str,
+    request: &Value,
+) -> reqwest::Result<reqwest::Response> {
+    client.post(url).json(request).send().await
+}
+
+pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin).lines();
+    let mut writer = stdout;
+
+    let client = proxy_client();
 
     // Whether anything has ever answered on the port. Until something has, a
     // daemon we spawned ourselves is presumed to be still starting; after it
@@ -988,11 +1005,8 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
         // reports every tool as broken.
         let waiting_since = std::time::Instant::now();
         let response = loop {
-            let attempt = client
-                .post("http://127.0.0.1:34343/mcp")
-                .json(&request)
-                .send()
-                .await;
+            let attempt =
+                forward_mcp_request(&client, "http://127.0.0.1:34343/mcp", &request).await;
 
             let still_starting = should_wait_for_startup(
                 daemon_has_answered,
@@ -1274,9 +1288,28 @@ pub(crate) async fn embed_dedup_and_upsert(
                         .payload
                         .metadata
                         .get("extracted_from")
-                        .map(|v| !v.is_null())
+                        .and_then(|v| v.as_array())
+                        .map(|a| !a.is_empty())
                         .unwrap_or(false);
-                    if has_extracted {
+                    // An incoming memory that itself declares an extraction
+                    // (e.g. task_complete's inline lesson, or an add_memory
+                    // carrying extracted_from) is a link, not a duplicate: the
+                    // lesson still needs to land on the existing row. Blocking
+                    // it here would strand the task in Lock 2 (the task_complete
+                    // dedup trap). Only a bare content duplicate with no
+                    // extraction on either side is a true BlockedExact.
+                    let incoming_ids: Vec<String> = payload
+                        .metadata
+                        .get("extracted_from")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let incoming_has_extracted = !incoming_ids.is_empty();
+                    if has_extracted || incoming_has_extracted {
                         linked_existing_id = Some(ec.id.clone());
                         decision = DedupDecision::LinkedExisting;
                         // Update existing candidate's metadata idempotently:
@@ -1284,13 +1317,6 @@ pub(crate) async fn embed_dedup_and_upsert(
                         if let Ok(Some((existing_vec, mut existing_payload))) =
                             store.get(namespace, &ec.id).await
                         {
-                            // merge extracted_from from incoming
-                            let incoming_ids: Vec<String> = payload
-                                .metadata
-                                .get("extracted_from")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                                .unwrap_or_default();
                             let meta = existing_payload.metadata.as_object_mut();
                             if let Some(m) = meta {
                                 let arr = m
@@ -1311,6 +1337,12 @@ pub(crate) async fn embed_dedup_and_upsert(
                         }
                     } else {
                         decision = DedupDecision::BlockedExact;
+                        // Surface the candidate so callers (e.g. task_complete)
+                        // can fall back to link_memory_id instead of failing
+                        // opaquely on Lock 2.
+                        if linked_existing_id.is_none() {
+                            linked_existing_id = Some(ec.id.clone());
+                        }
                     }
                     // No new row for exact reuse / bare exact duplicate.
                     return Ok(MemoryWriteReport {
@@ -1524,6 +1556,12 @@ async fn handle_add_memory(
         }
     }
     stamp_new_memory(&mut metadata);
+    // A procedure born on this node is locally authored: stamp it so the
+    // fire gate can tell authorship from import (Program Task 3). The
+    // stamp overwrites any caller-supplied trust value.
+    if memory_type == "procedure" {
+        crate::tools::procedure::stamp_local_trust(&mut metadata);
+    }
 
     // Honour an unambiguous Governs line in the prose (guinea-pig Option 2):
     // a declared pointer that is written but never honoured is the worst of
@@ -1729,7 +1767,7 @@ async fn handle_get_snapshot(
     let namespace = namespace.as_str();
 
     let mut all_memories = store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
 
@@ -2593,7 +2631,7 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
                     let mut best_len = 0usize;
                     for candidate in &candidates {
                         let held = store
-                            .list(candidate, None)
+                            .list(candidate, None, None)
                             .await
                             .map(|m| m.len())
                             .unwrap_or(0);
@@ -2739,7 +2777,7 @@ fn render_anchor(anchor: &Value) -> String {
 
 /// One rendering of a memory, shared by search and get, so a record reads the
 /// same however the agent reached it.
-fn format_memory(id: &str, payload: &MemoryPayload) -> String {
+pub(crate) fn format_memory(id: &str, payload: &MemoryPayload) -> String {
     let mut out = format!("--- Memory ID: {} ---\nType: {}", id, payload.memory_type);
     if crate::attempt::is_failed_attempt(&payload.metadata) {
         let attempt = payload.metadata.get("attempt").unwrap();
@@ -3032,7 +3070,7 @@ async fn handle_guard_validate(
     );
     if mutating {
         // Determine whether this namespace is task-enabled.
-        if let Ok(memories) = store.list(&namespace, None).await {
+        if let Ok(memories) = store.list(&namespace, None, None).await {
             let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
             if has_any_task {
                 let has_in_progress = memories
@@ -3373,6 +3411,69 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// Task 1 (F1/FM-2 regression): the stdio proxy's client must carry
+    /// the daemon bearer token, or every proxied MCP session is a 401
+    /// against the token-enforcing daemon -- the proxy is the product's
+    /// primary client surface. A recording stub stands in for the daemon
+    /// and captures the Authorization header of the forwarded request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_forwards_the_daemon_bearer_token() {
+        use std::io::{BufRead, Read, Write};
+
+        // The token the daemon would have created and the proxy must read.
+        let expected = crate::daemon::load_or_create_daemon_token();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut auth = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.starts_with("authorization:") {
+                    // The value is compared exactly, so take it from the
+                    // original line -- only the name match is folded.
+                    auth = trimmed["authorization:".len()..].trim().to_string();
+                }
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+            }
+            let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+            auth
+        });
+
+        let client = proxy_client();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let url = format!("http://{addr}/mcp");
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+        let auth = stub.join().unwrap();
+        assert_eq!(
+            auth,
+            format!("Bearer {expected}"),
+            "the proxy must forward the daemon bearer token"
+        );
+    }
 
     #[test]
     fn locations_preserve_opaque_source_context_without_interpreting_it() {
@@ -4508,7 +4609,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -4541,7 +4642,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -4572,7 +4673,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -4684,7 +4785,7 @@ mod tests {
         let boot = add_with_domain(&store, serde_json::json!("Auth"), None).await;
         assert!(boot.starts_with("Successfully added memory"), "{}", boot);
 
-        let before = store.list("probe", None).await.expect("list").len();
+        let before = store.list("probe", None, None).await.expect("list").len();
         let reply = add_with_domain(&store, serde_json::json!("storage"), None).await;
 
         assert!(reply.contains("ERROR [DOMAIN]"), "{}", reply);
@@ -4700,7 +4801,7 @@ mod tests {
         );
         assert!(reply.contains("register_domain: true"), "{}", reply);
 
-        let after = store.list("probe", None).await.expect("list");
+        let after = store.list("probe", None, None).await.expect("list");
         assert_eq!(after.len(), before, "a rejection writes nothing");
         assert!(
             after
@@ -4790,7 +4891,7 @@ mod tests {
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         seed_row(&store, "probe", "the legacy rule").await;
 
-        let before = store.list("probe", None).await.expect("list").len();
+        let before = store.list("probe", None, None).await.expect("list").len();
         let reply = add_with_domain(&store, serde_json::json!(42), None).await;
 
         assert!(reply.contains("ERROR [DOMAIN]"), "{}", reply);
@@ -4805,7 +4906,7 @@ mod tests {
             reply
         );
         assert_eq!(
-            store.list("probe", None).await.expect("list").len(),
+            store.list("probe", None, None).await.expect("list").len(),
             before,
             "nothing is written"
         );
@@ -4820,7 +4921,7 @@ mod tests {
 
         assert!(reply.starts_with("Successfully added memory"), "{}", reply);
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -5507,7 +5608,7 @@ mod tests {
         let (store, _) = store_with_one_rule("probe").await;
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
 
-        let before = store.list("probe", None).await.unwrap().len();
+        let before = store.list("probe", None, None).await.unwrap().len();
 
         let reply = handle_add_memory(
             serde_json::json!({
@@ -5523,7 +5624,7 @@ mod tests {
         .await;
         assert!(reply.contains("ERROR [SECURITY]"), "got {}", reply);
 
-        let after = store.list("probe", None).await.unwrap().len();
+        let after = store.list("probe", None, None).await.unwrap().len();
         assert_eq!(before, after, "no memory should be stored after rejection");
     }
 
@@ -6045,7 +6146,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -6235,7 +6336,7 @@ mod tests {
                 // The id is the store's, not a fresh uuid: the whole point of
                 // the pulse is that a subscriber can read that row back.
                 let stored: Vec<String> = store
-                    .list("probe", None)
+                    .list("probe", None, None)
                     .await
                     .expect("list")
                     .into_iter()
@@ -6246,6 +6347,97 @@ mod tests {
             }
             other => panic!("expected Created, got {:?}", other),
         }
+    }
+
+    /// Program Task 3 (a): a procedure created through add_memory is
+    /// stamped trust="local" at creation — a caller-supplied trust value
+    /// is overwritten, because local authorship is a fact about the
+    /// write path, not a claim the caller gets to make. The stamped row
+    /// fires through the gate; a non-procedure row gains no trust key.
+    #[tokio::test]
+    async fn locally_created_procedure_carries_local_stamp() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, _seen) = recording_bus();
+
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "rehearse the release checklist",
+                "namespace": "probe",
+                "memory_type": "procedure",
+                "metadata": {
+                    "trust": "untrusted",
+                    "trigger": "session-start",
+                    "remaining_fires": 2
+                }
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            reply.starts_with("Successfully added memory"),
+            "{reply}"
+        );
+
+        let rows = store.list("probe", None, None).await.expect("list");
+        let proc_row = rows
+            .iter()
+            .find(|r| r.payload.memory_type == "procedure")
+            .expect("the procedure row was stored");
+        assert_eq!(
+            proc_row.payload.metadata["trust"],
+            serde_json::json!("local"),
+            "creation stamps local authorship over the caller's claim: {:?}",
+            proc_row.payload.metadata
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("ns-task3-local-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("scratch root");
+        let outcome_text = crate::tools::procedure::handle_procedure_perform(
+            serde_json::json!({
+                "id": proc_row.id,
+                "project_root": root.display().to_string()
+            }),
+            store.clone(),
+        )
+        .await;
+        let outcome: Value = serde_json::from_str(&outcome_text).expect("perform returns JSON");
+        assert_eq!(
+            outcome["performed"],
+            serde_json::json!(true),
+            "a locally created procedure fires: {outcome}"
+        );
+
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "a plain local rule about stamping",
+                "namespace": "probe",
+                "memory_type": "rule",
+                "metadata": {}
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            bus,
+        )
+        .await;
+        assert!(
+            reply.starts_with("Successfully added memory"),
+            "{reply}"
+        );
+        let rows = store.list("probe", None, None).await.expect("list");
+        let rule_row = rows
+            .iter()
+            .find(|r| r.payload.content == "a plain local rule about stamping")
+            .expect("the rule row was stored");
+        assert!(
+            rule_row.payload.metadata.get("trust").is_none(),
+            "non-procedure rows gain no trust stamp: {:?}",
+            rule_row.payload.metadata
+        );
     }
 
     /// Emit site 2: a correction is two rows moving, and the pulse has to name
@@ -7526,7 +7718,7 @@ mod tests {
         }
 
         let before: Vec<(String, i64)> = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .unwrap()
             .iter()
@@ -7546,7 +7738,7 @@ mod tests {
             .expect("snapshot");
 
         let after: Vec<(String, i64)> = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .unwrap()
             .iter()

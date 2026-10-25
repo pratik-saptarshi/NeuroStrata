@@ -791,7 +791,20 @@ async fn search_inner(
     store
         .with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-            let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+            let vec_str = format!(
+                "[{}]",
+                // R16: defense-in-depth (no native bind in lbug 0.20.4).
+                // Always emit decimal (e.g. 0 → 0.0) so ARRAY_DISTANCE
+                // binder never sees pure-integer arrays.
+                vector.iter().map(|f| {
+                    let s = format!("{}", f);
+                    if s.contains('.') || s.contains('e') || s.contains('E') {
+                        s
+                    } else {
+                        format!("{}.0", s)
+                    }
+                }).collect::<Vec<_>>().join(",")
+            );
             let now = chrono::Utc::now().timestamp();
 
             // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
@@ -837,6 +850,7 @@ async fn search_inner(
             );
 
             let result = conn.query(&search_query)?;
+            let result_count = result.get_num_tuples() as usize;
             let mut all_primaries = Vec::new();
             let mut filtered_primaries = Vec::new();
 
@@ -1252,8 +1266,20 @@ async fn search_inner(
                 // The real discriminator is EvidenceKind, not score.
                 const EXPANSION_BASE_SCORE: f32 = 1.0; // sorts after any real boosted_distance (< 1.0 typically)
                 for id in &admitted {
-                    let entry = by_id.remove(id).unwrap();
-                    let payload = entry.payload.unwrap();
+                    let entry = match by_id.remove(id) {
+                        Some(e) => e,
+                        None => {
+                            tracing::warn!("admitted id {} not in by_id map (drift); skipping", id);
+                            continue;
+                        }
+                    };
+                    let payload = match entry.payload {
+                        Some(p) => p,
+                        None => {
+                            tracing::warn!("entry for {} has no payload (drift); skipping", id);
+                            continue;
+                        }
+                    };
                     let mut evidence = entry.evidence;
                     // Sort evidence: kind (OneHop < Governs2hop), then path edges
                     evidence.sort_by(|a, b| {
@@ -1290,9 +1316,14 @@ async fn search_inner(
                 }
             });
 
-            // Return limit primaries + their expansions (no truncation to limit*2)
-            // The admission caps already bound expansions to limit per family.
-            Ok(DomainSearchOutcome { results, mode })
+            // Incomplete marker: set when the full 10x budget was consumed by the
+// Cypher LIMIT, meaning more matching rows beyond the page may exist and
+// must be fetched via pagination to avoid losing live matches hidden behind
+// rows filtered out after LIMIT. Heuristic: if result_count == fetch_limit
+// the engine's LIMIT was hit, indicating the multiplier exhausted and pages
+// beyond remain.
+let incomplete = result_count >= fetch_limit;
+Ok(DomainSearchOutcome { results, mode, incomplete })
         })
         .await
 }
@@ -3316,6 +3347,10 @@ impl VectorStore for LadybugStore {
             .filter(|_| namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX))
             .map(ToOwned::to_owned);
         let namespace = namespace.to_string();
+        // R14: reject empty/whitespace namespaces before hitting the store.
+        if namespace.trim().is_empty() {
+            anyhow::bail!("namespace must be non-empty");
+        }
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
@@ -3345,7 +3380,20 @@ impl VectorStore for LadybugStore {
             let safe_location_lines = escape_ladybug_string(&payload.location_lines);
             let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
 
-            let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+            let vec_str = format!(
+                "[{}]",
+                // R16: defense-in-depth (no native bind in lbug 0.20.4).
+                // Always emit decimal (e.g. 0 → 0.0) so ARRAY_DISTANCE
+                // binder never sees pure-integer arrays.
+                vector.iter().map(|f| {
+                    let s = format!("{}", f);
+                    if s.contains('.') || s.contains('e') || s.contains('E') {
+                        s
+                    } else {
+                        format!("{}.0", s)
+                    }
+                }).collect::<Vec<_>>().join(",")
+            );
 
             let insert_query = format!(
                 "MERGE (m:Memory {{id: '{}'}})
@@ -3538,7 +3586,17 @@ impl VectorStore for LadybugStore {
             let safe_ns = escape_ladybug_string(&namespace);
             let vec_str = format!(
                 "[{}]",
-                vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+                // R16: defense-in-depth (no native bind in lbug 0.20.4).
+                // Always emit decimal (e.g. 0 → 0.0) so ARRAY_DISTANCE
+                // binder never sees pure-integer arrays.
+                vector.iter().map(|f| {
+                    let s = format!("{}", f);
+                    if s.contains('.') || s.contains('e') || s.contains('E') {
+                        s
+                    } else {
+                        format!("{}.0", s)
+                    }
+                }).collect::<Vec<_>>().join(",")
             );
             let now = chrono::Utc::now().timestamp();
 
@@ -3975,7 +4033,7 @@ impl VectorStore for LadybugStore {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is
         // therefore a read of what is already stored, not a guess.
-        let memories = self.list(namespace, None).await?;
+        let memories = self.list(namespace, None, None).await?;
 
         // Ids stored before node ids became repository-relative are absolute, so
         // a rule written to match them declares C:/proj/src/foo.rs and matches
@@ -4329,17 +4387,24 @@ impl VectorStore for LadybugStore {
         Ok(published)
     }
 
-    async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
+    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
         let namespace = namespace.to_string();
         let user_id = user_id.map(|v| v.to_string());
+        let memory_type = memory_type.map(|v| v.to_string());
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
-            let query = if let Some(uid) = user_id {
-                format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_ladybug_string(&uid))
-            } else {
-                format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns)
-            };
+            // Build WHERE clause with optional filters (R15: push into Cypher).
+            let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
+            if let Some(ref uid) = user_id {
+                conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
+            }
+            if let Some(ref mt) = memory_type {
+                conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
+            }
+            let where_clause = conditions.join(" AND ");
+
+            let query = format!("MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", where_clause);
 
             let result = conn.query(&query)?;
             let mut results = Vec::new();
