@@ -371,6 +371,22 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// Increment the access count of a specific memory by its ID.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;
 
+    /// Increment the access counts of several memories in one namespace.
+    ///
+    /// The default loops the single-row method; stores override it to land
+    /// the whole batch in one write session, so one search costs one write
+    /// instead of one spawned write per hit — and the batch's
+    /// read-modify-writes cannot interleave with each other and lose
+    /// updates the way concurrent per-hit writes could. Ids are applied in
+    /// slice order, and each occurrence of an id counts once, exactly as
+    /// repeated single calls would. An empty slice performs no write.
+    async fn increment_access_counts(&self, namespace: &str, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.increment_access_count(namespace, id).await?;
+        }
+        Ok(())
+    }
+
     /// Search with an optional domain key set. The default implementation ignores
     /// the key set and reports `Vector`, so a store that cannot filter stays honest.
     async fn search_with_domain(

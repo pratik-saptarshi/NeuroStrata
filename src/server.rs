@@ -2543,18 +2543,25 @@ async fn handle_search_memory(
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
                 } else {
-                    // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
-                    for res in &results {
-                        if crate::traits::is_direct_match(&res.evidence) {
-                            let store_clone = store.clone();
-                            let ns_clone = namespace.to_string();
-                            let id_clone = res.id.clone();
-                            tokio::spawn(async move {
-                                let _ = store_clone
-                                    .increment_access_count(&ns_clone, &id_clone)
-                                    .await;
-                            });
-                        }
+                    // Increment access_count ONLY for direct hits
+                    // (EvidenceKind::DirectMatch) — one batched write for
+                    // the whole search, still fire-and-forget inside one
+                    // spawned task (J18: a spawn + write per hit was write
+                    // amplification, and the concurrent read-modify-writes
+                    // could lose updates against each other).
+                    let hit_ids: Vec<String> = results
+                        .iter()
+                        .filter(|res| crate::traits::is_direct_match(&res.evidence))
+                        .map(|res| res.id.clone())
+                        .collect();
+                    if !hit_ids.is_empty() {
+                        let store_clone = store.clone();
+                        let ns_clone = namespace.to_string();
+                        tokio::spawn(async move {
+                            let _ = store_clone
+                                .increment_access_counts(&ns_clone, &hit_ids)
+                                .await;
+                        });
                     }
 
                     let report = render_search_results(&results);

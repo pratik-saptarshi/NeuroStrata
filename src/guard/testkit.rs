@@ -446,6 +446,20 @@ impl VectorStore for MockStore {
         Ok(())
     }
 
+    async fn increment_access_counts(&self, namespace: &str, ids: &[String]) -> Result<()> {
+        self.batch_calls
+            .lock()
+            .expect("mock store lock")
+            .push((namespace.to_string(), ids.to_vec()));
+        // The batch lands each id exactly once, so the singles record —
+        // which rows were counted — gains one entry per id as well.
+        let mut singles = self.incremented_ids.lock().expect("mock store lock");
+        for id in ids {
+            singles.push((namespace.to_string(), id.clone()));
+        }
+        Ok(())
+    }
+
     async fn export_database(&self, _dir: &str) -> Result<()> {
         Ok(())
     }
