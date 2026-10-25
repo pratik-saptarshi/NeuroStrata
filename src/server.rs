@@ -587,97 +587,68 @@ pub async fn process_mcp_request(
                         deduplication_checker: deduplication_checker.clone(),
                         bus: bus.clone(),
                     };
-                    let mut claimed = false;
-                    if let Some(outcome) =
-                        crate::handlers::memory::dispatch_memory_tool(name, &arguments, &ctx).await
-                    {
-                        claimed = true;
-                        match outcome {
-                            Ok(text) => result_text = text,
-                            Err(msg) => {
-                                // Encoding failures must be JSON-RPC errors with
-                                // the original id — never a successful result
-                                // containing an error string.
-                                error_response = Some(serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "error": {
-                                        "code": INTERNAL_ERROR,
-                                        "message": msg
-                                    }
-                                }));
-                            }
-                        }
+                    // The dispatch table: each family claims its tool
+                    // names in turn; a name no family claims is the
+                    // unknown-tool fallthrough. (Before the Task 20
+                    // split this was one match over every tool name,
+                    // with the handlers defined below it in this file.)
+                    let mut outcome = crate::handlers::memory::dispatch_memory_tool(
+                        name,
+                        &arguments,
+                        &ctx,
+                    )
+                    .await;
+                    if outcome.is_none() {
+                        outcome = crate::handlers::tasks::dispatch_task_tool(
+                            name,
+                            &arguments,
+                            &ctx,
+                        )
+                        .await;
                     }
-                    if !claimed {
-                        if let Some(Ok(text)) =
-                            crate::handlers::guard::dispatch_guard_tool(name, &arguments, &ctx)
-                                .await
-                        {
-                            claimed = true;
-                            result_text = text;
-                        }
+                    if outcome.is_none() {
+                        outcome = crate::handlers::guard::dispatch_guard_tool(
+                            name,
+                            &arguments,
+                            &ctx,
+                        )
+                        .await;
                     }
-                    if !claimed {
-                        if let Some(outcome) =
-                            crate::handlers::tasks::dispatch_task_tool(name, &arguments, &ctx).await
-                        {
-                            claimed = true;
-                            match outcome {
-                                Ok(text) => result_text = text,
-                                Err(msg) => {
-                                    // A refused completion (Lock 2) is a JSON-RPC
-                                    // error, never a success payload carrying an
-                                    // error string.
-                                    error_response = Some(serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "id": id,
-                                        "error": {
-                                            "code": INTERNAL_ERROR,
-                                            "message": msg
-                                        }
-                                    }));
+                    if outcome.is_none() {
+                        outcome = crate::handlers::system::dispatch_system_tool(
+                            name,
+                            &arguments,
+                            &ctx,
+                        )
+                        .await;
+                    }
+                    if outcome.is_none() {
+                        outcome = crate::handlers::mesh::dispatch_mesh_tool(
+                            name,
+                            &arguments,
+                            &ctx,
+                        )
+                        .await;
+                    }
+                    match outcome {
+                        Some(Ok(text)) => result_text = text,
+                        Some(Err(msg)) => {
+                            // A handler failure that must surface as a
+                            // JSON-RPC error, never a successful result
+                            // containing an error string (the channel
+                            // get_snapshot encoding failures and refused
+                            // Lock 2 task completions use).
+                            error_response = Some(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": INTERNAL_ERROR,
+                                    "message": msg
                                 }
-                            }
+                            }));
                         }
-                    }
-                    if !claimed {
-                        match name {
-                        "neurostrata_procedure_perform" => {
-                            result_text = crate::tools::procedure::handle_procedure_perform(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_append_log" => {
-                            result_text = crate::buffer::handle_append_log(arguments, emb.clone(), store.clone()).await;
-                        }
-                        // SynapticMesh: the handler is a pure string-in/
-                        // string-out dispatch (filesystem + git only; no
-                        // store, no bus, no daemon dependency), so it owns
-                        // its own name mapping in the mesh module. Slice 4
-                        // exception: pull is the consume path — it replays
-                        // validated committed mesh records into the store
-                        // through the traits, so it takes store + embedder
-                        // and lives in crate::synaptic_mesh::import.
-                        mesh_name if mesh_name.starts_with("neurostrata_synaptic_mesh_") => {
-                            if mesh_name == "neurostrata_synaptic_mesh_pull" {
-                                result_text = crate::synaptic_mesh::import::handle_mesh_pull(
-                                    &arguments,
-                                    store.clone(),
-                                    emb.clone(),
-                                )
-                                .await;
-                            } else {
-                                result_text = crate::synaptic_mesh::handle_mesh_tool_call(
-                                    mesh_name, &arguments,
-                                );
-                            }
-                        }
-                            _ => {
-                                result_text = format!("Unknown tool: {}", name);
-                            }
+                        None => {
+                            result_text = format!("Unknown tool: {}", name);
                         }
                     }
                 }
