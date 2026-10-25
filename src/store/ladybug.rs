@@ -7106,17 +7106,15 @@ mod tests {
         flush_stdout();
     }
 
-    /// Baseline parent for the continuation scenario (plan Task 1,
-    /// Amendment 1): confirms on either re-registered baseline
-    /// signature — (A) child killed by signal 11 after
-    /// `REFUSAL_OBSERVED`, PASS marker absent; or (B) child exit 0
-    /// with the post-refusal checkpoint returning an engine-internal
-    /// assertion error (the stock engine's manifestation through
-    /// this stack, run 40218968296) — and even then fails with the
-    /// record, by design: the panic text is the evidence the run's
-    /// log carries. Any other signature (including a checkpoint
-    /// that succeeds or refuses again cleanly) panics as a MISMATCH
-    /// with the same record.
+    /// Patched-run parent for the continuation scenario (plan
+    /// Task 2, Amendments 1 and 3): spawns the unchanged baseline
+    /// child against the PR #1389 engine tree and classifies the
+    /// outcome — crash / internal-assertion / clean-re-refusal /
+    /// success / other — panicking with the full record on EVERY
+    /// outcome (Amendment 3 §4: a passing test's captured output
+    /// is discarded, so the panic text is the evidence the run's
+    /// log carries). The contract is met iff the class is success
+    /// or clean-re-refusal.
     #[test]
     fn cap_refusal_post_refusal_continuation_outcome() {
         let db = std::env::temp_dir()
@@ -7136,60 +7134,46 @@ mod tests {
                 "PROFILE_CAP_CONTINUATION_PASS",
             ],
         );
-        // Amendment 1 signatures. (A) the crash: signal 11 after
-        // REFUSAL_OBSERVED, PASS absent. (B) the assertion throw:
-        // exit 0, REFUSAL_OBSERVED before the checkpoint marker, and
-        // the POST_REFUSAL_CHECKPOINT_ERR line itself carries an
-        // engine-internal assertion and not the max-DB-size family
-        // (the checks are scoped to that line: the REFUSAL_OBSERVED
-        // line legitimately contains the refusal text). A checkpoint
-        // OK or a checkpoint ERR with the max-DB-size text is
-        // healthy behavior — neither signature.
+        // Task 2 outcome classification (Amendment 3 §3), in
+        // order. The assertion scan is over the child's whole
+        // captured output (stdout + stderr). A watchdog timeout is
+        // class `other` (the record keeps its TIMEOUT wording),
+        // never crash.
         let out = &outcome.output;
-        let checkpoint_err_line = out.lines().find(|line| {
-            line.trim_start()
-                .starts_with("POST_REFUSAL_CHECKPOINT_ERR")
+        let combined = format!("{}\n{}", outcome.output, outcome.stderr);
+        let has_assertion = combined.contains("Assertion failed in file");
+        let checkpoint_err_line = out
+            .lines()
+            .find(|line| line.trim_start().starts_with("POST_REFUSAL_CHECKPOINT_ERR"));
+        let checkpoint_refused_cleanly = checkpoint_err_line.is_some_and(|line| {
+            line.contains("Maximum database size") && line.contains("has been reached")
         });
-        let signature_a = !outcome.timed_out
-            && scenario_exit_signal(&outcome.status) == Some(11)
-            && out.contains("REFUSAL_OBSERVED")
-            && !out.contains("PROFILE_CAP_CONTINUATION_PASS");
-        let signature_b = !outcome.timed_out
-            && outcome.status.code() == Some(0)
-            && matches!(
-                (
-                    out.find("REFUSAL_OBSERVED"),
-                    out.find("POST_REFUSAL_CHECKPOINT_ERR")
-                ),
-                (Some(refusal_pos), Some(checkpoint_pos)) if refusal_pos < checkpoint_pos
-            )
-            && checkpoint_err_line.is_some_and(|line| {
-                line.contains("Assertion failed in file")
-                    && !line.contains("Maximum database size")
-            });
-        let confirmed = signature_a || signature_b;
+        let (class, contract) = if outcome.timed_out {
+            ("other", "unclassified")
+        } else if scenario_exit_signal(&outcome.status).is_some() {
+            ("crash", "not-met")
+        } else if has_assertion {
+            ("internal-assertion", "not-met")
+        } else if outcome.status.code() == Some(0)
+            && out.contains("PROFILE_CAP_CONTINUATION_PASS")
+            && out.contains("POST_REFUSAL_CHECKPOINT_OK")
+        {
+            ("success", "met")
+        } else if outcome.status.code() == Some(0)
+            && out.contains("PROFILE_CAP_CONTINUATION_PASS")
+            && checkpoint_refused_cleanly
+        {
+            ("clean-re-refusal", "met")
+        } else {
+            ("other", "unclassified")
+        };
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(width_marker_path(&db));
-        if confirmed {
-            let signature = if signature_a { "A" } else { "B" };
-            panic!(
-                "BASELINE SIGNATURE CONFIRMED (Amendment 1 signature {signature}) | \
-                 {record} | expected on the stock engine: signal 11 after \
-                 REFUSAL_OBSERVED, PROFILE_CAP_CONTINUATION_PASS absent \
-                 (signature A), or exit 0 with POST_REFUSAL_CHECKPOINT_ERR \
-                 carrying an engine-internal assertion and not the \
-                 max-db-size family (signature B)"
-            );
-        } else {
-            panic!(
-                "BASELINE SIGNATURE MISMATCH | {record} | expected on the stock \
-                 engine: signal 11 after REFUSAL_OBSERVED, \
-                 PROFILE_CAP_CONTINUATION_PASS absent (Amendment 1 signature A), \
-                 or exit 0 with POST_REFUSAL_CHECKPOINT_ERR carrying an \
-                 engine-internal assertion and not the max-db-size family \
-                 (signature B), no watchdog timeout"
-            );
-        }
+        panic!(
+            "PATCHED OUTCOME | scenario=continuation class={class} contract={contract} | \
+             {record} | stock baseline for comparison: Amendment 1 signature B \
+             (residency assertion at the post-refusal checkpoint)"
+        );
     }
 
     /// Read one `current_setting` value as a string (the engine
@@ -7403,11 +7387,15 @@ mod tests {
         flush_stdout();
     }
 
-    /// Baseline parent for the reopen scenario (plan Task 1): passes
-    /// only on the exact baseline signature — child killed by signal
-    /// 11 after `REFUSAL_OBSERVED`, PASS marker absent, no
-    /// `REOPEN_NO_REFUSAL`, no watchdog timeout — and even then fails
-    /// with the record, by design (see the continuation parent).
+    /// Patched-run parent for the reopen scenario (plan Task 2,
+    /// Amendment 3): spawns the unchanged bindings-level child
+    /// against the PR #1389 engine tree and classifies the
+    /// outcome — crash / internal-assertion / clean-re-refusal /
+    /// success / other — panicking with the full record on EVERY
+    /// outcome (Amendment 3 §4). The contract is met iff the
+    /// class is success or clean-re-refusal; the
+    /// internal-assertion scan is over the child's whole captured
+    /// output, not per-probe (Amendment 3 §2).
     #[test]
     fn reopen_scenario_outcome() {
         let db = std::env::temp_dir()
@@ -7431,27 +7419,59 @@ mod tests {
                 "REOPEN_SCENARIO_PASS",
             ],
         );
-        let confirmed = !outcome.timed_out
-            && scenario_exit_signal(&outcome.status) == Some(11)
-            && outcome.output.contains("REFUSAL_OBSERVED")
-            && !outcome.output.contains("REOPEN_NO_REFUSAL")
-            && !outcome.output.contains("REOPEN_SCENARIO_PASS");
+        // Task 2 outcome classification (Amendment 3 §3), in
+        // order. A watchdog timeout is class `other` (the record
+        // keeps its TIMEOUT wording), never crash. A probe ERR
+        // carries the max-DB-size family only if its own line
+        // names it; any other-family probe ERR (that is not the
+        // assertion class, already handled above) makes the
+        // outcome `other`, never clean-re-refusal.
+        let out = &outcome.output;
+        let combined = format!("{}\n{}", outcome.output, outcome.stderr);
+        let has_assertion = combined.contains("Assertion failed in file");
+        let carries_max_db_size = |line: &str| {
+            line.contains("Maximum database size") && line.contains("has been reached")
+        };
+        let probe_err_lines: Vec<&str> = out
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                line.starts_with("PROBE_WRITE_ERR")
+                    || line.starts_with("PROBE_READ_ERR")
+                    || line.starts_with("PROBE_CHECKPOINT_ERR")
+            })
+            .collect();
+        let (class, contract) = if outcome.timed_out {
+            ("other", "unclassified")
+        } else if scenario_exit_signal(&outcome.status).is_some() {
+            ("crash", "not-met")
+        } else if has_assertion {
+            ("internal-assertion", "not-met")
+        } else if outcome.status.code() == Some(0)
+            && out.contains("REOPEN_SCENARIO_PASS")
+            && out.contains("REFUSAL_OBSERVED")
+            && out.contains("PROBE_WRITE_OK")
+            && out.contains("PROBE_READ_OK")
+            && out.contains("PROBE_CHECKPOINT_OK")
+        {
+            ("success", "met")
+        } else if outcome.status.code() == Some(0)
+            && out.contains("REOPEN_SCENARIO_PASS")
+            && !probe_err_lines.is_empty()
+            && probe_err_lines.iter().copied().any(carries_max_db_size)
+            && probe_err_lines.iter().copied().all(carries_max_db_size)
+        {
+            ("clean-re-refusal", "met")
+        } else {
+            ("other", "unclassified")
+        };
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(width_marker_path(&db));
-        if confirmed {
-            panic!(
-                "BASELINE SIGNATURE CONFIRMED | {record} | expected on the stock \
-                 engine: signal 11 at a phase-2 probe after REFUSAL_OBSERVED, \
-                 REOPEN_SCENARIO_PASS absent"
-            );
-        } else {
-            panic!(
-                "BASELINE SIGNATURE MISMATCH | {record} | expected on the stock \
-                 engine: signal 11 at a phase-2 probe after REFUSAL_OBSERVED, \
-                 REOPEN_SCENARIO_PASS absent, no REOPEN_NO_REFUSAL, \
-                 no watchdog timeout"
-            );
-        }
+        panic!(
+            "PATCHED OUTCOME | scenario=reopen class={class} contract={contract} | \
+             {record} | stock baseline for comparison: Amendment 3 signature-B \
+             family (residency assertion at post-refusal probes 1 and 3)"
+        );
     }
 
     #[cfg(unix)]
