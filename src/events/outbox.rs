@@ -263,6 +263,59 @@ pub struct EventOutbox {
     inner: Mutex<Inner>,
 }
 
+/// The file operations the append write step needs, factored behind a
+/// trait so a test can drive the step with a file whose write fails after
+/// a partial write — the mid-line failure (a disk filling, a device
+/// dropping) the rollback in [`write_line_durably`] exists for.
+/// Production always passes the real [`File`]; the trait is a seam for
+/// the write step only, never a behavior switch.
+trait AppendTarget: Write {
+    /// The file's current length: the point a failed append rolls back to.
+    fn file_len(&self) -> std::io::Result<u64>;
+    /// Flush the file's data to storage (`File::sync_data`).
+    fn sync(&self) -> std::io::Result<()>;
+    /// Truncate the file to `len` (`File::set_len`): the rollback itself.
+    fn truncate_to(&self, len: u64) -> std::io::Result<()>;
+}
+
+impl AppendTarget for File {
+    fn file_len(&self) -> std::io::Result<u64> {
+        self.metadata().map(|metadata| metadata.len())
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+
+    fn truncate_to(&self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+/// Write one entry line and sync it, atomically from the caller's point
+/// of view: the file's length is recorded before the write, and on any
+/// write or sync error the file is truncated back to that length (and
+/// synced again, once the truncation itself has succeeded) before the
+/// error returns. Without the rollback, the torn bytes of a mid-line
+/// failure stay in the file and the next successful append glues onto
+/// them; the glued physical line is then truncated as torn at the next
+/// open, taking the later, successfully-receipted entry with it. A failed
+/// append therefore leaves the file byte-identical to its pre-append
+/// state — the same "changes nothing" the mirror already guarantees.
+/// Callers hold the outbox lock across the whole call, so no other
+/// append or compaction can interleave with the write + rollback.
+fn write_line_durably(target: &mut impl AppendTarget, line: &[u8]) -> Result<(), OutboxError> {
+    let prior_len = target.file_len()?;
+    let outcome = target.write_all(line).and_then(|()| target.sync());
+    if let Err(err) = outcome {
+        if target.truncate_to(prior_len).is_ok() {
+            let _ = target.sync();
+        }
+        return Err(err.into());
+    }
+    Ok(())
+}
+
 impl EventOutbox {
     /// Open (creating if needed) the outbox in `dir`: load the offsets,
     /// repair a torn tail, load the entries, recover the sequence base,
@@ -333,8 +386,10 @@ impl EventOutbox {
     /// Durably append `pulse` for `class`: encode the entry, `write` the
     /// line, `sync_data`, and only then record it in the mirror and return
     /// its sequence. A failed append changes nothing — no mirror entry, no
-    /// sequence consumed — so the caller can fail the operation knowing
-    /// the outbox does not half-hold the pulse.
+    /// sequence consumed, and no bytes: the write step ([`write_line_durably`])
+    /// rolls the file back to its pre-append length on any write or sync
+    /// failure, so the caller can fail the operation knowing the outbox
+    /// does not half-hold the pulse, in the mirror or on disk.
     pub fn append(
         &self,
         class: EventClass,
@@ -353,8 +408,7 @@ impl EventOutbox {
             .create(true)
             .append(true)
             .open(self.file_path())?;
-        file.write_all(&line)?;
-        file.sync_data()?;
+        write_line_durably(&mut file, &line)?;
         drop(file);
         inner.entries.push(entry);
         inner.next_seq = seq + 1;
@@ -624,5 +678,114 @@ mod tests {
             Some(EventClass::Mesh)
         );
         assert_eq!(EventClass::class_of_subscriber("episodic_pointer_echo"), None);
+    }
+
+    /// A real file whose writes stop after a fixed byte budget and then
+    /// fail, as a disk filling mid-write behaves: a prefix of the
+    /// caller's bytes genuinely lands in the real file before the error
+    /// surfaces. `len_at_failure` records the file's length at the
+    /// moment of failure, so the test can prove the partial bytes landed
+    /// — and were then rolled back.
+    struct FailAfterFile {
+        file: File,
+        budget: usize,
+        len_at_failure: Option<u64>,
+    }
+
+    impl Write for FailAfterFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.budget == 0 {
+                self.len_at_failure = Some(self.file.metadata()?.len());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "simulated mid-write failure (disk full)",
+                ));
+            }
+            let accepted = buf.len().min(self.budget);
+            let written = self.file.write(&buf[..accepted])?;
+            self.budget -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl AppendTarget for FailAfterFile {
+        fn file_len(&self) -> std::io::Result<u64> {
+            self.file.metadata().map(|metadata| metadata.len())
+        }
+
+        fn sync(&self) -> std::io::Result<()> {
+            self.file.sync_data()
+        }
+
+        fn truncate_to(&self, len: u64) -> std::io::Result<()> {
+            self.file.set_len(len)
+        }
+    }
+
+    #[test]
+    fn failed_append_rolls_back_a_partial_write() {
+        let dir = scratch("append-rollback");
+        let file_path = dir.join(OUTBOX_FILE_NAME);
+        let ob = EventOutbox::open(&dir).expect("the outbox opens");
+        ob.append(EventClass::Mesh, &created("kept")).unwrap();
+        drop(ob);
+        let prior = std::fs::read(&file_path).unwrap();
+
+        // Drive the write step `append` itself uses, against a file that
+        // fails after 10 bytes of the new line have genuinely landed.
+        let entry = OutboxEntry {
+            seq: 2,
+            class: EventClass::Mesh,
+            pulse: created("victim"),
+        };
+        let mut line = serde_json::to_vec(&entry).unwrap();
+        line.push(b'\n');
+        let mut failing = FailAfterFile {
+            file: OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .unwrap(),
+            budget: 10,
+            len_at_failure: None,
+        };
+        let err = write_line_durably(&mut failing, &line).unwrap_err();
+        assert!(
+            matches!(err, OutboxError::Io(_)),
+            "the write failure surfaces as an io error, got {err:?}"
+        );
+        assert_eq!(
+            failing.len_at_failure,
+            Some(prior.len() as u64 + 10),
+            "the partial bytes genuinely landed before the failure"
+        );
+        drop(failing);
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            prior,
+            "the rollback leaves the file byte-identical to its pre-append state"
+        );
+
+        // A subsequent successful append lands as its own parseable
+        // entry — it does not glue onto the failed append's debris.
+        let ob = EventOutbox::open(&dir).expect("the outbox reopens");
+        let seq = ob
+            .append(EventClass::Mesh, &created("after-rollback"))
+            .unwrap();
+        assert_eq!(seq, 2, "the failed append consumed no sequence");
+        let text = std::fs::read_to_string(&file_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "the new append is its own line");
+        for line in lines {
+            serde_json::from_str::<OutboxEntry>(line)
+                .expect("every remaining line is a parseable entry");
+        }
+        drop(ob);
+
+        let ob = EventOutbox::open(&dir).expect("the outbox reopens again");
+        assert_eq!(ob.pending(EventClass::Mesh).len(), 2);
     }
 }
