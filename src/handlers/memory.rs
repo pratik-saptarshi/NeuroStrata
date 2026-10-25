@@ -642,7 +642,7 @@ pub async fn handle_ingest_directory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    let schema_str = include_str!("schema.json");
+    let schema_str = include_str!("../schema.json");
     let schema = match crate::parser::schema::ParserSchema::load(schema_str) {
         Ok(schema) => schema,
         Err(_) => return "Failed to load default parser schema.".to_string(),
