@@ -224,6 +224,37 @@ struct Inner {
     offsets: Offsets,
 }
 
+/// The length of the clean prefix of an outbox file: the offset just past
+/// the last newline-terminated, parseable entry. A trailing physical line
+/// is clean only in that form; an unterminated line was never durably
+/// receipted (append writes the line and newline before `sync_data`), and
+/// an unparseable trailing line cannot be trusted as an entry boundary.
+fn clean_outbox_len(bytes: &[u8]) -> usize {
+    let mut end = bytes.len();
+    while end > 0 {
+        let terminated = bytes[end - 1] == b'\n';
+        let line_end = end - usize::from(terminated);
+        let line_start = bytes[..line_end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let line = &bytes[line_start..line_end];
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            if terminated {
+                return end;
+            }
+            end = line_start;
+            continue;
+        }
+        if terminated && serde_json::from_slice::<OutboxEntry>(line).is_ok() {
+            return end;
+        }
+        end = line_start;
+    }
+    0
+}
+
 /// The durable outbox over one directory. Send + Sync by construction
 /// (one `Mutex` over the state); the bus shares it between `emit`'s
 /// append path and the two delivery workers.
@@ -234,9 +265,10 @@ pub struct EventOutbox {
 
 impl EventOutbox {
     /// Open (creating if needed) the outbox in `dir`: load the offsets,
-    /// load the entries, recover the sequence base, and run startup
-    /// compaction. A line that does not parse — the torn tail of an append
-    /// interrupted by a crash, whose publisher never saw success — is
+    /// repair a torn tail, load the entries, recover the sequence base,
+    /// and run startup compaction. Repair truncates an unterminated or
+    /// unparseable final line back to the last clean boundary before any
+    /// append can glue a new entry onto it. Other unparseable lines are
     /// skipped with a warning; an offsets file that does not parse reads
     /// as all-zero, which redelivers: the safe direction under an
     /// at-least-once contract.
@@ -249,7 +281,19 @@ impl EventOutbox {
         }
         let offsets = read_offsets(dir);
         let mut entries = Vec::new();
-        let text = std::fs::read_to_string(&file_path)?;
+        let bytes = std::fs::read(&file_path)?;
+        let clean_len = clean_outbox_len(&bytes);
+        if clean_len < bytes.len() {
+            let file = OpenOptions::new().write(true).open(&file_path)?;
+            file.set_len(clean_len as u64)?;
+            file.sync_data()?;
+            tracing::warn!(
+                "event outbox: truncated {} torn trailing byte(s) from {} at open",
+                bytes.len() - clean_len,
+                file_path.display()
+            );
+        }
+        let text = String::from_utf8_lossy(&bytes[..clean_len]);
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -303,13 +347,13 @@ impl EventOutbox {
             class,
             pulse: pulse.clone(),
         };
-        let line = serde_json::to_string(&entry)?;
+        let mut line = serde_json::to_vec(&entry)?;
+        line.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.file_path())?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        file.write_all(&line)?;
         file.sync_data()?;
         drop(file);
         inner.entries.push(entry);
@@ -353,8 +397,11 @@ impl EventOutbox {
         if seq <= inner.offsets.get(class) {
             return Ok(());
         }
-        inner.offsets.set(class, seq);
-        write_offsets(&self.dir, inner.offsets)
+        let mut new_offsets = inner.offsets;
+        new_offsets.set(class, seq);
+        write_offsets(&self.dir, new_offsets)?;
+        inner.offsets = new_offsets;
+        Ok(())
     }
 
     /// Rewrite the entries file keeping only entries their own class has
@@ -393,8 +440,9 @@ impl EventOutbox {
         {
             let mut file = File::create(&tmp_path)?;
             for entry in &kept {
-                file.write_all(serde_json::to_string(entry)?.as_bytes())?;
-                file.write_all(b"\n")?;
+                let mut line = serde_json::to_vec(entry)?;
+                line.push(b'\n');
+                file.write_all(&line)?;
             }
             file.sync_data()?;
         }
@@ -476,6 +524,80 @@ mod tests {
         assert_eq!(ob.pending(EventClass::Mesh).len(), 1);
         let s3 = ob.append(EventClass::Mesh, &created("c")).unwrap();
         assert_eq!(s3, 3, "the sequence continues across a reopen");
+    }
+
+    #[test]
+    fn torn_tail_is_repaired_at_open_before_next_append() {
+        let dir = scratch("torn-tail");
+        let file_path = dir.join(OUTBOX_FILE_NAME);
+        let ob = EventOutbox::open(&dir).expect("the outbox opens");
+        ob.append(EventClass::Mesh, &created("kept")).unwrap();
+        ob.append(EventClass::Mesh, &created("torn")).unwrap();
+        drop(ob);
+
+        // Simulate a crash after part of the second entry's bytes landed:
+        // the file no longer ends at a clean line boundary.
+        let len = std::fs::metadata(&file_path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+
+        let ob = EventOutbox::open(&dir).expect("the torn outbox reopens");
+        let pending = ob.pending(EventClass::Mesh);
+        assert_eq!(pending.len(), 1, "the torn entry is removed cleanly");
+        assert!(matches!(
+            &pending[0].pulse,
+            ThalamicPulse::Created { id, .. } if id == "kept"
+        ));
+
+        let seq = ob
+            .append(EventClass::Mesh, &created("after-repair"))
+            .unwrap();
+        assert_eq!(seq, 2, "the unreceipted torn sequence is reused");
+        let text = std::fs::read_to_string(&file_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "the new append is its own line");
+        for line in lines {
+            serde_json::from_str::<OutboxEntry>(line)
+                .expect("every remaining line is a parseable entry");
+        }
+        drop(ob);
+
+        let ob = EventOutbox::open(&dir).expect("the repaired outbox reopens");
+        assert_eq!(ob.pending(EventClass::Mesh).len(), 2);
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_skipped_at_open() {
+        use std::io::Write as _;
+
+        let dir = scratch("invalid-utf8");
+        let file_path = dir.join(OUTBOX_FILE_NAME);
+        let ob = EventOutbox::open(&dir).expect("the outbox opens");
+        ob.append(EventClass::Mesh, &created("before")).unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .unwrap();
+            file.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        }
+        ob.append(EventClass::Mesh, &created("after")).unwrap();
+        drop(ob);
+
+        let ob = EventOutbox::open(&dir).expect("invalid UTF-8 does not fail open");
+        let ids: Vec<String> = ob
+            .pending(EventClass::Mesh)
+            .into_iter()
+            .map(|entry| match entry.pulse {
+                ThalamicPulse::Created { id, .. } => id,
+                other => panic!("expected a Created pulse, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["before".to_string(), "after".to_string()]);
     }
 
     #[test]

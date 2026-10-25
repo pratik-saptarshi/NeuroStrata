@@ -204,6 +204,17 @@ pub struct BusMetrics {
     /// in addition to failing their operation. Zero while no outbox is
     /// attached.
     pub outbox_append_failures: u64,
+    /// Whether a durable event outbox is attached to this bus (Task 12).
+    /// Together with `outbox_attach_failed`, this separates the three
+    /// operator states: never attached (both false), attached (this
+    /// true), and attach attempted but failed (the failure flag true).
+    pub outbox_attached: bool,
+    /// Whether the latest event-outbox attach attempt failed (Task 12).
+    /// The bus remains fail-soft and keeps serving on the bounded queue;
+    /// this flag is how that non-durable state is visible on
+    /// `POST /bus/metrics` instead of looking like a healthy bus that was
+    /// simply never asked to attach an outbox.
+    pub outbox_attach_failed: bool,
 }
 
 #[cfg(test)]
