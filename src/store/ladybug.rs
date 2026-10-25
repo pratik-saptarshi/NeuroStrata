@@ -7308,7 +7308,7 @@ mod tests {
             )
             .await
         {
-            Ok(()) => println!("PROBE_WRITE_OK"),
+            Ok(_) => println!("PROBE_WRITE_OK"),
             Err(error) => println!("PROBE_WRITE_ERR {}", format!("{error:#}")),
         }
         flush_stdout();
