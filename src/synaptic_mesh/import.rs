@@ -2216,6 +2216,33 @@ mod tests {
         );
     }
 
+    /// Task 8: validate_record refuses a record whose namespace is illegal
+    /// under DR-1 even when the namespace is served and path-consistent —
+    /// the legality leg is the shared validator's, beside the parity check.
+    #[test]
+    fn site_refuses_illegal_namespace() {
+        let id = Uuid::new_v4();
+        let value = record_value(
+            "synaptic-mesh-record/v1",
+            id,
+            "bad ns",
+            "rule",
+            "active",
+            None,
+            json!({"text": "a shared rule"}),
+        );
+        let raw = serde_json::to_string(&value).unwrap();
+        let candidate = Candidate {
+            namespace: "bad ns".to_string(),
+            file_stem: id.to_string(),
+        };
+        let served = vec!["bad ns".to_string()];
+        match validate_record(&candidate, &served, &raw) {
+            Ok(_) => panic!("an illegal namespace must be refused"),
+            Err(e) => assert!(e.contains("ERROR [NAMESPACE]"), "{e}"),
+        }
+    }
+
     /// A record larger than `MAX_RECORD_BYTES` is ignored BEFORE parse, with
     /// a reason naming the cap — an oversized JSON blob never applies.
     #[tokio::test]

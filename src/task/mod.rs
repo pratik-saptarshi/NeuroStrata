@@ -5897,6 +5897,21 @@ impl crate::traits::AsAny for ListHidingStore {
         assert!(reply.starts_with("ERROR [NAMESPACE]"), "{}", reply);
     }
 
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace() {
+        // "bad ns" passes the old hand-rolled check (it has no slash, and
+        // the namespace-existence refusal is a different message); only the
+        // shared DR-1 validator refuses it as a namespace-shape violation.
+        let store = temp_store().await;
+        let reply = handle_task_create(
+            json!({ "namespace": "bad ns", "title": "a perfectly fine title" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
+    }
+
     // ── task_setup (sections 3.2 and 8) ─────────────────────────────────
 
     #[tokio::test]
