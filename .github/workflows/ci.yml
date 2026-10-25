@@ -133,3 +133,82 @@ jobs:
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
+
+  # Quality gates (J16). These four jobs are REPORT-ONLY: each records the
+  # pre-existing backlog in .github/quality-baseline.md and reports against
+  # it; none of them blocks a merge. The backlog itself is Task 15b's to
+  # burn down, upstream, module by module -- a tree-wide cleanup sweep is
+  # never landed from a fork. Promotion of a job from report-only to
+  # required happens only when its baseline count reaches zero.
+  fmt:
+    name: fmt (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The tree uses no toolchain action (the images provide Rust), so the
+      # component is added the same way here.
+      - name: Add rustfmt component
+        shell: bash
+        run: rustup component add rustfmt
+
+      - name: cargo fmt --check
+        shell: bash
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Add clippy component
+        shell: bash
+        run: rustup component add clippy
+
+      # Clippy compiles the dependency graph, so lbug's build script runs
+      # and needs CMake, exactly as in the build/test jobs.
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: cargo clippy
+        shell: bash
+        run: cargo clippy --locked -- -D warnings
+
+  audit:
+    name: audit (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The maintained RustSec action, so no audit tooling is added to the
+      # repository's own dependency tree.
+      - name: cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: deny (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The maintained cargo-deny action, for the same reason as audit.
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
