@@ -11,6 +11,7 @@
 
 pub mod archive_memory;
 pub mod bus_metrics;
+pub mod guard;
 pub mod memory;
 
 use crate::traits::{Embedder, VectorStore};
