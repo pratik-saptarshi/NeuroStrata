@@ -31,18 +31,39 @@ SYNCED_FILES = (
 )
 
 
+class ManifestProblem(Exception):
+    """A manifest is missing, unreadable, or carries no version field."""
+
+
 def _manifest_version(path: Path) -> str:
-    """Return the package version recorded in a TOML or JSON manifest."""
-    if path.suffix == ".toml":
-        with path.open("rb") as fh:
-            return tomllib.load(fh)["package"]["version"]
-    with path.open(encoding="utf-8") as fh:
-        return json.load(fh)["version"]
+    """Return the package version recorded in a TOML or JSON manifest.
+
+    Raises:
+        ManifestProblem: with a short problem phrase ("is missing",
+            "has no version field", "is unreadable (...)"), so callers
+            can name the file and fail in the checker's voice instead of
+            surfacing a raw traceback.
+    """
+    try:
+        if path.suffix == ".toml":
+            with path.open("rb") as fh:
+                return tomllib.load(fh)["package"]["version"]
+        with path.open(encoding="utf-8") as fh:
+            return json.load(fh)["version"]
+    except FileNotFoundError:
+        raise ManifestProblem("is missing") from None
+    except KeyError:
+        raise ManifestProblem("has no version field") from None
+    except (OSError, ValueError) as exc:
+        raise ManifestProblem(f"is unreadable ({exc})") from None
 
 
 def root_version(root: Path) -> str:
     """The one version fact: root ``Cargo.toml``'s ``[package] version``."""
-    return _manifest_version(root / "Cargo.toml")
+    try:
+        return _manifest_version(root / "Cargo.toml")
+    except ManifestProblem as exc:
+        raise ManifestProblem(f"Cargo.toml {exc}") from None
 
 
 def find_drift(root: Path) -> list[tuple[str, str, str]]:
@@ -50,7 +71,10 @@ def find_drift(root: Path) -> list[tuple[str, str, str]]:
     expected = root_version(root)
     drift = []
     for rel in SYNCED_FILES:
-        actual = _manifest_version(root / rel)
+        try:
+            actual = _manifest_version(root / rel)
+        except ManifestProblem as exc:
+            raise ManifestProblem(f"{rel} {exc}") from None
         if actual != expected:
             drift.append((rel, actual, expected))
     return drift
@@ -62,7 +86,11 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(args[0]).resolve()
     else:
         root = Path(__file__).resolve().parent.parent
-    drift = find_drift(root)
+    try:
+        drift = find_drift(root)
+    except ManifestProblem as exc:
+        print(f"version drift: {exc}")
+        return 1
     if drift:
         for rel, actual, expected in drift:
             print(

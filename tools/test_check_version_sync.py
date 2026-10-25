@@ -63,6 +63,17 @@ def test_check_names_each_drifting_file(tmp_path, capsys):
     )
 
 
+def test_missing_manifest_fails_with_clean_message(tmp_path, capsys):
+    """A deleted copy fails closed: exit 1 and the checker's own message
+    naming the file -- not an uncaught FileNotFoundError traceback."""
+    root = _write_fixture_tree(tmp_path, ROOT_VERSION)
+    (root / "web-ui" / "package.json").unlink()
+    assert cvs.main([str(root)]) == 1
+    out = capsys.readouterr().out
+    assert "version drift: web-ui/package.json is missing" in out
+    assert "Traceback" not in out
+
+
 def test_real_tree_is_in_sync(capsys):
     """The repository this test lives in must satisfy its own check."""
     assert cvs.main([]) == 0
