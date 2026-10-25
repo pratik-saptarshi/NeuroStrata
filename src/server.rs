@@ -5947,6 +5947,441 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    // ── Characterization suite (Task 20, J28/J20) ────────────────────────
+    //
+    // Golden request/response pairs for `process_mcp_request`, written
+    // BEFORE the dispatch split and required to pass against the
+    // unmodified dispatch: they pin the wire behaviour the split must
+    // preserve — same request JSON, same response JSON, same error
+    // strings, same side effects. Where a response carries a
+    // nondeterministic value (a minted id), the test pins the shape
+    // (prefix, keys, types) and threads the value into the next call
+    // instead of asserting the literal.
+
+    /// Drive one `tools/call` through the dispatch exactly as the stdio
+    /// surface does and return the whole JSON-RPC response value.
+    async fn call_tool(store: Arc<dyn VectorStore>, name: &str, arguments: Value) -> Value {
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": name, "arguments": arguments })),
+        };
+        let (bus, _seen) = recording_bus();
+        process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await
+    }
+
+    /// The text payload of a successful `tools/call` response.
+    fn result_text(response: &Value) -> String {
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a successful tools/call carries content text")
+            .to_string()
+    }
+
+    /// The id an add_memory reply minted: the `Memory ID: <id>` line's
+    /// value (the reply may carry further lines after it).
+    fn minted_id(add_reply: &str) -> String {
+        add_reply
+            .lines()
+            .find_map(|line| line.strip_prefix("Memory ID: "))
+            .expect("the add reply names the minted id")
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn characterization_add_and_get_memory_round_trip() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let added = call_tool(
+            store.clone(),
+            "neurostrata_add_memory",
+            serde_json::json!({
+                "content": "characterization probe rule for the dispatch split",
+                "namespace": "probe",
+                "memory_type": "fact",
+            }),
+        )
+        .await;
+        let text = result_text(&added);
+        assert!(
+            text.starts_with("Successfully added memory for namespace: probe"),
+            "add reply shape: {text}"
+        );
+        let id = minted_id(&text);
+        let got = call_tool(
+            store,
+            "neurostrata_get_memory",
+            serde_json::json!({ "id": id, "namespace": "probe" }),
+        )
+        .await;
+        let got_text = result_text(&got);
+        assert!(
+            got_text.contains("characterization probe rule for the dispatch split"),
+            "get returns what add stored: {got_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_search_memory_returns_the_seeded_rule() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let found = call_tool(
+            store,
+            "neurostrata_search_memory",
+            serde_json::json!({ "namespace": "probe", "query": "podman" }),
+        )
+        .await;
+        let text = result_text(&found);
+        assert!(
+            text.contains("always use podman"),
+            "search renders the seeded rule: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_list_namespaces_uses_the_live_format() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let listed = call_tool(store, "neurostrata_list_namespaces", serde_json::json!({})).await;
+        assert_eq!(
+            result_text(&listed),
+            "Existing namespaces: [\"probe\"]",
+            "the dispatch's namespace listing format is pinned verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_get_snapshot_carries_head_and_seeded_row() {
+        let (store, seed_id) = store_with_one_rule("probe").await;
+        let snapshot = call_tool(
+            store,
+            "neurostrata_get_snapshot",
+            serde_json::json!({ "namespace": "probe" }),
+        )
+        .await;
+        let text = result_text(&snapshot);
+        assert!(
+            text.contains("Zero-Action Start: claim or create a task before editing."),
+            "snapshot opens with the task head: {text}"
+        );
+        assert!(
+            text.contains(&seed_id),
+            "snapshot body carries the seeded row: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_get_snapshot_without_namespace_is_a_jsonrpc_error() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let response = call_tool(store, "neurostrata_get_snapshot", serde_json::json!({})).await;
+        assert!(
+            response.get("result").is_none(),
+            "a refused snapshot is not a success payload: {response}"
+        );
+        assert_eq!(response["error"]["code"], serde_json::json!(-32603));
+        assert_eq!(
+            response["error"]["message"],
+            serde_json::json!("Missing 'namespace' parameter.")
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_task_create_claim_complete_lifecycle() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let created = call_tool(
+            store.clone(),
+            "neurostrata_task_create",
+            serde_json::json!({ "namespace": "probe", "title": "characterization task" }),
+        )
+        .await;
+        let created_text = result_text(&created);
+        let created_json: Value =
+            serde_json::from_str(&created_text).expect("task_create replies with JSON");
+        let task_id = created_json["id"]
+            .as_str()
+            .expect("the create reply names the task id")
+            .to_string();
+        assert_eq!(created_json["task"]["status"], serde_json::json!("open"));
+        assert_eq!(
+            created_json["task"]["title"],
+            serde_json::json!("characterization task")
+        );
+
+        let claimed = call_tool(
+            store.clone(),
+            "neurostrata_task_claim",
+            serde_json::json!({
+                "id": task_id,
+                "namespace": "probe",
+                "session_id": "characterization-session",
+                "assignee": "characterization",
+            }),
+        )
+        .await;
+        let claimed_text = result_text(&claimed);
+        let claimed_json: Value =
+            serde_json::from_str(&claimed_text).expect("task_claim replies with JSON");
+        assert_eq!(claimed_json["status"], serde_json::json!("in_progress"));
+        assert_eq!(claimed_json["claimed"], serde_json::json!(true));
+        assert_eq!(
+            claimed_json["transition"],
+            serde_json::json!({ "from": "open", "to": "in_progress" })
+        );
+
+        let completed = call_tool(
+            store,
+            "neurostrata_task_complete",
+            serde_json::json!({
+                "id": task_id,
+                "namespace": "probe",
+                "memory": { "content": "characterization lesson: golden pairs pin the dispatch" },
+            }),
+        )
+        .await;
+        let completed_text = result_text(&completed);
+        let completed_json: Value =
+            serde_json::from_str(&completed_text).expect("task_complete replies with JSON");
+        assert_eq!(completed_json["task"]["status"], serde_json::json!("done"));
+        assert_eq!(
+            completed_json["transition"]["to"],
+            serde_json::json!("done")
+        );
+        assert!(
+            !completed_json["extracted_memory_ids"]
+                .as_array()
+                .expect("extracted ids are an array")
+                .is_empty(),
+            "the inline extraction was recorded: {completed_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_task_complete_without_extraction_is_blocked() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let created = call_tool(
+            store.clone(),
+            "neurostrata_task_create",
+            serde_json::json!({ "namespace": "probe", "title": "characterization blocked task" }),
+        )
+        .await;
+        let created_json: Value =
+            serde_json::from_str(&result_text(&created)).expect("task_create replies with JSON");
+        let task_id = created_json["id"].as_str().expect("task id").to_string();
+        let claimed = call_tool(
+            store.clone(),
+            "neurostrata_task_claim",
+            serde_json::json!({
+                "id": task_id,
+                "namespace": "probe",
+                "session_id": "characterization-session",
+            }),
+        )
+        .await;
+        assert!(
+            result_text(&claimed).contains("in_progress"),
+            "the claim precedes the refused completion"
+        );
+        let response = call_tool(
+            store,
+            "neurostrata_task_complete",
+            serde_json::json!({ "id": task_id, "namespace": "probe" }),
+        )
+        .await;
+        assert!(
+            response.get("result").is_none(),
+            "a refused completion is a JSON-RPC error, never a success payload: {response}"
+        );
+        assert_eq!(response["error"]["code"], serde_json::json!(-32603));
+        let message = response["error"]["message"]
+            .as_str()
+            .expect("the error carries a message");
+        assert!(
+            message.starts_with("BLOCKED (Lock 2)"),
+            "the Lock 2 refusal text is pinned: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_procedure_perform_spends_one_fire() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let added = call_tool(
+            store.clone(),
+            "neurostrata_add_memory",
+            serde_json::json!({
+                "content": "characterization procedure body",
+                "namespace": "probe",
+                "memory_type": "procedure",
+                "metadata": { "trigger": "session-start", "remaining_fires": 3 },
+            }),
+        )
+        .await;
+        let proc_id = minted_id(&result_text(&added));
+        let performed = call_tool(
+            store,
+            "neurostrata_procedure_perform",
+            serde_json::json!({ "id": proc_id }),
+        )
+        .await;
+        let reply_text = result_text(&performed);
+        let reply: Value =
+            serde_json::from_str(&reply_text).expect("procedure_perform replies with JSON");
+        assert_eq!(reply["performed"], serde_json::json!(true));
+        assert_eq!(reply["remaining_fires"], serde_json::json!(2));
+        assert_eq!(reply["performance_count"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn characterization_supersede_records_its_reason() {
+        let (store, seed_id) = store_with_one_rule("probe").await;
+        let superseded = call_tool(
+            store.clone(),
+            "neurostrata_supersede_memory",
+            serde_json::json!({
+                "id": seed_id,
+                "namespace": "probe",
+                "content": "always use podman, never docker (characterization correction)",
+                "reason": "characterization correction",
+            }),
+        )
+        .await;
+        let text = result_text(&superseded);
+        assert!(
+            text.contains(
+                "Recorded why on the retired memory as superseded_reason: characterization correction."
+            ),
+            "the supersede report names the recorded reason: {text}"
+        );
+        let found = call_tool(
+            store,
+            "neurostrata_search_memory",
+            serde_json::json!({ "namespace": "probe", "query": "podman" }),
+        )
+        .await;
+        assert!(
+            result_text(&found).contains("never docker (characterization correction)"),
+            "search finds the correction afterwards"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_append_log_lands_in_the_sessions_buffer() {
+        let scratch =
+            std::env::temp_dir().join(format!("ns-char-append-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let appended = call_tool(
+            store,
+            "neurostrata_append_log",
+            serde_json::json!({
+                "content": "characterization log entry",
+                "project_root": scratch.display().to_string(),
+            }),
+        )
+        .await;
+        let text = result_text(&appended);
+        assert!(
+            !text.contains("ERROR"),
+            "append_log accepts the entry: {text}"
+        );
+        let sessions = scratch.join(".NeuroStrata").join("sessions");
+        let entries = std::fs::read_dir(&sessions)
+            .expect("the sessions buffer directory exists")
+            .count();
+        assert!(entries >= 1, "the entry landed in the buffer: {sessions:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn characterization_guard_and_ingest_route_to_their_validators() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let guard = call_tool(store.clone(), "neurostrata_guard_validate", serde_json::json!({}))
+            .await;
+        assert_eq!(
+            result_text(&guard),
+            "ERROR: 'action_type' is required for guard_validate."
+        );
+        let ingest = call_tool(store, "neurostrata_ingest_directory", serde_json::json!({})).await;
+        assert_eq!(result_text(&ingest), "ERROR: dir_path missing.");
+    }
+
+    #[tokio::test]
+    async fn characterization_unknown_tool_missing_params_and_method_shapes() {
+        let (store, _seed) = store_with_one_rule("probe").await;
+        let unknown = call_tool(store.clone(), "neurostrata_nope", serde_json::json!({})).await;
+        assert_eq!(
+            result_text(&unknown),
+            "Unknown tool: neurostrata_nope",
+            "the unknown-tool fallthrough text is pinned verbatim"
+        );
+
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let (bus, _seen) = recording_bus();
+        let bare_call = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(7)),
+            method: "tools/call".to_string(),
+            params: None,
+        };
+        let response = process_mcp_request(
+            bare_call,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert_eq!(result_text(&response), "Tool execution failed");
+
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(9)),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let response = process_mcp_request(
+            initialize,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["protocolVersion"],
+            serde_json::json!("2024-11-05")
+        );
+        assert_eq!(
+            response["result"]["serverInfo"]["name"],
+            serde_json::json!("neurostrata-mcp")
+        );
+        assert_eq!(response["id"], serde_json::json!(9));
+
+        for method in ["notifications/initialized", "bogus/method"] {
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                method: method.to_string(),
+                params: None,
+            };
+            let response = process_mcp_request(
+                request,
+                Arc::new(StubEmbedder),
+                store.clone(),
+                ingests.clone(),
+                None,
+                bus.clone(),
+            )
+            .await;
+            assert_eq!(
+                response,
+                serde_json::json!({}),
+                "{method} answers with the empty object"
+            );
+        }
+    }
+
     /// Every tool the surface exposes, in the order tools/list returns them.
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
