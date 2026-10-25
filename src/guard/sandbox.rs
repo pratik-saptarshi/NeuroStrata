@@ -9,7 +9,7 @@ use tracing::{info, warn};
 /// the sandbox mounts the directory read-only at /workspace, so anything
 /// here would be exposed to the evaluated payload.
 const FORBIDDEN_PREFIXES: &[&str] = &[
-    "/etc", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+    "/etc", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot", "/home",
 ];
 
 fn is_forbidden_cwd(cwd: &str) -> bool {
@@ -19,17 +19,33 @@ fn is_forbidden_cwd(cwd: &str) -> bool {
             .any(|prefix| cwd.starts_with(prefix))
 }
 
-/// The container image the sandbox evaluates payloads in.
-const SANDBOX_IMAGE: &str = "alpine:latest";
+/// The container image the sandbox evaluates payloads in, pinned by
+/// digest: a floating tag would let the evaluated environment change
+/// under the guard. This is the digest of the multi-arch index that
+/// `alpine:latest` resolved to when pinned — read from the Docker Hub
+/// registry (Docker-Content-Digest) and cross-checked against a local
+/// podman pull's RepoDigests, 2026-10-24.
+const SANDBOX_IMAGE: &str =
+    "alpine@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a";
+
+/// DR-3 starting values for the sandbox's resource limits: labeled
+/// starting points from the Decisions Register, not constants derived
+/// from measurement. Tune them here, in one place.
+const SANDBOX_PIDS_LIMIT: &str = "256";
+const SANDBOX_MEMORY_LIMIT: &str = "512m";
 
 /// Arguments for the ephemeral evaluation container: --rm (ephemeral),
-/// --network=none (isolated), the working directory mounted read-only at
-/// /workspace, a tmpfs scratch /tmp, payload via `sh -c`.
+/// --network=none (isolated), every capability dropped, DR-3 resource
+/// limits, the working directory mounted read-only at /workspace, a
+/// tmpfs scratch /tmp, payload via `sh -c`.
 fn run_args(cwd: &str, payload: &str) -> Vec<String> {
     vec![
         "run".to_string(),
         "--rm".to_string(),
         "--network=none".to_string(),
+        "--cap-drop=ALL".to_string(),
+        format!("--pids-limit={}", SANDBOX_PIDS_LIMIT),
+        format!("--memory={}", SANDBOX_MEMORY_LIMIT),
         format!("-v={}:/workspace:ro", cwd),
         "--tmpfs=/tmp".to_string(),
         "-w=/workspace".to_string(),
@@ -41,11 +57,15 @@ fn run_args(cwd: &str, payload: &str) -> Vec<String> {
 }
 
 /// The evaluation command: `run_args`, output piped for the verdict.
+/// kill_on_drop is load-bearing: `evaluate` waits under a timeout, and
+/// when the timeout fires the wait is dropped — without it, the
+/// container CLI and its container would be left running.
 fn sandbox_command(engine: &str, cwd: &str, payload: &str) -> Command {
     let mut cmd = Command::new(engine);
     cmd.args(run_args(cwd, payload))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     cmd
 }
 
