@@ -38,6 +38,8 @@ pub struct MockStore {
     search_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
     incremented_ids: Mutex<Vec<(String, String)>>,
+    /// Track every batched increment call as (namespace, ids), in call order.
+    batch_calls: Mutex<Vec<(String, Vec<String>)>>,
 }
 
 impl MockStore {
@@ -48,6 +50,7 @@ impl MockStore {
             fail_next_upsert_in_namespace: Mutex::new(None),
             search_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
+            batch_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -76,6 +79,12 @@ impl MockStore {
             .lock()
             .expect("mock store lock")
             .clone()
+    }
+
+    /// Every batched increment call as (namespace, ids), in call order.
+    /// Used by tests to verify a search lands as one batched write.
+    pub(crate) fn batch_calls(&self) -> Vec<(String, Vec<String>)> {
+        self.batch_calls.lock().expect("mock store lock").clone()
     }
 
     /// Configure whether `search` and `search_with_domain` should fail.

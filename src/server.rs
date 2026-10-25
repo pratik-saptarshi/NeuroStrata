@@ -4009,6 +4009,175 @@ mod tests {
         );
     }
 
+    /// Wait until the fire-and-forget access-count writes from a search have
+    /// landed in the mock, however they were issued: however many single
+    /// increments plus however many ids arrived via batch calls reaches
+    /// `expected` (or the deadline passes and the caller's assertion speaks).
+    async fn wait_for_increments(mock: &crate::guard::testkit::MockStore, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let singles = mock.incremented_ids().len();
+            let batched: usize = mock.batch_calls().iter().map(|(_, ids)| ids.len()).sum();
+            if singles + batched >= expected || std::time::Instant::now() > deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// J18: one search must land its access-count writes as ONE batched call
+    /// carrying every direct hit — not one spawned write per hit (the write
+    /// amplification + lost-update race this task removes).
+    #[tokio::test]
+    async fn one_search_one_batch_call() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        store.init("probe").await.expect("init the namespace");
+        let ids = ["hit-a", "hit-b", "hit-c"];
+        for (i, id) in ids.iter().enumerate() {
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.1 * (i as f32 + 1.0), 0.2, 0.3, 0.4],
+                    payload("a rule worth counting"),
+                )
+                .await
+                .expect("seed a hit");
+        }
+
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "rules" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            text.contains("hit-a") && text.contains("hit-c"),
+            "the search returned the seeded hits: {text}"
+        );
+
+        wait_for_increments(&mock, ids.len()).await;
+        // A short settle so any straggler per-hit spawn is recorded too --
+        // the batch shape is judged on the complete record, not a prefix.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let batches = mock.batch_calls();
+        assert_eq!(
+            batches.len(),
+            1,
+            "one search must make exactly one batch call, got {batches:?} \
+             (single increments recorded: {:?})",
+            mock.incremented_ids()
+        );
+        assert_eq!(batches[0].0, "probe", "the batch is in the searched namespace");
+        assert_eq!(
+            batches[0].1,
+            ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "the one batch carries every direct hit, in result order"
+        );
+    }
+
+    /// Zero-change pin on the data: whatever the write pattern, a search
+    /// leaves each direct hit's stored access_count exactly +1.
+    #[tokio::test]
+    async fn access_counts_still_increment_each_hit() {
+        let dir = std::env::temp_dir().join(format!("ns-batch-pin-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("create the schema");
+        let contents = [
+            "always use podman",
+            "never commit a secret",
+            "prefer boring technology",
+        ];
+        let mut ids = Vec::new();
+        for content in contents {
+            let id = uuid::Uuid::new_v4().to_string();
+            let vector = StubEmbedder.embed(content).await.unwrap();
+            store
+                .upsert("probe", &id, vector, payload(content))
+                .await
+                .expect("seed a hit");
+            ids.push(id);
+        }
+
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "podman" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        for id in &ids {
+            assert!(
+                text.contains(id.as_str()),
+                "the search returned every seeded hit: {text}"
+            );
+        }
+
+        // Poll until every hit's stored count reaches 1 (or deadline): the
+        // increments are fire-and-forget, so the test waits for the writes
+        // rather than assuming them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut counts = Vec::new();
+        loop {
+            counts = Vec::new();
+            for id in &ids {
+                let (_, p) = store
+                    .get("probe", id)
+                    .await
+                    .expect("read back")
+                    .expect("the seeded row");
+                counts.push(
+                    p.metadata
+                        .get("access_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                );
+            }
+            if counts.iter().all(|c| *c == 1) || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            counts,
+            vec![1, 1, 1],
+            "each direct hit's access_count is exactly +1 after one search"
+        );
+    }
+
+    /// A search with no hits performs no access-count write at all: no batch
+    /// call, no single increment.
+    #[tokio::test]
+    async fn empty_search_writes_nothing() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        store.init("probe").await.expect("init the namespace");
+
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "anything" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert_eq!(text, "No relevant memories found.");
+
+        // Settle long enough that a (hypothetical) stray spawn would land.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            mock.batch_calls().is_empty(),
+            "an empty search must not batch-write: {:?}",
+            mock.batch_calls()
+        );
+        assert!(
+            mock.incremented_ids().is_empty(),
+            "an empty search must not increment anything: {:?}",
+            mock.incremented_ids()
+        );
+    }
+
     /// A store holding two rules in two different domains, so a domain filter
     /// has something to choose between.
     async fn store_with_two_domains(namespace: &str) -> (Arc<dyn VectorStore>, String, String) {
