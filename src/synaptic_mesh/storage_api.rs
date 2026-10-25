@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
+
 /// The operations the synaptic-mesh CLI and MCP tools need.
 ///
 /// Contract notes the callers rely on:
@@ -18,9 +20,14 @@ use std::path::{Path, PathBuf};
 ///   report) when no mesh is joined. They never block on a network prompt:
 ///   all git plumbing runs with `GIT_TERMINAL_PROMPT=0`.
 /// - `init_mesh` returns the new mesh id, which the caller echoes back.
+/// - The git-touching methods (`init_mesh`, `status`, `push`, `pull`) are
+///   async: mesh git runs as a timed async subprocess at the storage
+///   funnel (DR-4), never as a blocking call on the runtime. The pure
+///   pointer operations stay synchronous — no git is reachable from them.
+#[async_trait]
 pub trait StorageApi {
     /// Create a mesh repo under `base_root` and return its id.
-    fn init_mesh(
+    async fn init_mesh(
         &mut self,
         base_root: &Path,
         node_id: &str,
@@ -55,11 +62,11 @@ pub trait StorageApi {
     fn remove_pointer(&mut self, project: &Path) -> Result<(), String>;
 
     /// Human-readable status report (see spec §"Status surfaces").
-    fn status(&self) -> Result<String, String>;
+    async fn status(&self) -> Result<String, String>;
 
     /// Pull-before-push, fail-soft, non-interactive.
-    fn push(&mut self) -> Result<String, String>;
+    async fn push(&mut self) -> Result<String, String>;
 
     /// Non-interactive, fail-soft.
-    fn pull(&mut self) -> Result<String, String>;
+    async fn pull(&mut self) -> Result<String, String>;
 }

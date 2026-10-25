@@ -48,7 +48,7 @@ use super::manifest::Trust;
 use super::record::{
     Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
-use super::storage::MeshStorage;
+use super::storage::{remote_refs_present, run, run_ok, MeshStorage};
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
 
 /// The on-disk schema version of the accepted-head cursor file.
@@ -178,12 +178,12 @@ pub async fn handle_mesh_pull(
             "error: pull failed — mesh {mesh_id} has no remote configured; join a mesh with a remote before pull/push"
         );
     }
-    if matches!(remote_refs_present(mesh.root()), Some(false)) {
+    if matches!(remote_refs_present(mesh.root()).await, Some(false)) {
         return format!(
             "pulled mesh {mesh_id}: nothing on the remote yet — records land with the mesh-worker (slice 3)"
         );
     }
-    if let Err(e) = mesh.pull() {
+    if let Err(e) = mesh.pull().await {
         return format!("error: pull failed — {:#}", e);
     }
 
@@ -273,24 +273,6 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
     out
 }
 
-/// Does the configured remote have refs yet? `Some(false)` = reachable but
-/// EMPTY (a normal "team inbox not yet filled" state, answered with a
-/// courtesy instead of a merge error); `Some(true)`/`None` = pull will do
-/// real work or will fail loudly. Mirrors mesh_service's private probe; the
-/// behavior cannot drift because both feeds `storage.pull()`.
-fn remote_refs_present(root: &Path) -> Option<bool> {
-    let out = std::process::Command::new("git")
-        .args(["ls-remote", "--refs", "origin", "HEAD"])
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(!out.stdout.is_empty())
-}
-
 /// The reusable innards: diff the committed content against the accepted
 /// cursor, validate every candidate, apply the survivors through the store
 /// traits, then advance the cursor. The caller must have completed its fetch
@@ -312,7 +294,7 @@ pub async fn apply_changed(
     // the cursor-diff path is protected in practice (ff-only pull never
     // touches dirty files) but the full-tree fallback is not, and identity
     // would not self-heal until a later commit bumps update_id.
-    let dirty = dirty_checkout_paths(root)?;
+    let dirty = dirty_checkout_paths(root).await?;
     if !dirty.is_empty() {
         anyhow::bail!(
             "dirty mesh checkout — sync paused, nothing read or written; dirty: {}. \
@@ -323,7 +305,7 @@ pub async fn apply_changed(
 
     let (paths, full_tree) = {
         let cursor = load_cursor(root, &mesh_id);
-        changed_paths(root, cursor.as_deref())?
+        changed_paths(root, cursor.as_deref()).await?
     };
 
     let mut report = ApplyReport {
@@ -355,7 +337,7 @@ pub async fn apply_changed(
     // stamp source. The HEAD signature state rides along for
     // provenance recording (DR-9: metadata only, never a gate).
     let import_trust = mesh.manifest().policy.imported_procedures_trust;
-    let head_signature = head_commit_signature_state(root);
+    let head_signature = head_commit_signature_state(root).await;
 
     for rel in paths {
         let candidate = match classify_path(&rel, served) {
@@ -427,7 +409,7 @@ pub async fn apply_changed(
     // conflicted ids are re-presented (and re-preserved idempotently) on the
     // next pull, so a team-side resolution is picked up while a still-open
     // conflict is never silently dropped.
-    report.head = current_head(root)?.unwrap_or_default();
+    report.head = current_head(root).await?.unwrap_or_default();
     if !report.head.is_empty() && report.conflicted == 0 {
         write_cursor(root, &mesh_id, &report.head)?;
     }
@@ -478,8 +460,8 @@ pub fn write_cursor(mesh_root: &Path, mesh_id: &str, head: &str) -> anyhow::Resu
 }
 
 /// HEAD of the checkout, `Ok(None)` while the branch is unborn.
-pub fn current_head(mesh_root: &Path) -> anyhow::Result<Option<String>> {
-    let out = git(mesh_root, &["rev-parse", "--verify", "-q", "HEAD"])?;
+pub async fn current_head(mesh_root: &Path) -> anyhow::Result<Option<String>> {
+    let out = run(mesh_root, &["rev-parse", "--verify", "-q", "HEAD"]).await?;
     if out.status.success() {
         Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -491,37 +473,39 @@ pub fn current_head(mesh_root: &Path) -> anyhow::Result<Option<String>> {
 
 /// Which committed files a replay pass must examine, and whether it had to
 /// fall back to the full tree.
-pub fn changed_paths(
+pub async fn changed_paths(
     mesh_root: &Path,
     cursor: Option<&str>,
 ) -> anyhow::Result<(Vec<String>, bool)> {
-    let head = current_head(mesh_root)?;
+    let head = current_head(mesh_root).await?;
     let Some(head) = head else {
         // Unborn branch: nothing committed yet; an empty full-tree pass.
-        return Ok((tracked_paths(mesh_root)?, true));
+        return Ok((tracked_paths(mesh_root).await?, true));
     };
     if let Some(cursor) = cursor {
         // The cursor is usable only while the checkout still contains that
         // commit (rewritten or divergent history falls through to the
         // validated full-tree reconciliation; nothing is blindly applied).
         let approach = format!("{cursor}^{{commit}}");
-        if run_ok(mesh_root, &["cat-file", "-e", &approach]).is_ok() {
+        if run_ok(mesh_root, &["cat-file", "-e", &approach]).await.is_ok() {
             if let Ok(out) = run_ok(
                 mesh_root,
                 &["diff", "--name-only", "-z", &format!("{cursor}..{head}")],
-            ) {
+            )
+            .await
+            {
                 return Ok((split_nul(&out.stdout), false));
             }
         }
     }
-    Ok((tracked_paths(mesh_root)?, true))
+    Ok((tracked_paths(mesh_root).await?, true))
 }
 
 /// Committed content via the index. apply_changed always runs after a
 /// ff-merge (index == HEAD) or against a clean checkout, so the index never
 /// outlives what is committed here.
-fn tracked_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
-    let out = run_ok(mesh_root, &["ls-files", "-z"])?;
+async fn tracked_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
+    let out = run_ok(mesh_root, &["ls-files", "-z"]).await?;
     Ok(split_nul(&out.stdout))
 }
 
@@ -1000,8 +984,8 @@ fn mesh_provenance(
 /// "G" for a good signature and "N" for none; anything else — bad or
 /// unknown validity, a git failure, no HEAD — reads as "unverifiable"
 /// rather than a guess.
-fn head_commit_signature_state(root: &Path) -> &'static str {
-    match run_ok(root, &["log", "-1", "--format=%G?", "HEAD"]) {
+async fn head_commit_signature_state(root: &Path) -> &'static str {
+    match run_ok(root, &["log", "-1", "--format=%G?", "HEAD"]).await {
         Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
             "G" => "signed",
             "N" => "unsigned",
@@ -1606,42 +1590,19 @@ fn preserved_edit_record(
     }
 }
 
-// --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
+// --- git plumbing (fail-soft, non-interactive; via storage.rs's funnel) ---
 
-/// The checkout's dirty porcelain paths (`git status --porcelain`, run like
-/// storage.rs runs git: non-interactive, std::process::Command). An EMPTY
-/// result is the only green light for a replay pass.
-fn dirty_checkout_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
-    let out = run_ok(mesh_root, &["status", "--porcelain"])?;
+/// The checkout's dirty porcelain paths (`git status --porcelain`, run
+/// through storage.rs's funnel: non-interactive, async, DR-4-timed). An
+/// EMPTY result is the only green light for a replay pass.
+async fn dirty_checkout_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
+    let out = run_ok(mesh_root, &["status", "--porcelain"]).await?;
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-fn git(root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .with_context(|| format!("git {} could not be executed", args.join(" ")))
-}
-
-/// Prefer using `run_ok` from storage.rs / mesh_service.rs where they exist.
-fn run_ok(root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    let out = git(root, args)?;
-    if out.status.success() {
-        return Ok(out);
-    }
-    anyhow::bail!(
-        "git {} failed ({}): {}",
-        args.join(" "),
-        out.status,
-        String::from_utf8_lossy(&out.stderr).trim()
-    )
 }
 
 /// Program Task 3 (c): classify procedure rows written before stamping
@@ -1776,7 +1737,7 @@ mod tests {
     }
 
     /// A mesh joined on the `probe` namespace, committed so HEAD exists.
-    fn mesh_with_commit(tag: &str) -> (PathBuf, MeshStorage) {
+    async fn mesh_with_commit(tag: &str) -> (PathBuf, MeshStorage) {
         let base = scratch(tag);
         let mesh = MeshStorage::init(
             &base,
@@ -1784,7 +1745,7 @@ mod tests {
             "import-tests",
             &["probe".to_string()],
             None,
-        )
+        ).await
         .unwrap();
         (base, mesh)
     }
@@ -1796,7 +1757,7 @@ mod tests {
     /// Rewrite the on-disk manifest to a new `epoch`, commit it (the local
     /// half of an epoch migration), and reopen the mesh so its cached
     /// manifest reflects the new epoch.
-    fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
+    async fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
         let mut manifest = mesh.manifest().clone();
         manifest.epoch = epoch;
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -1805,7 +1766,7 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("epoch migration", "node-import-test")
+        mesh.commit_all("epoch migration", "node-import-test").await
             .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
@@ -1859,7 +1820,7 @@ mod tests {
 
     /// Write `<ns>/{memories,procedures}/<stem>.json` into the mesh and
     /// commit as the peer node. Returns the rel path.
-    fn commit_record_json(
+    async fn commit_record_json(
         mesh: &MeshStorage,
         ns: &str,
         dir: &str,
@@ -1870,7 +1831,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let rel = format!("{ns}/{dir}/{stem}.json");
         std::fs::write(mesh.root().join(&rel), body).unwrap();
-        mesh.commit_all("peer record", "node-peer-1").unwrap();
+        mesh.commit_all("peer record", "node-peer-1").await.unwrap();
         rel
     }
 
@@ -1902,7 +1863,7 @@ mod tests {
     /// search-shaped read without any special casing.
     #[tokio::test]
     async fn pull_replays_a_committed_record_into_the_store_with_provenance() {
-        let (_base, mesh) = mesh_with_commit("happy");
+        let (_base, mesh) = mesh_with_commit("happy").await;
         let id = Uuid::new_v4();
         let value = simple_rule(id, "always use podman");
         commit_record_json(
@@ -1911,7 +1872,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("happy").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -1950,7 +1911,7 @@ mod tests {
         assert_eq!(hits[0].id, id.to_string());
 
         // Cursor advanced to HEAD.
-        let head = current_head(mesh.root()).unwrap().unwrap();
+        let head = current_head(mesh.root()).await.unwrap().unwrap();
         assert_eq!(load_cursor(mesh.root(), &mesh_id_str(&mesh)).unwrap(), head);
     }
 
@@ -1959,7 +1920,7 @@ mod tests {
     /// applies nothing AND duplicates nothing (the update_id skip).
     #[tokio::test]
     async fn reapply_advances_zero_and_crash_replay_never_duplicates() {
-        let (_base, mesh) = mesh_with_commit("reapply");
+        let (_base, mesh) = mesh_with_commit("reapply").await;
         let id = Uuid::new_v4();
         commit_record_json(
             &mesh,
@@ -1967,7 +1928,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "deterministic dedup")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("reapply").await;
         let served = ["probe".to_string()];
 
@@ -2013,7 +1974,7 @@ mod tests {
             .expect_err("traversal must be refused");
         assert!(err.contains("traversal"), "got: {err}");
 
-        let (_base, mesh) = mesh_with_commit("hostile");
+        let (_base, mesh) = mesh_with_commit("hostile").await;
         let secret = _base.join("outside.json");
         std::fs::write(&secret, r#"{"id":"stolen"}"#).unwrap();
 
@@ -2024,14 +1985,14 @@ mod tests {
 
         let exec_id = Uuid::new_v4();
         let bad_id = Uuid::new_v4();
-        commit_record_json(&mesh, "probe", "memories", &bad_id.to_string(), "{not json");
+        commit_record_json(&mesh, "probe", "memories", &bad_id.to_string(), "{not json").await;
         commit_record_json(
             &mesh,
             "probe",
             "memories",
             &exec_id.to_string(),
             &serde_json::to_string(&simple_rule(exec_id, "executable payload")).unwrap(),
-        );
+        ).await;
         let exec_path = mesh
             .root()
             .join("probe")
@@ -2040,7 +2001,7 @@ mod tests {
         let mut mode = std::fs::metadata(&exec_path).unwrap().permissions();
         mode.set_mode(0o755);
         std::fs::set_permissions(&exec_path, mode).unwrap();
-        mesh.commit_all("peer bits", "node-peer-1").unwrap();
+        mesh.commit_all("peer bits", "node-peer-1").await.unwrap();
 
         let store = fresh_store("hostile").await;
         store.init("probe").await.unwrap();
@@ -2070,7 +2031,7 @@ mod tests {
     /// over, NAMED in the report, and never crashes the pass.
     #[tokio::test]
     async fn unknown_schema_version_is_ignored_and_named() {
-        let (_base, mesh) = mesh_with_commit("schema");
+        let (_base, mesh) = mesh_with_commit("schema").await;
         let id = Uuid::new_v4();
         let future = record_value(
             "synaptic-mesh-record/v99",
@@ -2087,7 +2048,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&future).unwrap(),
-        );
+        ).await;
         let store = fresh_store("schema").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2124,8 +2085,8 @@ mod tests {
     /// not replayed into the new epoch.
     #[tokio::test]
     async fn epoch_older_refused_named() {
-        let (_base, mesh) = mesh_with_commit("epoch-older");
-        let mesh = reopen_with_epoch(&mesh, 2);
+        let (_base, mesh) = mesh_with_commit("epoch-older").await;
+        let mesh = reopen_with_epoch(&mesh, 2).await;
         let id = Uuid::new_v4();
         // A record born in the pre-migration epoch (origin_mesh_epoch 1).
         let value = simple_rule(id, "published before the purge");
@@ -2135,7 +2096,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("epoch-older").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2161,7 +2122,7 @@ mod tests {
     /// behavior to the pre-gate flow.
     #[tokio::test]
     async fn epoch_equal_applies() {
-        let (_base, mesh) = mesh_with_commit("epoch-equal");
+        let (_base, mesh) = mesh_with_commit("epoch-equal").await;
         let id = Uuid::new_v4();
         let value = simple_rule(id, "same epoch as the manifest");
         commit_record_json(
@@ -2170,7 +2131,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("epoch-equal").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2191,7 +2152,7 @@ mod tests {
     /// accepted.
     #[tokio::test]
     async fn epoch_future_refused() {
-        let (_base, mesh) = mesh_with_commit("epoch-future");
+        let (_base, mesh) = mesh_with_commit("epoch-future").await;
         let id = Uuid::new_v4();
         let mut value = simple_rule(id, "from a future epoch");
         value["origin_mesh_epoch"] = json!(2);
@@ -2201,7 +2162,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("epoch-future").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2254,7 +2215,7 @@ mod tests {
     /// a reason naming the cap — an oversized JSON blob never applies.
     #[tokio::test]
     async fn oversized_record_ignored_named() {
-        let (_base, mesh) = mesh_with_commit("oversized");
+        let (_base, mesh) = mesh_with_commit("oversized").await;
         let id = Uuid::new_v4();
         let big_text = "x".repeat(MAX_RECORD_BYTES + 1);
         let value = simple_rule(id, &big_text);
@@ -2264,7 +2225,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("oversized").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2290,7 +2251,7 @@ mod tests {
     /// ignored with a reason — other teams' files are not applied here.
     #[tokio::test]
     async fn foreign_namespace_file_is_ignored() {
-        let (_base, mesh) = mesh_with_commit("foreign");
+        let (_base, mesh) = mesh_with_commit("foreign").await;
         let id = Uuid::new_v4();
         let other = simple_rule(id, "belongs to another team");
         commit_record_json(
@@ -2299,7 +2260,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&other).unwrap(),
-        );
+        ).await;
         let store = fresh_store("foreign").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2326,7 +2287,7 @@ mod tests {
     /// reported into the ignore list.
     #[tokio::test]
     async fn private_row_with_same_id_is_never_stomped() {
-        let (_base, mesh) = mesh_with_commit("private");
+        let (_base, mesh) = mesh_with_commit("private").await;
         let id = Uuid::new_v4();
         commit_record_json(
             &mesh,
@@ -2334,7 +2295,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "the mesh's version")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("private").await;
         store.init("probe").await.unwrap();
         store
@@ -2381,7 +2342,7 @@ mod tests {
     /// `{"archived": true}` metadata convention onto the row.
     #[tokio::test]
     async fn archived_candidate_merges_the_archived_tombstone_convention() {
-        let (_base, mesh) = mesh_with_commit("archived");
+        let (_base, mesh) = mesh_with_commit("archived").await;
         let id = Uuid::new_v4();
         let archived_at = chrono::Utc::now();
         let value = record_value(
@@ -2399,7 +2360,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("archived").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -2433,7 +2394,7 @@ mod tests {
     /// the applied row's metadata gains none.
     #[tokio::test]
     async fn procedure_definition_applies_and_carries_no_counters() {
-        let (_base, mesh) = mesh_with_commit("procedure");
+        let (_base, mesh) = mesh_with_commit("procedure").await;
         let id = Uuid::new_v4();
         let proc_json = json!({
             "schema_version": "synaptic-mesh-record/v1",
@@ -2454,7 +2415,7 @@ mod tests {
             "trust": "untrusted"
         });
         let body = serde_json::to_string(&proc_json).unwrap();
-        let rel = commit_record_json(&mesh, "probe", "procedures", &id.to_string(), &body);
+        let rel = commit_record_json(&mesh, "probe", "procedures", &id.to_string(), &body).await;
         // The ASSERT: the shared file itself carries no counters.
         for counter in RUNTIME_COUNTER_KEYS {
             assert!(
@@ -2500,7 +2461,7 @@ mod tests {
     /// second commit apply ONLY the changed file.
     #[tokio::test]
     async fn cursor_second_commit_applies_only_the_changed_file() {
-        let (_base, mesh) = mesh_with_commit("cursor");
+        let (_base, mesh) = mesh_with_commit("cursor").await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         commit_record_json(
@@ -2509,7 +2470,7 @@ mod tests {
             "memories",
             &a.to_string(),
             &serde_json::to_string(&simple_rule(a, "first commit")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("cursor").await;
         let served = ["probe".to_string()];
 
@@ -2524,7 +2485,7 @@ mod tests {
             "memories",
             &b.to_string(),
             &serde_json::to_string(&simple_rule(b, "second commit")).unwrap(),
-        );
+        ).await;
 
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
@@ -2569,7 +2530,7 @@ mod tests {
     /// once the checkout is clean again the pass applies normally.
     #[tokio::test]
     async fn dirty_checkout_refuses_full_tree_pass() {
-        let (_base, mesh) = mesh_with_commit("dirty-full");
+        let (_base, mesh) = mesh_with_commit("dirty-full").await;
         let id = Uuid::new_v4();
         commit_record_json(
             &mesh,
@@ -2577,7 +2538,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "the committed content")).unwrap(),
-        );
+        ).await;
         // Dirty BOTH ways: a modified tracked record (uncommitted content is
         // exactly what a full-tree pass would wrongly read off disk) and an
         // untracked extra file.
@@ -2618,13 +2579,13 @@ mod tests {
         );
 
         // Committed (clean again): the same pass applies normally.
-        mesh.commit_all("clean local edits", "node-peer-1").unwrap();
+        mesh.commit_all("clean local edits", "node-peer-1").await.unwrap();
         let report = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
             .await
             .expect("clean checkout applies");
         assert_eq!(report.applied, 1, "the record applies normally");
         assert_eq!(row_count(&store, "probe").await, 1);
-        let head = current_head(mesh.root()).unwrap().unwrap();
+        let head = current_head(mesh.root()).await.unwrap().unwrap();
         assert_eq!(load_cursor(mesh.root(), &mesh_id_str(&mesh)).unwrap(), head);
     }
 
@@ -2634,7 +2595,7 @@ mod tests {
     /// committed change.
     #[tokio::test]
     async fn dirty_guard_covers_diff_path_too() {
-        let (_base, mesh) = mesh_with_commit("dirty-diff");
+        let (_base, mesh) = mesh_with_commit("dirty-diff").await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         commit_record_json(
@@ -2643,7 +2604,7 @@ mod tests {
             "memories",
             &a.to_string(),
             &serde_json::to_string(&simple_rule(a, "first commit")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("dirty-diff").await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
@@ -2660,7 +2621,7 @@ mod tests {
             "memories",
             &b.to_string(),
             &serde_json::to_string(&simple_rule(b, "second commit")).unwrap(),
-        );
+        ).await;
         let junk_name = format!("{}.txt", Uuid::new_v4());
         let junk_rel = format!("probe/memories/{junk_name}");
         std::fs::write(mesh.root().join(&junk_rel), "untracked junk").unwrap();
@@ -2976,7 +2937,7 @@ mod tests {
     /// the resurrection candidate is refused and reported, never stomped.
     #[tokio::test]
     async fn tombstone_never_resurrects_end_to_end() {
-        let (_base, mesh) = mesh_with_commit("tombstone-e2e");
+        let (_base, mesh) = mesh_with_commit("tombstone-e2e").await;
         let id = Uuid::new_v4();
         let served = ["probe".to_string()];
         commit_record_json(
@@ -2985,7 +2946,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "original")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("tombstone-e2e").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -3001,7 +2962,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "tombstoned", None, "original")).unwrap(),
-        );
+        ).await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -3016,7 +2977,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "zombie")).unwrap(),
-        );
+        ).await;
         let third = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -3036,7 +2997,7 @@ mod tests {
     /// the retired id — never dropped.
     #[tokio::test]
     async fn supersede_plus_edit_preserves_edit_as_new_record_end_to_end() {
-        let (_base, mesh) = mesh_with_commit("supersede-edit-e2e");
+        let (_base, mesh) = mesh_with_commit("supersede-edit-e2e").await;
         let id = Uuid::new_v4();
         let replacement = Uuid::new_v4();
         let served = ["probe".to_string()];
@@ -3052,7 +3013,7 @@ mod tests {
                 "original",
             ))
             .unwrap(),
-        );
+        ).await;
         let store = fresh_store("supersede-edit-e2e").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -3070,7 +3031,7 @@ mod tests {
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "edited content"))
                 .unwrap(),
-        );
+        ).await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -3437,7 +3398,7 @@ mod tests {
     /// candidate.
     #[tokio::test]
     async fn conflict_is_never_silently_dropped() {
-        let (_base, mesh) = mesh_with_commit("conflict-nodrop");
+        let (_base, mesh) = mesh_with_commit("conflict-nodrop").await;
         let id = Uuid::new_v4();
         let served = ["probe".to_string()];
         commit_record_json(
@@ -3446,7 +3407,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "original")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("conflict-nodrop").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -3464,7 +3425,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "their edit")).unwrap(),
-        );
+        ).await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -3472,7 +3433,7 @@ mod tests {
         assert!(second.conflicted_ids.contains(&id.to_string()));
 
         // Cursor NOT advanced past an unresolved conflict.
-        let head = current_head(mesh.root()).unwrap().unwrap();
+        let head = current_head(mesh.root()).await.unwrap().unwrap();
         assert_ne!(
             load_cursor(mesh.root(), &mesh_id_str(&mesh)),
             Some(head),
@@ -3514,7 +3475,7 @@ mod tests {
     /// away.
     #[tokio::test]
     async fn a_topology_fact_survives_the_mesh_round_trip() {
-        let (_base, mesh) = mesh_with_commit("topology");
+        let (_base, mesh) = mesh_with_commit("topology").await;
         let id = Uuid::new_v4();
         let topology = json!({
             "component": "api-gateway",
@@ -3539,7 +3500,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
 
         let store = fresh_store("topology").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -3565,7 +3526,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_imported_records_domain_is_unioned_into_the_local_registry() {
-        let (_base, mesh) = mesh_with_commit("domainunion");
+        let (_base, mesh) = mesh_with_commit("domainunion").await;
         let id = Uuid::new_v4();
         let mut value = record_value(
             "synaptic-mesh-record/v1",
@@ -3583,7 +3544,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
 
         let store = fresh_store("domainunion").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -3617,7 +3578,7 @@ mod tests {
     /// Rewrite the on-disk manifest's imported-procedures policy, commit,
     /// and reopen so the cached manifest reflects it (mirrors
     /// `reopen_with_epoch`).
-    fn reopen_with_policy(mesh: &MeshStorage, trust: super::super::manifest::Trust) -> MeshStorage {
+    async fn reopen_with_policy(mesh: &MeshStorage, trust: super::super::manifest::Trust) -> MeshStorage {
         let mut manifest = mesh.manifest().clone();
         manifest.policy.imported_procedures_trust = trust;
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -3626,7 +3587,7 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("policy change", "node-import-test").unwrap();
+        mesh.commit_all("policy change", "node-import-test").await.unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
 
@@ -3682,7 +3643,7 @@ mod tests {
     /// gate refuses to fire it.
     #[tokio::test]
     async fn imported_procedure_with_forged_trusted_metadata_does_not_fire() {
-        let (_base, mesh) = mesh_with_commit("forged");
+        let (_base, mesh) = mesh_with_commit("forged").await;
         let id = Uuid::new_v4();
         let value = procedure_value(id, Some("trusted"), "trusted", "Read the forged spec once.");
         commit_record_json(
@@ -3691,7 +3652,7 @@ mod tests {
             "procedures",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("forged").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -3725,8 +3686,8 @@ mod tests {
     /// real exports arrive in — is stamped from the manifest too.
     #[tokio::test]
     async fn manifest_policy_is_the_stamp_source() {
-        let (_base, mesh) = mesh_with_commit("pol-trusted");
-        let mesh = reopen_with_policy(&mesh, super::super::manifest::Trust::Trusted);
+        let (_base, mesh) = mesh_with_commit("pol-trusted").await;
+        let mesh = reopen_with_policy(&mesh, super::super::manifest::Trust::Trusted).await;
         let id = Uuid::new_v4();
         let value = procedure_value(id, Some("untrusted"), "untrusted", "Read the spec once.");
         commit_record_json(
@@ -3735,7 +3696,7 @@ mod tests {
             "procedures",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("pol-trusted").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -3756,7 +3717,7 @@ mod tests {
         assert_eq!(outcome["performed"], json!(true), "{outcome}");
 
         // No sender claim at all, default manifest: stamped untrusted.
-        let (_base2, mesh2) = mesh_with_commit("pol-none");
+        let (_base2, mesh2) = mesh_with_commit("pol-none").await;
         let id2 = Uuid::new_v4();
         let value2 = procedure_value(id2, None, "untrusted", "Read the unstamped spec once.");
         commit_record_json(
@@ -3765,7 +3726,7 @@ mod tests {
             "procedures",
             &id2.to_string(),
             &serde_json::to_string(&value2).unwrap(),
-        );
+        ).await;
         let store2 = fresh_store("pol-none").await;
         let report2 = apply_changed(&mesh2, &["probe".to_string()], store2.clone(), emb())
             .await
@@ -3789,7 +3750,7 @@ mod tests {
     /// the report's ignore list naming the scan.
     #[tokio::test]
     async fn record_with_secret_is_rejected() {
-        let (_base, mesh) = mesh_with_commit("secret");
+        let (_base, mesh) = mesh_with_commit("secret").await;
         let id = Uuid::new_v4();
         let pat = format!("ghp_{}", "A".repeat(36));
         let value = simple_rule(id, &format!("use this token: {pat}"));
@@ -3799,7 +3760,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("secret").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -3821,7 +3782,7 @@ mod tests {
     /// the record matched, never the raw location and never the value.
     #[tokio::test]
     async fn secret_scan_report_never_echoes_sender_key_names() {
-        let (_base, mesh) = mesh_with_commit("secret-key");
+        let (_base, mesh) = mesh_with_commit("secret-key").await;
         let id = Uuid::new_v4();
         let evil_key = format!("ghp_{}", "K".repeat(36));
         let secret_value = format!("ghp_{}", "V".repeat(36));
@@ -3840,7 +3801,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        );
+        ).await;
         let store = fresh_store("secret-key").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -3873,7 +3834,7 @@ mod tests {
     /// state as metadata only (DR-9: recorded, never gated on).
     #[tokio::test]
     async fn imported_created_by_is_marked_unverified() {
-        let (_base, mesh) = mesh_with_commit("createdby");
+        let (_base, mesh) = mesh_with_commit("createdby").await;
         let id = Uuid::new_v4();
         commit_record_json(
             &mesh,
@@ -3881,7 +3842,7 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "always use podman")).unwrap(),
-        );
+        ).await;
         let store = fresh_store("createdby").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await

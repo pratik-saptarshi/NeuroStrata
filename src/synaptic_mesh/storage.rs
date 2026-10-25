@@ -35,7 +35,7 @@ impl MeshStorage {
     /// `base_root` is normally `~/.NeuroStrata/synaptic-mesh`; tests pass a
     /// scratch dir. `remote` only records the URL and configures `origin` —
     /// no network happens here.
-    pub fn init(
+    pub async fn init(
         base_root: &Path,
         node_id: &str,
         mesh_name: &str,
@@ -51,9 +51,9 @@ impl MeshStorage {
             )
         })?;
 
-        run_ok(&root, &["init"])?;
+        run_ok(&root, &["init"]).await?;
         if let Some(url) = remote {
-            run_ok(&root, &["remote", "add", "origin", url])?;
+            run_ok(&root, &["remote", "add", "origin", url]).await?;
         }
 
         let manifest = MeshManifest {
@@ -189,9 +189,9 @@ impl MeshStorage {
     /// Stage + commit everything in the mesh repo as `node_id`. Returns
     /// `Ok(false)` on a no-op (nothing changed) — an empty commit is a bug
     /// in the caller, never a fallback.
-    pub fn commit_all(&self, message: &str, node_id: &str) -> Result<bool> {
-        run_ok(&self.root, &["add", "-A"])?;
-        let staged = run(&self.root, &["status", "--porcelain"])?;
+    pub async fn commit_all(&self, message: &str, node_id: &str) -> Result<bool> {
+        run_ok(&self.root, &["add", "-A"]).await?;
+        let staged = run(&self.root, &["status", "--porcelain"]).await?;
         if String::from_utf8_lossy(&staged.stdout).trim().is_empty() {
             return Ok(false);
         }
@@ -207,34 +207,34 @@ impl MeshStorage {
             "-m",
             message,
         ];
-        run_ok(&self.root, &args)?;
+        run_ok(&self.root, &args).await?;
         Ok(true)
     }
 
     /// `git fetch` + fast-forward merge from the configured remote. Err when
     /// no remote is set, or when history has genuinely diverged (operator
     /// resolves; never force-overwrite).
-    pub fn pull(&self) -> Result<()> {
+    pub async fn pull(&self) -> Result<()> {
         self.require_remote()?;
         // `origin HEAD` = the remote's default branch, written as the single
         // line of FETCH_HEAD (a bare `git fetch origin` lists every branch and
         // the first line is not necessarily the one to merge).
-        run_ok(&self.root, &["fetch", "origin", "HEAD"])?;
+        run_ok(&self.root, &["fetch", "origin", "HEAD"]).await?;
         // NOT bare `FETCH_HEAD`: git special-cases that literal name and skips
         // FETCH_HEAD lines marked `not-for-merge` (which is what a fetch that
         // also updated a remote-tracking ref writes), silently reporting
         // "Already up to date" without merging. `FETCH_HEAD^{commit}` peels to
         // the commit and bypasses the special case. --ff-only: divergent
         // history is an operator decision, never a silent merge commit.
-        run_ok(&self.root, &["merge", "--ff-only", "FETCH_HEAD^{commit}"])?;
+        run_ok(&self.root, &["merge", "--ff-only", "FETCH_HEAD^{commit}"]).await?;
         Ok(())
     }
 
     /// `git push` the current checkout to the configured remote. Err when no
     /// remote is set.
-    pub fn push(&self) -> Result<()> {
+    pub async fn push(&self) -> Result<()> {
         self.require_remote()?;
-        run_ok(&self.root, &["push", "origin", "HEAD"])?;
+        run_ok(&self.root, &["push", "origin", "HEAD"]).await?;
         Ok(())
     }
 
@@ -264,19 +264,59 @@ fn write_manifest(root: &Path, manifest: &MeshManifest) -> Result<()> {
     Ok(())
 }
 
-/// Run one git subcommand non-interactively (`GIT_TERMINAL_PROMPT=0`: a
-/// credential prompt would wedge the daemon) inside the mesh checkout.
-fn run(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .with_context(|| format!("git {} could not be executed", args.join(" ")))
+/// DR-4's mesh git timeout: no single git subprocess runs longer than
+/// this. A mesh git call that hangs (unreachable remote, wedged transport)
+/// must die here, at the funnel — never wedge the async runtime, the drain
+/// loop, or a session-start pull.
+pub(crate) const GIT_COMMAND_TIMEOUT_SECS: u64 = 30;
+
+/// The effective git timeout: DR-4's 30 s, overridable via
+/// `NEUROSTRATA_GIT_TIMEOUT_SECS` (whole seconds, minimum 1; an unset,
+/// unparsable, or zero value falls back to the DR-4 default). Read per
+/// call — one env lookup next to a subprocess spawn is not a hot path, and
+/// per-call reading keeps the knob deterministic in tests.
+pub(crate) fn git_timeout() -> std::time::Duration {
+    let secs = std::env::var("NEUROSTRATA_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s >= 1)
+        .unwrap_or(GIT_COMMAND_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
-fn run_ok(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let out = run(root, args)?;
+/// Run one git subcommand non-interactively (`GIT_TERMINAL_PROMPT=0`: a
+/// credential prompt would wedge the daemon) inside the mesh checkout, as
+/// an async subprocess bounded by [`git_timeout`]. This funnel is the ONLY
+/// place production mesh git executes: every caller — storage methods,
+/// mesh_service probes, import plumbing — inherits the timeout from here.
+///
+/// Timeout semantics: when the timeout fires, the returned future is
+/// dropped and `kill_on_drop` kills the git child (SIGKILL on unix) and
+/// reaps it; the caller receives an error naming the subcommand and the
+/// timeout. A git operation killed mid-flight may leave the checkout's
+/// own lock files behind exactly as a crashed git would — recovery is the
+/// existing `mesh recover` surface, not a retry inside the funnel.
+pub(crate) async fn run(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let timeout = git_timeout();
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(e).with_context(|| format!("git {} could not be executed", args.join(" "))),
+        Err(_) => bail!(
+            "git {} timed out after {}s — process killed (mesh git timeout; \
+             override with NEUROSTRATA_GIT_TIMEOUT_SECS)",
+            args.join(" "),
+            timeout.as_secs()
+        ),
+    }
+}
+
+pub(crate) async fn run_ok(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let out = run(root, args).await?;
     if out.status.success() {
         return Ok(out);
     }
@@ -286,6 +326,24 @@ fn run_ok(root: &Path, args: &[&str]) -> Result<std::process::Output> {
         out.status,
         String::from_utf8_lossy(&out.stderr).trim()
     )
+}
+
+/// Does the configured remote have refs yet? Three answers, not two:
+/// `Some(false)` = reachable but EMPTY (bare repo nobody pushed to — a
+/// normal "team inbox not yet filled" state); `Some(true)` = has refs;
+/// `None` = could not ask (unreachable/auth/timeout) — and an unreachable
+/// remote must fall through to the real fetch so the failure SURFACES, per
+/// the spec's fail-soft rule ("an unreachable remote reports the failure").
+/// The one shared probe: mesh_service and import both feed `pull()` from
+/// this answer, so it lives beside the funnel they share.
+pub(crate) async fn remote_refs_present(root: &Path) -> Option<bool> {
+    let out = run(root, &["ls-remote", "--refs", "origin", "HEAD"])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(!out.stdout.is_empty())
 }
 
 #[cfg(test)]
@@ -307,7 +365,7 @@ mod tests {
         dir
     }
 
-    fn init_under(base: &Path) -> MeshStorage {
+    async fn init_under(base: &Path) -> MeshStorage {
         MeshStorage::init(
             base,
             "node-abc123",
@@ -315,6 +373,7 @@ mod tests {
             &["stripe-api".to_string()],
             None,
         )
+        .await
         .unwrap()
     }
 
@@ -334,10 +393,10 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
-    #[test]
-    fn init_creates_dir_repo_and_manifest() {
+    #[tokio::test]
+    async fn init_creates_dir_repo_and_manifest() {
         let base = scratch("init");
-        let mesh = init_under(&base);
+        let mesh = init_under(&base).await;
 
         let root = mesh.root();
         assert!(root.is_dir(), "mesh dir must exist at {}", root.display());
@@ -365,10 +424,10 @@ mod tests {
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     }
 
-    #[test]
-    fn manifest_round_trips_to_disk() {
+    #[tokio::test]
+    async fn manifest_round_trips_to_disk() {
         let base = scratch("roundtrip");
-        let mesh = init_under(&base);
+        let mesh = init_under(&base).await;
         let original = mesh.manifest().clone();
 
         let reopened = MeshStorage::open(mesh.root()).expect("open freshly inited mesh");
@@ -376,10 +435,10 @@ mod tests {
         assert_eq!(reopened.root(), mesh.root());
     }
 
-    #[test]
-    fn open_refuses_unknown_schema_version() {
+    #[tokio::test]
+    async fn open_refuses_unknown_schema_version() {
         let base = scratch("schema-mismatch");
-        let mesh = init_under(&base);
+        let mesh = init_under(&base).await;
         let path = mesh.root().join(MANIFEST_FILE_NAME);
 
         let mut doc: serde_json::Value =
@@ -428,10 +487,10 @@ mod tests {
         MeshStorage::remove_pointer(&project).unwrap();
     }
 
-    #[test]
-    fn commit_all_records_a_commit_and_author() {
+    #[tokio::test]
+    async fn commit_all_records_a_commit_and_author() {
         let base = scratch("commit");
-        let mesh = init_under(&base);
+        let mesh = init_under(&base).await;
 
         // The slice-3 mesh-worker's shape: one file per record.
         let memories = mesh.root().join("stripe-api").join("memories");
@@ -440,6 +499,7 @@ mod tests {
 
         assert!(
             mesh.commit_all("mesh slice 2a: first record", "node-author-1")
+                .await
                 .unwrap(),
             "a dirty tree must commit"
         );
@@ -450,13 +510,15 @@ mod tests {
         assert_eq!(git_out(mesh.root(), &["rev-list", "--count", "HEAD"]), "1");
 
         assert!(
-            !mesh.commit_all("nothing changed", "node-author-1").unwrap(),
+            !mesh.commit_all("nothing changed", "node-author-1")
+                .await
+                .unwrap(),
             "a clean tree is Ok(false), never an empty commit"
         );
     }
 
-    #[test]
-    fn push_and_pull_between_two_checkouts() {
+    #[tokio::test]
+    async fn push_and_pull_between_two_checkouts() {
         let base = scratch("sync");
         let remote = base.join("remote.git");
         let out = Command::new("git")
@@ -478,9 +540,10 @@ mod tests {
             &["stripe-api".to_string()],
             Some(remote.to_str().unwrap()),
         )
+        .await
         .unwrap();
-        assert!(a.commit_all("bootstrap", "node-a").unwrap());
-        a.push().unwrap();
+        assert!(a.commit_all("bootstrap", "node-a").await.unwrap());
+        a.push().await.unwrap();
 
         // Point the bare repo's HEAD at the branch A actually pushed, so the
         // clone checks it out (git init's default HEAD may not match).
@@ -520,11 +583,11 @@ mod tests {
         let memories = b.root().join("stripe-api").join("memories");
         std::fs::create_dir_all(&memories).unwrap();
         std::fs::write(memories.join("m2.json"), r#"{"id":"m2"}"#).unwrap();
-        assert!(b.commit_all("node-b record", "node-b").unwrap());
-        b.push().unwrap();
+        assert!(b.commit_all("node-b record", "node-b").await.unwrap());
+        b.push().await.unwrap();
         assert_eq!(git_out(b.root(), &["log", "--format=%an", "-1"]), "node-b");
 
-        a.pull().unwrap();
+        a.pull().await.unwrap();
         assert!(
             a.root()
                 .join("stripe-api")
@@ -535,18 +598,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn push_without_remote_errors() {
+    #[tokio::test]
+    async fn push_without_remote_errors() {
         let base = scratch("no-remote");
-        let mesh = init_under(&base);
+        let mesh = init_under(&base).await;
         assert!(mesh.manifest().remote.is_none());
 
-        let pull_err = mesh.pull().expect_err("pull with no remote must error");
+        let pull_err = mesh.pull().await.expect_err("pull with no remote must error");
         assert!(
             pull_err.to_string().contains("no remote"),
             "got: {pull_err}"
         );
-        let push_err = mesh.push().expect_err("push with no remote must error");
+        let push_err = mesh.push().await.expect_err("push with no remote must error");
         assert!(
             push_err.to_string().contains("no remote"),
             "got: {push_err}"
@@ -601,8 +664,8 @@ mod tests {
     /// ~1 s rather than the shim's 60 s, and the shim process is gone —
     /// killed, not abandoned.
     #[cfg(unix)]
-    #[test]
-    fn git_hang_times_out_and_kills() {
+    #[tokio::test]
+    async fn git_hang_times_out_and_kills() {
         use std::os::unix::fs::PermissionsExt;
 
         let shim_dir = scratch("git-shim");
@@ -618,7 +681,7 @@ mod tests {
         let _env = EnvGuard::install(&shim_dir);
 
         let start = std::time::Instant::now();
-        let res = run(&root, &["fetch", "origin", "HEAD"]);
+        let res = run(&root, &["fetch", "origin", "HEAD"]).await;
         let elapsed = start.elapsed();
 
         let err = res.expect_err("a hung git must error at the timeout, not run to completion");
@@ -651,8 +714,8 @@ mod tests {
 
     /// Pin: the success path is unchanged — init/commit/push/pull round-trip
     /// against a real bare remote moves the record exactly as before.
-    #[test]
-    fn git_success_path_unchanged() {
+    #[tokio::test]
+    async fn git_success_path_unchanged() {
         let base = scratch("pin-sync");
         let remote = base.join("remote.git");
         let out = Command::new("git")
@@ -674,9 +737,10 @@ mod tests {
             &["stripe-api".to_string()],
             Some(remote.to_str().unwrap()),
         )
+        .await
         .unwrap();
-        assert!(a.commit_all("bootstrap", "node-a").unwrap());
-        a.push().unwrap();
+        assert!(a.commit_all("bootstrap", "node-a").await.unwrap());
+        a.push().await.unwrap();
 
         let branch = git_out(a.root(), &["branch", "--show-current"]);
         let out = Command::new("git")
@@ -711,10 +775,10 @@ mod tests {
         let memories = b.root().join("stripe-api").join("memories");
         std::fs::create_dir_all(&memories).unwrap();
         std::fs::write(memories.join("pin.json"), r#"{"id":"pin"}"#).unwrap();
-        assert!(b.commit_all("pin record", "node-b").unwrap());
-        b.push().unwrap();
+        assert!(b.commit_all("pin record", "node-b").await.unwrap());
+        b.push().await.unwrap();
 
-        a.pull().unwrap();
+        a.pull().await.unwrap();
         assert!(
             a.root()
                 .join("stripe-api")
@@ -727,10 +791,10 @@ mod tests {
 
     /// Pin: a failing subcommand surfaces git's stderr in the error, in the
     /// same shape as the synchronous funnel produced.
-    #[test]
-    fn git_failure_surfaces_stderr() {
+    #[tokio::test]
+    async fn git_failure_surfaces_stderr() {
         let base = scratch("pin-failure");
-        let mesh = init_under(&base);
+        let mesh = init_under(&base).await;
 
         let err = run_ok(mesh.root(), &["rev-parse", "--verify", "refs/heads/no-such-ref"])
             .expect_err("verifying a missing ref must fail");

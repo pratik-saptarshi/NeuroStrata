@@ -783,7 +783,8 @@ pub async fn process_mcp_request(
                             } else {
                                 result_text = crate::synaptic_mesh::handle_mesh_tool_call(
                                     mesh_name, &arguments,
-                                );
+                                )
+                                .await;
                             }
                         }
                         _ => {

@@ -636,8 +636,10 @@ fn wire_mesh_publish(
     let store_for_drain = vector_store.clone();
     tokio::spawn(mesh_drain_loop(project_root.clone(), wake, store_for_drain));
 
-    // Session start (spec §Triggers): ONE best-effort pull + validation,
-    // never blocking startup beyond a 5s timeout and never crashing it.
+    // Session start (spec §Triggers): ONE best-effort pull + validation on
+    // its own spawned task — never blocking startup and never crashing it.
+    // Each git subprocess inside the pull is capped at the storage funnel's
+    // DR-4 timeout (30 s), so a hung remote cannot wedge the pull forever.
     tokio::spawn(session_start_mesh_pull(
         project_root.clone(),
         vector_store.clone(),
@@ -659,38 +661,32 @@ fn wire_mesh_publish(
     }
 }
 
-/// The 5s ceiling spec §Triggers puts on a session-start pull: fail-soft
-/// both over time (timeout) and on outcome (errors logged, never propagated).
-const MESH_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// One throttled (≤5s) best-effort pull for the given project: resolves the
-/// pointer, runs the slice-4 import/replay, and reports — errors that would
-/// wedge startup become log lines. Returns the report (or `None` on
-/// timeout) so the caller decides the logging level.
+/// One best-effort pull for the given project: resolves the pointer,
+/// runs the slice-4 import/replay, and reports — errors that would wedge
+/// startup become log lines. Returns the report so the caller decides the
+/// logging level.
+///
+/// There is deliberately NO outer timeout here anymore: the old 5 s
+/// wrapper could not preempt the synchronous git call it wrapped (the
+/// blocking call held the runtime thread past the deadline). Mesh git now
+/// runs as a timed async subprocess at the storage funnel (DR-4: 30 s per
+/// subcommand, killed on expiry), which is the bound that actually binds;
+/// the pull itself runs on a spawned task, so a slow remote delays only
+/// the pull's own report.
 async fn pull_mesh_once(
     project_root: &Path,
     vector_store: &Arc<dyn VectorStore>,
     embedder: &Arc<dyn Embedder>,
 ) -> Option<String> {
     let arguments = serde_json::json!({ "project_root": project_root.display().to_string() });
-    match tokio::time::timeout(
-        MESH_PULL_TIMEOUT,
+    Some(
         crate::synaptic_mesh::import::handle_mesh_pull(
             &arguments,
             vector_store.clone(),
             embedder.clone(),
-        ),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(report) => Some(report),
-        Err(_) => {
-            tracing::warn!(
-                "mesh pull timed out after 5s; session start is unaffected — try `neurostrata-mcp mesh pull`"
-            );
-            None
-        }
-    }
 }
 
 /// The session-start trigger body: run the throttled pull once and record
@@ -758,9 +754,10 @@ fn auto_pull_interval_for_policy(
 }
 
 /// The drain loop: once per interval, or as soon as a subscriber appends an
-/// entry (the `Notify` edge). A drain is synchronous git + file I/O, so it is
-/// called directly rather than awaited — the mesh repo is tiny and the
-/// interval is seconds, so it never meaningfully blocks the executor.
+/// entry (the `Notify` edge). A drain is awaited: its one git commit runs
+/// through the storage funnel as a timed async subprocess (DR-4), so a hung
+/// git can stall a drain only up to the funnel timeout, never the executor
+/// forever.
 async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>, store: Arc<dyn VectorStore>) {
     let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -816,7 +813,7 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
         &namespaces,
         epoch,
     ).await;
-    match drain_once(&outbox, &mesh, &node_id) {
+    match drain_once(&outbox, &mesh, &node_id).await {
         Ok(report) if report.pending_seen > 0 => {
             tracing::debug!(
                 applied = report.applied,
