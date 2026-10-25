@@ -619,48 +619,11 @@ pub async fn process_mcp_request(
                         }
                     }
                     if !claimed {
-                        match name {
-                        "neurostrata_procedure_perform" => {
-                            result_text = crate::tools::procedure::handle_procedure_perform(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_task_create" => {
-                            result_text = crate::task::handle_task_create(
-                                arguments,
-                                emb.clone(),
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_task_claim" => {
-                            result_text =
-                                crate::task::handle_task_claim(arguments, store.clone()).await;
-                        }
-                        "neurostrata_task_update" => {
-                            result_text = crate::task::handle_task_update(
-                                arguments,
-                                emb.clone(),
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_task_list" => {
-                            result_text =
-                                crate::task::handle_task_list(arguments, store.clone()).await;
-                        }
-                        "neurostrata_task_complete" => {
-                            match crate::task::handle_task_complete(
-                                arguments,
-                                emb.clone(),
-                                store.clone(),
-                                deduplication_checker.clone(),
-                                bus.clone(),
-                            )
-                            .await
-                            {
+                        if let Some(outcome) =
+                            crate::handlers::tasks::dispatch_task_tool(name, &arguments, &ctx).await
+                        {
+                            claimed = true;
+                            match outcome {
                                 Ok(text) => result_text = text,
                                 Err(msg) => {
                                     // A refused completion (Lock 2) is a JSON-RPC
@@ -677,43 +640,12 @@ pub async fn process_mcp_request(
                                 }
                             }
                         }
-                        "neurostrata_task_validate" => {
-                            result_text =
-                                crate::task::handle_task_validate(arguments, store.clone()).await;
-                        }
-                        "neurostrata_task_intake" => {
-                            result_text = crate::task::intake::handle_intake(
+                    }
+                    if !claimed {
+                        match name {
+                        "neurostrata_procedure_perform" => {
+                            result_text = crate::tools::procedure::handle_procedure_perform(
                                 arguments,
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_task_intake_list" => {
-                            result_text = crate::task::intake::handle_intake_list(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_task_intake_resolve" => {
-                            result_text = crate::task::intake::handle_intake_resolve(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_bootstrap" => {
-                            result_text = crate::task::handle_bootstrap(
-                                arguments,
-                                emb.clone(),
-                                store.clone(),
-                            )
-                            .await;
-                        }
-                        "neurostrata_task_setup" => {
-                            result_text = crate::task::handle_task_setup(
-                                arguments,
-                                emb.clone(),
                                 store.clone(),
                             )
                             .await;
