@@ -10,11 +10,13 @@
 
 mod bus;
 mod event;
+pub(crate) mod outbox;
 mod subscriber;
 pub(crate) mod subscribers;
 
 pub use self::bus::{SubscriberId, ThalamicBus};
 pub use self::event::ThalamicPulse;
+pub use self::outbox::{EventClass, EventOutbox, OutboxEntry, OutboxError};
 pub use self::subscriber::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
     SubscriberError,

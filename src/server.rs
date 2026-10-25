@@ -1647,15 +1647,24 @@ async fn handle_add_memory(
                 }
 
                 let upsert = upsert.unwrap();
-                // Emit site 1 only for a newly inserted memory.
-                bus.emit(
+                // Emit site 1 only for a newly inserted memory. Class M
+                // (Task 12): this pulse is the memory's mesh sync record,
+                // so it goes through `emit_checked` — a failed durable
+                // append fails the report rather than letting a stored
+                // memory claim a success its sync record never made.
+                if let Err(err) = bus.emit_checked(
                     ThalamicPulse::Created {
                         id: upsert.id.clone(),
                         namespace: namespace.to_string(),
                         kind: payload.memory_type.clone(),
                     },
                     &RecursionToken::root(),
-                );
+                ) {
+                    return format!(
+                        "Stored memory {} in namespace {}, but its durable event record failed: {}. The write is not confirmed; the mesh may not see this memory until a later mutation or reconciliation.",
+                        upsert.id, namespace, err
+                    );
+                }
                 let mut msg = format!("Successfully added memory for namespace: {}", namespace);
                 msg.push_str(&format!("\nMemory ID: {}", upsert.id));
                 if adopted_governs {
@@ -2378,16 +2387,22 @@ async fn handle_supersede_memory(
 
     // Emit site 2. After both writes, not after the first: a pulse published
     // when only the successor existed would tell subscribers the old row was
-    // retired while it was still active. Fire-and-forget -- the move is
-    // durable either way.
-    bus.emit(
+    // retired while it was still active. Class M (Task 12): `emit_checked` —
+    // this pulse is the retirement's sync record, so a failed durable append
+    // is reported rather than swallowed.
+    if let Err(err) = bus.emit_checked(
         ThalamicPulse::Superseded {
             old_id: id.to_string(),
             new_id: new_id.clone(),
             namespace: namespace.to_string(),
         },
         &RecursionToken::root(),
-    );
+    ) {
+        return format!(
+            "Superseded {} with {} in namespace {}, but the retirement's durable event record failed: {}. Both rows are stored; the mesh may not see the retirement until a later mutation or reconciliation.",
+            id, new_id, namespace, err
+        );
+    }
 
     let mut report = format!(
         "Superseded {} with {} in namespace {}. The old memory keeps its text and is no longer returned by search; it is still readable by id.",

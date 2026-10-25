@@ -903,6 +903,14 @@ pub(crate) async fn start_daemon_on(
     // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
     wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
 
+    // Task 12: the durable event outbox, in the daemon's config directory
+    // beside the token files. Attaching starts the per-class delivery
+    // workers, whose first work is replaying whatever a previous run left
+    // unacknowledged — and it happens here, before the router binds, so a
+    // replayed entry stays ahead of any request-served pulse in its
+    // class's sequence order.
+    bus.attach_event_outbox(token_config_dir());
+
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let fingerprint = exe_fingerprint();

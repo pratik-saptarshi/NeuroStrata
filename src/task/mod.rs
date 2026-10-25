@@ -1454,14 +1454,24 @@ pub async fn handle_task_complete(
     // every subscriber down a chain that does not exist. The ordering is the
     // invariant -- nothing re-derives it from the adjacent check.
     if let Some(lesson_id) = inline_lesson {
-        bus.emit(
+        // Class M (Task 12): the completion's sync record goes through
+        // `emit_checked` — a failed durable append fails the completion
+        // before it is recorded below, so the caller can retry rather than
+        // strand a completion the mesh never hears about.
+        bus.emit_checked(
             crate::events::ThalamicPulse::Superseded {
                 old_id: id.clone(),
-                new_id: lesson_id,
+                new_id: lesson_id.clone(),
                 namespace: namespace.clone(),
             },
             &crate::events::RecursionToken::root(),
-        );
+        )
+        .map_err(|e| {
+            format!(
+                "ERROR: the lesson {} was extracted, but the completion's durable event record failed: {}. The completion was not recorded; retry neurostrata_task_complete.",
+                lesson_id, e
+            )
+        })?;
     }
 
     // With the edge in place the ExtractionRequired guard is satisfied.

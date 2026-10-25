@@ -196,6 +196,14 @@ pub struct BusMetrics {
     pub subscriber_timeouts: u64,
     /// Emits refused because they were attempted under a held [`RecursionToken`].
     pub recursion_blocks: u64,
+    /// Durable-outbox appends that failed since this bus was constructed
+    /// (Task 12). A Class A (audit) publisher whose append fails still
+    /// completes its operation — the guarded call already executed — so
+    /// this counter, surfaced at `POST /bus/metrics`, is that failure's
+    /// record: there is no silent path. Class M failures also count here
+    /// in addition to failing their operation. Zero while no outbox is
+    /// attached.
+    pub outbox_append_failures: u64,
 }
 
 #[cfg(test)]

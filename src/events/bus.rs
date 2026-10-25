@@ -7,6 +7,7 @@
 //! order, each under a 250ms timeout, each panic caught at the dispatcher join
 //! point. Nothing a subscriber does can reach back into the caller's write.
 
+use super::outbox::{EventClass, EventOutbox, OutboxError};
 use super::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
     ThalamicPulse,
@@ -18,6 +19,7 @@ use futures::FutureExt;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -42,6 +44,7 @@ struct AtomicMetrics {
     subscriber_panics: AtomicU64,
     subscriber_timeouts: AtomicU64,
     recursion_blocks: AtomicU64,
+    outbox_append_failures: AtomicU64,
 }
 
 /// The daemon's store, once attached. Until then the dispatcher substitutes an
@@ -208,6 +211,16 @@ pub struct ThalamicBus {
     /// Stated capacity, kept so `emit` can trim without a second lookup.
     capacity: usize,
     store: Arc<OnceLock<Arc<dyn VectorStore>>>,
+    /// The durable event outbox (Task 12), once the daemon attaches one.
+    /// `None` is the bus every test and non-daemon consumer runs — bounded
+    /// queue semantics exactly as before. `Some` switches
+    /// durability-qualified pulses to the durable path: a synchronous
+    /// append inside `emit`, and delivery by the per-class workers rather
+    /// than by the dispatcher.
+    outbox: Arc<Mutex<Option<Arc<EventOutbox>>>>,
+    /// The wakeup edge for the delivery workers: an append notifies, and
+    /// each worker re-checks its own class's pending list.
+    outbox_notify: Arc<Notify>,
 }
 
 impl ThalamicBus {
@@ -228,6 +241,8 @@ impl ThalamicBus {
         let subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>> = Arc::new(Mutex::new(Vec::new()));
         let metrics = Arc::new(AtomicMetrics::default());
         let store = Arc::new(OnceLock::<Arc<dyn VectorStore>>::new());
+        let outbox: Arc<Mutex<Option<Arc<EventOutbox>>>> = Arc::new(Mutex::new(None));
+        let outbox_notify = Arc::new(Notify::new());
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -237,6 +252,7 @@ impl ThalamicBus {
                     metrics.clone(),
                     bp_tx.clone(),
                     store.clone(),
+                    outbox.clone(),
                 ));
             }
             Err(_) => tracing::warn!(
@@ -251,7 +267,123 @@ impl ThalamicBus {
             bp_tx,
             capacity,
             store,
+            outbox,
+            outbox_notify,
         }
+    }
+
+    /// Attach the durable event outbox (Task 12) over `dir` and start the
+    /// per-class delivery workers. The daemon calls this once, before it
+    /// serves: the workers' first work is replaying whatever a previous
+    /// run left unacknowledged, and because every qualified pulse is
+    /// delivered by its class worker in sequence order, a replayed entry
+    /// stays ahead of any live pulse appended after it.
+    ///
+    /// Fail-soft, like the mesh wiring: if the outbox cannot open, the
+    /// error is logged and the bus stays on the bounded queue — a daemon
+    /// that cannot make its audit durable must say so loudly, not refuse
+    /// to start. The first attach wins; a second is a logged no-op.
+    pub fn attach_event_outbox(&self, dir: impl Into<PathBuf>) {
+        let dir = dir.into();
+        let outbox = match EventOutbox::open(&dir) {
+            Ok(outbox) => Arc::new(outbox),
+            Err(err) => {
+                tracing::error!(
+                    "event outbox could not open at {}: {err}; audit and mesh events stay on the lossy bounded queue",
+                    dir.display()
+                );
+                return;
+            }
+        };
+        {
+            let mut slot = self.outbox.lock().expect("outbox slot lock poisoned");
+            if slot.is_some() {
+                tracing::warn!(
+                    "ThalamicBus::attach_event_outbox called twice; keeping the first outbox"
+                );
+                return;
+            }
+            *slot = Some(outbox.clone());
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                for class in EventClass::all() {
+                    handle.spawn(delivery_worker(
+                        class,
+                        outbox.clone(),
+                        self.subs.clone(),
+                        self.store.clone(),
+                        self.metrics.clone(),
+                        self.bp_tx.clone(),
+                        self.outbox_notify.clone(),
+                    ));
+                }
+            }
+            Err(_) => tracing::warn!(
+                "event outbox attached outside a Tokio runtime; delivery workers not started, entries accumulate for the next start"
+            ),
+        }
+    }
+
+    /// The attached outbox, if any.
+    fn outbox(&self) -> Option<Arc<EventOutbox>> {
+        self.outbox
+            .lock()
+            .expect("outbox slot lock poisoned")
+            .clone()
+    }
+
+    /// The classes `event` is durability-qualified for *right now*: a
+    /// class qualifies iff an outbox is attached, its named subscriber is
+    /// registered, and that class is interested in the pulse. Follows the
+    /// subscription registry — never a hardcoded list of event kinds.
+    fn qualified_classes(&self, event: &ThalamicPulse) -> Vec<EventClass> {
+        if self.outbox().is_none() {
+            return Vec::new();
+        }
+        let subs = self.subs.lock().expect("subscriber registry lock poisoned");
+        EventClass::all()
+            .into_iter()
+            .filter(|class| {
+                class.interested_in(event)
+                    && subs
+                        .iter()
+                        .any(|s| EventClass::class_of_subscriber(s.name()) == Some(*class))
+            })
+            .collect()
+    }
+
+    /// Durably append `event` for every class it qualifies for, inside
+    /// `emit` and before queue dispatch — the append is a file write, and
+    /// synchronous is the honest shape at this seam. Every failure is
+    /// counted in `outbox_append_failures` and logged at `error` before
+    /// this returns: the failure counter is the record, and there is no
+    /// silent path. Returns the first failure, if any.
+    fn append_qualified(&self, event: &ThalamicPulse) -> Result<(), OutboxError> {
+        let classes = self.qualified_classes(event);
+        if classes.is_empty() {
+            return Ok(());
+        }
+        let outbox = self.outbox().expect("qualified implies an attached outbox");
+        let mut first_err = None;
+        for class in classes {
+            match outbox.append(class, event) {
+                Ok(_) => self.outbox_notify.notify_waiters(),
+                Err(err) => {
+                    self.metrics
+                        .outbox_append_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        class = class.as_str(),
+                        "durable outbox append failed: {err}"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Hand the daemon's store to the dispatcher, which stamps it into every
@@ -290,11 +422,51 @@ impl ThalamicBus {
             tracing::debug!("pulse refused: caller holds a recursion token at depth >= 1");
             return;
         }
+        // Task 12: a durability-qualified pulse is appended to the outbox
+        // synchronously, before queue dispatch. This is the Class A path
+        // (audit publishers): the guarded operation has already executed,
+        // so a failed append cannot fail it retroactively — the failure is
+        // counted and logged inside `append_qualified`, and the pulse
+        // still dispatches. The result is deliberately discarded here;
+        // publishers that must fail on a failed append use `emit_checked`.
+        let _ = self.append_qualified(&event);
         let evicted = self.queue.push(event, self.capacity);
         self.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
         if evicted {
             self.note_drop();
         }
+    }
+
+    /// Publish one pulse whose durability the caller must know about —
+    /// the Class M path (mesh-state publishers on memory-write paths).
+    /// These pulses *are* the sync record, so a failed durable append
+    /// fails the operation: the error returns before the pulse enters the
+    /// queue, and a write that cannot be durably recorded does not report
+    /// success. On success this is `emit` with a receipt. A recursion
+    /// refusal is an error here too (counted and published exactly as in
+    /// `emit`), rather than a silent drop the caller cannot see.
+    pub fn emit_checked(
+        &self,
+        event: ThalamicPulse,
+        token: &RecursionToken,
+    ) -> Result<(), OutboxError> {
+        if !token.allows_emit() {
+            self.metrics
+                .recursion_blocks
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = self.bp_tx.send(BackpressureEvent::RecursionRefused {
+                token_allows_emit: false,
+            });
+            tracing::debug!("pulse refused: caller holds a recursion token at depth >= 1");
+            return Err(OutboxError::RecursionRefused);
+        }
+        self.append_qualified(&event)?;
+        let evicted = self.queue.push(event, self.capacity);
+        self.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
+        if evicted {
+            self.note_drop();
+        }
+        Ok(())
     }
 
     /// Account one lost pulse: counter, watch notification, and a WARN at the
@@ -334,6 +506,10 @@ impl ThalamicBus {
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
             subscriber_timeouts: self.metrics.subscriber_timeouts.load(Ordering::Relaxed),
             recursion_blocks: self.metrics.recursion_blocks.load(Ordering::Relaxed),
+            outbox_append_failures: self
+                .metrics
+                .outbox_append_failures
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -400,6 +576,7 @@ async fn dispatch(
     metrics: Arc<AtomicMetrics>,
     bp_tx: watch::Sender<BackpressureEvent>,
     store: Arc<OnceLock<Arc<dyn VectorStore>>>,
+    outbox: Arc<Mutex<Option<Arc<EventOutbox>>>>,
 ) {
     loop {
         let event = match queue.pop() {
@@ -428,7 +605,26 @@ async fn dispatch(
             .lock()
             .expect("subscriber registry lock poisoned")
             .clone();
+        // Task 12: with an outbox attached, a durability class's own
+        // subscriber is *not* invoked here for the pulses its class is
+        // interested in — its delivery worker delivers them from the
+        // outbox, in sequence order, without this dispatcher's 250 ms
+        // budget. Every other subscriber still sees the pulse here,
+        // exactly as before (the class subscribers no-op the pulses they
+        // are not interested in, so being skipped only for their own
+        // class's pulses changes nothing they observe).
+        let durable = outbox
+            .lock()
+            .expect("outbox slot lock poisoned")
+            .is_some();
         for sub in registered.iter() {
+            if durable {
+                if let Some(class) = EventClass::class_of_subscriber(sub.name()) {
+                    if class.interested_in(&event) {
+                        continue;
+                    }
+                }
+            }
             // A fresh depth-1 token per subscriber: the token exists to refuse
             // a subscriber emitting from inside its own invocation.
             let token = RecursionToken::new();
@@ -473,6 +669,134 @@ async fn dispatch(
         // `dispatcher_handled` term of the metrics invariant.
         metrics.dispatcher_handled.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// One class's delivery worker (Task 12): the outbox's reader. Two of
+/// these run — audit and mesh — so audit delivery never queues behind
+/// mesh deliveries performing git operations.
+///
+/// The worker delivers its class's unacknowledged entries in sequence
+/// order and advances the class offset only after the class's subscriber
+/// returns. The contract is **at-least-once**: a subscriber failure, a
+/// panic, or a failed offset write leaves the offset where it was, and
+/// the entry is delivered again — after a short backoff in-process, or
+/// on the next start after a crash. There is deliberately **no**
+/// per-delivery timeout here: the 250 ms dispatcher budget is the loss
+/// this design exists to remove, and a slow mesh delivery (git work is
+/// budgeted at 30 s by DR-4) must be allowed to finish. A hung
+/// subscriber stalls only its own class.
+///
+/// Startup replay is not a separate mechanism: it is this loop's first
+/// pass over the entries a previous run left unacknowledged.
+async fn delivery_worker(
+    class: EventClass,
+    outbox: Arc<EventOutbox>,
+    subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>>,
+    store: Arc<OnceLock<Arc<dyn VectorStore>>>,
+    metrics: Arc<AtomicMetrics>,
+    bp_tx: watch::Sender<BackpressureEvent>,
+    notify: Arc<Notify>,
+) {
+    loop {
+        let head = outbox.pending(class).into_iter().next();
+        let Some(entry) = head else {
+            // Nothing pending: park until an append wakes us. The bounded
+            // poll is a backstop — a missed wakeup delays a delivery by
+            // at most the poll interval, and can never lose one, because
+            // the entry is durable and the loop re-reads `pending`.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
+            continue;
+        };
+        let targets: Vec<Arc<dyn MemorySubscriber>> = subs
+            .lock()
+            .expect("subscriber registry lock poisoned")
+            .iter()
+            .filter(|s| EventClass::class_of_subscriber(s.name()) == Some(class))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            // Nobody is registered for this class in this process (the
+            // mesh is not wired, say, though a previous run appended
+            // entries for it). The entries stay unacknowledged: wedging
+            // is honest and visible, dropping them would be loss.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
+            continue;
+        }
+        if deliver_entry(&entry, &targets, &store, &metrics, &bp_tx).await {
+            match outbox.advance_offset(class, entry.seq) {
+                Ok(()) => {}
+                Err(err) => {
+                    // The side effect landed but the acknowledgment did
+                    // not: the entry *will* be redelivered, and the
+                    // subscriber's idempotency basis absorbs the dup.
+                    tracing::error!(
+                        class = class.as_str(),
+                        seq = entry.seq,
+                        "outbox offset advance failed: {err}; the entry will be redelivered"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Deliver one outbox entry to every subscriber of its class. Returns
+/// whether *all* of them returned `Ok` — the offset may advance only
+/// then. A panic is caught and counted exactly as the dispatcher counts
+/// it, and counts as a failure: the entry stays unacknowledged.
+async fn deliver_entry(
+    entry: &super::outbox::OutboxEntry,
+    targets: &[Arc<dyn MemorySubscriber>],
+    store: &Arc<OnceLock<Arc<dyn VectorStore>>>,
+    metrics: &Arc<AtomicMetrics>,
+    bp_tx: &watch::Sender<BackpressureEvent>,
+) -> bool {
+    let namespace = namespace_of(&entry.pulse);
+    let ts = chrono::Utc::now().timestamp();
+    let store: Arc<dyn VectorStore> = store
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(StoreNotAttached));
+    let ctx = SubscriberContext {
+        store: store.as_ref(),
+        namespace,
+        ts,
+    };
+    let mut all_ok = true;
+    for sub in targets {
+        // A fresh depth-1 token per subscriber, as in the dispatcher: a
+        // subscriber may not emit from inside its own invocation.
+        let token = RecursionToken::new();
+        let outcome = AssertUnwindSafe(sub.handle(&entry.pulse, &token, &ctx))
+            .catch_unwind()
+            .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    subscriber = sub.name(),
+                    "outbox delivery failed: {err:#}"
+                );
+                all_ok = false;
+            }
+            Err(payload) => {
+                metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
+                let text = panic_text(payload.as_ref());
+                let _ = bp_tx.send(BackpressureEvent::SubscriberPanic {
+                    name: sub.name(),
+                    payload: redact_panic(&text),
+                });
+                tracing::warn!(subscriber = sub.name(), "outbox delivery panicked: {text}");
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
 }
 
 #[cfg(test)]
