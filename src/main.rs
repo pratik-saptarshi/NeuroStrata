@@ -28,6 +28,7 @@ mod task;
 mod test_support;
 mod tools;
 mod traits;
+mod util;
 
 use crate::traits::SearchResult;
 use crate::traits::{Embedder, VectorStore};
