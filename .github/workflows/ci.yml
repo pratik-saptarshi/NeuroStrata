@@ -220,6 +220,37 @@ jobs:
         shell: bash
         run: cargo fmt --check
 
+  # ONE-OFF (Task 15b, slice 1): formats the tree in the runner and
+  # uploads the formatted src/server.rs plus its diff, so the slice's
+  # fmt fix can be applied without a local Rust toolchain. Ref-gated to
+  # the slice branch; removed before the slice is filed.
+  fmt-slice-1-artifact:
+    name: fmt slice-1 artifact (one-off)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/program/task-15b-slice-1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Add rustfmt component
+        shell: bash
+        run: rustup component add rustfmt
+
+      - name: Format tree, capture src/server.rs diff
+        shell: bash
+        run: |
+          cargo fmt
+          git diff -- src/server.rs > slice-1-server-fmt.patch
+          wc -l slice-1-server-fmt.patch
+
+      - name: Upload formatted server.rs and patch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: slice-1-server-fmt
+          path: |
+            src/server.rs
+            slice-1-server-fmt.patch
+
   clippy:
     name: clippy (report-only)
     runs-on: ubuntu-latest
