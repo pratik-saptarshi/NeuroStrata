@@ -5,6 +5,50 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+/// Host paths a guarded action's working directory may never sit under:
+/// the sandbox mounts the directory read-only at /workspace, so anything
+/// here would be exposed to the evaluated payload.
+const FORBIDDEN_PREFIXES: &[&str] = &[
+    "/etc", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+];
+
+fn is_forbidden_cwd(cwd: &str) -> bool {
+    cwd == "/"
+        || FORBIDDEN_PREFIXES
+            .iter()
+            .any(|prefix| cwd.starts_with(prefix))
+}
+
+/// The container image the sandbox evaluates payloads in.
+const SANDBOX_IMAGE: &str = "alpine:latest";
+
+/// Arguments for the ephemeral evaluation container: --rm (ephemeral),
+/// --network=none (isolated), the working directory mounted read-only at
+/// /workspace, a tmpfs scratch /tmp, payload via `sh -c`.
+fn run_args(cwd: &str, payload: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--network=none".to_string(),
+        format!("-v={}:/workspace:ro", cwd),
+        "--tmpfs=/tmp".to_string(),
+        "-w=/workspace".to_string(),
+        SANDBOX_IMAGE.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        payload.to_string(),
+    ]
+}
+
+/// The evaluation command: `run_args`, output piped for the verdict.
+fn sandbox_command(engine: &str, cwd: &str, payload: &str) -> Command {
+    let mut cmd = Command::new(engine);
+    cmd.args(run_args(cwd, payload))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 pub struct SandboxEvaluator {
     engine: String, // "podman" or "docker"
     available: bool,
@@ -46,14 +90,7 @@ impl SandboxEvaluator {
             std::fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
         let cwd_str = canonical_cwd.to_string_lossy().to_string();
 
-        let forbidden_prefixes = [
-            "/etc", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
-        ];
-        if cwd_str == "/"
-            || forbidden_prefixes
-                .iter()
-                .any(|prefix| cwd_str.starts_with(prefix))
-        {
+        if is_forbidden_cwd(&cwd_str) {
             return Ok(ValidateVerdict::DeterministicReject {
                 reasons: vec![format!(
                     "Security violation: Attempted to mount forbidden host path {}",
@@ -81,31 +118,8 @@ impl SandboxEvaluator {
 
         let start = std::time::Instant::now();
 
-        // Command execution inside ephemeral container
-        // --rm : ephemeral
-        // --network=none : isolate
-        // -v cwd:/workspace:ro : mount project read-only
-        // --tmpfs /tmp : scratch space
-        let child = Command::new(&self.engine)
-            .args([
-                "run",
-                "--rm",
-                "--network=none",
-                &format!("-v={}:/workspace:ro", cwd_str),
-                "--tmpfs=/tmp",
-                "-w=/workspace",
-                // Pinned to a specific Alpine release (R26) instead of
-                // `latest` so a registry re-push cannot silently change
-                // the sandbox behavior. Full digest pin (image@sha256:...)
-                // is filed as a follow-up (needs digest resolution at install).
-                "alpine:3.21",
-                "sh",
-                "-c",
-                payload,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        // Command execution inside ephemeral container (see run_args)
+        let child = sandbox_command(&self.engine, &cwd_str, payload).spawn()?;
 
         // Wait with a strict timeout (e.g., 5 seconds for inline guard)
         let execution_result = timeout(Duration::from_secs(5), child.wait_with_output()).await;
