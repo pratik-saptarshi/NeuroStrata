@@ -1109,4 +1109,658 @@ impl crate::traits::AsAny for RecordingStore {
         assert_eq!(m.queue_depth, 0);
         assert_eq!(*bp.borrow(), BackpressureEvent::Dropped { count: 1 });
     }
+
+    // ---- Task 12: durable outbox for audit & mesh events ----
+
+    use crate::events::{EventClass, EventOutbox, GuardEventLog};
+    use crate::store::LadybugStore;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// A fresh outbox directory per test, named after the test, so a leftover
+    /// from an earlier run can never be read back as this run's output.
+    fn outbox_scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-bus-outbox-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn pulse_label(event: &ThalamicPulse) -> String {
+        match event {
+            ThalamicPulse::Created { id, .. } => format!("created:{id}"),
+            ThalamicPulse::Superseded { old_id, new_id, .. } => {
+                format!("superseded:{old_id}->{new_id}")
+            }
+            ThalamicPulse::Archived { id, .. } => format!("archived:{id}"),
+            ThalamicPulse::GuardedActionFired { trace_id, .. } => format!("guard:{trace_id}"),
+        }
+    }
+
+    /// The record identity a delivery is absorbed by: the memory id for mesh
+    /// pulses (one mesh record per id — the mesh worker's dedup basis), the
+    /// trace id for a guard call.
+    fn pulse_identity(event: &ThalamicPulse) -> String {
+        match event {
+            ThalamicPulse::Created { id, .. } => id.clone(),
+            ThalamicPulse::Superseded { old_id, .. } => old_id.clone(),
+            ThalamicPulse::Archived { id, .. } => id.clone(),
+            ThalamicPulse::GuardedActionFired { trace_id, .. } => trace_id.clone(),
+        }
+    }
+
+    /// A durability-class subscriber double. It carries one of the two real
+    /// subscriber names so the bus classes it exactly as production does, and
+    /// — like the real subscribers — it records only the pulses its class is
+    /// interested in (the audit log ignores storage mutations; the mesh
+    /// outbox ignores guard verdicts). Every delivery is recorded in order,
+    /// and the identity set mirrors the idempotency basis a real subscriber
+    /// absorbs duplicates with.
+    struct ClassRecorder {
+        sub_name: &'static str,
+        delivered: Arc<Mutex<Vec<String>>>,
+        identities: Arc<Mutex<HashSet<String>>>,
+        delay: Duration,
+    }
+
+    impl ClassRecorder {
+        fn new(
+            sub_name: &'static str,
+            delivered: Arc<Mutex<Vec<String>>>,
+            identities: Arc<Mutex<HashSet<String>>>,
+        ) -> Self {
+            Self {
+                sub_name,
+                delivered,
+                identities,
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MemorySubscriber for ClassRecorder {
+        fn name(&self) -> &'static str {
+            self.sub_name
+        }
+
+        async fn handle(
+            &self,
+            event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &SubscriberContext<'_>,
+        ) -> Result<(), SubscriberError> {
+            let interested = match self.sub_name {
+                "guard_event_log" => {
+                    matches!(event, ThalamicPulse::GuardedActionFired { .. })
+                }
+                "mesh_outbox" => {
+                    !matches!(event, ThalamicPulse::GuardedActionFired { .. })
+                }
+                _ => true,
+            };
+            if !interested {
+                return Ok(());
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.delivered
+                .lock()
+                .expect("delivered log poisoned")
+                .push(pulse_label(event));
+            self.identities
+                .lock()
+                .expect("identity set poisoned")
+                .insert(pulse_identity(event));
+            Ok(())
+        }
+    }
+
+    /// A class subscriber that never returns: the worker delivering to it is
+    /// stuck mid-entry, so offsets can never advance — the shape of a daemon
+    /// that took a pulse into the outbox and died before delivering it.
+    struct BlockingClassSub {
+        sub_name: &'static str,
+    }
+
+    #[async_trait]
+    impl MemorySubscriber for BlockingClassSub {
+        fn name(&self) -> &'static str {
+            self.sub_name
+        }
+
+        async fn handle(
+            &self,
+            _event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &SubscriberContext<'_>,
+        ) -> Result<(), SubscriberError> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// Poll `cond` every 10ms until it holds or the deadline passes: the
+    /// workers deliver on their own tasks, so a guessed sleep could not tell
+    /// "hasn't happened yet" from "will never happen".
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn outbox_lines(dir: &std::path::Path) -> usize {
+        match std::fs::read_to_string(dir.join("event-outbox.jsonl")) {
+            Ok(text) => text.lines().filter(|l| !l.trim().is_empty()).count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// (audit, mesh) offsets as the offsets file currently records them; a
+    /// missing or unreadable file reads as (0, 0) — nothing acknowledged.
+    fn offsets_at(dir: &std::path::Path) -> (u64, u64) {
+        let Ok(text) = std::fs::read_to_string(dir.join("event-outbox.offsets.json")) else {
+            return (0, 0);
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        (
+            value["audit"].as_u64().unwrap_or(0),
+            value["mesh"].as_u64().unwrap_or(0),
+        )
+    }
+
+    fn created(id: &str, namespace: &str) -> ThalamicPulse {
+        ThalamicPulse::Created {
+            id: id.to_string(),
+            namespace: namespace.to_string(),
+            kind: "fact".to_string(),
+        }
+    }
+
+    fn guarded(trace_id: &str, namespace: &str) -> ThalamicPulse {
+        ThalamicPulse::GuardedActionFired {
+            trace_id: trace_id.to_string(),
+            action_type: "shell".to_string(),
+            payload_hash: 0xDEAD_BEEF,
+            verdict: "deny".to_string(),
+            rule_ids_triggered: vec!["rule.no-rm-rf".to_string()],
+            namespace: namespace.to_string(),
+        }
+    }
+
+    /// A current-thread runtime for the restart tests: each phase gets its
+    /// own, and dropping it kills that phase's bus tasks — the crash.
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime builds")
+    }
+
+    #[tokio::test]
+    async fn audit_event_survives_bus_overflow() {
+        // The real audit subscriber against a real store — the wiring the
+        // daemon builds, so the survival claim is about production parts.
+        let dir = outbox_scratch("overflow");
+        let store_dir = outbox_scratch("overflow-store");
+        let store = Arc::new(
+            LadybugStore::for_testing(
+                store_dir.join("audit.lbug").to_string_lossy().to_string(),
+                4,
+            )
+            .expect("a throwaway store opens"),
+        );
+        store.init("audit-ns").await.expect("the namespace table exists");
+
+        let bus = ThalamicBus::new(2);
+        bus.attach_store(store.clone());
+        bus.attach_event_outbox(dir);
+        // A slow class-O subscriber stalls the dispatcher 200ms per pulse,
+        // so the capacity-2 queue genuinely overflows behind it.
+        bus.register(Box::new(SlowSubscriber {
+            log: Arc::new(Mutex::new(Vec::new())),
+            delay: Duration::from_millis(200),
+        }));
+        bus.register(Box::new(GuardEventLog::new(4)));
+
+        bus.emit(created("c0", "audit-ns"), &RecursionToken::root());
+        for i in 1..=5 {
+            bus.emit(guarded(&format!("t{i}"), "audit-ns"), &RecursionToken::root());
+        }
+
+        // The queue could only hold two of the five audit pulses and
+        // drop-oldest evicted the rest — yet every one must land as an audit
+        // row, delivered in order by the outbox worker.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let rows = loop {
+            let rows: Vec<crate::traits::MemoryPayload> = store
+                .list("audit-ns", None, None)
+                .await
+                .expect("the namespace lists")
+                .into_iter()
+                .map(|r| r.payload)
+                .filter(|p| p.memory_type == "guard_event")
+                .collect();
+            if rows.len() == 5 {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected 5 audit rows after overflow, saw {}",
+                rows.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let traces: HashSet<String> = rows
+            .iter()
+            .map(|p| {
+                p.metadata["trace_id"]
+                    .as_str()
+                    .expect("an audit row names its trace")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            traces,
+            HashSet::from([
+                "t1".to_string(),
+                "t2".to_string(),
+                "t3".to_string(),
+                "t4".to_string(),
+                "t5".to_string()
+            ]),
+            "every flooded-out audit pulse still left its row"
+        );
+        assert!(
+            bus.metrics().drops_oldest >= 3,
+            "the queue really did overflow and drop: {:?}",
+            bus.metrics()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_lose_mesh_event() {
+        let dir = outbox_scratch("slow-mesh");
+        let bus = ThalamicBus::new(16);
+        bus.attach_event_outbox(dir);
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let identities = Arc::new(Mutex::new(HashSet::new()));
+        bus.register(Box::new(ClassRecorder {
+            sub_name: "mesh_outbox",
+            delivered: delivered.clone(),
+            identities: identities.clone(),
+            // Past the dispatcher's 250ms per-subscriber budget: on the old
+            // path this delivery was abandoned and the event was gone.
+            delay: Duration::from_millis(400),
+        }));
+        bus.emit(created("m1", "mesh-ns"), &RecursionToken::root());
+
+        let d = delivered.clone();
+        wait_until("the slow mesh delivery", move || {
+            d.lock().unwrap().len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec!["created:m1".to_string()],
+            "exactly one delivery — not zero (lost to the timeout) and not two"
+        );
+        let m = bus.metrics();
+        assert_eq!(
+            m.subscriber_timeouts, 0,
+            "the dispatcher's 250ms budget never abandoned it: {m:?}"
+        );
+        assert_eq!(m.drops_oldest, 0);
+    }
+
+    #[test]
+    fn unreplayed_outbox_entries_replay_on_startup() {
+        let dir = outbox_scratch("replay");
+
+        // Phase 1: a daemon that appends three qualified pulses and dies
+        // before delivering any of them (both class subscribers hang, so no
+        // offset can advance).
+        test_runtime().block_on(async {
+            let bus = ThalamicBus::new(16);
+            bus.attach_event_outbox(dir.clone());
+            bus.register(Box::new(BlockingClassSub {
+                sub_name: "mesh_outbox",
+            }));
+            bus.register(Box::new(BlockingClassSub {
+                sub_name: "guard_event_log",
+            }));
+            bus.emit(created("m1", "mesh-ns"), &RecursionToken::root());
+            bus.emit(created("m2", "mesh-ns"), &RecursionToken::root());
+            bus.emit(guarded("g1", "audit-ns"), &RecursionToken::root());
+            let d = dir.clone();
+            wait_until("three appended outbox entries", move || {
+                outbox_lines(&d) == 3
+            })
+            .await;
+            assert_eq!(
+                offsets_at(&dir),
+                (0, 0),
+                "nothing was delivered, so no offset may advance"
+            );
+        });
+
+        // Phase 2: the restart replays what phase 1 left behind, per class
+        // and in sequence order, and the offsets advance past it.
+        let mesh_delivered = Arc::new(Mutex::new(Vec::new()));
+        let audit_delivered = Arc::new(Mutex::new(Vec::new()));
+        test_runtime().block_on(async {
+            let bus = ThalamicBus::new(16);
+            bus.attach_event_outbox(dir.clone());
+            bus.register(Box::new(ClassRecorder::new(
+                "mesh_outbox",
+                mesh_delivered.clone(),
+                Arc::new(Mutex::new(HashSet::new())),
+            )));
+            bus.register(Box::new(ClassRecorder::new(
+                "guard_event_log",
+                audit_delivered.clone(),
+                Arc::new(Mutex::new(HashSet::new())),
+            )));
+            let (md, ad) = (mesh_delivered.clone(), audit_delivered.clone());
+            wait_until("replay of both classes", move || {
+                md.lock().unwrap().len() == 2 && ad.lock().unwrap().len() == 1
+            })
+            .await;
+            let d = dir.clone();
+            wait_until("offsets advanced past the replay", move || {
+                offsets_at(&d) == (3, 2)
+            })
+            .await;
+        });
+        assert_eq!(
+            *mesh_delivered.lock().unwrap(),
+            vec!["created:m1".to_string(), "created:m2".to_string()],
+            "mesh entries replay in sequence order"
+        );
+        assert_eq!(
+            *audit_delivered.lock().unwrap(),
+            vec!["guard:g1".to_string()]
+        );
+
+        // Phase 3: a second restart has nothing left to replay — the offsets
+        // held, so nothing is delivered twice.
+        let mesh2 = Arc::new(Mutex::new(Vec::new()));
+        let audit2 = Arc::new(Mutex::new(Vec::new()));
+        test_runtime().block_on(async {
+            let bus = ThalamicBus::new(16);
+            bus.attach_event_outbox(dir.clone());
+            bus.register(Box::new(ClassRecorder::new(
+                "mesh_outbox",
+                mesh2.clone(),
+                Arc::new(Mutex::new(HashSet::new())),
+            )));
+            bus.register(Box::new(ClassRecorder::new(
+                "guard_event_log",
+                audit2.clone(),
+                Arc::new(Mutex::new(HashSet::new())),
+            )));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+        assert!(
+            mesh2.lock().unwrap().is_empty(),
+            "no duplicate mesh delivery on the second restart"
+        );
+        assert!(
+            audit2.lock().unwrap().is_empty(),
+            "no duplicate audit delivery on the second restart"
+        );
+    }
+
+    #[test]
+    fn crash_between_effect_and_offset_redelivers() {
+        let dir = outbox_scratch("crash");
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let identities = Arc::new(Mutex::new(HashSet::new()));
+
+        // Sabotage the offsets file — a directory where it belongs — so
+        // every offset advance fails *after* the subscriber's side effect
+        // has landed: the crash point, held open.
+        std::fs::create_dir_all(dir.join("event-outbox.offsets.json")).unwrap();
+
+        test_runtime().block_on(async {
+            let bus = ThalamicBus::new(16);
+            bus.attach_event_outbox(dir.clone());
+            bus.register(Box::new(ClassRecorder::new(
+                "mesh_outbox",
+                delivered.clone(),
+                identities.clone(),
+            )));
+            bus.emit(created("m1", "mesh-ns"), &RecursionToken::root());
+            let d = delivered.clone();
+            wait_until("the side effect lands", move || {
+                !d.lock().unwrap().is_empty()
+            })
+            .await;
+            assert_eq!(
+                offsets_at(&dir),
+                (0, 0),
+                "the offset advance is fault-blocked, so the entry stays unacknowledged"
+            );
+        });
+
+        // The crash: the runtime and its workers die with the entry
+        // delivered-but-unacknowledged. The operator clears the fault.
+        std::fs::remove_dir_all(dir.join("event-outbox.offsets.json")).unwrap();
+        let before = delivered.lock().unwrap().len();
+        assert!(before >= 1, "the first delivery happened");
+
+        test_runtime().block_on(async {
+            let bus = ThalamicBus::new(16);
+            bus.attach_event_outbox(dir.clone());
+            bus.register(Box::new(ClassRecorder::new(
+                "mesh_outbox",
+                delivered.clone(),
+                identities.clone(),
+            )));
+            let d = delivered.clone();
+            wait_until("the entry redelivers after restart", move || {
+                d.lock().unwrap().len() > before
+            })
+            .await;
+            let dd = dir.clone();
+            wait_until("the offset advances once the fault clears", move || {
+                offsets_at(&dd).1 >= 1
+            })
+            .await;
+        });
+
+        // At-least-once, as assertions: the pulse was delivered again after
+        // the restart, and the duplicate was absorbed by the subscriber's
+        // idempotency basis — one record identity, however many deliveries.
+        assert!(
+            delivered.lock().unwrap().len() > before,
+            "redelivery happened after the restart"
+        );
+        assert_eq!(
+            *identities.lock().unwrap(),
+            HashSet::from(["m1".to_string()]),
+            "the duplicate is absorbed by record identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_publish_append_failure_fails_the_operation() {
+        let dir = outbox_scratch("mesh-append-fail");
+        let bus = ThalamicBus::new(16);
+        bus.attach_event_outbox(dir.clone());
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        bus.register(Box::new(ClassRecorder::new(
+            "mesh_outbox",
+            delivered.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )));
+
+        // Sabotage the append itself: a directory where the outbox file
+        // belongs, so the durable write fails with a real io error.
+        let _ = std::fs::remove_file(dir.join("event-outbox.jsonl"));
+        std::fs::create_dir_all(dir.join("event-outbox.jsonl")).unwrap();
+
+        let result = bus.emit_checked(created("m1", "mesh-ns"), &RecursionToken::root());
+        assert!(
+            result.is_err(),
+            "a mesh publish whose durable append failed must fail the operation"
+        );
+        assert_eq!(
+            bus.metrics().events_emitted,
+            0,
+            "the failed publish never entered the queue"
+        );
+        assert_eq!(
+            bus.metrics().outbox_append_failures,
+            1,
+            "the failure is counted, not silent"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "nothing was delivered for the failed publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_append_failure_alerts_and_continues() {
+        let dir = outbox_scratch("audit-append-fail");
+        let bus = ThalamicBus::new(16);
+        bus.attach_event_outbox(dir.clone());
+        bus.register(Box::new(ClassRecorder::new(
+            "guard_event_log",
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+        )));
+        let _ = std::fs::remove_file(dir.join("event-outbox.jsonl"));
+        std::fs::create_dir_all(dir.join("event-outbox.jsonl")).unwrap();
+
+        // Class A disposition: the guarded operation has already executed,
+        // so `emit` returns and the pulse is still accepted by the bus —
+        // the failure's record is the counter on the metrics surface.
+        bus.emit(guarded("g1", "audit-ns"), &RecursionToken::root());
+        assert_eq!(
+            bus.metrics().outbox_append_failures,
+            1,
+            "the failure counter is the alert surface"
+        );
+        assert_eq!(
+            bus.metrics().events_emitted,
+            1,
+            "the operation continued: the pulse was accepted"
+        );
+    }
+
+    #[test]
+    fn outbox_compaction_bounds_the_file() {
+        let dir = outbox_scratch("compaction");
+        let ob = EventOutbox::open(&dir).expect("the outbox opens");
+        for i in 0..10 {
+            ob.append(EventClass::Mesh, &created(&format!("m{i}"), "mesh-ns"))
+                .unwrap();
+        }
+        for i in 0..2 {
+            ob.append(EventClass::Audit, &guarded(&format!("g{i}"), "audit-ns"))
+                .unwrap();
+        }
+        ob.advance_offset(EventClass::Mesh, 10).unwrap();
+        ob.advance_offset(EventClass::Audit, 12).unwrap();
+        // 10 of 12 entries are past *both* offsets — over the dead-ratio
+        // line, so compaction keeps only the unacknowledged.
+        ob.compact().unwrap();
+        assert!(ob.pending(EventClass::Mesh).is_empty());
+        assert!(ob.pending(EventClass::Audit).is_empty());
+        // The sequence base survives the rewrite: the next append does not
+        // restart at 1 and collide with the recorded offsets.
+        let seq = ob
+            .append(EventClass::Mesh, &created("m10", "mesh-ns"))
+            .unwrap();
+        assert_eq!(seq, 13, "compaction preserves the sequence base");
+        drop(ob);
+
+        // The size trigger, on the startup path: a file past 8 MiB whose
+        // entries are all acknowledged is compacted away when the outbox is
+        // opened — no append is needed to bound it.
+        let dir2 = outbox_scratch("compaction-size");
+        let big = "x".repeat(3_000_000);
+        {
+            let ob2 = EventOutbox::open(&dir2).expect("the outbox opens");
+            for _ in 0..3 {
+                let mut p = created("big", "mesh-ns");
+                if let ThalamicPulse::Created { kind, .. } = &mut p {
+                    *kind = big.clone();
+                }
+                ob2.append(EventClass::Mesh, &p).unwrap();
+            }
+            ob2.advance_offset(EventClass::Mesh, 3).unwrap();
+            ob2.advance_offset(EventClass::Audit, 3).unwrap();
+            let size = std::fs::metadata(dir2.join("event-outbox.jsonl"))
+                .unwrap()
+                .len();
+            assert!(
+                size > 8 * 1024 * 1024,
+                "the fixture really is past the bound: {size}"
+            );
+        }
+        let ob2 = EventOutbox::open(&dir2).expect("the outbox reopens");
+        assert!(
+            ob2.pending(EventClass::Mesh).is_empty(),
+            "startup compaction kept no acknowledged entry"
+        );
+        let size = std::fs::metadata(dir2.join("event-outbox.jsonl"))
+            .unwrap()
+            .len();
+        assert!(
+            size < 1024 * 1024,
+            "startup compaction shrank the file: {size}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_event_classes_still_drop_oldest() {
+        // No durability-interested subscriber is registered, so every pulse
+        // here is Class O: even with an outbox attached, the bounded bus
+        // behaves exactly as it did before Task 12 (pin).
+        let dir = outbox_scratch("class-o");
+        let bus = ThalamicBus::new(2);
+        bus.attach_event_outbox(dir.clone());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        bus.register(Box::new(SlowSubscriber {
+            log: log.clone(),
+            delay: Duration::from_millis(200),
+        }));
+        for i in 0..5 {
+            bus.emit(
+                ThalamicPulse::Archived {
+                    id: format!("{i}"),
+                    namespace: "n".into(),
+                },
+                &RecursionToken::root(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["3".to_string(), "4".to_string()],
+            "drop-oldest is unchanged for non-qualified traffic"
+        );
+        assert_eq!(bus.metrics().drops_oldest, 3);
+        assert_eq!(
+            outbox_lines(&dir),
+            0,
+            "nothing was durability-qualified, so the outbox stays empty"
+        );
+    }
 }
