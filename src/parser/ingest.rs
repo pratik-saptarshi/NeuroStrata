@@ -182,6 +182,21 @@ enum IngestItem {
         symbols: Vec<SymbolRow>,
         path_display: String,
     },
+    /// A document the secret scanner refused: skipped whole, reported
+    /// through the observer. Carries the file's display path and the
+    /// scanner's reason — never the secret itself.
+    SkippedFile {
+        path_display: String,
+        reason: String,
+    },
+}
+
+/// Secret scan over a document's text, run in the producer as the file is
+/// read — before any part of the document reaches the store. The verdict
+/// text is the reason the skip reports.
+fn scan_for_ingest(text: &str) -> Option<String> {
+    crate::secrets::scan_entry_point(text, &serde_json::json!({}), "ingest")
+        .map(|r| r.to_string())
 }
 
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
@@ -297,6 +312,38 @@ fn run_producer(
 
         let node_id = qualified_id(&namespace, &node_path);
 
+        // A parseable file is read here, before its node goes out: the
+        // document's text meets the secret scanner first, and a document
+        // that trips it is skipped whole — no node, no symbols — with the
+        // skip reported through the consumer. The rest of the walk
+        // proceeds. (Files nothing is extracted from are never read, so
+        // there is no extracted text of theirs to scan.)
+        let mut document_text: Option<String> = None;
+        if is_file {
+            if let Some(ext_os) = path.extension() {
+                let ext = normalize_ext(&ext_os.to_string_lossy());
+                if let Some(lang_name) = ext_to_lang.get(&ext) {
+                    if get_language(lang_name).is_some() {
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            if let Some(reason) = scan_for_ingest(&content) {
+                                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
+                                    path_display: path.display().to_string(),
+                                    reason,
+                                }) {
+                                    return Err(anyhow::anyhow!(
+                                        "ingest consumer dropped: {}",
+                                        e
+                                    ));
+                                }
+                                continue;
+                            }
+                            document_text = Some(content);
+                        }
+                    }
+                }
+            }
+        }
+
         // `blocking_send` applies backpressure when the bounded queue is full.
         // A closed receiver is an error: otherwise a partial walk looked like
         // success when the consumer had failed.
@@ -320,9 +367,14 @@ fn run_producer(
             let ext = normalize_ext(&ext_os.to_string_lossy());
             if let Some(lang_name) = ext_to_lang.get(&ext) {
                 if let Some(ts_lang) = get_language(lang_name) {
-                    let content = match std::fs::read_to_string(path) {
-                        Ok(c) => c,
-                        Err(_) => continue,
+                    // Read in the scan step above; the fallback covers a
+                    // file that changed between the two reads.
+                    let content = match document_text.take() {
+                        Some(c) => c,
+                        None => match std::fs::read_to_string(path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        },
                     };
 
                     let mut parser = Parser::new();
@@ -528,6 +580,15 @@ async fn run_consumer(
                     if let Some(observer) = &observer {
                         observer.file_ingested(&path_display, symbols_stored);
                     }
+                }
+            }
+            IngestItem::SkippedFile {
+                path_display,
+                reason,
+            } => {
+                println!("Skipped {} during ingest: {}", path_display, reason);
+                if let Some(observer) = &observer {
+                    observer.file_skipped(&path_display, &reason);
                 }
             }
         }

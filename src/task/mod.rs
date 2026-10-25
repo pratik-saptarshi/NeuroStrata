@@ -382,6 +382,18 @@ async fn store_new_task(
     Ok((id, payload))
 }
 
+/// Secret scan over a task write's caller-supplied strings, in the
+/// add_memory refusal shape: the scanner's verdict text is the refusal.
+/// A task write is a store write, so it meets the same scanner.
+fn scan_for_task_create(title: &str, metadata: &Value) -> Option<String> {
+    crate::secrets::scan_entry_point(title, metadata, "task_create").map(|r| r.to_string())
+}
+
+/// The task_update surface of the same scan (see scan_for_task_create).
+fn scan_for_task_update(title: &str, metadata: &Value) -> Option<String> {
+    crate::secrets::scan_entry_point(title, metadata, "task_update").map(|r| r.to_string())
+}
+
 // ── tool: neurostrata_task_create ──────────────────────────────────────────
 
 pub async fn handle_task_create(
@@ -494,6 +506,15 @@ pub async fn handle_task_create(
         // The child declares its container (vocabulary: target_to_self), so
         // the materialized edge runs parent -> subtask.
         top_level.insert("contained_by".to_string(), json!([parent]));
+    }
+
+    // The caller's strings meet the scanner before the write below — the
+    // only store write in this handler. The title scans as content; the
+    // assembled metadata (description, labels, blocked_by, links) scans
+    // as the metadata values it is stored as.
+    let scan_meta = json!({ "fields": task_meta.clone(), "links": top_level.clone() });
+    if let Some(rejection) = scan_for_task_create(&title, &scan_meta) {
+        return rejection;
     }
 
     match store_new_task(
@@ -772,6 +793,19 @@ pub async fn handle_task_update(
         && !has_blocked_by
     {
         return "ERROR: nothing to update: pass at least one of title, status, note, priority, assignee, add_labels, blocked_by.".to_string();
+    }
+
+    // The caller's strings meet the scanner before the task is loaded for
+    // writing: the new title as content, the note / assignee / add_labels /
+    // blocked_by as the metadata values they are stored as.
+    let scan_meta = json!({
+        "note": &note,
+        "assignee": &assignee,
+        "add_labels": &add_labels,
+        "blocked_by": &blocked_by,
+    });
+    if let Some(rejection) = scan_for_task_update(new_title.as_deref().unwrap_or(""), &scan_meta) {
+        return rejection;
     }
 
     let (mut task, mut vector) = match load_task(&store, &namespace, &id).await {

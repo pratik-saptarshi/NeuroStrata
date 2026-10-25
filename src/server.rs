@@ -2664,6 +2664,13 @@ pub(crate) enum MetadataOutcome {
     Ingested,
 }
 
+/// Secret scan over replacement metadata values, in the add_memory
+/// refusal shape. Setting metadata is a store write, so the values meet
+/// the same scanner before anything is read or written.
+fn scan_for_set_metadata(metadata: &serde_json::Value) -> Option<String> {
+    crate::secrets::scan_entry_point("", metadata, "set_metadata").map(|r| r.to_string())
+}
+
 /// Update metadata on an existing memory without changing its ID or content.
 ///
 /// This is the operator's surgical path for fixing metadata issues (like missing
@@ -2674,6 +2681,10 @@ pub(crate) async fn set_metadata(
     id: &str,
     new_metadata: serde_json::Value,
 ) -> anyhow::Result<MetadataOutcome> {
+    if let Some(rejection) = scan_for_set_metadata(&new_metadata) {
+        return Err(anyhow::anyhow!("{}", rejection));
+    }
+
     let (vector, mut payload) = match store.get(namespace, id).await? {
         Some(found) => found,
         None => return Ok(MetadataOutcome::NotFound),
