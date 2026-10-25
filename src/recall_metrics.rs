@@ -216,4 +216,46 @@ mod tests {
             &format!("bounded-id-{}", RECENTLY_RECALLED_CAP + 4)
         ));
     }
+
+    /// RECENTLY_RECALLED is a process-global static: poisoning it in this
+    /// process would poison every sibling test that touches it, permanently.
+    /// The scenario therefore runs in a child process (the `crash.rs`
+    /// pattern): the child poisons the static, then the production calls
+    /// must degrade -- skip the recording, report no promotion -- instead of
+    /// panicking. The parent asserts the child exited clean.
+    #[test]
+    fn poisoned_lock_returns_error_not_panic() {
+        if std::env::var("NEUROSTRATA_RECALL_POISON_CHILD").is_ok() {
+            // Panic in a scoped thread while it holds the static lock: the
+            // mutex is poisoned when the thread unwinds out of the guard.
+            std::thread::scope(|scope| {
+                let _ = scope
+                    .spawn(|| {
+                        let _guard = RECENTLY_RECALLED.lock().unwrap();
+                        panic!("deliberate poison for the lock-policy test");
+                    })
+                    .join();
+            });
+            record_recall("poison-ns", &["id-1".to_string()]);
+            assert!(
+                !record_promotion("poison-ns", "id-1"),
+                "a poisoned recently-recalled lock reports no promotion"
+            );
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("recall_metrics::tests::poisoned_lock_returns_error_not_panic")
+            .arg("--nocapture")
+            .env("NEUROSTRATA_RECALL_POISON_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the child runs");
+        assert!(
+            status.success(),
+            "the poisoned-static child degrades instead of panicking"
+        );
+    }
 }

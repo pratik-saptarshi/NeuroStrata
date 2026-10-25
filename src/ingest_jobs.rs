@@ -365,4 +365,42 @@ mod tests {
             "another namespace starts its own"
         );
     }
+
+    #[tokio::test]
+    async fn poisoned_lock_returns_error_not_panic() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+
+        let jobs = Arc::new(IngestJobs::new());
+        // Panic in a scoped thread while it holds the jobs lock: the mutex
+        // is poisoned when the thread unwinds out of the guard.
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = jobs.jobs.lock().unwrap();
+                    panic!("deliberate poison for the lock-policy test");
+                })
+                .join();
+        });
+
+        let schema = crate::parser::schema::ParserSchema {
+            languages: std::collections::HashMap::new(),
+        };
+        let outcome = jobs
+            .run(
+                "ns",
+                "/nonexistent",
+                schema,
+                Arc::new(StubEmbedder),
+                Arc::new(MockStore::default()),
+            )
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a poisoned jobs lock fails the run with an error, not a panic"
+        );
+        assert!(
+            !jobs.wait_idle(std::time::Duration::from_millis(1)).await,
+            "a poisoned jobs lock cannot confirm idle"
+        );
+    }
 }
