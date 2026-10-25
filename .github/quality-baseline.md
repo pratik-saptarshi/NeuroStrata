@@ -32,11 +32,13 @@ Rules that keep this file honest:
 
 ## fmt — `cargo fmt --check`
 
-**212 diff hunks across 38 files.** Counting rule: one finding per
-`Diff in <file>:<line>` block in the `cargo fmt --check` output.
+**168 diff hunks across 37 files** (212 across 38 at sizing; slice 1
+retired `src/server.rs`'s 44 — see the slice plan below). Counting
+rule: one finding per `Diff in <file>:<line>` block in the
+`cargo fmt --check` output.
 
-Per-file hunks (the Task 15b slice map, largest first): `src/server.rs`
-44, `src/daemon.rs` 20, `src/buffer.rs` 20, `src/task/intake.rs` 15,
+Per-file hunks (the Task 15b slice map, largest first): `src/daemon.rs`
+20, `src/buffer.rs` 20, `src/task/intake.rs` 15,
 `src/synaptic_mesh/import.rs` 13, `src/store/ladybug.rs` 9,
 `src/recall_metrics.rs` 6, `src/learning/dataset.rs` 6,
 `src/judgment/mod.rs` 6, `src/task/mod.rs` 5, `src/main.rs` 5,
@@ -49,8 +51,9 @@ Per-file hunks (the Task 15b slice map, largest first): `src/server.rs`
 
 ## clippy — `cargo clippy --locked -- -D warnings`
 
-**210 diagnostics.** Counting rule: rustc's own tally in the job log
-("could not compile `neurostrata-mcp` … due to 210 previous errors").
+**204 diagnostics** (210 at sizing; slice 1 retired the 6 located in
+`src/server.rs`). Counting rule: rustc's own tally in the job log
+("could not compile `neurostrata-mcp` … due to N previous errors").
 
 Lint classes named in the log's (deduplicated) notes — a floor, not a
 census: rustc `unused-imports`, `unused-variables`, `unused-mut`,
@@ -194,4 +197,15 @@ retired below.
 | 12 | `src/config.rs` | 4 |
 | 13 | remainder tail (`src/guard/*`, `src/tools/procedure.rs`, `src/registry.rs`, `src/traits.rs`, `tests/*`, and any tail file not absorbed by slices 6–11) | remainder of 41 tail hunks |
 
-Slices retired: none yet.
+Slices retired:
+
+- **Slice 1 — `src/server.rs`** (this change): fmt 44 hunks → 0;
+  clippy 6 diagnostics → 0 (2 `useless-format`, 2 `needless-borrow`,
+  1 `redundant-pattern-matching`, 1 `redundant-closure`; no
+  `#[allow]` added). Counts after: fmt **168 hunks / 37 files**,
+  clippy **204**. Evidence: the slice branch's diagnostics dispatch
+  (fork CI run 40185970067) first reproduced the sizing map exactly
+  (212 hunks / 38 files, `src/server.rs` 44; clippy 210) on the
+  unmodified tree; the formatted `src/server.rs` was produced by
+  `cargo fmt` in that run and applied unchanged, and the verification
+  dispatch's `fmt`/`clippy` job logs show no `src/server.rs` finding.

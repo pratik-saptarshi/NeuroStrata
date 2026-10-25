@@ -699,18 +699,13 @@ pub async fn process_mcp_request(
                                 crate::task::handle_task_validate(arguments, store.clone()).await;
                         }
                         "neurostrata_task_intake" => {
-                            result_text = crate::task::intake::handle_intake(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
+                            result_text =
+                                crate::task::intake::handle_intake(arguments, store.clone()).await;
                         }
                         "neurostrata_task_intake_list" => {
-                            result_text = crate::task::intake::handle_intake_list(
-                                arguments,
-                                store.clone(),
-                            )
-                            .await;
+                            result_text =
+                                crate::task::intake::handle_intake_list(arguments, store.clone())
+                                    .await;
                         }
                         "neurostrata_task_intake_resolve" => {
                             result_text = crate::task::intake::handle_intake_resolve(
@@ -736,7 +731,12 @@ pub async fn process_mcp_request(
                             .await;
                         }
                         "neurostrata_append_log" => {
-                            result_text = crate::buffer::handle_append_log(arguments, emb.clone(), store.clone()).await;
+                            result_text = crate::buffer::handle_append_log(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_guard_validate" => {
                             result_text = handle_guard_validate(
@@ -1411,7 +1411,10 @@ pub(crate) async fn embed_dedup_and_upsert(
     }
 
     // Write unless blocked.
-    if matches!(decision, DedupDecision::BlockedExact | DedupDecision::BlockedModel) {
+    if matches!(
+        decision,
+        DedupDecision::BlockedExact | DedupDecision::BlockedModel
+    ) {
         return Ok(MemoryWriteReport {
             upsert: None,
             decision,
@@ -1630,17 +1633,18 @@ async fn handle_add_memory(
                     match decision {
                         DedupDecision::LinkedExisting => {
                             let id = linked_id.unwrap_or_default();
-                            return format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id);
+                            return format!(
+                                "Reused existing memory for namespace: {}\nMemory ID: {}",
+                                namespace, id
+                            );
                         }
                         DedupDecision::BlockedExact => {
-                            return format!(
-                                "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
-                            );
+                            return "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
+                                .to_string();
                         }
                         DedupDecision::BlockedModel => {
-                            return format!(
-                                "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory."
-                            );
+                            return "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory."
+                                .to_string();
                         }
                         _ => {}
                     }
@@ -1836,7 +1840,9 @@ async fn handle_get_snapshot(
     let (mode, requested_slugs) = match domain_arg {
         None => ("recent_domain", Vec::new()),
         Some(Value::String(s)) => {
-            let slugs = crate::domain::normalize_domain_slug(s).into_iter().collect();
+            let slugs = crate::domain::normalize_domain_slug(s)
+                .into_iter()
+                .collect();
             ("explicit", slugs)
         }
         Some(Value::Array(arr)) => {
@@ -1857,7 +1863,13 @@ async fn handle_get_snapshot(
         .filter(|r| {
             !matches!(
                 r.payload.memory_type.as_str(),
-                "directory" | "file" | "markdown" | "freshness_flag" | "guard_event" | "task" | "procedure"
+                "directory"
+                    | "file"
+                    | "markdown"
+                    | "freshness_flag"
+                    | "guard_event"
+                    | "task"
+                    | "procedure"
             )
         })
         .filter(|r| crate::domain::domain_key(&r.payload.metadata).is_some())
@@ -2276,7 +2288,7 @@ async fn handle_supersede_memory(
         }
     }
 
-    let vector = match emb.embed(&content).await {
+    let vector = match emb.embed(content).await {
         Ok(v) => v,
         // The whole point of superseding rather than editing: the new text gets
         // its own embedding, so search stops matching the words we replaced.
@@ -2516,8 +2528,8 @@ async fn handle_search_memory(
         .filter_map(crate::domain::normalize_domain_slug)
         .collect();
 
-    if let Ok(_) = store.init(namespace).await {
-        if let Ok(vec) = emb.embed(&query).await {
+    if store.init(namespace).await.is_ok() {
+        if let Ok(vec) = emb.embed(query).await {
             if let Ok(outcome) = store
                 .search_with_domain(
                     namespace,
@@ -2781,9 +2793,18 @@ pub(crate) fn format_memory(id: &str, payload: &MemoryPayload) -> String {
     let mut out = format!("--- Memory ID: {} ---\nType: {}", id, payload.memory_type);
     if crate::attempt::is_failed_attempt(&payload.metadata) {
         let attempt = payload.metadata.get("attempt").unwrap();
-        let context = attempt.get("context").and_then(|v| v.as_str()).unwrap_or("");
-        let approach = attempt.get("approach").and_then(|v| v.as_str()).unwrap_or("");
-        let failure_mode = attempt.get("failure_mode").and_then(|v| v.as_str()).unwrap_or("");
+        let context = attempt
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let approach = attempt
+            .get("approach")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let failure_mode = attempt
+            .get("failure_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         out.push_str(&format!(
             "\nAttempt [FAILED in {}]: tried '{}' -> failed with '{}' (single episode, not a global rule)",
             context, approach, failure_mode
@@ -2905,12 +2926,10 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                 let second = &ev.path[1];
                 // The intermediate is the node the two edges share: the endpoint
                 // of the first edge that is also an endpoint of the second.
-                let intermediate = if first.source == second.source
-                    || first.source == second.target
+                let intermediate = if first.source == second.source || first.source == second.target
                 {
                     first.source.as_str()
-                } else if first.target == second.source || first.target == second.target
-                {
+                } else if first.target == second.source || first.target == second.target {
                     first.target.as_str()
                 } else {
                     continue;
@@ -2973,19 +2992,25 @@ fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
         if !forward && edge.target != current {
             continue;
         }
-        let next = if forward { edge.target.as_str() } else { edge.source.as_str() };
+        let next = if forward {
+            edge.target.as_str()
+        } else {
+            edge.source.as_str()
+        };
         // The vocabulary declares the direction: an undirected relation has no
         // arrow, so the connector marks it instead.
-        let connector =
-            if crate::traits::memory_vocabulary()["relations"][edge.relation.as_str()]["direction"] == "undirected" {
-                format!(" --{}-- ", edge.relation)
-            } else if forward {
-                // Forward: source -> target
-                format!(" -{}- ", edge.relation)
-            } else {
-                // Reverse: target <- source
-                format!(" <-{}- ", edge.relation)
-            };
+        let connector = if crate::traits::memory_vocabulary()["relations"][edge.relation.as_str()]
+            ["direction"]
+            == "undirected"
+        {
+            format!(" --{}-- ", edge.relation)
+        } else if forward {
+            // Forward: source -> target
+            format!(" -{}- ", edge.relation)
+        } else {
+            // Reverse: target <- source
+            format!(" <-{}- ", edge.relation)
+        };
         parts.push(format!("\"{}\"{}\"{}\"", current, connector, next));
         current = next;
     }
@@ -3071,11 +3096,13 @@ async fn handle_guard_validate(
     if mutating {
         // Determine whether this namespace is task-enabled.
         if let Ok(memories) = store.list(&namespace, None, None).await {
-            let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
+            let has_any_task = memories.iter().any(crate::task::gate::is_task);
             if has_any_task {
-                let has_in_progress = memories
-                    .iter()
-                    .any(|m| crate::task::gate::is_task(m) && crate::task::gate::task_status(m) == crate::task::machine::Status::InProgress);
+                let has_in_progress = memories.iter().any(|m| {
+                    crate::task::gate::is_task(m)
+                        && crate::task::gate::task_status(m)
+                            == crate::task::machine::Status::InProgress
+                });
                 if !has_in_progress {
                     let trace_id = format!(
                         "guard-validate-{}-{}",
@@ -3748,21 +3775,17 @@ mod tests {
                 cb_backoff_max_seconds: 60,
             };
             let _ = &mut cfg;
-            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(
+                cfg, provider,
+            ));
 
             let incoming = payload("same subject");
             let mut incoming = incoming;
             incoming.memory_type = "fact".to_string();
             // no attempt
 
-            let res = embed_dedup_and_upsert(
-                &store,
-                &emb,
-                "probe",
-                &incoming,
-                Some(&checker),
-            )
-            .await;
+            let res =
+                embed_dedup_and_upsert(&store, &emb, "probe", &incoming, Some(&checker)).await;
             assert!(res.is_ok(), "write should succeed: {:?}", res);
             assert_eq!(
                 *calls.lock().unwrap(),
@@ -3804,7 +3827,9 @@ mod tests {
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
             };
-            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(
+                cfg, provider,
+            ));
 
             let mut incoming = payload("same subject");
             incoming.memory_type = "fact".to_string();
@@ -3817,14 +3842,8 @@ mod tests {
                 }
             });
 
-            let res = embed_dedup_and_upsert(
-                &store,
-                &emb,
-                "probe",
-                &incoming,
-                Some(&checker),
-            )
-            .await;
+            let res =
+                embed_dedup_and_upsert(&store, &emb, "probe", &incoming, Some(&checker)).await;
             assert!(res.is_ok(), "write should succeed: {:?}", res);
             assert_eq!(
                 *calls.lock().unwrap(),
@@ -3873,7 +3892,9 @@ mod tests {
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
             };
-            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(
+                cfg, provider,
+            ));
 
             let mut incoming = payload("same subject");
             incoming.memory_type = "fact".to_string();
@@ -3886,21 +3907,19 @@ mod tests {
                 }
             });
 
-            let res = embed_dedup_and_upsert(
-                &store,
-                &emb,
-                "probe",
-                &incoming,
-                Some(&checker),
-            )
-            .await;
+            let res =
+                embed_dedup_and_upsert(&store, &emb, "probe", &incoming, Some(&checker)).await;
             assert!(res.is_ok(), "write should succeed: {:?}", res);
             assert_eq!(
                 *calls.lock().unwrap(),
                 1,
                 "provider must be called for same-attempt candidates"
             );
-            assert_eq!(*last.lock().unwrap(), 1, "the candidate must be handed over");
+            assert_eq!(
+                *last.lock().unwrap(),
+                1,
+                "the candidate must be handed over"
+            );
         }
     }
 
@@ -4925,7 +4944,11 @@ mod tests {
             .await
             .expect("list")
             .into_iter()
-            .find(|r| r.payload.content.starts_with("a rule written under a domain"))
+            .find(|r| {
+                r.payload
+                    .content
+                    .starts_with("a rule written under a domain")
+            })
             .expect("the memory is stored");
         assert_eq!(stored.payload.metadata["domain"], serde_json::json!("!!!"));
         assert_eq!(
@@ -6376,10 +6399,7 @@ mod tests {
             bus.clone(),
         )
         .await;
-        assert!(
-            reply.starts_with("Successfully added memory"),
-            "{reply}"
-        );
+        assert!(reply.starts_with("Successfully added memory"), "{reply}");
 
         let rows = store.list("probe", None, None).await.expect("list");
         let proc_row = rows
@@ -6393,8 +6413,7 @@ mod tests {
             proc_row.payload.metadata
         );
 
-        let root =
-            std::env::temp_dir().join(format!("ns-task3-local-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("ns-task3-local-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("scratch root");
         let outcome_text = crate::tools::procedure::handle_procedure_perform(
             serde_json::json!({
@@ -6424,10 +6443,7 @@ mod tests {
             bus,
         )
         .await;
-        assert!(
-            reply.starts_with("Successfully added memory"),
-            "{reply}"
-        );
+        assert!(reply.starts_with("Successfully added memory"), "{reply}");
         let rows = store.list("probe", None, None).await.expect("list");
         let rule_row = rows
             .iter()
@@ -7044,7 +7060,10 @@ mod tests {
     async fn the_snapshot_body_holds_no_registry_row() {
         let (store, _live_id) = store_with_one_rule("probe").await;
         let registry_id = crate::registry::registry_row_id("probe");
-        let vector = StubEmbedder.embed("Domain registry for probe").await.unwrap();
+        let vector = StubEmbedder
+            .embed("Domain registry for probe")
+            .await
+            .unwrap();
         let mut p = payload("Domain registry for probe");
         p.memory_type = "fact".to_string();
         p.metadata = crate::registry::registry_metadata(&["auth".to_string()]);
@@ -7053,12 +7072,9 @@ mod tests {
             .await
             .expect("seed the registry row");
 
-        let text = handle_get_snapshot(
-            serde_json::json!({ "namespace": "probe" }),
-            store,
-        )
-        .await
-        .expect("snapshot");
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
         assert!(
             !text.contains(&registry_id),
             "the registry row is absent from the snapshot body: {text}"
@@ -7067,10 +7083,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fact_written_with_a_free_text_domain_is_recalled_by_its_slug_tag() {
-        let dir = std::env::temp_dir().join(format!(
-            "ns-recall-real-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("ns-recall-real-{}", uuid::Uuid::new_v4()));
         // Create the parent directory for both the store and buffer
         std::fs::create_dir_all(&dir).expect("create parent dir");
         // Use a subdirectory path for the LadybugStore database (not created yet)
@@ -7095,7 +7108,11 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(add_result.starts_with("Successfully added memory"), "add failed: {}", add_result);
+        assert!(
+            add_result.starts_with("Successfully added memory"),
+            "add failed: {}",
+            add_result
+        );
         // Extract the fact ID from the response
         let fact_id = add_result
             .lines()
@@ -7133,15 +7150,32 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&recall_result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false), "appended was false or missing: {}", recall_result);
-        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert!(
+            parsed
+                .get("appended")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "appended was false or missing: {}",
+            recall_result
+        );
+        let recalled = parsed
+            .get("recalled")
+            .expect("recalled field must be present");
         let recalled_arr = recalled.as_array().unwrap();
-        assert_eq!(recalled_arr.len(), 1, "exactly one fact recalled: {}", recall_result);
+        assert_eq!(
+            recalled_arr.len(),
+            1,
+            "exactly one fact recalled: {}",
+            recall_result
+        );
         assert_eq!(
             recalled_arr[0].get("id").and_then(|v| v.as_str()),
             Some(fact_id.as_str())
         );
-        assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+        assert_eq!(
+            parsed.get("recalled_from").and_then(|v| v.as_str()),
+            Some("domain")
+        );
 
         // Read access_count AFTER recall (must be present and unchanged)
         let after = store
@@ -7157,7 +7191,10 @@ mod tests {
             .as_u64()
             .expect("access_count must be a number");
         assert_eq!(access_after, 0, "access_count must still be 0 after recall");
-        assert_eq!(access_after, access_before, "access_count must not change during recall");
+        assert_eq!(
+            access_after, access_before,
+            "access_count must not change during recall"
+        );
     }
 
     /// The neurostrata_append_log tool's inputSchema must carry the optional
@@ -7173,15 +7210,8 @@ mod tests {
             params: Some(serde_json::json!({})),
         };
         let (bus, _seen) = recording_bus();
-        let response = process_mcp_request(
-            request,
-            Arc::new(StubEmbedder),
-            store,
-            ingests,
-            None,
-            bus,
-        )
-        .await;
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools/list returns an array");
@@ -7192,12 +7222,20 @@ mod tests {
         let props = append_log["inputSchema"]["properties"]
             .as_object()
             .expect("inputSchema.properties must be an object");
-        assert!(props.contains_key("namespace"), "namespace property missing: {:?}", props);
+        assert!(
+            props.contains_key("namespace"),
+            "namespace property missing: {:?}",
+            props
+        );
         let required = append_log["inputSchema"]["required"]
             .as_array()
             .expect("required must be an array");
         let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
-        assert!(!required_names.contains(&"namespace"), "namespace must not be in required: {:?}", required_names);
+        assert!(
+            !required_names.contains(&"namespace"),
+            "namespace must not be in required: {:?}",
+            required_names
+        );
     }
 
     /// End-to-end MCP path: tools/call → dispatch → handler → JSON with recalled.
@@ -7257,16 +7295,33 @@ mod tests {
             .expect("content[0].text must be a string");
         // Branch-tolerant: buffer may be disabled by machine config
         if text.contains("Episodic Buffer disabled") {
-            assert!(!text.contains("\"appended\":true"), "disabled response must not claim success: {}", text);
+            assert!(
+                !text.contains("\"appended\":true"),
+                "disabled response must not claim success: {}",
+                text
+            );
         } else {
-            let parsed: serde_json::Value = serde_json::from_str(text)
-                .expect("handler returns JSON");
-            assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
-            assert!(parsed.get("recalled").is_some(), "recalled must be present: {}", text);
+            let parsed: serde_json::Value =
+                serde_json::from_str(text).expect("handler returns JSON");
+            assert!(parsed
+                .get("appended")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false));
+            assert!(
+                parsed.get("recalled").is_some(),
+                "recalled must be present: {}",
+                text
+            );
             let recalled = parsed.get("recalled").unwrap().as_array().unwrap();
             assert_eq!(recalled.len(), 1);
-            assert_eq!(recalled[0].get("id").and_then(|v| v.as_str()), Some(fact_id));
-            assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+            assert_eq!(
+                recalled[0].get("id").and_then(|v| v.as_str()),
+                Some(fact_id)
+            );
+            assert_eq!(
+                parsed.get("recalled_from").and_then(|v| v.as_str()),
+                Some("domain")
+            );
         }
     }
 
@@ -7276,10 +7331,9 @@ mod tests {
     /// (src/server.rs:2468) -- so this pins an outgoing GOVERNS edge's text.
     #[tokio::test]
     async fn an_outgoing_directed_edge_is_printed_from_the_primary() {
-        let dir =
-            std::env::temp_dir().join(format!("ns-outgoing-render-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let dir = std::env::temp_dir().join(format!("ns-outgoing-render-{}", uuid::Uuid::new_v4()));
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The target first: an edge target must exist before the row that
@@ -7345,10 +7399,9 @@ mod tests {
     /// intermediate, to the neighbour that governs the intermediate.
     #[tokio::test]
     async fn a_two_hop_path_is_printed_from_the_primary_to_the_neighbour() {
-        let dir =
-            std::env::temp_dir().join(format!("ns-two-hop-render-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let dir = std::env::temp_dir().join(format!("ns-two-hop-render-{}", uuid::Uuid::new_v4()));
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The intermediate: an edge target must exist before the row that
@@ -7435,8 +7488,8 @@ mod tests {
     async fn an_undirected_relation_is_printed_once_with_an_undirected_connector() {
         let dir =
             std::env::temp_dir().join(format!("ns-undirected-render-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The neighbour: an edge target must exist before the row that
@@ -7488,8 +7541,7 @@ mod tests {
             .find(|l| l.contains("Path [one_hop]:"))
             .expect("the neighbour must carry the one-hop path");
         assert_eq!(
-            line,
-            "Path [one_hop]: \"probe::primary\" --RELATES_TO-- \"probe::neighbour\"",
+            line, "Path [one_hop]: \"probe::primary\" --RELATES_TO-- \"probe::neighbour\"",
             "an undirected relation is printed once, with an undirected connector"
         );
     }
@@ -7534,8 +7586,8 @@ mod tests {
     async fn a_two_hop_path_with_a_directed_first_hop_shows_its_orientation() {
         let dir =
             std::env::temp_dir().join(format!("ns-two-hop-directed-{}", uuid::Uuid::new_v4()));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // The intermediate: the target of both GOVERNS edges.
@@ -7608,7 +7660,6 @@ mod tests {
             line,
             "Path [governs_2hop]: \"probe::primary\" -GOVERNS- \"probe::mid\" \
              \"probe::mid\" <-GOVERNS- \"probe::ruler\"",
-
             "a directed first hop must show the graph's direction"
         );
     }
@@ -7658,7 +7709,10 @@ mod tests {
         )
         .await
         .expect("snapshot");
-        assert!(text2.contains(&low_id), "strap holds the low fact (explicit): {text2}");
+        assert!(
+            text2.contains(&low_id),
+            "strap holds the low fact (explicit): {text2}"
+        );
     }
 
     #[tokio::test]
@@ -7668,7 +7722,11 @@ mod tests {
         // Five high-access rows, one of them domain-tagged.
         let domain_high_id = "high-domain".to_string();
         for i in 0..5 {
-            let id = if i == 0 { domain_high_id.clone() } else { format!("high-{}", i) };
+            let id = if i == 0 {
+                domain_high_id.clone()
+            } else {
+                format!("high-{}", i)
+            };
             let mut p = payload(&format!("high access rule {}", i));
             if i == 0 {
                 p.metadata = serde_json::json!({ "domain": "auth", "access_count": 10 });
@@ -7818,7 +7876,10 @@ mod tests {
     async fn the_snapshot_names_the_registered_domains() {
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let registry_id = crate::registry::registry_row_id("probe");
-        let vector = StubEmbedder.embed("Domain registry for probe").await.unwrap();
+        let vector = StubEmbedder
+            .embed("Domain registry for probe")
+            .await
+            .unwrap();
         let mut p = payload("Domain registry for probe");
         p.memory_type = "fact".to_string();
         p.metadata = crate::registry::registry_metadata(&[
@@ -7892,10 +7953,12 @@ mod tests {
         let before_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
             .as_u64()
             .unwrap();
-        let before_bypass = crate::recall_metrics::domain_filter_snapshot()["single_domain_bypasses"]
+        let before_bypass = crate::recall_metrics::domain_filter_snapshot()
+            ["single_domain_bypasses"]
             .as_u64()
             .unwrap();
-        let before_narrowed = crate::recall_metrics::domain_filter_snapshot()["domain_narrowed_hits"]
+        let before_narrowed = crate::recall_metrics::domain_filter_snapshot()
+            ["domain_narrowed_hits"]
             .as_u64()
             .unwrap();
 
@@ -7909,10 +7972,12 @@ mod tests {
         let after_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
             .as_u64()
             .unwrap();
-        let after_bypass = crate::recall_metrics::domain_filter_snapshot()["single_domain_bypasses"]
+        let after_bypass = crate::recall_metrics::domain_filter_snapshot()
+            ["single_domain_bypasses"]
             .as_u64()
             .unwrap();
-        let after_narrowed = crate::recall_metrics::domain_filter_snapshot()["domain_narrowed_hits"]
+        let after_narrowed = crate::recall_metrics::domain_filter_snapshot()
+            ["domain_narrowed_hits"]
             .as_u64()
             .unwrap();
         assert_eq!(after_total, before_total + 1);
@@ -7938,5 +8003,4 @@ mod tests {
             .unwrap();
         assert_eq!(after, before + 1);
     }
-
 }
