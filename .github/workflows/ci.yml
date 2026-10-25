@@ -132,4 +132,10 @@ jobs:
 
       - name: Test
         shell: bash
+        env:
+          # LadybugDB #1386 validation: force lbug's build script to
+          # compile its engine source instead of downloading a prebuilt
+          # engine of the latest release. Provenance probe:
+          # engine_provenance_is_source_build in src/store/ladybug.rs.
+          LBUG_BUILD_FROM_SOURCE: "1"
         run: cargo test --locked -- --test-threads=1

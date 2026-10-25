@@ -6545,6 +6545,25 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
         let _ = std::fs::remove_file(width_marker_path(&dir));
     }
+
+    /// Provenance probe for the LadybugDB #1386 validation runs
+    /// (plan `2026-10-25-lbug-1386-validation.md`, Task 0 Step 3):
+    /// every validation run must prove its engine was compiled from
+    /// source — the published lbug crate's build script otherwise
+    /// tries downloading a prebuilt engine of the *latest* release.
+    /// CI sets `LBUG_BUILD_FROM_SOURCE=1`; this asserts the build
+    /// actually took the source path (the crate's `build.rs` emits
+    /// `LBUG_PRECOMPILED_SOURCE=source` only on that path).
+    #[test]
+    fn engine_provenance_is_source_build() {
+        assert_eq!(
+            lbug::LBUG_LIBRARY_SOURCE, "source",
+            "engine was not source-built (LBUG_LIBRARY_SOURCE = {:?}); \
+             a validation run on this build is void",
+            lbug::LBUG_LIBRARY_SOURCE
+        );
+    }
+
     /// Child worker for `profile_cap_refusal_fires_at_reduced_cap`:
     /// grows a store at an 8 MiB max-DB cap on incompressible rows,
     /// checkpointing after each upsert — a
