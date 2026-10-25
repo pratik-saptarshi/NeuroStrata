@@ -208,4 +208,5 @@ Slices retired:
   (212 hunks / 38 files, `src/server.rs` 44; clippy 210) on the
   unmodified tree; the formatted `src/server.rs` was produced by
   `cargo fmt` in that run and applied unchanged, and the verification
-  dispatch's `fmt`/`clippy` job logs show no `src/server.rs` finding.
+  dispatch (fork CI run 40187362864)'s `fmt`/`clippy` job logs show
+  no `src/server.rs` finding.
