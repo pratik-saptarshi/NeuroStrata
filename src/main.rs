@@ -3356,6 +3356,169 @@ mod tests {
 
         assert!(gate_verify_daemon(None, own).is_err());
     }
+
+    // ---- Task 19 (J26): the tracing subscriber these tests presume ----
+    //
+    // Until this task the crate declared `tracing` and emitted through
+    // ~50 call sites with no subscriber installed anywhere: every event
+    // went nowhere. The production seam is `init_tracing()` at the top
+    // of `main()`: it builds the subscriber via
+    // `tracing_fmt_subscriber(std::io::stderr, tracing_env_filter())`
+    // and installs it as the global default. The writer slot is stderr
+    // because stdout is the MCP stdio channel — a log line there would
+    // corrupt the protocol. These tests drive the same builder with a
+    // capture writer standing in the stderr slot, installed as a scoped
+    // default so they never contend for the process-global one.
+
+    /// An in-memory `Write` sink handed to the fmt layer through its
+    /// `MakeWriter` closure; cloning shares the one buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Serializes the tests that set `RUST_LOG` (env is process-global)
+    /// and restores the caller's prior value on drop.
+    struct RustLogRestore {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RustLogRestore {
+        fn set(value: Option<&str>) -> Self {
+            let lock = crate::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prior = std::env::var_os("RUST_LOG");
+            match value {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for RustLogRestore {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
+    #[test]
+    fn tracing_output_reaches_stderr() {
+        // The production entry point itself runs, and running it twice
+        // in one process is not an error (a re-exec'd helper or an
+        // embedded caller must never panic on the one-shot global).
+        init_tracing();
+        init_tracing();
+
+        let _env = RustLogRestore::set(None); // default filter: info
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("tracing_output_reaches_stderr marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("tracing_output_reaches_stderr marker"),
+            "the info event lands in the stderr slot: {text}"
+        );
+        assert!(
+            text.contains("INFO"),
+            "the default filter admits info, formatted with its level: {text}"
+        );
+    }
+
+    #[test]
+    fn stdout_carries_no_log_output() {
+        let _env = RustLogRestore::set(None);
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        // Stand-ins for the stdio mode's two channels: `captured` plays
+        // the stderr role (the writer production hands the fmt layer);
+        // a plain buffer plays stdout, written the way the stdio loop
+        // writes a protocol frame.
+        let mut stdout_role: Vec<u8> = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            stdout_role.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
+            tracing::info!("stdout_carries_no_log_output marker");
+        });
+        assert_eq!(
+            String::from_utf8(stdout_role).unwrap(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1}\n",
+            "stdout carries protocol bytes only — no log output"
+        );
+        assert!(
+            captured.text().contains("stdout_carries_no_log_output marker"),
+            "the log line went to the stderr slot instead"
+        );
+    }
+
+    #[test]
+    fn rust_log_filter_is_honored() {
+        let _env = RustLogRestore::set(Some("error"));
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("rust_log_filter_is_honored info marker");
+            tracing::error!("rust_log_filter_is_honored error marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("rust_log_filter_is_honored error marker"),
+            "the error event passes the RUST_LOG=error filter: {text}"
+        );
+        assert!(
+            !text.contains("rust_log_filter_is_honored info marker"),
+            "the info event is suppressed by RUST_LOG=error: {text}"
+        );
+    }
+
+    #[test]
+    fn unparsable_rust_log_falls_back_to_info() {
+        // `lolwut` is not a level, so the directive is invalid and
+        // `try_from_env` errors: the fallback must yield the `info`
+        // default — not a bricked startup, and not a permissive
+        // filter that lets everything through.
+        let _env = RustLogRestore::set(Some("neurostrata_mcp=lolwut"));
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("unparsable_rust_log_falls_back_to_info info marker");
+            tracing::debug!("unparsable_rust_log_falls_back_to_info debug marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("unparsable_rust_log_falls_back_to_info info marker"),
+            "the info event passes the fallback filter: {text}"
+        );
+        assert!(
+            !text.contains("unparsable_rust_log_falls_back_to_info debug marker"),
+            "the debug event is suppressed — the fallback is info, not trace: {text}"
+        );
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -3725,6 +3888,50 @@ fn appended_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(value)
 }
 
+/// Install the process-wide `tracing` subscriber — until this existed,
+/// the crate's ~50 `tracing::` call sites emitted into the void (J26):
+/// `tracing` was declared, call sites assumed a subscriber, and none
+/// was ever installed. Called once at the top of `main()`, before the
+/// runtime and every mode dispatch, so the daemon, the stdio proxy,
+/// and every CLI command all log through the one subscriber.
+///
+/// The fmt layer writes to **stderr**: stdout is the MCP stdio channel,
+/// and a log line there would corrupt the protocol.
+fn init_tracing() {
+    let subscriber = tracing_fmt_subscriber(std::io::stderr, tracing_env_filter());
+    // The global default can be installed only once per process. A
+    // second call — an embedded caller, a re-exec'd helper — must
+    // never panic, so the already-installed error is dropped.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// The filter for the startup subscriber: `RUST_LOG` when it is set and
+/// parses, the `info` default otherwise. An unparsable `RUST_LOG`
+/// falls back to the default rather than bricking startup on a typo.
+fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// The fmt subscriber over an arbitrary writer: production passes
+/// `std::io::stderr`; the tests pass a capture buffer in the same
+/// slot. ANSI escapes are off — the readers are operators tailing a
+/// terminal, a log file, or the daemon's captured stderr, and plain
+/// text serves all three.
+fn tracing_fmt_subscriber<W>(
+    writer: W,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .finish()
+}
+
 /// The tokio runtime, built by hand rather than by `#[tokio::main]`.
 ///
 /// The only reason to build it by hand is the crash handler. `SA_ONSTACK`
@@ -3743,6 +3950,7 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> anyhow::Result<()> {
+    init_tracing();
     let runtime = runtime()?;
     runtime.block_on(run())
 }
