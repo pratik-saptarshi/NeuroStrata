@@ -4854,6 +4854,7 @@ impl VectorStore for LadybugStore {
         }
         let namespace = namespace.to_string();
         let staged_namespace = staged_namespace.to_string();
+        let pk_ready = self.pk_ready();
         #[cfg(test)]
         let hook_db_path = self.local_path.clone();
         let published = self.write_to_completion(
@@ -4932,10 +4933,26 @@ impl VectorStore for LadybugStore {
                         let safe_new_id = escape_ladybug_string(&new_id);
                         let safe_metadata =
                             escape_ladybug_string(&serde_json::to_string(&metadata)?);
+                        // Task 7 fix round: the promoted row is a fresh
+                        // CREATE, so on a pk-carrying table it must supply
+                        // the derived key (memory_pk of the destination
+                        // namespace and the new id) as create input — the
+                        // binder refuses a create that omits the primary
+                        // key. In legacy mode (no pk column) the fragment
+                        // is empty and the statement is unchanged.
+                        let pk_prop = if pk_ready {
+                            format!(
+                                "pk: '{}', ",
+                                escape_ladybug_string(&memory_pk(&namespace, &new_id))
+                            )
+                        } else {
+                            String::new()
+                        };
                         conn.query(&format!(
-                            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' CREATE (n:Memory {{id: '{}'}}) SET n.namespace = '{}', n.content = m.content, n.user_id = m.user_id, n.memory_type = m.memory_type, n.agent_name = m.agent_name, n.location = m.location, n.location_lines = m.location_lines, n.metadata = '{}', n.embedding = m.embedding",
+                            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' CREATE (n:Memory {{{}id: '{}'}}) SET n.namespace = '{}', n.content = m.content, n.user_id = m.user_id, n.memory_type = m.memory_type, n.agent_name = m.agent_name, n.location = m.location, n.location_lines = m.location_lines, n.metadata = '{}', n.embedding = m.embedding",
                             safe_stage_namespace,
                             safe_old_id,
+                            pk_prop,
                             safe_new_id,
                             safe_namespace,
                             safe_metadata
