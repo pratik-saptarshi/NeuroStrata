@@ -1845,6 +1845,23 @@ mod tests {
         async fn clear_ingested(&self, _namespace: &str) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn publish_ingested(
+            &self,
+            namespace: &str,
+            staged_namespace: &str,
+        ) -> anyhow::Result<usize> {
+            // Publication for the recording double is the promotion of the
+            // staged upsert records into the target namespace. It keeps no
+            // edge table (upserts report no deferred edges), so the
+            // relinked-edge count is honestly zero.
+            let mut upserts = self.upserts.lock().expect("recording store poisoned");
+            for record in upserts.iter_mut() {
+                if record.0 == staged_namespace {
+                    record.0 = namespace.to_string();
+                }
+            }
+            Ok(0)
+        }
         async fn relink_edges(&self, _namespace: &str) -> anyhow::Result<usize> {
             Ok(0)
         }
