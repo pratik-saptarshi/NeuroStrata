@@ -41,6 +41,11 @@ pub struct IngestProgress {
     pub symbols_ingested: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_file: Option<String>,
+    /// Documents the secret scanner refused during this walk, as
+    /// "path: reason" entries. A skipped document contributes nothing to
+    /// the store; the rest of the walk proceeds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relinked_edges: Option<usize>,
     pub started_unix: u64,
@@ -58,6 +63,7 @@ impl IngestProgress {
             files_ingested: 0,
             symbols_ingested: 0,
             last_file: None,
+            skipped_files: Vec::new(),
             relinked_edges: None,
             started_unix: now_unix(),
             finished_unix: None,
@@ -89,6 +95,12 @@ impl IngestObserver for ProgressReporter {
     fn relinked(&self, edges: usize) {
         self.tx
             .send_modify(|progress| progress.relinked_edges = Some(edges));
+    }
+
+    fn file_skipped(&self, path: &str, reason: &str) {
+        self.tx.send_modify(|progress| {
+            progress.skipped_files.push(format!("{}: {}", path, reason));
+        });
     }
 }
 
@@ -321,6 +333,34 @@ mod tests {
         assert_eq!(progress.symbols_ingested, 7);
         assert_eq!(progress.last_file.as_deref(), Some("src/b.rs"));
         assert_eq!(progress.relinked_edges, Some(20));
+    }
+
+    /// A skipped document is part of the job result a caller reads, so the
+    /// reporter accumulates skips into the progress alongside the counts.
+    /// (Pin for the Task 6 plumbing: passes before the producer learns to
+    /// skip, and guards the reporting leg afterwards.)
+    #[test]
+    fn progress_records_skipped_files() {
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        let reporter = ProgressReporter { tx };
+
+        reporter.file_skipped(
+            "src/evil.rs",
+            "ERROR [SECURITY]: Rejected ingest.content (github_pat). Do not store secrets.",
+        );
+
+        let progress = rx.borrow();
+        assert_eq!(progress.skipped_files.len(), 1);
+        assert!(
+            progress.skipped_files[0].starts_with("src/evil.rs"),
+            "{}",
+            progress.skipped_files[0]
+        );
+        assert!(
+            progress.skipped_files[0].contains("github_pat"),
+            "{}",
+            progress.skipped_files[0]
+        );
     }
 
     #[tokio::test]

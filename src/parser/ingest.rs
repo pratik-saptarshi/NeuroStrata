@@ -158,6 +158,10 @@ fn symbol_id(path: &str, kind: &str, name: &str, start_line: usize) -> String {
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
     fn relinked(&self, edges: usize);
+    /// A document the secret scanner refused at ingest: skipped whole and
+    /// reported here with the scanner's reason. The default ignores it, so
+    /// observers that only count progress are unchanged.
+    fn file_skipped(&self, _path: &str, _reason: &str) {}
 }
 
 /// An owned item streamed from the blocking producer to the async consumer.
@@ -178,6 +182,21 @@ enum IngestItem {
         symbols: Vec<SymbolRow>,
         path_display: String,
     },
+    /// A document the secret scanner refused: skipped whole, reported
+    /// through the observer. Carries the file's display path and the
+    /// scanner's reason — never the secret itself.
+    SkippedFile {
+        path_display: String,
+        reason: String,
+    },
+}
+
+/// Secret scan over a document's text, run in the producer as the file is
+/// read — before any part of the document reaches the store. The verdict
+/// text is the reason the skip reports.
+fn scan_for_ingest(text: &str) -> Option<String> {
+    crate::secrets::scan_entry_point(text, &serde_json::json!({}), "ingest")
+        .map(|r| r.to_string())
 }
 
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
@@ -293,6 +312,38 @@ fn run_producer(
 
         let node_id = qualified_id(&namespace, &node_path);
 
+        // A parseable file is read here, before its node goes out: the
+        // document's text meets the secret scanner first, and a document
+        // that trips it is skipped whole — no node, no symbols — with the
+        // skip reported through the consumer. The rest of the walk
+        // proceeds. (Files nothing is extracted from are never read, so
+        // there is no extracted text of theirs to scan.)
+        let mut document_text: Option<String> = None;
+        if is_file {
+            if let Some(ext_os) = path.extension() {
+                let ext = normalize_ext(&ext_os.to_string_lossy());
+                if let Some(lang_name) = ext_to_lang.get(&ext) {
+                    if get_language(lang_name).is_some() {
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            if let Some(reason) = scan_for_ingest(&content) {
+                                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
+                                    path_display: path.display().to_string(),
+                                    reason,
+                                }) {
+                                    return Err(anyhow::anyhow!(
+                                        "ingest consumer dropped: {}",
+                                        e
+                                    ));
+                                }
+                                continue;
+                            }
+                            document_text = Some(content);
+                        }
+                    }
+                }
+            }
+        }
+
         // `blocking_send` applies backpressure when the bounded queue is full.
         // A closed receiver is an error: otherwise a partial walk looked like
         // success when the consumer had failed.
@@ -316,9 +367,14 @@ fn run_producer(
             let ext = normalize_ext(&ext_os.to_string_lossy());
             if let Some(lang_name) = ext_to_lang.get(&ext) {
                 if let Some(ts_lang) = get_language(lang_name) {
-                    let content = match std::fs::read_to_string(path) {
-                        Ok(c) => c,
-                        Err(_) => continue,
+                    // Read in the scan step above; the fallback covers a
+                    // file that changed between the two reads.
+                    let content = match document_text.take() {
+                        Some(c) => c,
+                        None => match std::fs::read_to_string(path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        },
                     };
 
                     let mut parser = Parser::new();
@@ -524,6 +580,15 @@ async fn run_consumer(
                     if let Some(observer) = &observer {
                         observer.file_ingested(&path_display, symbols_stored);
                     }
+                }
+            }
+            IngestItem::SkippedFile {
+                path_display,
+                reason,
+            } => {
+                println!("Skipped {} during ingest: {}", path_display, reason);
+                if let Some(observer) = &observer {
+                    observer.file_skipped(&path_display, &reason);
                 }
             }
         }
@@ -1507,5 +1572,122 @@ mod tests {
             .unwrap()
             .is_none());
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    /// Records the documents the walk skipped, so a test asserts on the
+    /// report rather than on what the walk printed.
+    struct SkipRecorder {
+        skipped: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl IngestObserver for SkipRecorder {
+        fn file_ingested(&self, _path: &str, _symbols: usize) {}
+
+        fn relinked(&self, _edges: usize) {}
+
+        fn file_skipped(&self, path: &str, reason: &str) {
+            self.skipped
+                .lock()
+                .expect("recorder lock")
+                .push((path.to_string(), reason.to_string()));
+        }
+    }
+
+    /// Task 6 (J15): a document whose text trips the scanner is skipped
+    /// whole — no file node, no symbols — and reported with the scanner's
+    /// reason, while the rest of the walk proceeds.
+    #[tokio::test]
+    async fn secret_in_ingest_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        std::fs::write(
+            tmp.join("evil.rs"),
+            format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret),
+        )
+        .expect("write leaking file");
+
+        let db =
+            std::env::temp_dir().join(format!("ns-ingest-secret-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped document: {:?}",
+            outcome.err()
+        );
+
+        // The clean document landed whole.
+        let good_sym = qualified_id("test-ns", &symbol_id("good.rs", "functions", "clean", 1));
+        assert!(
+            store
+                .get("test-ns", &good_sym)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean symbol was stored"
+        );
+
+        // The tripping document contributed nothing: no file node, no symbol.
+        let evil_node = qualified_id("test-ns", "evil.rs");
+        assert!(
+            store
+                .get("test-ns", &evil_node)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's file node was not stored"
+        );
+        let evil_sym = qualified_id("test-ns", &symbol_id("evil.rs", "functions", "leak", 1));
+        assert!(
+            store
+                .get("test-ns", &evil_sym)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's symbol was not stored"
+        );
+
+        // And the skip was reported with the file and the scanner's reason.
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(skipped.len(), 1, "exactly one skip reported: {:?}", *skipped);
+        assert!(
+            skipped[0].0.ends_with("evil.rs"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            skipped[0].1.contains("github_pat"),
+            "skip carries the scanner category: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 }
