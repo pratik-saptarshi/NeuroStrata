@@ -9345,6 +9345,9 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn a_timed_out_dispatched_write_marks_dirty_when_it_finishes() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root =
             std::env::temp_dir().join(format!("dispatched-write-timeout-{}", uuid::Uuid::new_v4()));
         let db = root.join("fixture.store");

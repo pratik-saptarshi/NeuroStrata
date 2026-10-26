@@ -1,15 +1,15 @@
 //! Support shared by the whole crate's test build.
 //!
-//! `std::env` is process-global, so tests that mutate it must not run
-//! concurrently: one test's `remove_var` strands another's `expect`.
-//! Every env-mutating test in the crate holds [`ENV_LOCK`] for its whole
-//! body. The lock lives here, once, rather than per module — two locks in
-//! two modules would still race across modules, which is exactly the
-//! failure this prevents. New env-mutating tests anywhere in the crate
-//! must use this lock.
+//! `std::env` is process-global, so tests that mutate the same variable
+//! must not run concurrently: one test's `remove_var` strands another's
+//! `expect`. The env-mutating tests over shared variables hold
+//! [`ENV_LOCK`] for their whole body — the daemon tests
+//! (`NEUROSTRATA_PROJECT_ROOT`), the config tests (`TYPESAFE_API_KEY`),
+//! and the store tests (`NEUROSTRATA_WRITE_TIMEOUT_SECS`). New tests
+//! that mutate a shared variable must use this lock; a test mutating a
+//! variable no other test reads does not race and needs no lock.
 
-/// The one crate-wide lock serializing env-mutating tests. Held for the
-/// full body of every env-mutating test; poisoning (a panic while
-/// holding it) is tolerated at the call site so one failure cannot
-/// cascade — callers lock with `.unwrap_or_else(|e| e.into_inner())`.
+/// The crate-wide lock serializing the env-mutating tests that route
+/// through it; held for each test's full body. Poisoning (a panic while
+/// holding it) is tolerated — `.unwrap_or_else(|e| e.into_inner())`.
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
