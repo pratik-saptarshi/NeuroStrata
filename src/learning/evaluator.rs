@@ -25,8 +25,23 @@ impl EvaluationReport {
 impl Default for EvaluationReport {
     fn default() -> Self {
         Self {
-            candidate: "v0.0.0-bridge".to_string(),
+            // No candidate has been evaluated; the field names itself a
+            // placeholder rather than posing as a version.
+            candidate: "bridge-placeholder".to_string(),
             suites: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_evaluation_report_names_its_placeholder() {
+        let report = EvaluationReport::default();
+        // A default report evaluated nothing; its candidate field must name
+        // itself a placeholder rather than pose as a version.
+        assert_eq!(report.candidate, "bridge-placeholder");
     }
 }

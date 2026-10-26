@@ -1,8 +1,11 @@
 /// Local Laya ONNX inference provider implementing `JudgmentProvider` for
 /// deduplication candidate judgment. Uses canonical Rust `noul` questions and a
-/// provisioned local ONNX bundle path (`allow_download = false`). CPU inference
-/// runs inside `spawn_blocking` under a semaphore; the permit is held until the
-/// blocking job ends even if the async caller times out.
+/// provisioned local ONNX bundle path (`allow_download = false`).
+///
+/// Inference is NOT implemented in this build: `load` validates the bundle
+/// and the provider reports `RuntimeState::Unavailable`, `judge_duplicates`
+/// returns an error, and `health_check` returns `Ok(false)`. No ONNX session
+/// is ever created here.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,21 +18,21 @@ use crate::judgment::{CalibrationTier, DuplicateJudgment, JudgmentProvider};
 use crate::traits::{MemoryPayload, SearchResult};
 
 /// A `JudgmentProvider` for Laya ONNX models loaded and validated by the
-/// runtime system. Inference is performed locally via ONNX Runtime with
-/// `spawn_blocking` to avoid blocking the async runtime.
+/// runtime system. In this build the provider is a validated stub: no ONNX
+/// session is created, so it reports `Unavailable` (see module docs).
 pub struct LayaOnnxProvider {
-    /// Path to the validated ONNX bundle directory (manifest + checkpoint).
+    /// Path to the validated ONNX bundle directory (manifest.json).
     bundle_root: PathBuf,
-    /// ONNX Runtime inference semaphore, bounding concurrent CPU inference.
+    /// Semaphore bounding concurrent callers of this provider.
     inference_semaphore: Arc<Semaphore>,
     /// The last-known runtime state of this provider.
     state: crate::judgment::RuntimeState,
 }
 
 impl LayaOnnxProvider {
-    /// Load an ONNX bundle from `bundle_dir`, attaching it to the inference
-    /// semaphore. Validates the bundle layout (manifest, checkpoint paths,
-    /// embedder identity) before attaching.
+    /// Load an ONNX bundle from `bundle_dir`, attaching it to the given
+    /// semaphore. Validates the bundle's manifest first: `manifest.json`
+    /// must exist, parse as JSON, and declare an `embedder_id`.
     pub fn load(bundle_dir: &Path, semaphore: Arc<Semaphore>) -> Result<Self> {
         // Phase-0 spike validation: ensure the bundle root exists and has the
         // minimum expected artifacts. Full manifest parsing deferred to bridge.
@@ -51,7 +54,10 @@ impl LayaOnnxProvider {
         Ok(Self {
             bundle_root: canonical,
             inference_semaphore: semaphore,
-            state: crate::judgment::RuntimeState::Ready,
+            // No ONNX session is created by `load` in this build, so the
+            // provider is not Ready: report Unavailable, consistent with
+            // `judge_duplicates` erroring and `health_check` returning false.
+            state: crate::judgment::RuntimeState::Unavailable,
         })
     }
 
@@ -69,8 +75,8 @@ impl JudgmentProvider for LayaOnnxProvider {
         new_memory: &MemoryPayload,
         candidates: &[SearchResult],
     ) -> Result<Vec<DuplicateJudgment>> {
-        // Inference runs inside spawn_blocking under the semaphore; the permit
-        // is acquired first so concurrent requests are bounded.
+        // Acquire the provider's semaphore permit first, so concurrent
+        // requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
         let n = candidates.len();
         // R10: Inference is not implemented in this build.
@@ -146,7 +152,10 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        RuntimeState::Ready
+        // The local Laya training runtime is not provisioned in this build.
+        // Report Unavailable honestly rather than claiming Ready (mirrors
+        // the canonical manager in `learning::runtime`).
+        RuntimeState::Unavailable
     }
 
     /// Return the local training runtime configuration.
@@ -161,5 +170,68 @@ impl LearningRuntimeManager {
             laya_train: PathBuf::from("laya-train"),
             model_cache: PathBuf::from(".cache/laya"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_bundle_dir(label: &str, manifest: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ns-laya-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        dir
+    }
+
+    fn payload() -> MemoryPayload {
+        MemoryPayload {
+            content: "hello".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_check_reflects_provider_state() {
+        let dir = temp_bundle_dir(
+            "state",
+            r#"{"embedder_id":"test-embedder","model_version":"v-test"}"#,
+        );
+        let provider = LayaOnnxProvider::load(&dir, Arc::new(Semaphore::new(1))).unwrap();
+        // `load` creates no ONNX session in this build, so the provider must
+        // not report Ready, and its health check must agree with its state.
+        assert_eq!(provider.state(), RuntimeState::Unavailable);
+        assert!(!provider.health_check().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn judge_duplicates_reports_unavailable() {
+        let dir = temp_bundle_dir("judge", r#"{"embedder_id":"test-embedder"}"#);
+        let provider = LayaOnnxProvider::load(&dir, Arc::new(Semaphore::new(1))).unwrap();
+        let err = provider
+            .judge_duplicates(&payload(), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not available"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn learning_runtime_manager_does_not_claim_ready() {
+        let manager = LearningRuntimeManager {
+            paths: LearningPaths {
+                root: PathBuf::from("/nonexistent"),
+            },
+        };
+        // Nothing is provisioned by this manager in this build; like the
+        // canonical manager in `learning::runtime`, it must not claim Ready.
+        assert_eq!(manager.ensure_ready().await, RuntimeState::Unavailable);
     }
 }
