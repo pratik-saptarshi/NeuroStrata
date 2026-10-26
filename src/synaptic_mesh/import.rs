@@ -621,9 +621,9 @@ fn has_exec_bit(_meta: &std::fs::Metadata) -> bool {
 }
 
 /// Parse + validate one record against the pinned contract: known schema
-/// version, served namespace parity with its path, shareable memory type,
-/// id/filename agreement, no runtime counter keys. `Ok(record)` is apt for
-/// apply; `Err(reason)` is an ignore entry.
+/// version, legal namespace (DR-1), served namespace parity with its path,
+/// shareable memory type, id/filename agreement, no runtime counter keys.
+/// `Ok(record)` is apt for apply; `Err(reason)` is an ignore entry.
 pub fn validate_record(
     candidate: &Candidate,
     served: &[String],
@@ -643,6 +643,13 @@ pub fn validate_record(
             "unknown schema_version {} (supported: {})",
             record.schema_version, MESH_RECORD_SCHEMA_VERSION
         ));
+    }
+    // Namespace legality is the shared validator's call (DR-1, Task 8) —
+    // beside, not instead of, the served-namespace parity check below: a
+    // peer's namespace must be a legal name before it matters whether this
+    // node serves it.
+    if let Err(e) = crate::domain::validate_namespace(&record.namespace) {
+        return Err(e);
     }
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
@@ -2214,6 +2221,33 @@ mod tests {
             joined.contains("origin_mesh_epoch 2") && joined.contains("manifest epoch 1"),
             "both epochs are named: {joined}"
         );
+    }
+
+    /// Task 8: validate_record refuses a record whose namespace is illegal
+    /// under DR-1 even when the namespace is served and path-consistent —
+    /// the legality leg is the shared validator's, beside the parity check.
+    #[test]
+    fn site_refuses_illegal_namespace() {
+        let id = Uuid::new_v4();
+        let value = record_value(
+            "synaptic-mesh-record/v1",
+            id,
+            "bad ns",
+            "rule",
+            "active",
+            None,
+            json!({"text": "a shared rule"}),
+        );
+        let raw = serde_json::to_string(&value).unwrap();
+        let candidate = Candidate {
+            namespace: "bad ns".to_string(),
+            file_stem: id.to_string(),
+        };
+        let served = vec!["bad ns".to_string()];
+        match validate_record(&candidate, &served, &raw) {
+            Ok(_) => panic!("an illegal namespace must be refused"),
+            Err(e) => assert!(e.contains("ERROR [NAMESPACE]"), "{e}"),
+        }
     }
 
     /// A record larger than `MAX_RECORD_BYTES` is ignored BEFORE parse, with

@@ -1460,8 +1460,8 @@ async fn handle_add_memory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e;
     }
 
     if namespace != "global" {
@@ -3031,14 +3031,11 @@ async fn build_guard_validator(
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("global");
-    // Validate namespace shape the same way handle_get_memory does, so the
-    // guard surface inherits the same project-vs-path rejection contract.
-    if namespace.contains('/') || namespace.contains('\\') || namespace.is_empty() {
-        return Err(format!(
-            "ERROR [NAMESPACE]: '{}' is not a valid namespace for guard_{}. \
-             Namespaces are exact project names (e.g., 'NeuroStrata') or 'global'.",
-            namespace, what
-        ));
+    // Namespace shape is the shared validator's call (src/domain.rs, DR-1),
+    // so the guard surface inherits the same rejection contract as every
+    // other entry point.
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return Err(format!("{e} (guard_{what})"));
     }
     let validator = GuardValidator::new(store, embedder, namespace).await;
     Ok((validator, namespace.to_string()))
@@ -3257,8 +3254,8 @@ async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> Str
     };
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e;
     }
 
     match store.get(namespace, id).await {
@@ -7976,6 +7973,53 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(after, before + 1);
+    }
+
+    // ── Task 8: the three server.rs namespace sites refuse illegal names ──
+    // Each test drives a namespace that is legal under the old hand-rolled
+    // checks (no '/', no '\\', non-empty) but illegal under DR-1 (it carries
+    // a space), so the refusal can only come from the shared validator.
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_add_memory() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let reply = handle_add_memory(
+            serde_json::json!({ "content": "a fact", "namespace": "bad ns" }),
+            Arc::new(StubEmbedder),
+            store,
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
+        assert!(reply.contains("bad ns"), "{}", reply);
+    }
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_guard() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let result = build_guard_validator(
+            &serde_json::json!({ "namespace": "bad ns" }),
+            store,
+            Arc::new(StubEmbedder),
+            "validate",
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("a namespace with a space must be refused"),
+            Err(e) => assert!(e.contains("ERROR [NAMESPACE]"), "{}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_get_memory() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let reply = handle_get_memory(
+            serde_json::json!({ "id": "x", "namespace": "bad ns" }),
+            store,
+        )
+        .await;
+        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
     }
 
 }
