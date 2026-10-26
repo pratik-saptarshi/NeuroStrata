@@ -3394,8 +3394,6 @@ mod tests {
 
     /// Serializes the tests that set `RUST_LOG` (env is process-global)
     /// and restores the caller's prior value on drop.
-    static RUST_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct RustLogRestore {
         prior: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -3403,7 +3401,7 @@ mod tests {
 
     impl RustLogRestore {
         fn set(value: Option<&str>) -> Self {
-            let lock = RUST_LOG_TEST_LOCK
+            let lock = crate::test_support::ENV_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let prior = std::env::var_os("RUST_LOG");
