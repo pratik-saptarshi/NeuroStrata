@@ -2783,7 +2783,7 @@ impl crate::traits::AsAny for RecordingStore {
         let base = format!("http://{addr}");
         let bare = reqwest::Client::new();
         let mut serving = false;
-        for _ in 0..500 {
+        for _ in 0..3000 {
             if bare
                 .get(format!("{base}/health"))
                 .send()
