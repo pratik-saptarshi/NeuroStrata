@@ -6343,8 +6343,23 @@ mod tests {
         let lease = store.begin_ingest_stage(stage).await.unwrap();
         let staged_namespace = stage.to_string();
         let staged_prefix = format!("{}{}", stage, crate::parser::ingest::NAMESPACE_SEPARATOR);
+        let pk_ready = store.pk_ready();
         store
             .write_with_deadline("seeding a staged process-crash fixture", move |conn| {
+                // Task 7 fix round: the fixture's raw CREATEs seed a
+                // fresh (pk-keyed) table, so each row supplies the
+                // derived key as create input, as a production writer
+                // must. In legacy mode the fragment is empty.
+                let pk_prop = |id: &str| {
+                    if pk_ready {
+                        format!(
+                            "pk: '{}', ",
+                            escape_ladybug_string(&memory_pk(&staged_namespace, id))
+                        )
+                    } else {
+                        String::new()
+                    }
+                };
                 for i in 0..130 {
                     let location = if i == 0 {
                         "old.rs".to_string()
@@ -6353,7 +6368,8 @@ mod tests {
                     };
                     let id = format!("{staged_prefix}{location}");
                     conn.query(&format!(
-                        "CREATE (m:Memory {{id: '{}', namespace: '{}', content: 'new-generation-{i}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: '', location: '{}', location_lines: '', metadata: '{{}}', embedding: [0.3, 0.3, 0.3, 0.3]}})",
+                        "CREATE (m:Memory {{{}id: '{}', namespace: '{}', content: 'new-generation-{i}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: '', location: '{}', location_lines: '', metadata: '{{}}', embedding: [0.3, 0.3, 0.3, 0.3]}})",
+                        pk_prop(&id),
                         escape_ladybug_string(&id),
                         escape_ladybug_string(&staged_namespace),
                         escape_ladybug_string(&location)
@@ -6363,7 +6379,8 @@ mod tests {
                 let target_id = format!("{staged_prefix}old.rs");
                 let metadata = serde_json::to_string(&json!({"governs": [target_id]}))?;
                 conn.query(&format!(
-                    "CREATE (m:Memory {{id: '{}', namespace: '{}', content: 'new rule', user_id: 'auto-ingestor', memory_type: 'rule', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.4, 0.4, 0.4, 0.4]}})",
+                    "CREATE (m:Memory {{{}id: '{}', namespace: '{}', content: 'new rule', user_id: 'auto-ingestor', memory_type: 'rule', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.4, 0.4, 0.4, 0.4]}})",
+                    pk_prop(&rule_id),
                     escape_ladybug_string(&rule_id),
                     escape_ladybug_string(&staged_namespace),
                     escape_ladybug_string(&metadata)
@@ -6846,14 +6863,26 @@ mod tests {
         id: &str,
         user_id: &str,
     ) {
+        // Task 7 fix round: derive the pk from the RAW namespace/id
+        // (before escaping) with memory_pk, exactly as a production
+        // writer does; the fragment is empty in legacy mode (no pk
+        // column), where the binder does not demand it.
+        let pk_prop = if store.pk_ready() {
+            format!(
+                "pk: '{}', ",
+                escape_ladybug_string(&memory_pk(namespace, id))
+            )
+        } else {
+            String::new()
+        };
         let namespace = escape_ladybug_string(namespace);
         let id = escape_ladybug_string(id);
         let user_id = escape_ladybug_string(user_id);
         store
             .with_conn(move |conn| {
                 conn.query(&format!(
-                    "CREATE (m:Memory {{id: '{}', namespace: '{}', content: 'preserve me', user_id: '{}', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{{}}', embedding: [0.0, 0.0, 0.0, 0.0]}})",
-                    id, namespace, user_id
+                    "CREATE (m:Memory {{{}id: '{}', namespace: '{}', content: 'preserve me', user_id: '{}', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{{}}', embedding: [0.0, 0.0, 0.0, 0.0]}})",
+                    pk_prop, id, namespace, user_id
                 ))?;
                 Ok(())
             })
@@ -9274,7 +9303,7 @@ eurostrata\src\daemon.rs",
             writer_store
                 .write_with_deadline("cancelled dispatched write", move |conn| {
                     conn.query("BEGIN TRANSACTION")?;
-                    conn.query("CREATE (m:Memory {id: 'dispatched-write-cancel::row', namespace: 'dispatched-write-cancel', content: 'committed', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'fixture.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
+                    conn.query("CREATE (m:Memory {pk: 'dispatched-write-cancel\u{1}dispatched-write-cancel::row', id: 'dispatched-write-cancel::row', namespace: 'dispatched-write-cancel', content: 'committed', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'fixture.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
                     started_tx.send(()).expect("signal dispatched write");
                     release_rx.lock().unwrap().recv().expect("release write");
                     conn.query("COMMIT")?;
@@ -9334,7 +9363,7 @@ eurostrata\src\daemon.rs",
             writer_store
                 .write_with_deadline("timed out dispatched write", move |conn| {
                     conn.query("BEGIN TRANSACTION")?;
-                    conn.query("CREATE (m:Memory {id: 'dispatched-write-timeout::row', namespace: 'dispatched-write-timeout', content: 'committed', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'fixture.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
+                    conn.query("CREATE (m:Memory {pk: 'dispatched-write-timeout\u{1}dispatched-write-timeout::row', id: 'dispatched-write-timeout::row', namespace: 'dispatched-write-timeout', content: 'committed', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'fixture.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
                     started_tx.send(()).expect("signal dispatched write");
                     release_rx.lock().unwrap().recv().expect("release write");
                     conn.query("COMMIT")?;
@@ -9391,7 +9420,7 @@ eurostrata\src\daemon.rs",
 
         let result: anyhow::Result<()> = store
             .write_with_deadline("partial write fixture", move |conn| {
-                conn.query("CREATE (m:Memory {id: 'partial-write-dirty::row', namespace: 'partial-write-dirty', content: 'partially written', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'partial.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
+                conn.query("CREATE (m:Memory {pk: 'partial-write-dirty\u{1}partial-write-dirty::row', id: 'partial-write-dirty::row', namespace: 'partial-write-dirty', content: 'partially written', user_id: 'owner', memory_type: 'fact', agent_name: 'fixture', location: 'partial.rs', location_lines: '1', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4]})")?;
                 anyhow::bail!("simulated failure after mutation")
             })
             .await;
