@@ -1841,6 +1841,7 @@ impl LadybugStore {
         payload: MemoryPayload,
     ) -> Result<()> {
         let (namespace, id) = (namespace.to_string(), id.to_string());
+        let pk_ready = self.pk_ready();
         self.write_with_deadline("seeding a legacy memory fixture", move |conn| {
             let vector = format!(
                 "[{}]",
@@ -1850,8 +1851,22 @@ impl LadybugStore {
                     .collect::<Vec<_>>()
                     .join(",")
             );
+            // Task 7 fix round: this fixture seeds rows into a fresh
+            // (pk-keyed) table, so the CREATE must supply the derived
+            // key as create input, exactly as a production writer
+            // does. In legacy mode (no pk column) the fragment is
+            // empty and the statement is unchanged.
+            let pk_prop = if pk_ready {
+                format!(
+                    "pk: '{}', ",
+                    escape_ladybug_string(&memory_pk(&namespace, &id))
+                )
+            } else {
+                String::new()
+            };
             conn.query(&format!(
-                "CREATE (m:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '{}', location: '{}', location_lines: '{}', metadata: '{}', embedding: {}}})",
+                "CREATE (m:Memory {{{}id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '{}', location: '{}', location_lines: '{}', metadata: '{}', embedding: {}}})",
+                pk_prop,
                 escape_ladybug_string(&id),
                 escape_ladybug_string(&namespace),
                 escape_ladybug_string(&payload.content),
