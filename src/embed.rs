@@ -2490,17 +2490,26 @@ mod tests {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // A 500 is retryable and the client retries exactly once (see
+        // remote_retry_policy_runs_against_a_local_http_server, where the
+        // [503, 503] sequence is two requests), so an endpoint returning
+        // 500 answers both attempts. A one-shot server would drop the
+        // retry into a connection-refused transport error with no status,
+        // and the assertions below would be testing the fixture's
+        // absence, not the client's error.
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let body = "MARKER-SECRET-BODY";
-                let response = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes());
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = "MARKER-SECRET-BODY";
+                    let response = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
             }
         });
         let embedder = RemoteEmbedder::new(
