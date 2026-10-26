@@ -24,6 +24,8 @@ mod source_context;
 mod store;
 mod synaptic_mesh;
 mod task;
+#[cfg(test)]
+mod test_support;
 mod tools;
 mod traits;
 
