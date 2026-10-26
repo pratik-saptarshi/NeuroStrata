@@ -975,7 +975,7 @@ impl FastEmbedder {
                 None => {
                     if target_model.artifact_pin.is_some() {
                         anyhow::bail!(
-                            "embedder model '{}' has an artifact_pin recorded in embedders.json \
+                            "embedder model '{}' has a recorded artifact_pin \
                              but no artifact directory was found under {} after load — refusing \
                              to run it unpinned",
                             target_model.model_name,
