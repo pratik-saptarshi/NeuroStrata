@@ -9,8 +9,13 @@
 /// `#[non_exhaustive]` because a new event kind should be an addition here and
 /// a matched-and-ignored arm everywhere, never a breaking change to every
 /// subscriber already written.
+///
+/// The serde derives are the durable outbox's wire format (Task 12): a
+/// qualified pulse is written to `event-outbox.jsonl` as JSON inside `emit`
+/// and read back by the delivery workers, so every field of every variant
+/// must round-trip losslessly — the test below holds that.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ThalamicPulse {
     /// A memory was written for the first time. `kind` is its `memory_type`.
     ///
@@ -142,6 +147,48 @@ mod tests {
                 assert_eq!(namespace, "n");
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Task 12: the pulse is the outbox's wire payload — it must survive a
+    /// serde round-trip through the exact JSON the outbox line carries, for
+    /// every variant. (`ThalamicPulse` has no `PartialEq`; the `Debug` form
+    /// is the comparison, and it covers every field.)
+    #[test]
+    fn thalamic_pulse_wire_format_round_trips() {
+        let pulses = [
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
+            ThalamicPulse::Superseded {
+                old_id: "a".into(),
+                new_id: "b".into(),
+                namespace: "n".into(),
+            },
+            ThalamicPulse::Archived {
+                id: "x".into(),
+                namespace: "n".into(),
+            },
+            ThalamicPulse::GuardedActionFired {
+                trace_id: "t".into(),
+                action_type: "shell".into(),
+                payload_hash: 0xDEAD_BEEF,
+                verdict: "deny".into(),
+                rule_ids_triggered: vec!["r1".into(), "r2".into()],
+                namespace: "n".into(),
+            },
+        ];
+        for pulse in &pulses {
+            let wire = serde_json::to_string(pulse).expect("a pulse serializes");
+            let back: ThalamicPulse =
+                serde_json::from_str(&wire).expect("the wire form deserializes");
+            assert_eq!(
+                format!("{back:?}"),
+                format!("{pulse:?}"),
+                "round-trip must be lossless: {wire}"
+            );
         }
     }
 }
