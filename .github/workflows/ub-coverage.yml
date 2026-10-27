@@ -1,0 +1,28 @@
+# TRIAL ONLY — dispatch-only. Never copy into ci.yml or make a required check. Branch disposition is the owner's decision under the deletion rule.
+name: ub-coverage (trial)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the baseline tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Add the llvm-tools-preview component
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version 0.9.1
+
+      - name: Run the suite under llvm-cov and produce LCOV
+        run: cargo llvm-cov --locked --lcov --output-path lcov.info -- --test-threads=1
+
+      - name: Upload the LCOV report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ub-lcov-fe2d41b3dc1a1b5f340938bf8ffbee0fd5daf403
+          path: lcov.info
