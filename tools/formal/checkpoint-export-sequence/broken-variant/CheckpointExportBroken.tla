@@ -181,9 +181,15 @@ WRelease ==      \* flock released, then the write turn (caller's guard)
 (* --- Export E ----------------------------------------------------------- *)
 
 ECall ==         \* step (4): E called while C's detached flush still holds
-                 \* the snapshot lock, and after C's caller was cancelled
+                 \* the snapshot lock, and after C's caller was cancelled.
+                 \* The cState/snapHolder conjuncts are what make this S:
+                 \* E is called BEFORE C's flush completes, so E then
+                 \* blocks in EAcquireSnap until CFinishFlush releases
+                 \* the snapshot lock -- E never slips in after the fact.
     /\ eState = "notCalled"
     /\ cCancelled
+    /\ cState = "flushing"
+    /\ snapHolder = "C"
     /\ wState /= "notDispatched"
     /\ eState' = "waitingSnap"
     /\ UNCHANGED <<snapHolder, turnHolder, flockHolder, dirty, cState,

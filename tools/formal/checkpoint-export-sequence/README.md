@@ -57,8 +57,11 @@ The model is deliberately exactly S, nothing more:
 - One checkpoint C, one write W, one export E, one follow-up checkpoint.
   The seed write is abstracted to the initial state `dirty = TRUE`.
 - Dispatch order is fixed by S: W is dispatched only while C is mid-flush;
-  E is called only after W is dispatched and C's caller is cancelled.
-  All other interleavings of the modelled steps are explored by TLC.
+  E is called only after W is dispatched and C's caller is cancelled, and
+  while C is still mid-flush holding the snapshot lock — `ECall` requires
+  `cState = "flushing" /\ snapHolder = "C"`, so E then blocks on the
+  snapshot lock until C's flush completes. All other interleavings of the
+  modelled steps are explored by TLC.
 - Locks are modelled as perfect mutual exclusion (single holder variables).
   The OS flock's behaviour, the `try_lock` probe used by tests, and lock
   poisoning are not modelled.
