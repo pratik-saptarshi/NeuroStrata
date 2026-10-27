@@ -2755,7 +2755,12 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let _cross_process_writer = acquire_database_writer_lock(&db_path)?;
                 let conn = Connection::new(&db)?;
-                let _mark_dirty = MarkDirtyOnDrop(dirty);
+                // SPIKE BREAK (branch spike/a2-break-dirty-remark, Task A2
+                // Step 3 preparation -- never merge): the MarkDirtyOnDrop
+                // arming line (`let _mark_dirty = MarkDirtyOnDrop(dirty);`)
+                // is removed. Writes through this path no longer re-mark
+                // the store dirty before the writer lock is released.
+                let _ = &dirty;
                 f(&conn)
             })();
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9564,6 +9569,151 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         assert_eq!(row.unwrap().1.content, "queued behind checkpoint");
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// SPIKE SCAFFOLDING (branch spike/a2-break-dirty-remark, Task A2 Step 3
+    /// preparation -- not for merge): forces sequence S from the Task A1
+    /// coverage-gap record as a triple -- (1) checkpoint barrier-held
+    /// mid-flush, (2) write queued on the writer lock, (3) checkpoint
+    /// caller cancelled, (4) export called against the detached flush,
+    /// (5) flush released -- and asserts the predicted properties:
+    /// (a) the export snapshot contains the queued write's row,
+    /// (b) the live store is dirty after the export,
+    /// (c) a following checkpoint clears the flag.
+    /// On the unbroken tree this must PASS; with the dirty re-mark removed
+    /// (this branch) assertion (b) must FAIL.
+    /// NOT COMPILE-VERIFIED LOCALLY (no Rust toolchain on the spike VM);
+    /// written by mirroring `cancelled_checkpoint_keeps_snapshot_exclusion_
+    /// until_flush_finishes` and `a_write_queued_behind_checkpoint_marks_
+    /// dirty_after_checkpoint_clears` step for step. Assertion (a) opens
+    /// the snapshot copy with `for_testing` + `init`, mirroring the two
+    /// baseline snapshot-read precedents (`snapshot-cut-check`,
+    /// `export-cancel-check`).
+    #[tokio::test]
+    async fn spike_cancelled_checkpoint_queued_write_then_export_keeps_snapshot_and_dirty() {
+        let root = std::env::temp_dir().join(format!(
+            "checkpoint-export-sequence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("fixture.store");
+        let store = Arc::new(LadybugStore::for_testing(&db, 4).unwrap());
+        store.init("checkpoint-export-sequence").await.unwrap();
+        store
+            .upsert(
+                "checkpoint-export-sequence",
+                "checkpoint-export-sequence::seed",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "seed".into(),
+                    user_id: "owner".into(),
+                    memory_type: "fact".into(),
+                    agent_name: None,
+                    location: "seed.rs".into(),
+                    location_lines: "1".into(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        store.checkpoint().await.unwrap();
+        assert!(!store.is_dirty(), "seed work was checkpointed first");
+
+        // (1) C starts and pauses mid-flush at the barrier, flag taken.
+        let checkpoint_barrier = root.join("checkpoint-entered");
+        set_test_snapshot_operation_barrier("checkpoint", db.clone(), checkpoint_barrier.clone());
+        let checkpoint_store = store.clone();
+        let checkpoint = tokio::spawn(async move { checkpoint_store.checkpoint().await });
+        wait_for_test_barrier(&checkpoint_barrier).await;
+        assert!(!store.is_dirty(), "checkpoint took the seed dirty flag");
+
+        // (2) W is dispatched and blocks acquiring the writer lock.
+        let write_lock_attempt = root.join("write-lock-attempted");
+        set_test_write_lock_attempt(db.clone(), write_lock_attempt.clone());
+        let write_store = store.clone();
+        let write = tokio::spawn(async move {
+            write_store
+                .upsert(
+                    "checkpoint-export-sequence",
+                    "checkpoint-export-sequence::queued",
+                    vec![0.4; 4],
+                    MemoryPayload {
+                        content: "queued behind cancelled checkpoint".into(),
+                        user_id: "owner".into(),
+                        memory_type: "fact".into(),
+                        agent_name: None,
+                        location: "queued.rs".into(),
+                        location_lines: "2".into(),
+                        metadata: json!({}),
+                    },
+                )
+                .await
+        });
+        wait_for_test_barrier(&write_lock_attempt).await;
+        assert!(
+            !write.is_finished(),
+            "the write cannot pass the checkpoint's writer lock"
+        );
+
+        // (3) C's caller is cancelled; the detached flush holds both locks.
+        checkpoint.abort();
+        assert!(checkpoint.await.unwrap_err().is_cancelled());
+
+        // (4) E is called and must wait for the detached flush.
+        let output = root.join("snapshot");
+        let export_output = output.clone();
+        let export_store = store.clone();
+        let export = tokio::spawn(async move {
+            export_store
+                .export_database(&export_output.to_string_lossy())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !export.is_finished(),
+            "export must wait for detached checkpoint"
+        );
+
+        // (5) Release the flush. W completes first (E needs the write turn
+        // W's caller holds), then E completes.
+        release_test_barrier(&checkpoint_barrier);
+        write.await.unwrap().unwrap();
+        export.await.unwrap().unwrap();
+        assert!(output.join("manifest.json").is_file());
+
+        // (a) The snapshot contains W's row in full.
+        let snapshot_store = LadybugStore::for_testing(output.join("ladybug.store"), 4).unwrap();
+        snapshot_store
+            .init("checkpoint-export-sequence-check")
+            .await
+            .unwrap();
+        let row = snapshot_store
+            .get(
+                "checkpoint-export-sequence",
+                "checkpoint-export-sequence::queued",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.expect("the snapshot must contain the queued write")
+                .1
+                .content,
+            "queued behind cancelled checkpoint"
+        );
+        drop(snapshot_store);
+
+        // (b) The live store is still dirty: E never touches the flag and
+        // W re-marked after C's take.
+        assert!(
+            store.is_dirty(),
+            "the queued write marks dirty after the checkpoint's take, and export must not clear it"
+        );
+
+        // (c) A following checkpoint clears the flag.
         store.checkpoint().await.unwrap();
         assert!(!store.is_dirty());
         drop(store);
