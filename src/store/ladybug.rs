@@ -5471,6 +5471,46 @@ impl VectorStore for LadybugStore {
         })
         .await
     }
+
+    /// The batched form of `increment_access_count`: one write session for
+    /// the whole set. The per-hit read-modify-write runs sequentially on
+    /// one connection, so a search's hits land as a single write and cannot
+    /// lose updates against each other. Statements commit as they execute:
+    /// a failure partway leaves the earlier rows bumped and the later rows
+    /// not — for access counts (best-effort telemetry whose call site is
+    /// fire-and-forget) that is the same failure shape as one of today's
+    /// per-hit writes failing, never a corruption.
+    async fn increment_access_counts(&self, namespace: &str, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let namespace = namespace.to_string();
+        let ids: Vec<String> = ids.to_vec();
+        self.write_with_deadline("counting reads", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            for id in &ids {
+                let safe_id = escape_ladybug_string(id);
+                let read = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.metadata",
+                    safe_ns, safe_id
+                );
+                let mut result = conn.query(&read)?;
+                let current = match result.next() {
+                    Some(row) => format!("{}", row[0]),
+                    None => continue,
+                };
+                let write = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                    safe_ns,
+                    safe_id,
+                    escape_ladybug_string(&bump_access_count(&current))
+                );
+                conn.query(&write)?;
+            }
+            Ok(())
+        })
+        .await
+    }
 }
 
 impl crate::traits::AsAny for LadybugStore {
