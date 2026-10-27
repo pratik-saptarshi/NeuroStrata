@@ -92,10 +92,10 @@ fn no_mesh_joined() -> &'static str {
 ///
 /// `Err` from the storage layer is rendered, never propagated as a panic:
 /// the CLI prints one line and the caller decides the exit code.
-pub fn handle_synaptic_mesh_command(
+pub async fn handle_synaptic_mesh_command(
     cmd: &SynapticMeshCommands,
     ctx: &MeshContext,
-    store: &mut dyn StorageApi,
+    store: &mut (dyn StorageApi + Send),
 ) -> String {
     match cmd {
         SynapticMeshCommands::Init {
@@ -109,7 +109,8 @@ pub fn handle_synaptic_mesh_command(
                 name,
                 namespace,
                 remote.as_deref(),
-            ),
+            )
+            .await,
             |mesh_id| format!("mesh created: {mesh_id} — joined this project"),
         ),
         // `open_mesh` owns the whole adoption: it opens the repo AND writes
@@ -118,9 +119,9 @@ pub fn handle_synaptic_mesh_command(
         SynapticMeshCommands::Join { dir } => render(store.open_mesh(dir), |()| {
             format!("joined mesh at {}", dir.display())
         }),
-        SynapticMeshCommands::Push => render(store.push(), |line| line),
-        SynapticMeshCommands::Pull => render(store.pull(), |line| line),
-        SynapticMeshCommands::Status => render(store.status(), |line| line),
+        SynapticMeshCommands::Push => render(store.push().await, |line| line),
+        SynapticMeshCommands::Pull => render(store.pull().await, |line| line),
+        SynapticMeshCommands::Status => render(store.status().await, |line| line),
         SynapticMeshCommands::Leave => {
             let pointer = pointer_path(&ctx.project_root);
             render(store.remove_pointer(&ctx.project_root), |()| {
@@ -129,10 +130,10 @@ pub fn handle_synaptic_mesh_command(
         }
         // The hook target renders its own single line — the value IS the
         // reply, never collapsed and never an Err (exit-0 rule).
-        SynapticMeshCommands::SyncEnqueue => super::mesh_service::sync_enqueue_line(store),
+        SynapticMeshCommands::SyncEnqueue => super::mesh_service::sync_enqueue_line(store).await,
         // Recovery is print-only: it reads the checkout, names each paused
         // state, and hands back the manual fix.
-        SynapticMeshCommands::Recover => super::mesh_service::recover_report(&ctx.project_root),
+        SynapticMeshCommands::Recover => super::mesh_service::recover_report(&ctx.project_root).await,
     }
 }
 
@@ -238,8 +239,9 @@ mod tests {
         calls: Vec<String>,
     }
 
+    #[async_trait::async_trait]
     impl StorageApi for MockMesh {
-        fn init_mesh(
+        async fn init_mesh(
             &mut self,
             base_root: &Path,
             node_id: &str,
@@ -288,17 +290,17 @@ mod tests {
             self.pointer_removed = Some(project.to_path_buf());
             Ok(())
         }
-        fn status(&self) -> Result<String, String> {
+        async fn status(&self) -> Result<String, String> {
             Err(self.status_err.clone().unwrap_or_else(|| no_mesh_err()))
         }
-        fn push(&mut self) -> Result<String, String> {
+        async fn push(&mut self) -> Result<String, String> {
             if let Some(line) = self.push_ok.clone() {
                 self.calls.push("push:ok".into());
                 return Ok(line);
             }
             Err(self.push_err.clone().unwrap_or_else(no_mesh_err))
         }
-        fn pull(&mut self) -> Result<String, String> {
+        async fn pull(&mut self) -> Result<String, String> {
             self.calls.push("pull".into());
             if let Some(line) = self.pull_ok.clone() {
                 return Ok(line);
@@ -313,15 +315,15 @@ mod tests {
         format!("{NO_MESH_PREFIX} (no pointer at /proj/.NeuroStrata)")
     }
 
-    #[test]
-    fn sync_enqueue_pulls_before_pushing_and_renders_one_line() {
+    #[tokio::test]
+    async fn sync_enqueue_pulls_before_pushing_and_renders_one_line() {
         let mut store = MockMesh {
             pull_ok: Some("pulled mesh x".to_string()),
             push_ok: Some("pushed mesh x".to_string()),
             ..Default::default()
         };
         let reply =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store).await;
         assert_eq!(
             reply, "mesh sync-enqueued: pulled mesh x; pushed mesh x",
             "one line, pull result first: {reply}"
@@ -333,12 +335,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sync_enqueue_quiets_no_mesh_into_a_soft_nothing_to_do() {
+    #[tokio::test]
+    async fn sync_enqueue_quiets_no_mesh_into_a_soft_nothing_to_do() {
         // Mock pulls fail with the storage-layer no-mesh error by default.
         let mut store = MockMesh::default();
         let reply =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store).await;
         assert!(
             reply.contains("no mesh joined") && reply.contains("nothing to do"),
             "hook sees a quiet success, not an error: {reply}"
@@ -349,8 +351,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sync_enqueue_renders_push_failure_as_one_blocking_free_line() {
+    #[tokio::test]
+    async fn sync_enqueue_renders_push_failure_as_one_blocking_free_line() {
         // An unreachable/rejecting remote: the hook STILL gets one line and
         // the CLI still exits 0 — never blocks the source push (spec §Hooks).
         let mut store = MockMesh {
@@ -359,7 +361,7 @@ mod tests {
             ..Default::default()
         };
         let reply =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store).await;
         assert!(
             reply.starts_with("mesh sync-enqueue failed (non-blocking"),
             "fatal shape for a hook: {reply}"
@@ -371,8 +373,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn init_command_calls_trait_and_reports_mesh_id() {
+    #[tokio::test]
+    async fn init_command_calls_trait_and_reports_mesh_id() {
         let mut store = MockMesh {
             mesh_id: "deadbeef".to_string(),
             ..Default::default()
@@ -382,7 +384,7 @@ mod tests {
             namespace: vec!["Alpha".to_string(), "Beta".to_string()],
             remote: Some("git@example.com:team/mesh.git".to_string()),
         };
-        let reply = handle_synaptic_mesh_command(&cmd, &ctx(), &mut store);
+        let reply = handle_synaptic_mesh_command(&cmd, &ctx(), &mut store).await;
         assert!(
             reply.contains("deadbeef"),
             "reply must name the mesh id: {reply}"
@@ -399,15 +401,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn push_pull_status_without_mesh_say_no_mesh_joined() {
+    #[tokio::test]
+    async fn push_pull_status_without_mesh_say_no_mesh_joined() {
         let mut store = MockMesh::default();
         for cmd in [
             SynapticMeshCommands::Push,
             SynapticMeshCommands::Pull,
             SynapticMeshCommands::Status,
         ] {
-            let reply = handle_synaptic_mesh_command(&cmd, &ctx(), &mut store);
+            let reply = handle_synaptic_mesh_command(&cmd, &ctx(), &mut store).await;
             assert_eq!(reply, no_mesh_joined(), "clean message for {cmd:?}");
         }
     }
@@ -416,8 +418,8 @@ mod tests {
     /// canonical CLI wording must survive that. 3h37's MeshStorage impl
     /// depends on this collapsing rather than leaking `no mesh joined at
     /// /some/path` to the user.
-    #[test]
-    fn render_collapses_path_carrying_no_mesh_errors() {
+    #[tokio::test]
+    async fn render_collapses_path_carrying_no_mesh_errors() {
         let mut store = MockMesh {
             push_err: Some("no mesh joined at /weird/path".to_string()),
             pull_err: Some("no mesh joined at /another/weird/path".to_string()),
@@ -429,7 +431,7 @@ mod tests {
             SynapticMeshCommands::Pull,
             SynapticMeshCommands::Status,
         ] {
-            let reply = handle_synaptic_mesh_command(&cmd, &ctx(), &mut store);
+            let reply = handle_synaptic_mesh_command(&cmd, &ctx(), &mut store).await;
             assert_eq!(
                 reply,
                 no_mesh_joined(),
@@ -439,10 +441,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn leave_removes_pointer_at_the_context_project_root() {
+    #[tokio::test]
+    async fn leave_removes_pointer_at_the_context_project_root() {
         let mut store = MockMesh::default();
-        let reply = handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &ctx(), &mut store);
+        let reply = handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &ctx(), &mut store).await;
         assert_eq!(
             store.pointer_removed.as_deref(),
             Some(Path::new("/proj")),
@@ -459,8 +461,8 @@ mod tests {
     /// adopts AND writes the pointer per storage_api.rs), so this asserts the
     /// call the CLI actually makes — and, by the `calls` log, that it makes
     /// no pointer write of its own.
-    #[test]
-    fn join_opens_the_mesh_at_the_given_dir() {
+    #[tokio::test]
+    async fn join_opens_the_mesh_at_the_given_dir() {
         let mut store = MockMesh::default();
         let reply = handle_synaptic_mesh_command(
             &SynapticMeshCommands::Join {
@@ -468,7 +470,7 @@ mod tests {
             },
             &ctx(),
             &mut store,
-        );
+        ).await;
         assert_eq!(
             store.calls,
             vec!["open_mesh:/tmp/mesh".to_string()],
@@ -480,11 +482,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn init_failure_reports_error_without_panicking() {
+    #[tokio::test]
+    async fn init_failure_reports_error_without_panicking() {
         struct Failing;
+        #[async_trait::async_trait]
         impl StorageApi for Failing {
-            fn init_mesh(
+            async fn init_mesh(
                 &mut self,
                 _: &Path,
                 _: &str,
@@ -515,13 +518,13 @@ mod tests {
             fn remove_pointer(&mut self, _: &Path) -> Result<(), String> {
                 unreachable!()
             }
-            fn status(&self) -> Result<String, String> {
+            async fn status(&self) -> Result<String, String> {
                 unreachable!()
             }
-            fn push(&mut self) -> Result<String, String> {
+            async fn push(&mut self) -> Result<String, String> {
                 unreachable!()
             }
-            fn pull(&mut self) -> Result<String, String> {
+            async fn pull(&mut self) -> Result<String, String> {
                 unreachable!()
             }
         }
@@ -535,15 +538,15 @@ mod tests {
             },
             &ctx(),
             &mut store,
-        );
+        ).await;
         assert!(reply.contains("disk full"), "reply: {reply}");
     }
 
     /// Issue 1: `MeshContext` is the ONLY channel for project root, mesh root
     /// and node id. With an explicit context in hand, the handler must not
     /// consult `$HOME` or `$NEUROSTRATA_NODE_ID` at all.
-    #[test]
-    fn context_alone_supplies_every_ambient_value() {
+    #[tokio::test]
+    async fn context_alone_supplies_every_ambient_value() {
         let explicit = MeshContext {
             project_root: PathBuf::from("/explicit/project"),
             base_root: PathBuf::from("/explicit/base"),
@@ -558,8 +561,8 @@ mod tests {
             },
             &explicit,
             &mut store,
-        );
-        let _ = handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &explicit, &mut store);
+        ).await;
+        let _ = handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &explicit, &mut store).await;
 
         let (base, node, _, _, _) = &store.init_calls[0];
         assert_eq!(

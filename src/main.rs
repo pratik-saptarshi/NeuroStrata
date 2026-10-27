@@ -4131,7 +4131,8 @@ async fn run() -> anyhow::Result<()> {
                 };
                 let mut svc = crate::synaptic_mesh::MeshService::new(project_root);
                 let reply =
-                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc);
+                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc)
+                        .await;
                 println!("{}", reply);
                 // Hook piggyback contract (spec §Hooks): the hook target
                 // ALWAYS exits 0, even when its reply carries a failure —

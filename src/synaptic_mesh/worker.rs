@@ -6,13 +6,13 @@
 //! entries, and this module never touches the network (no push, no pull — a
 //! configured-but-unreachable remote is irrelevant to a drain).
 //!
-//! [`drain_once`] is a **pure, synchronous** function: it reads pending outbox
-//! entries in stable order, builds a [`MeshRecord`] for each, atomically
-//! replaces `memories/<id>.json` / `procedures/<id>.json`, commits once per
-//! drain, then marks the entries committed. Everything it needs is in the
-//! outbox entry or the mesh checkout — it never reads the LadybugDB store,
-//! which is why it can run without the daemon's async runtime (and why the
-//! in-file tests can drive it directly).
+//! [`drain_once`] is a **pure** function of the outbox + checkout: it reads
+//! pending outbox entries in stable order, builds a [`MeshRecord`] for
+//! each, atomically replaces `memories/<id>.json` / `procedures/<id>.json`,
+//! commits once per drain, then marks the entries committed. Everything it
+//! needs is in the outbox entry or the mesh checkout — it never reads the
+//! LadybugDB store. It is async because the commit runs mesh git, which
+//! executes as a timed async subprocess at the storage funnel (DR-4).
 
 use std::path::{Path, PathBuf};
 
@@ -75,7 +75,7 @@ enum ApplyOutcome {
 /// An I/O error mid-batch aborts *before* the commit and before any
 /// mark-committed, so nothing is half-acknowledged: the files already written
 /// are idempotently re-applied on the next drain.
-pub fn drain_once(
+pub async fn drain_once(
     outbox: &Outbox,
     mesh: &MeshStorage,
     node_id: &str,
@@ -122,7 +122,7 @@ pub fn drain_once(
     if report.applied > 0 || report.already_applied > 0 {
         let n = report.applied + report.already_applied;
         let message = format!("synaptic-mesh: {} record(s)", n);
-        match mesh.commit_all(&message, node_id) {
+        match mesh.commit_all(&message, node_id).await {
             Ok(did_commit) => report.committed = did_commit,
             Err(e) => return Err(format!("mesh commit failed: {e}")),
         }
@@ -409,10 +409,11 @@ mod tests {
     }
 
     /// A fresh mesh checkout + its outbox, under one scratch base.
-    fn fixture(tag: &str, remote: Option<&str>) -> (MeshStorage, Outbox) {
+    async fn fixture(tag: &str, remote: Option<&str>) -> (MeshStorage, Outbox) {
         let base = scratch(tag);
-        let mesh =
-            MeshStorage::init(&base, "node-fixture", "team", &["ns".to_string()], remote).unwrap();
+        let mesh = MeshStorage::init(&base, "node-fixture", "team", &["ns".to_string()], remote)
+            .await
+            .unwrap();
         let outbox = Outbox::open(&outbox_dir_for(mesh.root())).unwrap();
         (mesh, outbox)
     }
@@ -481,7 +482,7 @@ mod tests {
     /// Rewrite the on-disk manifest to a new `epoch`, commit it (the local
     /// half of an epoch migration), and reopen the mesh so its cached manifest
     /// reflects the new epoch. Mirrors `import.rs`'s test helper.
-    fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
+    async fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
         let mut manifest = mesh.manifest().clone();
         manifest.epoch = epoch;
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -490,18 +491,18 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("epoch migration", "node-fixture").unwrap();
+        mesh.commit_all("epoch migration", "node-fixture").await.unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
 
-    #[test]
-    fn a_created_mutation_writes_a_record_that_round_trips() {
-        let (mesh, outbox) = fixture("roundtrip", None);
+    #[tokio::test]
+    async fn a_created_mutation_writes_a_record_that_round_trips() {
+        let (mesh, outbox) = fixture("roundtrip", None).await;
         let id = Uuid::new_v4();
         let entry = created(&id.to_string(), shareable_metadata());
         outbox.append(&entry).unwrap();
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 1);
         assert_eq!(report.skipped, 0);
         assert!(report.committed);
@@ -528,25 +529,25 @@ mod tests {
         assert_eq!(record.trust, Trust::Trusted);
     }
 
-    #[test]
-    fn a_second_drain_is_a_no_op() {
-        let (mesh, outbox) = fixture("second-drain", None);
+    #[tokio::test]
+    async fn a_second_drain_is_a_no_op() {
+        let (mesh, outbox) = fixture("second-drain", None).await;
         let id = Uuid::new_v4();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
             .unwrap();
 
-        drain_once(&outbox, &mesh, "node-author").unwrap();
-        let second = drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
+        let second = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(second.pending_seen, 0);
         assert_eq!(second.applied, 0);
         assert!(!second.committed, "nothing to commit on an empty drain");
         assert_eq!(git_count(mesh.root()), 1, "still exactly one commit");
     }
 
-    #[test]
-    fn a_pending_entry_applies_on_the_next_drain_after_a_crash() {
-        let (mesh, outbox) = fixture("crash-before-drain", None);
+    #[tokio::test]
+    async fn a_pending_entry_applies_on_the_next_drain_after_a_crash() {
+        let (mesh, outbox) = fixture("crash-before-drain", None).await;
         let id = Uuid::new_v4();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
@@ -561,28 +562,28 @@ mod tests {
             .join(format!("{id}.json"));
         assert!(!path.exists(), "the mesh has not exported yet");
 
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert!(
             path.exists(),
             "the next drain applies the pending entry — nothing lost"
         );
     }
 
-    #[test]
-    fn a_crash_between_rename_and_mark_committed_retries_idempotently() {
-        let (mesh, outbox) = fixture("crash-rename-commit", None);
+    #[tokio::test]
+    async fn a_crash_between_rename_and_mark_committed_retries_idempotently() {
+        let (mesh, outbox) = fixture("crash-rename-commit", None).await;
         let id = Uuid::new_v4();
         let entry = created(&id.to_string(), shareable_metadata());
         outbox.append(&entry).unwrap();
 
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(git_count(mesh.root()), 1);
 
         // Simulate the crash state: the file + commit landed, but the WAL was
         // never compacted (mark-committed did not run), so the entry is still
         // pending. Re-appending the same entry reconstructs that state.
         outbox.append(&entry).unwrap();
-        let retry = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let retry = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(retry.applied, 0);
         assert_eq!(
             retry.already_applied, 1,
@@ -595,15 +596,15 @@ mod tests {
         assert_eq!(git_count(mesh.root()), 1, "no duplicate commit");
     }
 
-    #[test]
-    fn a_batch_produces_one_git_commit() {
-        let (mesh, outbox) = fixture("batch", None);
+    #[tokio::test]
+    async fn a_batch_produces_one_git_commit() {
+        let (mesh, outbox) = fixture("batch", None).await;
         for _ in 0..3 {
             outbox
                 .append(&created(&Uuid::new_v4().to_string(), shareable_metadata()))
                 .unwrap();
         }
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 3);
         assert!(report.committed);
         assert_eq!(git_count(mesh.root()), 1, "three records in one commit");
@@ -617,15 +618,15 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains("synaptic-mesh: 3 record(s)"));
     }
 
-    #[test]
-    fn a_foreign_origin_row_is_skipped_never_re_exported() {
-        let (mesh, outbox) = fixture("foreign", None);
+    #[tokio::test]
+    async fn a_foreign_origin_row_is_skipped_never_re_exported() {
+        let (mesh, outbox) = fixture("foreign", None).await;
         let id = Uuid::new_v4();
         let mut metadata = shareable_metadata();
         metadata["mesh"] = json!({ "mesh_id": "imported-from-peer" });
         outbox.append(&created(&id.to_string(), metadata)).unwrap();
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.skipped, 1);
         assert_eq!(report.applied, 0);
         assert!(!report.committed);
@@ -643,9 +644,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_procedure_record_omits_the_runtime_counters() {
-        let (mesh, outbox) = fixture("procedure", None);
+    #[tokio::test]
+    async fn a_procedure_record_omits_the_runtime_counters() {
+        let (mesh, outbox) = fixture("procedure", None).await;
         let id = Uuid::new_v4();
         let entry = OutboxEntry {
             stable_op_id: Uuid::new_v4(),
@@ -668,7 +669,7 @@ mod tests {
         };
         outbox.append(&entry).unwrap();
 
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
         let path = mesh
             .root()
             .join("ns")
@@ -707,18 +708,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unreachable_remote_does_not_stop_the_drain() {
+    #[tokio::test]
+    async fn an_unreachable_remote_does_not_stop_the_drain() {
         let (mesh, outbox) = fixture(
             "unreachable",
             Some("https://unreachable.invalid/team/mesh.git"),
-        );
+        ).await;
         let id = Uuid::new_v4();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
             .unwrap();
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 1, "the worker never touches the network");
         assert!(report.committed);
         let path = mesh
@@ -729,9 +730,9 @@ mod tests {
         assert!(path.exists());
     }
 
-    #[test]
-    fn eligibility_absenting_or_private_is_not_published_shareable_is() {
-        let (mesh, outbox) = fixture("eligibility", None);
+    #[tokio::test]
+    async fn eligibility_absenting_or_private_is_not_published_shareable_is() {
+        let (mesh, outbox) = fixture("eligibility", None).await;
 
         let shareable_id = Uuid::new_v4();
         outbox
@@ -752,7 +753,7 @@ mod tests {
             .append(&created(&absent_id.to_string(), json!({})))
             .unwrap();
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 1, "only the shareable record is written");
         assert_eq!(
             report.skipped, 2,
@@ -766,9 +767,9 @@ mod tests {
         assert!(!dir.join(format!("{absent_id}.json")).exists());
     }
 
-    #[test]
-    fn a_superseded_entry_records_the_lifecycle_and_successor() {
-        let (mesh, outbox) = fixture("superseded", None);
+    #[tokio::test]
+    async fn a_superseded_entry_records_the_lifecycle_and_successor() {
+        let (mesh, outbox) = fixture("superseded", None).await;
         let old_id = Uuid::new_v4();
         let new_id = Uuid::new_v4();
         let entry = OutboxEntry {
@@ -785,7 +786,7 @@ mod tests {
         };
         outbox.append(&entry).unwrap();
 
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
         let path = mesh
             .root()
             .join("ns")
@@ -797,9 +798,9 @@ mod tests {
         assert_eq!(record.lifecycle.superseded_by, Some(new_id));
     }
 
-    #[test]
-    fn an_archived_entry_records_the_lifecycle_and_tombstone() {
-        let (mesh, outbox) = fixture("archived", None);
+    #[tokio::test]
+    async fn an_archived_entry_records_the_lifecycle_and_tombstone() {
+        let (mesh, outbox) = fixture("archived", None).await;
         let id = Uuid::new_v4();
         let entry = OutboxEntry {
             stable_op_id: Uuid::new_v4(),
@@ -815,7 +816,7 @@ mod tests {
         };
         outbox.append(&entry).unwrap();
 
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
         let path = mesh
             .root()
             .join("ns")
@@ -827,9 +828,9 @@ mod tests {
         assert!(record.lifecycle.archived_at.is_some());
     }
 
-    #[test]
-    fn a_file_rename_fault_keeps_the_entry_pending_until_the_fault_clears() {
-        let (mesh, outbox) = fixture("rename-fault", None);
+    #[tokio::test]
+    async fn a_file_rename_fault_keeps_the_entry_pending_until_the_fault_clears() {
+        let (mesh, outbox) = fixture("rename-fault", None).await;
         let id = Uuid::new_v4();
         let entry = created(&id.to_string(), shareable_metadata());
         outbox.append(&entry).unwrap();
@@ -843,7 +844,7 @@ mod tests {
         let target = dir.join(format!("{id}.json"));
         std::fs::create_dir_all(&target).unwrap();
 
-        let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
+        let err = drain_once(&outbox, &mesh, "node-author").await.unwrap_err();
         assert!(
             err.contains("record rename"),
             // The fixture tag "rename-fault" lives in the path, so a loose
@@ -869,7 +870,7 @@ mod tests {
         // The fault clears: the next drain applies cleanly — the pending
         // entry is replayed, exactly one mesh file exists, exactly one commit.
         std::fs::remove_dir(&target).unwrap();
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 1);
         assert!(report.committed);
         assert_eq!(
@@ -890,16 +891,16 @@ mod tests {
         assert!(target.is_file());
     }
 
-    #[test]
-    fn a_lifecycle_transition_preserves_the_origin_fields() {
-        let (mesh, outbox) = fixture("origin-preserved", None);
+    #[tokio::test]
+    async fn a_lifecycle_transition_preserves_the_origin_fields() {
+        let (mesh, outbox) = fixture("origin-preserved", None).await;
         let id = Uuid::new_v4();
 
         // Create, then archive the same record.
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
             .unwrap();
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
 
         let archive = OutboxEntry {
             stable_op_id: Uuid::new_v4(),
@@ -914,7 +915,7 @@ mod tests {
             epoch: 1,
         };
         outbox.append(&archive).unwrap();
-        drain_once(&outbox, &mesh, "node-author").unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
 
         let path = mesh
             .root()
@@ -947,17 +948,17 @@ mod tests {
     /// An entry captured at epoch 1, drained after a migration to epoch 2, is
     /// quarantined: no file write, a named report line, and the entry STAYS
     /// pending for operator inspection (never consumed).
-    #[test]
-    fn a_stale_epoch_entry_is_quarantined_named_and_stays_pending() {
-        let (mesh, outbox) = fixture("stale-epoch", None);
+    #[tokio::test]
+    async fn a_stale_epoch_entry_is_quarantined_named_and_stays_pending() {
+        let (mesh, outbox) = fixture("stale-epoch", None).await;
         let id = Uuid::new_v4();
         let entry = created(&id.to_string(), shareable_metadata()); // epoch 1
         outbox.append(&entry).unwrap();
 
         // Migrate: manifest epoch 1 -> 2 (the filter-repo purge).
-        let mesh = reopen_with_epoch(&mesh, 2);
+        let mesh = reopen_with_epoch(&mesh, 2).await;
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 0, "the stale entry must not publish");
         assert_eq!(report.quarantined, 1, "one entry quarantined: {report:?}");
         assert!(!report.committed, "no commit for a quarantined entry");
@@ -987,16 +988,16 @@ mod tests {
 
     /// An entry captured at the CURRENT epoch drains after a migration — the
     /// publish gate only quarantines OLDER epochs, never current ones.
-    #[test]
-    fn a_current_epoch_entry_drains_after_an_epoch_migration() {
-        let (mesh, outbox) = fixture("current-epoch", None);
-        let mesh = reopen_with_epoch(&mesh, 2); // migrate FIRST
+    #[tokio::test]
+    async fn a_current_epoch_entry_drains_after_an_epoch_migration() {
+        let (mesh, outbox) = fixture("current-epoch", None).await;
+        let mesh = reopen_with_epoch(&mesh, 2).await; // migrate FIRST
         let id = Uuid::new_v4();
         let mut entry = created(&id.to_string(), shareable_metadata());
         entry.epoch = 2; // born after the migration
         outbox.append(&entry).unwrap();
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 1, "current-epoch entry drains: {report:?}");
         assert_eq!(report.quarantined, 0, "nothing quarantined: {report:?}");
         assert!(report.committed);
@@ -1016,9 +1017,9 @@ mod tests {
     /// A mixed batch drains the current-epoch entry (committing it) while the
     /// stale entry is quarantined and LEFT PENDING — the commit step must
     /// never consume a quarantined entry.
-    #[test]
-    fn a_mixed_batch_quarantines_stale_and_drains_current() {
-        let (mesh, outbox) = fixture("mixed-epoch", None);
+    #[tokio::test]
+    async fn a_mixed_batch_quarantines_stale_and_drains_current() {
+        let (mesh, outbox) = fixture("mixed-epoch", None).await;
         let stale_id = Uuid::new_v4();
         let current_id = Uuid::new_v4();
         let stale = created(&stale_id.to_string(), shareable_metadata()); // epoch 1
@@ -1027,8 +1028,8 @@ mod tests {
         current.epoch = 2; // born post-migration
         outbox.append(&current).unwrap();
 
-        let mesh = reopen_with_epoch(&mesh, 2);
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let mesh = reopen_with_epoch(&mesh, 2).await;
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(
             report.applied, 1,
             "only the current entry drains: {report:?}"
@@ -1050,9 +1051,9 @@ mod tests {
     /// `metadata.topology` crosses the mesh as a `fact` RECORD — the type
     /// closure holds and the content travels — while the declared field
     /// itself stays node-local: the wire format is unchanged.
-    #[test]
-    fn a_published_fact_keeps_the_curated_metadata_envelope() {
-        let (mesh, outbox) = fixture("curated-envelope", None);
+    #[tokio::test]
+    async fn a_published_fact_keeps_the_curated_metadata_envelope() {
+        let (mesh, outbox) = fixture("curated-envelope", None).await;
         let id = Uuid::new_v4();
         let topology = json!({
             "component": "api-gateway",
@@ -1075,7 +1076,7 @@ mod tests {
         };
         outbox.append(&entry).unwrap();
 
-        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
         assert_eq!(report.applied, 1, "the fact is published: {report:?}");
         assert_eq!(report.skipped, 0, "the fact is not skipped: {report:?}");
 
