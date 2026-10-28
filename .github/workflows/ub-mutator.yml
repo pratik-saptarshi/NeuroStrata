@@ -1,0 +1,87 @@
+# TRIAL ONLY — dispatch-only. Never copy into ci.yml or make a required check. Branch disposition is the owner's decision under the deletion rule.
+name: ub-mutator (trial)
+
+on:
+  workflow_dispatch:
+    inputs:
+      coverage_run_id:
+        description: "Run ID of the ub-coverage.yml run that produced the ub-lcov artifact"
+        required: true
+        type: string
+      scope_file:
+        description: "Scope file to mutate"
+        required: false
+        default: "src/domain.rs"
+        type: string
+      line_range:
+        description: "Optional line range, e.g. 40-64 (empty = whole file)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  mutator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the baseline tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check out mutator (owner fork, pinned)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: pratik-saptarshi/mutator
+          ref: a5a0cb803b66e0cdb8bf471b3b08af701d424a41
+          path: tools/mutator
+
+      - name: Check out crapper (pinned, sibling of mutator)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: unclebob/crapper
+          ref: 6fd92c4c9bcc56efb64a2f8743d5a2993bcfd42d
+          path: tools/crapper
+
+      - name: Download the coverage artifact from the coverage run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ub-lcov-fe2d41b3dc1a1b5f340938bf8ffbee0fd5daf403
+          path: downloaded-lcov
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.coverage_run_id }}
+
+      - name: Place the LCOV where mutator reads existing coverage
+        run: |
+          mkdir -p target/coverage/rust
+          cp downloaded-lcov/lcov.info target/coverage/rust/lcov.info
+
+      # Mutator's own documented behaviour also runs the baseline first:
+      # per its README and --help, the baseline command must pass before
+      # any mutant runs, and a failed baseline exits 2 without rewriting
+      # the snapshot. The explicit baseline run below mirrors that
+      # precondition so a baseline failure is visible before mutants.
+      - name: Run mutator on the scoped file
+        env:
+          SCOPE_FILE: ${{ inputs.scope_file }}
+          LINE_RANGE: ${{ inputs.line_range }}
+        run: |
+          set -euo pipefail
+          module="$(basename "$SCOPE_FILE" .rs)"
+          test_command="cargo test --locked ${module} -- --test-threads=1"
+          echo "Baseline module tests: ${test_command}"
+          cargo test --locked "$module" -- --test-threads=1
+          lines_args=()
+          if [ -n "$LINE_RANGE" ]; then
+            start="${LINE_RANGE%%-*}"
+            end="${LINE_RANGE##*-}"
+            lines_csv="$(seq -s, "$start" "$end")"
+            lines_args=(--lines "$lines_csv")
+          fi
+          tools/mutator/mutator --root . --use-existing-coverage --test-command "$test_command" "${lines_args[@]}" "$SCOPE_FILE"
+
+      - name: Upload the mutation snapshot
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ub-mutate-fe2d41b3dc1a1b5f340938bf8ffbee0fd5daf403
+          path: .metrics/mutate/
+          if-no-files-found: ignore
