@@ -165,6 +165,63 @@ pub async fn check_export_freshness(store: &dyn VectorStore) -> Result<(), Strin
     }
 }
 
+/// Clears the per-namespace `dirty` flag set by `ExportFreshnessDirty`.
+///
+/// Walks every namespace, finds any `freshness_flag` row with
+/// `metadata.dirty == true`, and flips it back to `false` so the
+/// export-freshness gate (`check_export_freshness`) passes.
+///
+/// Two call sites clear it: the `export-graph --clear` CLI path, and the
+/// post-ingest normalization subscriber (`post_ingest_normalize`), which
+/// clears the flags as part of its `ingest_done` pass — the flags are
+/// propagated to the dispatcher, so a failed clear is a subscriber error
+/// the bus records, never a silent no-op.
+pub async fn clear_export_freshness(store: &dyn VectorStore) -> Result<(), String> {
+    let namespaces = store
+        .list_namespaces()
+        .await
+        .map_err(|e| format!("Failed to list namespaces: {e}"))?;
+    for ns in &namespaces {
+        clear_export_freshness_for_namespace(store, ns)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+    }
+    Ok(())
+}
+
+/// Clears the `dirty` freshness flag of a single namespace only.
+///
+/// A post-`ingest_done` pass just normalized the records of one namespace,
+/// so it must not mark every other namespace's flag as clean: a namespace
+/// whose mutations have not been exported yet would silently pass the
+/// export-freshness gate. Flips the flag row of `namespace` only — a
+/// missing flag row is a no-op, never an error.
+pub async fn clear_export_freshness_for_namespace(
+    store: &dyn VectorStore,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    match store.get(namespace, &flag_id(namespace)).await {
+        Ok(Some((vector, mut payload))) => {
+            if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
+                payload.metadata["dirty"] = serde_json::json!(false);
+                store
+                    .upsert(namespace, &flag_id(namespace), vector, payload)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to clear freshness flag for {namespace}: {e}"
+                        )
+                    })?;
+            }
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to read freshness flag for {namespace}: {e}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +304,7 @@ mod tests {
         let deadline = Instant::now() + FLAG_WAIT;
         loop {
             if let Some(payload) = flag_of(store, namespace).await {
+                tokio::task::yield_now().await;
                 return payload;
             }
             assert!(
@@ -323,6 +381,22 @@ mod tests {
             );
         }
 
+        // The dispatcher_free metric write trails subscriber completion, and
+        // under a loaded test process a fixed wait can race it: poll until the
+        // handled count reaches the emitted count (deadline-bounded), exactly
+        // as await_flag does for the flags themselves.
+        let deadline = Instant::now() + FLAG_WAIT;
+        loop {
+            let m = bus.metrics().dispatcher_handled;
+            if m >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not handle all 3 pulses within {FLAG_WAIT:?} (handled {m})"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             bus.metrics().dispatcher_handled,
             3,
@@ -422,6 +496,16 @@ mod tests {
             "two flips in one namespace are one row, updated"
         );
 
+        // Same poll-until discipline as every flag assertion: the handled
+        // counter write can trail the flags themselves under load.
+        let deadline = Instant::now() + FLAG_WAIT;
+        while bus.metrics().dispatcher_handled < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not handle all 4 pulses within {FLAG_WAIT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             bus.metrics().dispatcher_handled,
             4,
@@ -480,6 +564,10 @@ mod tests {
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let payload = await_flag(&store, "audited").await;
+        let deadline = Instant::now() + FLAG_WAIT;
+        while bus.metrics().dispatcher_handled < 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(
             payload.metadata["dirty_reason"],
             serde_json::json!("guarded_action"),

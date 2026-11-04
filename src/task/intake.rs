@@ -9,10 +9,8 @@
 //! - No mesh travel, no task status expansion, no extraction exemption
 
 use crate::task::intent::detect_task_intents;
-use crate::traits::VectorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Source kind for an intake receipt.
@@ -102,6 +100,20 @@ pub struct IntakeCandidate {
     pub cas_version: u64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default = "default_candidate_kind")]
+    pub candidate_kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub source_span: Option<Value>,
+    #[serde(default)]
+    pub extractor_fingerprint: Option<String>,
+}
+
+fn default_candidate_kind() -> String {
+    "task".to_string()
 }
 
 /// Request to create an intake receipt.
@@ -115,6 +127,21 @@ pub struct CreateReceiptRequest {
     /// Optional explicit title/description override (for manual intake)
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Optional candidate kind override (rule/task/etc.)
+    #[serde(default)]
+    pub candidate_kind: Option<String>,
+    /// Optional payload for the candidate.
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Optional confidence score.
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// Optional source span (e.g. `{"start": 0, "end": 42}`).
+    #[serde(default)]
+    pub source_span: Option<serde_json::Value>,
+    /// Optional extractor fingerprint identifying the extraction mechanism.
+    #[serde(default)]
+    pub extractor_fingerprint: Option<String>,
 }
 
 /// Request to list receipts.
@@ -174,67 +201,31 @@ pub struct ResolveCandidateResult {
     pub task_id: Option<String>,
 }
 
-/// Trait for intake storage operations.
-#[async_trait::async_trait]
-pub trait IntakeStore: Send + Sync {
-    /// Create intake receipt and candidate(s) atomically.
-    async fn create_receipt(
-        &self,
-        request: CreateReceiptRequest,
-    ) -> Result<CreateReceiptResult, String>;
-
-    /// List receipts with pagination.
-    async fn list_receipts(
-        &self,
-        request: ListReceiptsRequest,
-    ) -> Result<IntakeListResponse<IntakeReceipt>, String>;
-
-    /// List candidates with filters and pagination.
-    async fn list_candidates(
-        &self,
-        request: ListCandidatesRequest,
-    ) -> Result<IntakeListResponse<IntakeCandidate>, String>;
-
-    /// Resolve a candidate with CAS (atomic compare-and-swap).
-    async fn resolve_candidate(
-        &self,
-        request: ResolveCandidateRequest,
-    ) -> Result<ResolveCandidateResult, String>;
-
-    /// Get a single receipt by ID.
-    async fn get_receipt(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<IntakeReceipt>, String>;
-
-    /// Get a single candidate by ID.
-    async fn get_candidate(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<IntakeCandidate>, String>;
-}
 
 /// Generate a deterministic ID for a receipt.
+/// Uses SHA-256 (not `DefaultHasher`, which is toolchain-unstable) so the
+/// persisted MERGE keys survive Rust version changes.
 pub fn generate_receipt_id(namespace: &str, source_digest: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    namespace.hash(&mut hasher);
-    source_digest.hash(&mut hasher);
-    format!("rcpt-{:x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(source_digest.as_bytes());
+    let digest = hasher.finalize();
+    format!("rcpt-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
 }
 
-/// Generate a deterministic ID for a candidate.
+/// Generate a deterministic ID for a candidate (SHA-256, toolchain-stable).
 fn generate_candidate_id(namespace: &str, receipt_id: &str, index: usize) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    namespace.hash(&mut hasher);
-    receipt_id.hash(&mut hasher);
-    index.hash(&mut hasher);
-    format!("cand-{:x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(receipt_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(index.to_le_bytes());
+    let digest = hasher.finalize();
+    format!("cand-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
 }
 
 /// Extract title from text using heuristics.
@@ -256,6 +247,37 @@ pub fn create_candidates_from_intents(
     request: &CreateReceiptRequest,
     intents: Vec<DetectedIntent>,
 ) -> Vec<IntakeCandidate> {
+    // Explicit title wins: one deterministic candidate, no M2 re-splitting.
+    if let Some(title) = request.title.clone() {
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let candidate_kind = request.candidate_kind.clone().unwrap_or_else(|| {
+            if title.starts_with("[rule_candidate]") { "rule".to_string() } else { "task".to_string() }
+        });
+        return vec![IntakeCandidate {
+            id: generate_candidate_id(namespace, receipt_id, 0),
+            namespace: namespace.to_string(),
+            receipt_id: receipt_id.to_string(),
+            title,
+            description: request.description.clone(),
+            review_state: ReviewState::Pending,
+            disposition: Disposition::Pending,
+            task_id: None,
+            cas_version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+            candidate_kind,
+            payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
+            confidence: request.confidence,
+            source_span: request.source_span.clone().or_else(|| {
+                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
+            }),
+            extractor_fingerprint: request
+                .extractor_fingerprint
+                .clone()
+                .or_else(|| Some("manual-override-v1".to_string())),
+        }];
+    }
+
     let mut candidates = Vec::new();
 
     if intents.is_empty() {
@@ -281,12 +303,33 @@ pub fn create_candidates_from_intents(
             cas_version: 1,
             created_at: now.clone(),
             updated_at: now,
+            candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+            payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
+            confidence: request.confidence,
+            source_span: request.source_span.clone().or_else(|| {
+                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
+            }),
+            extractor_fingerprint: request
+                .extractor_fingerprint
+                .clone()
+                .or_else(|| Some("raw-text-fallback-v1".to_string())),
         });
     } else {
         // Create one candidate per distinct intent
         for (i, intent) in intents.into_iter().enumerate() {
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let title = format!("[{}] {}", intent.marker, intent.excerpt.chars().take(80).collect::<String>());
+            let span = request.source_span.clone().or_else(|| {
+                request
+                    .text
+                    .find(&intent.excerpt)
+                    .map(|start| serde_json::json!({"start": start, "end": start + intent.excerpt.len()}))
+                    .or_else(|| Some(serde_json::json!({"start": 0, "end": request.text.len()})))
+            });
+            let fp = request
+                .extractor_fingerprint
+                .clone()
+                .or_else(|| Some(format!("lexical-intent:{}", intent.marker)));
             candidates.push(IntakeCandidate {
                 id: generate_candidate_id(namespace, receipt_id, i),
                 namespace: namespace.to_string(),
@@ -299,6 +342,11 @@ pub fn create_candidates_from_intents(
                 cas_version: 1,
                 created_at: now.clone(),
                 updated_at: now,
+                candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+                payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
+                confidence: request.confidence,
+                source_span: span,
+                extractor_fingerprint: fp,
             });
         }
     }
@@ -372,11 +420,18 @@ mod tests {
             text: "Just a note, no task here".to_string(),
             title: None,
             description: None,
+            candidate_kind: None,
+            payload: None,
+            confidence: None,
+            source_span: None,
+            extractor_fingerprint: None,
         };
         let candidates = create_candidates_from_intents("test", "rcpt-1", &request, vec![]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].review_state, ReviewState::Pending);
         assert_eq!(candidates[0].disposition, Disposition::Pending);
+        assert!(candidates[0].source_span.is_some());
+        assert!(candidates[0].extractor_fingerprint.is_some());
     }
 
     #[test]
@@ -389,6 +444,11 @@ mod tests {
             text: "TODO: fix bug\nLater we need to refactor".to_string(),
             title: None,
             description: None,
+            candidate_kind: None,
+            payload: None,
+            confidence: None,
+            source_span: None,
+            extractor_fingerprint: None,
         };
         let intents = vec![
             DetectedIntent { marker: "todo:".to_string(), excerpt: "TODO: fix bug".to_string() },
@@ -397,6 +457,180 @@ mod tests {
         let candidates = create_candidates_from_intents("test", "rcpt-1", &request, intents);
         assert_eq!(candidates.len(), 2);
     }
+
+    /// End-to-end probe of the IntakeStore handlers against a real temp
+    /// `LadybugStore`: intake twice, then list receipts and candidates both
+    /// unpaged and paged (`limit: 1, offset: 1`), then resolve a candidate.
+    /// Guards the LIMIT syntax: `OFFSET` is not Ladybug Cypher, so any output
+    /// containing "parser exception" (or an ERROR from the underlying query)
+    /// fails here.
+    #[tokio::test]
+    async fn handle_intake_round_trips_receipts_candidates_and_pagination() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(
+                dir.path().join("intake.lbug").to_string_lossy().to_string(),
+                4,
+            )
+            .expect("open temp database"),
+        );
+        store.init("intake-list-test").await.expect("create schema");
+
+        let ns = "intake-list-test";
+        let text = "TODO: fix the offset pagination bug";
+
+        // Intake twice, separated enough that `created_at` (second
+        // resolution) orders the two receipts deterministically.
+        for (rev, digest) in [("rev-1", "digest-1"), ("rev-2", "digest-2")] {
+            let out = handle_intake(
+                json!({
+                    "namespace": ns,
+                    "source_revision": rev,
+                    "source_digest": digest,
+                    "text": text,
+                }),
+                store.clone(),
+            )
+            .await;
+            assert!(!out.contains("ERROR"), "intake {} failed: {}", rev, out);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+
+        // Receipts: unpaged
+        let out = handle_intake_list(
+            json!({"namespace": ns, "mode": "receipts"}),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "unpaged receipts list broke: {}",
+            out
+        );
+        let receipts: Value = serde_json::from_str(&out).expect("parse receipts");
+        assert_eq!(receipts["count"], json!(2));
+        assert_eq!(receipts["total"], json!(2));
+        let all_receipt_ids: Vec<String> = receipts["receipts"]
+            .as_array()
+            .expect("receipts array")
+            .iter()
+            .map(|r| r["id"].as_str().expect("receipt id").to_string())
+            .collect();
+
+        // Receipts: paged pages reassemble the full listing
+        let pages: [Vec<String>; 2] = [
+            page_of(handle_intake_list(
+                json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 0}),
+                store.clone(),
+            ).await, "receipts"),
+            page_of(handle_intake_list(
+                json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 1}),
+                store.clone(),
+            ).await, "receipts"),
+        ];
+        assert_eq!(pages[0].len(), 1, "receipt page at offset 0: {:?}", pages);
+        assert_eq!(pages[1].len(), 1, "receipt page at offset 1: {:?}", pages);
+        assert_ne!(pages[0][0], pages[1][0], "offset must move to the next row");
+        let mut combined = pages.concat();
+        combined.sort();
+        let mut sorted_all = all_receipt_ids.clone();
+        sorted_all.sort();
+        assert_eq!(combined, sorted_all, "paged pages must cover every receipt");
+
+        // Candidates: unpaged (one intent per receipt → one candidate each)
+        let out = handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates"}),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "unpaged candidates list broke: {}",
+            out
+        );
+        let candidates: Value = serde_json::from_str(&out).expect("parse candidates");
+        assert_eq!(candidates["count"], json!(2));
+        assert_eq!(candidates["total"], json!(2));
+        let all_candidate_ids: Vec<String> = candidates["candidates"]
+            .as_array()
+            .expect("candidates array")
+            .iter()
+            .map(|c| c["id"].as_str().expect("candidate id").to_string())
+            .collect();
+
+        // Candidates: paged pages reassemble the full listing
+        let page0 = page_of(handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 0}),
+            store.clone(),
+        ).await, "candidates");
+        let page1 = page_of(handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 1}),
+            store.clone(),
+        ).await, "candidates");
+        assert_eq!(page0.len(), 1, "candidate page at offset 0");
+        assert_eq!(page1.len(), 1, "candidate page at offset 1");
+        assert_ne!(page0[0], page1[0], "offset must move to the next candidate");
+        let mut combined = [page0.clone(), page1.clone()].concat();
+        combined.sort();
+        let mut sorted_all = all_candidate_ids.clone();
+        sorted_all.sort();
+        assert_eq!(combined, sorted_all, "paged pages must cover every candidate");
+
+        // Resolve one candidate (dismissed keeps the resolve path free of
+        // task creation side effects).
+        let out = handle_intake_resolve(
+            json!({
+                "namespace": ns,
+                "candidate_id": page1[0],
+                "disposition": "dismissed",
+                "cas_version": 1,
+            }),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "resolve broke: {}",
+            out
+        );
+        let resolved: Value = serde_json::from_str(&out).expect("parse resolve");
+        assert_eq!(resolved["candidate"]["disposition"], json!("dismissed"));
+
+        // The remaining pending candidate is still listable, filtered.
+        let out = handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates", "review_state": "pending"}),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "filtered candidates list broke: {}",
+            out
+        );
+        let pending: Value = serde_json::from_str(&out).expect("parse pending");
+        assert_eq!(pending["count"], json!(1));
+        assert_eq!(pending["total"], json!(1));
+    }
+
+    /// Pull the ids off one listing page, after checking the page answered.
+    fn page_of(raw: String, key: &str) -> Vec<String> {
+        assert!(
+            !raw.contains("ERROR") && !raw.contains("parser exception"),
+            "listing page ({} items) broke: {}",
+            key,
+            raw
+        );
+        let value: Value =
+            serde_json::from_str(&raw).expect("page must be valid JSON");
+        value[key]
+            .as_array()
+            .expect("page array")
+            .iter()
+            .map(|row| row["id"].as_str().expect("id").to_string())
+            .collect()
+    }
 }
 
 /// Handler for neurostrata_task_intake tool.
@@ -404,8 +638,6 @@ pub async fn handle_intake(
     args: Value,
     store: Arc<dyn crate::traits::VectorStore>,
 ) -> String {
-    use crate::traits::IntakeStore;
-
     // Parse arguments
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
@@ -416,7 +648,10 @@ pub async fn handle_intake(
         Some("manual") => SourceKind::Manual,
         Some("imported") => SourceKind::Imported,
         Some("tool") => SourceKind::Tool,
-        _ => SourceKind::Conversation, // default
+        Some("conversation") | Some("") | None => SourceKind::Conversation, // default
+        Some(s) => {
+            return serde_json::json!({ "error": format!("unknown source_kind '{s}' (expected conversation|manual|imported|tool)") }).to_string();
+        }
     };
 
     let source_revision = match args.get("source_revision").and_then(|v| v.as_str()) {
@@ -436,9 +671,16 @@ pub async fn handle_intake(
 
     let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
     let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let candidate_kind =
+        args.get("candidate_kind").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let payload = args.get("payload").cloned();
+    let confidence = args.get("confidence").and_then(|v| v.as_f64());
+    let source_span = args.get("source_span").cloned();
+    let extractor_fingerprint = args.get("extractor_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // Downcast to IntakeStore
-    let intake_store = match store.as_any().downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -451,6 +693,11 @@ pub async fn handle_intake(
         text,
         title,
         description,
+        candidate_kind,
+        payload,
+        confidence,
+        source_span,
+        extractor_fingerprint,
     };
 
     match intake_store.create_receipt(request).await {
@@ -462,7 +709,13 @@ pub async fn handle_intake(
             });
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
         }
-        Err(e) => e,
+        Err(e) => {
+            if e.starts_with("ERROR:") {
+                e
+            } else {
+                format!("ERROR: {e}")
+            }
+        }
     }
 }
 
@@ -471,8 +724,6 @@ pub async fn handle_intake_list(
     args: Value,
     store: Arc<dyn crate::traits::VectorStore>,
 ) -> String {
-    use crate::traits::IntakeStore;
-
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
@@ -480,7 +731,8 @@ pub async fn handle_intake_list(
 
     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("candidates");
 
-    let intake_store = match store.as_any().downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -508,28 +760,40 @@ pub async fn handle_intake_list(
                     });
                     serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
-                Err(e) => e,
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
             }
         }
         "candidates" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
             let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
 
-            let review_state = args.get("review_state").and_then(|v| v.as_str()).and_then(|s| match s {
-                "pending" => Some(ReviewState::Pending),
-                "in_review" => Some(ReviewState::InReview),
-                "accepted" => Some(ReviewState::Accepted),
-                "dismissed" => Some(ReviewState::Dismissed),
+            let review_state = match args.get("review_state").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match s {
+                    "pending" => Some(ReviewState::Pending),
+                    "in_review" => Some(ReviewState::InReview),
+                    "accepted" => Some(ReviewState::Accepted),
+                    "dismissed" => Some(ReviewState::Dismissed),
+                    _ => return format!("ERROR: Invalid review_state '{}'", s),
+                },
                 _ => None,
-            });
+            };
 
-            let disposition = args.get("disposition").and_then(|v| v.as_str()).and_then(|s| match s {
-                "pending" => Some(Disposition::Pending),
-                "created" => Some(Disposition::Created),
-                "linked" => Some(Disposition::Linked),
-                "dismissed" => Some(Disposition::Dismissed),
+            let disposition = match args.get("disposition").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match s {
+                    "pending" => Some(Disposition::Pending),
+                    "created" => Some(Disposition::Created),
+                    "linked" => Some(Disposition::Linked),
+                    "dismissed" => Some(Disposition::Dismissed),
+                    _ => return format!("ERROR: Invalid disposition '{}'", s),
+                },
                 _ => None,
-            });
+            };
 
             let request = ListCandidatesRequest {
                 namespace: namespace.clone(),
@@ -551,7 +815,13 @@ pub async fn handle_intake_list(
                     });
                     serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
-                Err(e) => e,
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
             }
         }
         _ => "ERROR: 'mode' must be 'receipts' or 'candidates'.".to_string(),
@@ -563,8 +833,6 @@ pub async fn handle_intake_resolve(
     args: Value,
     store: Arc<dyn crate::traits::VectorStore>,
 ) -> String {
-    use crate::traits::IntakeStore;
-
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
@@ -594,7 +862,8 @@ pub async fn handle_intake_resolve(
         None => return "ERROR: 'cas_version' is required (u64).".to_string(),
     };
 
-    let intake_store = match store.as_any().downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -616,17 +885,12 @@ pub async fn handle_intake_resolve(
             });
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
         }
-        Err(e) => e,
-    }
-}
-
-// Add AsAny trait for downcasting
-trait AsAny {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-impl<T: 'static> AsAny for T {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+        Err(e) => {
+            if e.starts_with("ERROR:") {
+                e
+            } else {
+                format!("ERROR: {e}")
+            }
+        }
     }
 }

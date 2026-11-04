@@ -16,7 +16,7 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 // target. These re-exports keep `ingest.rs` and the store naming the same
 // functions through the path they already use.
 pub use crate::parser::generation::{
-    generation_key, generation_scoped_id, logical_path_of, sha256_hex, split_scoped_id,
+    generation_key, generation_scoped_id, ingest_version, logical_path_of, sha256_hex, split_scoped_id,
     symbol_id, NAMESPACE_SEPARATOR,
 };
 
@@ -173,6 +173,167 @@ struct SymbolRow {
     /// SHA-256 of the full (untruncated) definition text. This is the symbol's
     /// stable identity tail (`symbol_id`), stable across line moves.
     span_sha256: String,
+    calls: Vec<String>,
+}
+
+/// Extract identifiers followed by `(` from `body`, excluding `self_name` and
+/// language keywords/builtins. Sorted and deduplicated.
+fn extract_called_identifiers(body: &str, self_name: &str) -> Vec<String> {
+    const KEYWORDS: &[&str] = &[
+        "if", "else", "for", "while", "loop", "match", "switch", "return",
+        "sizeof", "typeof", "catch", "fn", "def", "function", "pub", "Some",
+        "None", "Ok", "Err", "vec", "format", "println", "eprintln", "assert",
+        "assert_eq", "assert_ne",
+    ];
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &body[start..i];
+            if i < bytes.len()
+                && bytes[i] == b'('
+                && ident != self_name
+                && !KEYWORDS.contains(&ident)
+            {
+                out.push(ident.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+/// One embedded markdown section.
+#[derive(Clone)]
+struct DocSection {
+    slug: String,
+    heading: String,
+    /// Markdown heading depth (# = 1, ## = 2, ...); 0 for the implicit root.
+    /// Persisted as `heading_level` in the doc-section node metadata.
+    level: usize,
+    text: String,
+    sha256: String,
+    backticked: Vec<String>,
+    links: Vec<String>,
+}
+
+/// Parse markdown into sections by heading.
+fn parse_markdown_sections(content: &str) -> Vec<DocSection> {
+    let mut sections: Vec<DocSection> = Vec::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_level: usize = 0;
+    let mut body: Vec<String> = Vec::new();
+
+    let flush = |heading: Option<String>, level: usize, body: &Vec<String>, out: &mut Vec<DocSection>| {
+        let heading = heading.unwrap_or_else(|| "root".to_string());
+        let text = body.join("\n").trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let slug = slugify(&heading);
+        let mut backticked = Vec::new();
+        let mut links = Vec::new();
+        for line in body {
+            let mut rest = line.as_str();
+            while let Some(start) = rest.find('`') {
+                let after = &rest[start+1..];
+                if let Some(end) = after.find('`') {
+                    let code = after[..end].trim();
+                    if !code.is_empty() && !code.contains('\n') {
+                        backticked.push(code.to_string());
+                    }
+                    rest = &after[end+1..];
+                } else {
+                    break;
+                }
+            }
+            let mut r = line.as_str();
+            while let Some(start) = r.find('[') {
+                let after = &r[start..];
+                if let Some(bracket_end) = after.find(']') {
+                    let rest2 = &after[bracket_end+1..];
+                    if rest2.starts_with('(') {
+                        if let Some(paren_end) = rest2.find(')') {
+                            let url = &rest2[1..paren_end];
+                            links.push(url.to_string());
+                        }
+                    }
+                    r = &after[bracket_end+1..];
+                } else {
+                    break;
+                }
+            }
+        }
+        backticked.sort();
+        backticked.dedup();
+        links.sort();
+        links.dedup();
+        let sha = sha256_hex(text.as_bytes());
+        out.push(DocSection {
+            slug,
+            heading,
+            level,
+            text,
+            sha256: sha,
+            backticked,
+            links,
+        });
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            if level == 0 { continue; }
+            if current_heading.is_some() {
+                flush(current_heading.take(), current_level, &body, &mut sections);
+                body.clear();
+            }
+            let heading_text = trimmed[level..].trim().to_string();
+            current_heading = Some(heading_text);
+            current_level = level;
+        } else {
+            body.push(line.to_string());
+        }
+    }
+    if current_heading.is_some() || !body.is_empty() {
+        flush(current_heading.take(), current_level, &body, &mut sections);
+    }
+    if sections.is_empty() {
+        let text = content.trim().to_string();
+        if !text.is_empty() {
+            sections.push(DocSection {
+                slug: "root".to_string(),
+                heading: "root".to_string(),
+                level: 0,
+                text: text.clone(),
+                sha256: sha256_hex(text.as_bytes()),
+                backticked: vec![],
+                links: vec![],
+            });
+        }
+    }
+    sections
+}
+
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if (c == ' ' || c == '-' || c == '_') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 // `symbol_id` and `NAMESPACE_SEPARATOR` are re-exported from
@@ -188,6 +349,12 @@ pub trait IngestObserver: Send + Sync {
     /// reported here with the scanner's reason. The default ignores it, so
     /// observers that only count progress are unchanged.
     fn file_skipped(&self, _path: &str, _reason: &str) {}
+    /// Called once per run when the previous generation's `ingest_version`
+    /// differs from the current one (or is absent). Implementors surface this
+    /// as a warning; the ingest continues with a full re-parse.
+    fn version_gate_tripped(&self, prev: &str, current: &str) {
+        tracing::warn!("ingest version gate tripped: prev={prev} current={current}");
+    }
 }
 
 /// An owned item streamed from the blocking producer to the async consumer.
@@ -220,6 +387,12 @@ enum IngestItem {
         path_display: String,
         reason: String,
     },
+    /// Embedded markdown sections.
+    DocSections {
+        node_path: String,
+        sections: Vec<DocSection>,
+        file_sha256: String,
+    },
 }
 
 /// Secret scan over a document's text, run in the producer as the file is
@@ -240,7 +413,19 @@ fn run_producer(
     tx: mpsc::Sender<IngestItem>,
     namespace: String,
     generation: u64,
-) -> anyhow::Result<()> {
+    prev_file_map: std::collections::HashMap<String, String>,
+    force_reparse: bool,
+    observer: Option<std::sync::Arc<dyn IngestObserver>>,
+) -> anyhow::Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, Vec<String>>,
+)> {
+    let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let skipped_dirs = [
         "node_modules",
         "target",
@@ -353,12 +538,24 @@ fn run_producer(
 
         let node_id = generation_scoped_id(&namespace, generation, &node_path);
 
+        // Every visited path is recorded so carry-forward can decide whether a
+        // previous row still belongs to the current tree.
+        current_paths.insert(node_path.clone());
+
         // Every file's bytes are read once and hashed so `file_sha256` is
         // captured on file and markdown nodes too, not only on parseable code
         // files. The same bytes are parsed only when the extension maps to a
         // grammar; directories carry no hash.
-        let (file_sha256, content, lang_name) = if is_file {
-            let bytes = std::fs::read(path).ok();
+        let (file_sha256, content, lang_name, raw_bytes) = if is_file {
+            // A single read per file: the bytes below are hashed, parsed (when
+            // a grammar applies) and reused for the markdown section pass.
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!("failed to read {} for sha256: {e}", path.display());
+                    None
+                }
+            };
             let hash = bytes.as_deref().map(sha256_hex);
             let lang_name = path
                 .extension()
@@ -369,9 +566,9 @@ fn run_producer(
                 (Some(b), Some(_)) => Some(String::from_utf8_lossy(b).to_string()),
                 _ => None,
             };
-            (hash, content, lang_name)
+            (hash, content, lang_name, bytes)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // Before its node goes out, a parseable file's text meets the
@@ -398,6 +595,29 @@ fn run_producer(
             }
         }
 
+        // Incremental skip: if this file's hash matches the previous active
+        // generation, carry it forward instead of re-parsing/re-embedding.
+        if is_file {
+            if !force_reparse {
+                if let Some(prev_hash) = prev_file_map.get(&node_path) {
+                    if prev_hash == file_sha256.as_deref().unwrap_or("") {
+                        if let Some(obs) = &observer {
+                            obs.file_skipped(&path_str, "unchanged");
+                        }
+                        // Record the current hash so unchanged rows can be carried.
+                        if let Some(h) = file_sha256.as_deref() {
+                            current_hashes.insert(node_path.clone(), h.to_string());
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        // Record the current hash for every file the walk visits.
+        if let Some(h) = file_sha256.as_deref() {
+            current_hashes.insert(node_path.clone(), h.to_string());
+        }
+
         // `blocking_send` applies backpressure when the bounded queue is full.
         // A closed receiver is an error: otherwise a partial walk looked like
         // success when the consumer had failed.
@@ -412,6 +632,24 @@ fn run_producer(
         .map_err(|_| {
             anyhow::anyhow!("ingest consumer stopped before node {node_path} was queued")
         })?;
+
+        // For markdown files, parse into sections and stream them for embedding.
+        if is_file && path_str.ends_with(".md") {
+            if let Some(bytes) = raw_bytes.as_ref() {
+                let content = String::from_utf8_lossy(bytes).to_string();
+                let sections = parse_markdown_sections(&content);
+                if !sections.is_empty() {
+                    let file_sha = sha256_hex(bytes);
+                    if let Err(e) = tx.blocking_send(IngestItem::DocSections {
+                        node_path: node_path.clone(),
+                        sections,
+                        file_sha256: file_sha,
+                    }) {
+                        return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                    }
+                }
+            }
+        }
 
         // Parse the content already read above and stream the symbols.
         if let (Some(content), Some(lang_name)) = (content, lang_name) {
@@ -434,7 +672,7 @@ fn run_producer(
                 let query = match Query::new(&ts_lang, query_str) {
                     Ok(q) => q,
                     Err(e) => {
-                        eprintln!("Invalid query for {}: {}", lang_name, e);
+                        tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
                         continue;
                     }
                 };
@@ -470,8 +708,15 @@ fn run_producer(
                         end_line: definition.end_position().row + 1,
                         body: truncate_for_embedding(full),
                         span_sha256: sha256_hex(full.as_bytes()),
+                        calls: extract_called_identifiers(full, name),
                     });
                 }
+            }
+
+            // Extract module/import dependencies (best-effort, warn-free).
+            let imports = extract_import_specifiers(&lang_name, &content);
+            if !imports.is_empty() {
+                raw_imports.insert(node_path.clone(), imports);
             }
 
             if !pending.is_empty() {
@@ -501,9 +746,16 @@ fn run_producer(
         );
     }
 
-    Ok(())
+    // Resolve raw imports to in-repo file paths now that the full file set is known.
+    let mut resolved = std::collections::HashMap::new();
+    for (src, imports) in raw_imports {
+        let targets = resolve_dependency_paths(&src, &imports, &current_paths);
+        if !targets.is_empty() {
+            resolved.insert(src, targets);
+        }
+    }
+    Ok((current_paths, current_hashes, resolved))
 }
-
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
 /// it governs differs per node, so each row records its own.
@@ -529,6 +781,8 @@ async fn run_consumer(
     zero_vector: Vec<f32>,
     generation: u64,
     source_identity: serde_json::Value,
+    ingest_version: &str,
+    node_set: &[String],
 ) -> anyhow::Result<()> {
     while let Some(item) = rx.recv().await {
         match item {
@@ -551,6 +805,8 @@ async fn run_consumer(
                 if let Some(hash) = file_sha256 {
                     metadata.insert("file_sha256".to_string(), serde_json::json!(hash));
                 }
+                metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
+                metadata.insert("node_set".to_string(), serde_json::json!(node_set));
 
                 let payload = MemoryPayload {
                     content: format!("Path: {}", node_path),
@@ -579,6 +835,24 @@ async fn run_consumer(
                 file_sha256,
             } => {
                 let mut symbols_stored = 0usize;
+                let file_symbol_ids: std::collections::HashMap<String, String> = symbols
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            generation_scoped_id(
+                                namespace,
+                                generation,
+                                &symbol_id(
+                                    &node_path,
+                                    &s.kind,
+                                    &s.name,
+                                    &s.span_sha256,
+                                ),
+                            ),
+                        )
+                    })
+                    .collect();
                 for symbol in symbols {
                     let summary = format!(
                         "{} {} in {}\nlines {}-{}\n\n{}",
@@ -617,6 +891,8 @@ async fn run_consumer(
                         ]),
                     );
                     metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                    metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
+                metadata.insert("node_set".to_string(), serde_json::json!(node_set));
                     metadata.insert(
                         "span_sha256".to_string(),
                         serde_json::json!(symbol.span_sha256),
@@ -626,6 +902,20 @@ async fn run_consumer(
                         with_relative_path(&source_identity, &node_path),
                     );
                     metadata.insert("index_generation".to_string(), serde_json::json!(generation));
+
+                    if !symbol.calls.is_empty() {
+                        metadata.insert("calls".to_string(), serde_json::json!(symbol.calls));
+                        let called_ids: Vec<String> = symbol
+                            .calls
+                            .iter()
+                            .filter_map(|c| file_symbol_ids.get(c))
+                            .filter(|cid| *cid != &id)
+                            .cloned()
+                            .collect();
+                        if !called_ids.is_empty() {
+                            metadata.insert("depends_on".to_string(), serde_json::json!(called_ids));
+                        }
+                    }
 
                     let payload = MemoryPayload {
                         content: summary.clone(),
@@ -679,7 +969,55 @@ async fn run_consumer(
                     observer.file_skipped(&path_display, &reason);
                 }
             }
+        IngestItem::DocSections {
+            node_path,
+            sections,
+            file_sha256,
+        } => {
+            for section in sections {
+                let id = generation_scoped_id(
+                    namespace,
+                    generation,
+                    &format!("{}#section:{}@{}", node_path, section.slug, section.sha256),
+                );
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("domain".to_string(), serde_json::json!("docs"));
+                metadata.insert("heading".to_string(), serde_json::json!(section.heading));
+                metadata.insert("heading_level".to_string(), serde_json::json!(section.level));
+                metadata.insert("slug".to_string(), serde_json::json!(section.slug));
+                metadata.insert("backticked".to_string(), serde_json::json!(section.backticked));
+                metadata.insert("links".to_string(), serde_json::json!(section.links));
+                metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
+                metadata.insert("node_set".to_string(), serde_json::json!(node_set));
+                metadata.insert(
+                    "contained_by".to_string(),
+                    serde_json::json!([generation_scoped_id(namespace, generation, &node_path)]),
+                );
+                metadata.insert("source_identity".to_string(), with_relative_path(&source_identity, &node_path));
+                metadata.insert("index_generation".to_string(), serde_json::json!(generation));
+
+                let summary = format!("{}\n\n{}", section.heading, section.text);
+                let payload = MemoryPayload {
+                    content: summary.clone(),
+                    location: node_path.clone(),
+                    location_lines: String::new(),
+                    memory_type: "doc_section".to_string(),
+                    metadata: serde_json::Value::Object(metadata),
+                    user_id: "auto-ingestor".to_string(),
+                    agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                };
+
+                let embedding = embedder.embed(&summary).await.map_err(|e| {
+                    anyhow::anyhow!("failed to embed doc section {}: {}", section.heading, e)
+                })?;
+                vector_store
+                    .upsert(namespace, &id, embedding, payload)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to store doc section {}: {}", id, e))?;
+            }
         }
+    }
     }
 
     Ok(())
@@ -701,10 +1039,18 @@ pub async fn ingest_directory(
     vector_store: Arc<dyn VectorStore>,
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
+    node_set: &[String],
 ) -> anyhow::Result<()> {
     if is_reserved_ingest_destination(namespace) {
         anyhow::bail!("ingest destination uses the reserved internal staging namespace");
     }
+    // Normalize node_set: sorted + deduped (C2 deterministic contract).
+    let node_set: Vec<String> = {
+        let mut v = node_set.to_vec();
+        v.sort();
+        v.dedup();
+        v
+    };
 
     // Prove the root is a readable directory before anything is staged. A
     // missing or mistyped path used to clear the namespace, walk nothing -- the
@@ -726,11 +1072,55 @@ pub async fn ingest_directory(
     // overwrite the other's active pointer.
     let worktree_id = source_key_for(dir_path);
     let source_key = worktree_id.clone();
+    let ingest_start = std::time::Instant::now();
+    match crate::registry::enrichment_start(&vector_store, Some(&embedder), namespace, &source_key).await {
+        Ok(status) => {
+            if status.get("acquired").and_then(|v| v.as_bool()) == Some(false) {
+                tracing::warn!("enrichment lock already held for namespace '{namespace}'");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("enrichment registry update failed: {e}");
+        }
+    }
     let source_identity = crate::context::model::SourceIdentity {
         worktree_id,
         ..Default::default()
     };
     let source_identity_json = serde_json::to_value(&source_identity)?;
+
+    // Previous active generation for this source (for incremental carry-forward).
+    let prev_gen = vector_store
+        .active_generation(namespace, &source_key)
+        .await
+        .unwrap_or(0);
+
+    // Build prev_file_map: node_path -> file_sha256 for files in prev gen.
+    let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut prev_stamps: Vec<String> = Vec::new();
+    if prev_gen > 0 {
+        match vector_store.list(namespace, None, None).await {
+            Ok(rows) => {
+                for r in rows {
+                    let id = r.id.clone();
+                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    if gen != prev_gen { continue; }
+                    let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    if let Some(h) = hash {
+                        prev_file_map.insert(tail.to_string(), h.clone());
+                    }
+                    let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    prev_stamps.push(stamp);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("vector_store.list failed while building prev_file_map for '{namespace}': {e}");
+            }
+        }
+    }
 
     // Allocate a fresh generation. Nothing is deleted: the previous active
     // generation stays visible until this one publishes, so a failed build
@@ -753,10 +1143,25 @@ pub async fn ingest_directory(
     let dir_path_owned = dir_path.to_path_buf();
     let schema_clone = schema.clone();
 
+    // Version gate: a changed (or missing) ingest_version stamps a full re-parse.
+    // A mixed previous generation (any row missing or differing) trips too.
+    let current_version = ingest_version(&schema.fingerprint());
+    let offending_stamp = prev_stamps.iter().find(|s| crate::parser::generation::version_gate_tripped(if s.is_empty() { None } else { Some(s.as_str()) }, &current_version)).cloned();
+    let force_reparse = prev_gen > 0 && offending_stamp.is_some();
+    if force_reparse {
+        let warn_prev = offending_stamp.as_deref().filter(|s| !s.is_empty()).unwrap_or("(none)");
+        if let Some(obs) = &observer {
+            obs.version_gate_tripped(warn_prev, &current_version);
+        }
+        tracing::warn!(prev = warn_prev, current = %current_version, "ingest version changed; re-parsing all files");
+    }
+
     let (tx, rx) = mpsc::channel::<IngestItem>(256);
 
     // The blocking producer walks the filesystem and parses files on a
     // blocking thread, streaming owned results through the channel.
+    let prev_file_map_clone = prev_file_map.clone();
+    let observer_clone = observer.clone();
     let producer = tokio::task::spawn_blocking(move || {
         run_producer(
             dir_path_owned,
@@ -765,6 +1170,9 @@ pub async fn ingest_directory(
             tx,
             namespace_owned,
             generation,
+            prev_file_map_clone,
+            force_reparse,
+            observer_clone,
         )
     });
 
@@ -779,6 +1187,8 @@ pub async fn ingest_directory(
         zero_vector,
         generation,
         source_identity_json,
+        &current_version,
+        &node_set,
     )
     .await;
 
@@ -786,8 +1196,16 @@ pub async fn ingest_directory(
 
     // Any failure aborts the staging generation: the previous active generation
     // stays reachable, and this one's half-built tree is discarded.
+    let mut current_hashes = std::collections::HashMap::new();
+    let mut current_paths = std::collections::HashSet::new();
+    let mut dependency_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok(()))) => None,
+        (Ok(()), Ok(Ok((paths, hashes, deps)))) => {
+            current_paths = paths;
+            current_hashes = hashes;
+            dependency_map = deps;
+            None
+        }
         (Err(e), _) => Some(e),
         (Ok(()), Ok(Err(e))) => Some(e),
         (Ok(()), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
@@ -801,6 +1219,9 @@ pub async fn ingest_directory(
                 "Failed to abort staging generation {} of namespace {}: {}",
                 generation, namespace, abort
             );
+        }
+        if let Err(e) = crate::registry::enrichment_fail(&vector_store, Some(&embedder), namespace, "ingest", &e.to_string()).await {
+            tracing::warn!("enrichment registry update failed: {e}");
         }
         return Err(e);
     }
@@ -833,20 +1254,134 @@ pub async fn ingest_directory(
             ));
         }
     };
+    // Carry forward unchanged nodes from the previous generation so the
+    // new generation contains the full tree without re-embedding.
+    // A forced re-parse (version trip) stages every current node itself, so
+    // no previous row is carried in that mode.
+    if prev_gen > 0 && !force_reparse {
+        let mut carried = 0usize;
+        let rows = match vector_store.list(namespace, None, None).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "carry-forward: could not list previous-generation rows of namespace {}: {}",
+                    namespace, e
+                );
+                Vec::new()
+            }
+        };
+        for r in rows {
+            let id = r.id.clone();
+            let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                Some(x) => x,
+                None => continue,
+            };
+            if gen != prev_gen { continue; }
+            // The row's `location` is the file it came from (stamped at
+            // ingest time), which survives `#` in file names unlike
+            // splitting the symbol id.
+            let file_path = r.payload.location.clone();
+            let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+            // Carry a previous row only when its file is still present with
+            // the same bytes, or (for no-hash rows) when the path is still
+            // visited. Deleted files and stale symbols drop out.
+            let carry = if current_paths.contains(&file_path) {
+                match &hash {
+                    Some(h) => current_hashes.get(&file_path) == Some(h),
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if !carry { continue; }
+            match vector_store.get(namespace, &id).await {
+                Ok(Some((vec, mut payload))) => {
+                    let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
+                    let new_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, generation, crate::parser::generation::NAMESPACE_SEPARATOR);
+                    payload.metadata.as_object_mut().map(|o| {
+                        o.insert("index_generation".to_string(), serde_json::json!(generation));
+                        o.insert("ingest_version".to_string(), serde_json::json!(current_version));
+                        // Fix contained_by generation prefixes (F2).
+                        if let Some(serde_json::Value::Array(arr)) = o.get("contained_by").cloned() {
+                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                            o.insert("contained_by".to_string(), serde_json::Value::Array(updated));
+                        }
+                        // Fix depends_on generation prefixes (F2).
+                        if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
+                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                            o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
+                        }
+                    });
+                    let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
+                    if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
+                        tracing::warn!(
+                            "carry-forward: failed to re-stage node {} into generation {}: {}",
+                            new_id, generation, e
+                        );
+                    } else {
+                        carried += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("carry-forward: vector_store.get failed for node {id}: {e}");
+                }
+            }
+        }
+        println!("Carried forward {} unchanged nodes", carried);
+    }
+
+    // Stamp DEPENDS_ON targets onto file nodes (best-effort, warn-first).
+    for (src_path, targets) in &dependency_map {
+        let src_id = crate::parser::ingest::generation_scoped_id(namespace, generation, src_path);
+        match vector_store.get(namespace, &src_id).await {
+            Ok(Some((vec, mut payload))) => {
+                let target_ids: Vec<String> = targets
+                    .iter()
+                    .map(|t| crate::parser::ingest::generation_scoped_id(namespace, generation, t))
+                    .collect();
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.insert("depends_on".to_string(), serde_json::json!(target_ids));
+                    obj.insert("imports".to_string(), serde_json::json!(targets));
+                }
+                if let Err(e) = vector_store.upsert(namespace, &src_id, vec, payload).await {
+                    tracing::warn!(
+                        "depends_on stamping: failed to upsert file node {} for namespace {}: {}",
+                        src_id, namespace, e
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("vector_store.get failed for depends_on source '{src_id}': {e}");
+            }
+        }
+    }
 
     // Atomically flip the active pointer onto this generation. Only now are its
     // nodes reachable; the previous generation remains as history.
-    vector_store
+    if let Err(e) = vector_store
         .publish_generation(namespace, &source_key, generation)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "stored the nodes of namespace {} but could not make generation {} active: {}",
-                namespace,
-                generation,
-                e
-            )
-        })?;
+    {
+        // Publication failed: abort the staged generation so its rows do not
+        // leak as orphaned staging (same cleanup as the failure branch above).
+        if let Err(abort) = vector_store
+            .abort_generation(namespace, &source_key, generation)
+            .await
+        {
+            eprintln!(
+                "Failed to abort staging generation {} of namespace {}: {}",
+                generation, namespace, abort
+            );
+        }
+        return Err(anyhow::anyhow!(
+            "stored the nodes of namespace {} but could not make generation {} active: {}",
+            namespace,
+            generation,
+            e
+        ));
+    }
 
     // A rule is not rewritten just because its file came back, so replay what
     // the memories still declare now that the nodes they point at are the
@@ -905,6 +1440,47 @@ pub async fn ingest_directory(
         &dir_path.to_string_lossy(),
     )
     .await;
+
+    // Watermark + stage telemetry on the namespace registry row (F12).
+    // `current_version` was computed at the version gate above (AH-40: no re-shadow).
+    // Compute deterministic source_digest over sorted (path, hash) pairs.
+    let mut digest_entries: Vec<(String, String)> = current_hashes
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    digest_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let digest_str = digest_entries
+        .iter()
+        .map(|(p, h)| format!("{}={}", p, h))
+        .collect::<Vec<_>>()
+        .join(";");
+    let source_digest = sha256_hex(digest_str.as_bytes());
+    let watermark = serde_json::json!({
+        "last_enriched_at": chrono::Utc::now().to_rfc3339(),
+        "enriched_count": current_paths.len(),
+        "extractor_fingerprint": current_version,
+        "source_digest": format!("sha256:{}", source_digest),
+    });
+    let telemetry = serde_json::json!({
+        "stages": [{
+            "name": "ingest",
+            "count": current_paths.len(),
+            "failures": 0,
+            "latency_ms": ingest_start.elapsed().as_millis() as u64,
+            "fingerprint": current_version,
+        }]
+    });
+    if let Err(e) = crate::registry::enrichment_commit(
+        &vector_store,
+        Some(&embedder),
+        namespace,
+        watermark,
+        telemetry,
+    )
+    .await
+    {
+        tracing::warn!("enrichment_commit failed for '{namespace}': {e}");
+    }
 
     Ok(())
 }
@@ -1139,6 +1715,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_called_identifiers_finds_function_calls_and_skips_keywords_and_self() {
+        // Test that extract_called_identifiers finds function calls and skips keywords and self
+        let body = "fn foo() { bar() }";
+        let self_name = "foo";
+        let result = extract_called_identifiers(body, self_name);
+        // Should find "bar" as a function call, skip "foo" (self), and skip keywords
+        assert!(result.iter().any(|s| s == "bar"));
+        assert!(!result.iter().any(|s| s == "foo"));
+        assert!(!result.iter().any(|s| s == "if"));
+        assert!(!result.iter().any(|s| s == "fn"));
+    }
+
+    #[test]
     fn unknown_extension_has_no_language() {
         let map = map_from(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{}}}}"#);
         assert_eq!(map.get(&normalize_ext("toml")), None);
@@ -1218,6 +1807,7 @@ mod tests {
             store.clone(),
             "probe",
             None,
+            &[],
         )
         .await;
 
@@ -1297,7 +1887,7 @@ mod tests {
                 store.clone(),
                 &namespace,
                 None,
-            )
+                &[],)
             .await;
             assert!(result
                 .unwrap_err()
@@ -1351,10 +1941,11 @@ mod tests {
             .expect("the held generation publishes after rejected requests");
         assert_eq!(published.0, active_before.0);
         assert_eq!(published.1.content, "held active generation");
-        assert_eq!(
-            published.1.metadata,
-            serde_json::json!({"generation": "keep"})
-        );
+        // The staged row's stored metadata carries main's facet enrichment
+        // (`facets`/`facets_bitemporal`, empty for this fixture) from upsert;
+        // publish preserves it verbatim, so compare against what staging
+        // stored rather than the pre-enrichment literal.
+        assert_eq!(published.1.metadata, active_before.1.metadata);
         assert!(concrete.ingest_stage_namespaces().await.unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(db);
@@ -1400,6 +1991,7 @@ mod tests {
             store.clone(),
             "test-ns",
             None,
+            &[],
         )
         .await;
 
@@ -1454,7 +2046,7 @@ mod tests {
             store.clone(),
             "test-ns",
             None,
-        )
+            &[],)
         .await
         .expect("publish replacement");
         // Merge integration: this tail came from the fork's version of the
@@ -1521,6 +2113,7 @@ mod tests {
             store.clone(),
             "shared-ns",
             None,
+            &[],
         )
         .await
         .expect("worktree a ingests");
@@ -1539,6 +2132,7 @@ mod tests {
             store.clone(),
             "shared-ns",
             None,
+            &[],
         )
         .await
         .expect("worktree b ingests");
@@ -1597,6 +2191,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await
         .expect("first ingest publishes");
@@ -1619,6 +2214,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await;
         assert!(outcome.is_err(), "a missing root is refused");
@@ -1668,6 +2264,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await
         .expect("first ingest publishes");
@@ -1679,6 +2276,10 @@ mod tests {
             1
         );
 
+        // Mutate the file so the incremental skip does not short-circuit the
+        // staging path: the second ingest must actually stage + embed.
+        std::fs::write(dir.join("hello.rs"), "fn main() { loop {} }").expect("rewrite file");
+
         // Second ingest begins generation 2, stages the file node, then the
         // symbol embed fails mid-stage.
         let outcome = ingest_directory(
@@ -1688,6 +2289,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await;
         assert!(outcome.is_err(), "a mid-stage embed failure aborts the ingest");
@@ -1965,7 +2567,7 @@ mod tests {
             store.clone(),
             "relink-ns",
             None,
-        )
+            &[],)
         .await
         .expect("first ingest publishes");
         assert_eq!(
@@ -1999,7 +2601,7 @@ mod tests {
             store.clone(),
             "relink-ns",
             None,
-        )
+            &[],)
         .await;
         let err = outcome.expect_err("a failed relink fails the ingest");
         assert!(
@@ -2049,7 +2651,7 @@ mod tests {
             store.clone(),
             "relink-ns",
             None,
-        )
+            &[],)
         .await
         .expect("retry publishes");
         assert_eq!(
@@ -2120,7 +2722,7 @@ mod tests {
             store.clone(),
             "test-ns",
             Some(observer),
-        )
+            &[],)
         .await;
         assert!(
             outcome.is_ok(),
@@ -2189,4 +2791,717 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
+
+    #[tokio::test]
+    async fn version_gate_trips_on_schema_change_and_deletion_does_not_resurrect() {
+        // First ingest publishes generation 1; nothing is skipped.
+        let tmp = std::env::temp_dir().join(format!("ns-version-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-version-gate-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+
+        struct Recorder(std::sync::Mutex<(usize, usize)>); // (skipped, gate trips)
+        impl IngestObserver for Recorder {
+            fn file_ingested(&self, _path: &str, _symbols: usize) {}
+            fn file_skipped(&self, _path: &str, _reason: &str) {
+                self.0.lock().unwrap().0 += 1;
+            }
+            fn relinked(&self, _edges: usize) {}
+            fn version_gate_tripped(&self, _prev: &str, _current: &str) {
+                self.0.lock().unwrap().1 += 1;
+            }
+        }
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let rec1 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec1.clone()), &[])
+            .await
+            .expect("first ingest");
+        assert_eq!(rec1.0.lock().unwrap().0, 0, "first ingest has nothing to skip");
+        assert_eq!(rec1.0.lock().unwrap().1, 0, "first ingest does not trip the gate");
+
+        // Same schema: unchanged file is skipped and the gate stays quiet.
+        let rec2 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec2.clone()), &[])
+            .await
+            .expect("second ingest");
+        assert_eq!(rec2.0.lock().unwrap().0, 1, "unchanged file skipped");
+        assert_eq!(rec2.0.lock().unwrap().1, 0, "version gate quiet");
+
+        // Changed schema (fingerprint differs): gate trips once, nothing is skipped.
+        let mut altered = schema.clone();
+        altered
+            .languages
+            .get_mut("rust")
+            .expect("shipped schema has rust")
+            .extensions
+            .push("rs2".to_string());
+        let rec3 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec3.clone()), &[])
+            .await
+            .expect("third ingest");
+        assert_eq!(rec3.0.lock().unwrap().1, 1, "version gate tripped once");
+        assert_eq!(rec3.0.lock().unwrap().0, 0, "nothing skipped after a schema change");
+
+        // Deleting the file must not resurrect it in the next generation.
+        std::fs::remove_file(tmp.join("hello.rs")).expect("remove file");
+        let rec4 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec4.clone()), &[])
+            .await
+            .expect("fourth ingest");
+        let gen4 = store
+            .active_generation("probe", &source_key_for(&tmp))
+            .await
+            .expect("read active generation");
+        let file_id = generation_scoped_id("probe", gen4, "hello.rs");
+        assert!(
+            store.get("probe", &file_id).await.expect("read").is_none(),
+            "deleted file must not be resurrected by carry-forward"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn hash_filename_with_hash_survives_carry_forward() {
+        let tmp = std::env::temp_dir().join(format!("ns-hashname-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a#b.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-hashname-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("second ingest");
+
+        let gen2 = store
+            .active_generation("probe", &source_key_for(&tmp))
+            .await
+            .expect("read active generation");
+        let file_id = generation_scoped_id("probe", gen2, "a#b.rs");
+        assert!(
+            store.get("probe", &file_id).await.expect("read").is_some(),
+            "file node with '#' in name must survive carry-forward"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn pre_migration_generation_re_parses_and_stamps_every_row() {
+        let tmp = std::env::temp_dir().join(format!("ns-premig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-premig-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&tmp);
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+
+        // Simulate a pre-migration generation by stripping ingest_version from
+        // every row of the active generation.
+        let gen1 = store.active_generation("probe", &source_key).await.expect("read");
+        let rows = store.list("probe", None, None).await.expect("list");
+        for r in rows {
+            let scoped = crate::parser::ingest::split_scoped_id(&r.id);
+            if scoped.is_none() { continue; }
+            let (_, g, _) = scoped.unwrap();
+            if g != gen1 {
+                continue;
+            }
+            if let Ok(Some((vec, mut payload))) = store.get("probe", &r.id).await {
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.remove("ingest_version");
+                }
+                store.upsert("probe", &r.id, vec, payload).await.expect("upsert");
+            }
+        }
+
+        // Re-ingest must trip the gate (missing stamps) and stamp every row.
+        struct Rec(std::sync::Mutex<usize>);
+        impl IngestObserver for Rec {
+            fn file_ingested(&self, _p: &str, _s: usize) {}
+            fn file_skipped(&self, _p: &str, _reason: &str) {}
+            fn relinked(&self, _e: usize) {}
+            fn version_gate_tripped(&self, _p: &str, _c: &str) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+        let rec = Arc::new(Rec(std::sync::Mutex::new(0)));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()), &[])
+            .await
+            .expect("second ingest");
+        assert_eq!(*rec.0.lock().unwrap(), 1, "pre-migration generation trips the gate");
+
+        let gen2 = store.active_generation("probe", &source_key).await.expect("read");
+        let rows2 = store.list("probe", None, None).await.expect("list");
+        for r in rows2 {
+            let scoped = crate::parser::ingest::split_scoped_id(&r.id);
+            if scoped.is_none() { continue; }
+            let (_, g, _) = scoped.unwrap();
+            if g != gen2 {
+                continue;
+            }
+            let v = r.payload.metadata.get("ingest_version").and_then(|x| x.as_str());
+            assert!(v.is_some() && !v.unwrap().is_empty(), "every current row must be stamped");
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn mixed_stamps_trip_even_if_first_row_is_current() {
+        let tmp = std::env::temp_dir().join(format!("ns-mixed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-mixed-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&tmp);
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        let gen1 = store.active_generation("probe", &source_key).await.expect("read");
+        let current = ingest_version(&schema.fingerprint());
+
+        // Tamper with one row's stamp to a different value.
+        let rows = store.list("probe", None, None).await.expect("list");
+        let target = rows.iter().find(|r| {
+            crate::parser::ingest::split_scoped_id(&r.id).map(|x| x.1 == gen1).unwrap_or(false)
+        }).expect("row").id.clone();
+        if let Ok(Some((vec, mut payload))) = store.get("probe", &target).await {
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("ingest_version".to_string(), serde_json::json!("tampered"));
+            }
+            store.upsert("probe", &target, vec, payload).await.expect("upsert");
+        }
+        assert_ne!(current, "tampered");
+
+        struct Rec(std::sync::Mutex<usize>);
+        impl IngestObserver for Rec {
+            fn file_ingested(&self, _p: &str, _s: usize) {}
+            fn file_skipped(&self, _p: &str, _reason: &str) {}
+            fn relinked(&self, _e: usize) {}
+            fn version_gate_tripped(&self, _p: &str, _c: &str) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+        let rec = Arc::new(Rec(std::sync::Mutex::new(0)));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()), &[])
+            .await
+            .expect("second ingest");
+        assert_eq!(*rec.0.lock().unwrap(), 1, "mixed stamps must trip the gate");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[test]
+    fn markdown_sections_extract_headings_backticks_links_and_skip_empty() {
+        let md = "# Heading\n\nbody with `sym` and [link](https://example.com)\n\n## Empty\n\n   \n\n## Second\nmore";
+        let secs = parse_markdown_sections(md);
+        assert_eq!(secs.len(), 2);
+        assert_eq!(secs[0].heading, "Heading");
+        assert!(secs[0].backticked.contains(&"sym".to_string()));
+        assert!(secs[0].links.contains(&"https://example.com".to_string()));
+        assert_eq!(secs[1].heading, "Second");
+    }
+
+    /// F8 dry-run estimate and presort with all required fields present.
+    #[tokio::test]
+    async fn test_f8_dry_run_estimate_and_presort_zero_writes() {
+        let tmp = std::env::temp_dir().join(format!("ns-f8-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create");
+        std::fs::write(tmp.join("foo.rs"), "pub fn bar() {}").unwrap();
+        std::fs::write(tmp.join("README.md"), "# Hello\n\nSecret token x.\n").unwrap();
+        // Duplicate file with same hash
+        std::fs::write(tmp.join("dup.rs"), "pub fn bar() {}").unwrap();
+        // Versioned file
+        std::fs::write(tmp.join("foo_v2.rs"), "pub fn bar_v2() {}").unwrap();
+        // Junk / bak file
+        std::fs::write(tmp.join("foo.bak"), "old").unwrap();
+        // Secret / PII content
+        std::fs::write(tmp.join("secret.rs"), "const TOKEN: &str = \"secret123\";\nlet email = \"a@b.com\";\n").unwrap();
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
+        let est_report = dry_run_directory(&tmp, &schema, "estimate").await.unwrap();
+        let pre_report = dry_run_directory(&tmp, &schema, "presort").await.unwrap();
+
+        for (label, r) in [("estimate", &est_report), ("presort", &pre_report)] {
+            assert!(r.contains(&format!("Dry-run ({})", label)), "{} mode header", label);
+            assert!(r.contains("Files:"), "{} Files", label);
+            assert!(r.contains("Parseable files:"), "{} Parseable", label);
+            assert!(r.contains("Symbols:"), "{} Symbols", label);
+            assert!(r.contains("Doc sections:"), "{} Doc sections", label);
+            assert!(r.contains("Embeddings needed (est):"), "{} Embeddings", label);
+            assert!(r.contains("Avoided embeddings:"), "{} Avoided", label);
+            assert!(r.contains("Secret hits:"), "{} Secret hits", label);
+            assert!(r.contains("PII warnings:"), "{} PII", label);
+            assert!(r.contains("Junk candidates:"), "{} Junk candidates", label);
+            assert!(r.contains("Duplicate candidates:"), "{} Duplicate", label);
+            assert!(r.contains("Version candidates:"), "{} Version", label);
+        }
+        assert!(pre_report.contains("Junk files:"));
+        assert!(pre_report.contains("Duplicate groups:"));
+        assert!(pre_report.contains("Version candidate files:"));
+        assert!(pre_report.contains("Proposed dataset groups:"));
+    }
+
+    /// F7 extract imports / resolve dependency paths for Rust/TS.
+    #[test]
+    fn test_f7_extract_and_resolve_dependencies() {
+        let rust = r#"mod foo;
+use crate::bar::baz;
+use super::x;"#;
+        let specs = extract_import_specifiers("rust", rust);
+        assert!(specs.contains(&"mod:foo".to_string()));
+        assert!(specs.contains(&"use:crate::bar::baz".to_string()));
+
+        let ts = r#"import { x } from "./utils";\nrequire("./helper");"#;
+        let ts_specs = extract_import_specifiers("typescript", ts);
+        assert!(ts_specs.contains(&"js:./utils".to_string()) || ts_specs.contains(&"js:./utils".to_string()));
+
+        let all = std::collections::HashSet::from(["src/foo.rs".to_string(), "src/bar.rs".to_string(), "src/utils.ts".to_string(), "src/helper.js".to_string()]);
+        // Resolve rust `mod foo;` from src/main.rs -> src/foo.rs
+        let rust_deps = resolve_dependency_paths("src/main.rs", &specs, &all);
+        assert!(rust_deps.contains(&"src/foo.rs".to_string()));
+        // Resolve rust `use crate::bar::baz;` -> src/bar.rs
+        assert!(rust_deps.contains(&"src/bar.rs".to_string()));
+
+        // Resolve TypeScript imports
+        let ts_deps = resolve_dependency_paths("src/app.ts", &ts_specs, &all);
+        assert!(ts_deps.contains(&"src/utils.ts".to_string()) || ts_deps.contains(&"src/helper.js".to_string()));
+    }
+
+    /// F2 incremental ingest + F12 watermark.
+    #[tokio::test]
+    async fn test_f2_f12_incremental_ingest_and_watermark() {
+        let tmp = std::env::temp_dir().join(format!("ns-f2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create");
+        std::fs::write(tmp.join("hello.rs"), "pub fn hello() {}").unwrap();
+        let db = std::env::temp_dir().join(format!("ns-f2-db-{}", std::process::id()));
+        let store: Arc<dyn VectorStore> = Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open"));
+        store.init("f2").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let embedder = Arc::new(ZeroEmbedder);
+
+        // First ingest -> generation 1, writes watermark.
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("first");
+        let source_key = source_key_for(&tmp);
+        let gen1 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen1 > 0, "first ingest produces a generation");
+
+        // Check registry row has watermark and telemetry.
+        let registry_id = crate::registry::registry_row_id("f2");
+        let (_vec, payload) = store.get("f2", &registry_id).await.unwrap().expect("registry row");
+        let meta = payload.metadata.as_object().expect("metadata");
+        assert!(meta.contains_key("enrichment_state"), "enrichment_state present");
+        let state = meta.get("enrichment_state").expect("state");
+        let wm = state.get("watermark").expect("watermark");
+        assert!(wm.get("extractor_fingerprint").is_some(), "fingerprint");
+        assert!(wm.get("source_digest").is_some(), "source_digest");
+        assert_ne!(wm.get("source_digest").and_then(|v| v.as_str()).unwrap_or(""), "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "source_digest must not be empty hash");
+        assert!(wm.get("last_enriched_at").is_some(), "last_enriched_at");
+
+        // Second ingest with unchanged files -> generation 2, carries forward unchanged nodes.
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("second");
+        let gen2 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen2 > gen1, "second ingest produces newer generation");
+        // Watermark updated (same fingerprint if schema unchanged, updated digest if files same).
+        let (_vec2, payload2) = store.get("f2", &registry_id).await.unwrap().expect("registry row 2");
+        let meta2 = payload2.metadata.as_object().expect("meta2");
+        let wm2 = meta2.get("enrichment_state").expect("state2").get("watermark").expect("wm2");
+        assert!(wm2.get("source_digest").is_some(), "updated digest");
+
+        // Modify file -> re-embeds changed file; old generation superseded.
+        std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("modified");
+    }
+}
+/// Dry-run ingest: walk the tree and produce a report without writing or
+/// downloading anything.
+pub async fn dry_run_directory(
+    dir_path: &std::path::Path,
+    schema: &crate::parser::schema::ParserSchema,
+    mode: &str,
+) -> anyhow::Result<String> {
+    let ext_to_lang = build_ext_map(schema);
+    let skipped_dirs = [
+        "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
+        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt",
+        "__pycache__", ".fastembed_cache", ".idea", ".vscode", "coverage",
+    ];
+
+    let mut files = 0usize;
+    let mut parseable = 0usize;
+    let mut symbols = 0usize;
+    let mut doc_sections = 0usize;
+    let mut secret_hits = 0usize;
+    let mut file_hashes: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut junk: Vec<String> = Vec::new();
+    let mut pii_warnings: Vec<String> = Vec::new();
+    let mut groups: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut all_file_paths: Vec<String> = Vec::new();
+    let mut avoided_embeddings: usize = 0;
+    let mut version_candidates: Vec<String> = Vec::new();
+
+    // Pattern: version suffixes in file stem; used after loop too.
+    let v_pattern = regex::Regex::new(r"(_v[0-9]+|-v[0-9]+|\.bak$|\.old$|_old$|_copy$)").unwrap();
+
+    let walker = ignore::WalkBuilder::new(dir_path).build();
+    for result in walker {
+        let entry = match result { Ok(e) => e, Err(e) => { tracing::warn!("dry_run walk entry error: {e}"); continue; } };
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+        let mut should_skip = false;
+        for skip_dir in &skipped_dirs {
+            let skip_pattern = format!("/{}/", skip_dir);
+            let skip_start = format!("{}/", skip_dir);
+            let skip_exact = format!("./{}", skip_dir);
+            if path_str.contains(&skip_pattern) || path_str.starts_with(&skip_start) || path_str == skip_exact {
+                should_skip = true; break;
+            }
+        }
+        if should_skip { continue; }
+        let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
+        if !is_file { continue; }
+        files += 1;
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(e) => { tracing::warn!("dry_run failed to read {}: {e}", path.display()); continue; } };
+        let hash = sha256_hex(&bytes);
+        file_hashes.entry(hash.clone()).or_default().push(path_str.to_string());
+
+        // Version-candidate detection: collect paths for post-loop analysis.
+        all_file_paths.push(path_str.to_string());
+
+        let lang_name = path.extension()
+            .map(|e| normalize_ext(&e.to_string_lossy()))
+            .and_then(|e| ext_to_lang.get(&e).cloned())
+            .filter(|ln| get_language(ln).is_some());
+
+        let content = String::from_utf8_lossy(&bytes).to_string();
+
+        if crate::secrets::scan_entry_point(&content, &serde_json::json!({}), "dry_run").is_some() {
+            secret_hits += 1;
+        }
+
+        if mode == "presort" {
+            if content.contains('@') && content.split_whitespace().any(|w| w.contains('@') && w.contains('.')) {
+                pii_warnings.push(format!("{}: possible email", path_str));
+            }
+            let mut found_ssn = false;
+            for window in content.as_bytes().windows(11) {
+                let s = String::from_utf8_lossy(window);
+                if s.chars().nth(3) == Some('-') && s.chars().nth(6) == Some('-') {
+                    found_ssn = true;
+                }
+            }
+            if found_ssn { pii_warnings.push(format!("{}: possible SSN", path_str)); }
+            let digits: String = content.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 16 {
+                pii_warnings.push(format!("{}: possible credit card digits", path_str));
+            }
+            if content.trim().len() < 20 {
+                junk.push(path_str.to_string());
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            let g = parent.to_string_lossy().to_string();
+            *groups.entry(g).or_insert(0) += 1;
+        }
+
+        if path_str.ends_with(".md") {
+            let secs = parse_markdown_sections(&content);
+            doc_sections += secs.len();
+            parseable += 1;
+        } else if let Some(ln) = lang_name {
+            if let Some(ts_lang) = get_language(&ln) {
+                parseable += 1;
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&ts_lang).is_ok() {
+                    if let Some(tree) = parser.parse(&content, None) {
+                        let schema_lang = &schema.languages[&ln];
+                        for (_qname, qstr) in &schema_lang.queries {
+                            if let Ok(q) = tree_sitter::Query::new(&ts_lang, qstr) {
+                                let mut cursor = tree_sitter::QueryCursor::new();
+                                let mut iter = cursor.matches(&q, tree.root_node(), content.as_bytes());
+                                while let Some(_) = iter.next() { symbols += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut duplicates: Vec<String> = Vec::new();
+    for (h, paths) in &file_hashes {
+        if paths.len() > 1 {
+            duplicates.push(format!("{} files share hash {}", paths.len(), &h[..12]));
+            // Avoided embeddings = extra copies of identical content.
+            avoided_embeddings += paths.len() - 1;
+        }
+    }
+
+    // Version-candidate detection from patterns and from shared normalized base stems.
+    // Pattern-based was tracked during loop; now add shared-stem detection.
+    let mut stem_dir_map: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for path_str in &all_file_paths {
+        let p = std::path::Path::new(path_str);
+        // Pattern candidates must test the full file name, not the stem alone:
+        // `.bak`/`.old` suffixes strip off in file_stem() and would never match (AH-17).
+        if p.file_name().and_then(|s| s.to_str()).map_or(false, |name| v_pattern.is_match(name))
+            && !version_candidates.contains(path_str)
+        {
+            version_candidates.push(path_str.clone());
+        }
+        if let Some(stem) = p.file_stem() {
+            let stem_str = stem.to_string_lossy().to_string();
+            let normalized = v_pattern.replace_all(&stem_str, "");
+            if let Some(parent) = p.parent() {
+                let parent_key = parent.to_string_lossy().to_string();
+                let dir_stem_key = format!("{}::{}", parent_key, normalized);
+                stem_dir_map.entry(dir_stem_key.clone()).or_default().insert(path_str.clone());
+            }
+        }
+    }
+    for (_key, path_set) in &stem_dir_map {
+        if path_set.len() > 1 {
+            for path_str in path_set {
+                if !version_candidates.contains(path_str) {
+                    version_candidates.push(path_str.clone());
+                }
+            }
+        }
+    }
+    version_candidates.sort();
+    version_candidates.dedup();
+
+    let mut report = String::new();
+    report.push_str(&format!("Dry-run ({}) report:\n", mode));
+    report.push_str(&format!("Files: {}\n", files));
+    report.push_str(&format!("Parseable files: {}\n", parseable));
+    report.push_str(&format!("Symbols: {}\n", symbols));
+    report.push_str(&format!("Doc sections: {}\n", doc_sections));
+    report.push_str(&format!("Embeddings needed (est): {}\n", symbols + doc_sections));
+    report.push_str(&format!("Avoided embeddings: {}\n", avoided_embeddings));
+    report.push_str(&format!("Secret hits: {}\n", secret_hits));
+    report.push_str(&format!("PII warnings: {}\n", pii_warnings.len()));
+    report.push_str(&format!("Junk candidates: {}\n", junk.len()));
+    report.push_str(&format!("Duplicate candidates: {}\n", duplicates.len()));
+    report.push_str(&format!("Version candidates: {}\n", version_candidates.len()));
+    if mode == "presort" {
+        report.push_str(&format!("Junk files: {}\n", junk.len()));
+        for j in &junk { report.push_str(&format!("  junk: {}\n", j)); }
+        report.push_str(&format!("Duplicate groups: {}\n", duplicates.len()));
+        for d in &duplicates { report.push_str(&format!("  dup: {}\n", d)); }
+        report.push_str(&format!("Version candidate files: {}\n", version_candidates.len()));
+        for v in &version_candidates { report.push_str(&format!("  version: {}\n", v)); }
+        for w in &pii_warnings { report.push_str(&format!("  pii: {}\n", w)); }
+        report.push_str("Proposed dataset groups:\n");
+        for (g, c) in &groups { report.push_str(&format!("  {} ({} files)\n", g, c)); }
+    }
+    Ok(report)
+}
+
+/// Best-effort extraction of import/module specifiers from source text.
+pub fn extract_import_specifiers(lang: &str, content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match lang {
+        "rust" => {
+            // `mod foo;`
+            for cap in regex::Regex::new(r"(?m)\bmod\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;").unwrap().captures_iter(content) {
+                out.push(format!("mod:{}", &cap[1]));
+            }
+            // `use a::b::c;` or `use a::b::{x, y};`
+            for cap in regex::Regex::new(r"(?m)\buse\s+([a-zA-Z0-9_:\.]+)").unwrap().captures_iter(content) {
+                out.push(format!("use:{}", &cap[1]));
+            }
+            // `extern crate foo;`
+            for cap in regex::Regex::new(r"(?m)\bextern\s+crate\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap().captures_iter(content) {
+                out.push(format!("extern:{}", &cap[1]));
+            }
+        }
+        "python" => {
+            for line in content.lines() {
+                let t = line.trim();
+                if let Some(caps) = regex::Regex::new(r"^from\s+(\.+[A-Za-z0-9_\.]*|[A-Za-z0-9_\.]+)\s+import").unwrap().captures(t) {
+                    out.push(format!("from:{}", &caps[1]));
+                } else if let Some(caps) = regex::Regex::new(r"^import\s+([A-Za-z0-9_\.]+)").unwrap().captures(t) {
+                    out.push(format!("import:{}", &caps[1]));
+                }
+            }
+        }
+        "typescript" | "tsx" | "javascript" => {
+            for cap in regex::Regex::new(r#"(?m)(?:from|require)\s*\(?['"]([^'"]+)['"]"#).unwrap().captures_iter(content) {
+                out.push(format!("js:{}", &cap[1]));
+            }
+        }
+        "go" => {
+            for cap in regex::Regex::new(r#"(?m)"([^"]+)""#).unwrap().captures_iter(content) {
+                // only inside import blocks is hard; accept quoted paths
+                let p = &cap[1];
+                if p.contains('/') || p.contains('.') {
+                    out.push(format!("go:{}", p));
+                }
+            }
+        }
+        "java" => {
+            for cap in regex::Regex::new(r"(?m)^\s*import\s+([A-Za-z0-9_\.]+)\s*;").unwrap().captures_iter(content) {
+                out.push(format!("java:{}", &cap[1]));
+            }
+        }
+        _ => {}
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn resolve_dependency_paths(
+    current_rel: &str,
+    imports: &[String],
+    all_paths: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let current = std::path::Path::new(current_rel);
+    let parent = current.parent().unwrap_or(std::path::Path::new(""));
+    let exts = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java"];
+
+    for imp in imports {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(spec) = imp.strip_prefix("js:") {
+            if spec.starts_with('.') {
+                let base = parent.join(spec);
+                push_candidates(&mut candidates, &base, &exts);
+            } else {
+                // bare specifier: try as relative path anyway
+                push_candidates(&mut candidates, std::path::Path::new(spec), &exts);
+            }
+        } else if let Some(spec) = imp.strip_prefix("from:") {
+            if spec.starts_with('.') {
+                // python relative: .foo -> foo.py in same package, ..foo -> parent
+                let dots = spec.bytes().take_while(|b| *b == b'.').count();
+                let rest = &spec[dots..];
+                let mut base = parent.to_path_buf();
+                for _ in 1..dots {
+                    base = base.parent().unwrap_or(&base).to_path_buf();
+                }
+                let rest_path = rest.replace('.', "/");
+                if rest_path.is_empty() {
+                    // package import: __init__.py
+                    candidates.push(base.join("__init__.py").to_string_lossy().replace('\\', "/"));
+                } else {
+                    let base = base.join(&rest_path);
+                    push_candidates(&mut candidates, &base, &exts);
+                }
+            } else {
+                let base = spec.replace('.', "/");
+                // try at root and src/
+                push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+            }
+        } else if let Some(spec) = imp.strip_prefix("import:") {
+            let base = spec.replace('.', "/");
+            push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+            push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+        } else if let Some(spec) = imp.strip_prefix("mod:") {
+            let base = parent.join(spec);
+            push_candidates(&mut candidates, &base, &exts);
+            // mod foo; could be foo/mod.rs
+            candidates.push(parent.join(spec).join("mod.rs").to_string_lossy().replace('\\', "/"));
+        } else if let Some(spec) = imp.strip_prefix("use:") {
+            let spec = spec.trim_end_matches(';');
+            if let Some(rest) = spec.strip_prefix("crate::") {
+                let segments: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len() {
+                    let base = segments[..len].join("/");
+                    push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+                    push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                }
+            } else if let Some(rest) = spec.strip_prefix("super::") {
+                let base = rest.replace("::", "/");
+                let parent_parent = parent.parent().unwrap_or(parent);
+                push_candidates(&mut candidates, &parent_parent.join(&base), &exts);
+            } else if let Some(rest) = spec.strip_prefix("self::") {
+                let base = rest.replace("::", "/");
+                push_candidates(&mut candidates, &parent.join(&base), &exts);
+            } else if spec.contains("::") {
+                // external crate or module path; try as path under src
+                let base = spec.replace("::", "/");
+                push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+            }
+        } else if let Some(spec) = imp.strip_prefix("extern:") {
+            push_candidates(&mut candidates, std::path::Path::new("src").join(spec).as_path(), &exts);
+        } else if let Some(spec) = imp.strip_prefix("go:") {
+            let base = spec.trim_matches('"');
+            push_candidates(&mut candidates, std::path::Path::new(base), &exts);
+        } else if let Some(spec) = imp.strip_prefix("java:") {
+            let base = spec.replace('.', "/");
+            push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+            push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+        }
+
+        for cand in candidates {
+            let norm = normalize_rel_path(&cand);
+            if all_paths.contains(&norm) && norm != current_rel && !out.contains(&norm) {
+                out.push(norm);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn push_candidates(out: &mut Vec<String>, base: &std::path::Path, exts: &[&str]) {
+    let s = base.to_string_lossy().replace('\\', "/");
+    // strip leading ./
+    let s = s.trim_start_matches("./");
+    out.push(s.to_string());
+    for ext in exts {
+        out.push(format!("{}.{}", s, ext));
+    }
+    // index files
+    for ext in exts {
+        out.push(format!("{}/index.{}", s, ext));
+        out.push(format!("{}/mod.{}", s, ext));
+        out.push(format!("{}/__init__.py", s));
+    }
+}
+
+fn normalize_rel_path(p: &str) -> String {
+    // Resolve . and .. lexically.
+    let mut parts: Vec<String> = Vec::new();
+    for part in p.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop();
+        } else {
+            parts.push(part.to_string());
+        }
+    }
+    parts.join("/")
 }

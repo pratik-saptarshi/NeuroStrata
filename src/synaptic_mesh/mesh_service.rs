@@ -49,9 +49,13 @@ pub fn resolve_node_id_at(home: &Path) -> String {
     }
     let fresh = Uuid::new_v4().to_string();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("mesh-node-id dir {} could not be created: {e}", dir.display());
+        }
     }
-    let _ = std::fs::write(&path, format!("{}\n", fresh));
+    if let Err(e) = std::fs::write(&path, format!("{}\n", fresh)) {
+        tracing::warn!("mesh-node-id write to {} failed: {e}", path.display());
+    }
     fresh
 }
 
@@ -119,7 +123,7 @@ impl MeshService {
             let storage = MeshStorage::open(&dir).map_err(|e| format!("{:#}", e))?;
             if storage.manifest().mesh_id.to_string() != mesh_id {
                 return Err(format!(
-                    "no mesh joined — pointer names mesh {} but {} holds {}",
+                    "corrupt mesh pointer — pointer names mesh {} but {} holds {}",
                     mesh_id,
                     dir.display(),
                     storage.manifest().mesh_id
@@ -151,7 +155,7 @@ impl MeshService {
         let m = storage.manifest();
         if m.mesh_id.to_string() != mesh_id {
             return Err(format!(
-                "no mesh joined — pointer names mesh {} but {} holds {}",
+                "corrupt mesh pointer — pointer names mesh {} but {} holds {}",
                 mesh_id,
                 dir.display(),
                 m.mesh_id
@@ -251,11 +255,91 @@ impl MeshService {
                 .to_string(),
         );
         lines.push(format!("health: {}", health_line(&root).await));
+
+        // Federated remotes: a configured HTTP peer is probed in production
+        // (fail-soft rules — an unreachable peer renders a line, never a
+        // crash, and every count is explicit rather than silent). Only the
+        // manifest's `remote` can name a peer; there is no `remotes` list in
+        // the synaptic-mesh/v1 schema, so one remote is probed per namespace.
+        if let Some(remote) = m.remote.as_deref() {
+            if remote.starts_with("http://") || remote.starts_with("https://") {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        for ns in &m.namespaces {
+                            let ns = ns.clone();
+                            let remote = remote.to_string();
+                            // The status path runs on sync trait signatures; block the
+                            // probe in-place so nested block_on is legal on worker
+                            // threads of the multi-threaded runtime. A current-thread
+                            // runtime (e.g. #[tokio::test]) has no multi-thread worker
+                            // pool for block_in_place, so the probe runs on a scoped
+                            // OS thread instead.
+                            let bearer =
+                                std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN")
+                                    .unwrap_or_default();
+                            let probe = if handle.runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::MultiThread
+                            {
+                                tokio::task::block_in_place(|| {
+                                    handle.block_on(self.federated_remote_list(&remote, &ns, &bearer))
+                                })
+                            } else {
+                                std::thread::scope(|s| {
+                                    s.spawn(|| {
+                                        handle.clone().block_on(self.federated_remote_list(
+                                            &remote, &ns, &bearer,
+                                        ))
+                                    })
+                                    .join()
+                                    .map_err(|_| "federated probe thread panicked".to_string())
+                                    .and_then(|probe| probe)
+                                })
+                            };
+                            match probe {
+                                Ok(rows) => lines.push(format!(
+                                    "federated remote {remote} {ns}: {} record(s)",
+                                    rows.len()
+                                )),
+                                Err(e) => lines.push(format!(
+                                    "federated remote {remote} {ns}: unreachable ({e})"
+                                )),
+                            }
+                        }
+                    }
+                    Err(_) => lines.push(
+                        "federated remote: no async runtime in scope — probe skipped".to_string(),
+                    ),
+                }
+            }
+        }
+
         lines.push(
             "DISCLOSURE: the mesh is a permanent record shared with the team — tombstones suppress content from search, but full erasure requires a coordinated history rewrite, and an uncooperative peer's clone retains the content."
                 .to_string(),
         );
         Ok(lines.join("\n"))
+    }
+
+    /// Remote peer probe: used by `status_report` to inspect a configured
+    /// HTTP federated peer in production, and by the test surface directly.
+    pub async fn federated_remote_list(&self, base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
+        crate::synaptic_mesh::federation::remote_list(base_url, namespace, token).await
+    }
+}
+
+#[cfg(test)]
+mod async_surface_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn federated_remote_list_fails_soft_on_unreachable_peer() {
+        // The mesh is fail-soft everywhere: an unreachable peer answers as a
+        // rendered Err, never as a crash or a silent success line.
+        let svc = MeshService::new(std::env::temp_dir());
+        let res = svc
+            .federated_remote_list("http://127.0.0.1:1", "ns", "t")
+            .await;
+        assert!(res.is_err());
     }
 }
 
@@ -282,7 +366,11 @@ pub async fn dirty_paths(mesh_root: &Path) -> Vec<String> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter(|l| {
-            !(l.starts_with("?? ") && l.trim_start_matches("?? ").trim() == MANIFEST_FILE_NAME)
+            !(l.starts_with("?? ")
+                && matches!(
+                    l.trim_start_matches("?? ").trim(),
+                    MANIFEST_FILE_NAME | ".gitignore"
+                ))
         })
         .map(|l| l.trim().to_string())
         .collect()
@@ -570,6 +658,10 @@ pub async fn recover_report(project_root: &Path) -> String {
 
 #[async_trait::async_trait]
 impl StorageApi for MeshService {
+    /// One mesh per project (tools.rs init contract): a project that
+    /// already carries a pointer refuses a second `init_mesh` — the first
+    /// mesh wins and its pointer is preserved. `leave` is the explicit way
+    /// to create a different one.
     async fn init_mesh(
         &mut self,
         base_root: &Path,
@@ -578,7 +670,29 @@ impl StorageApi for MeshService {
         namespaces: &[String],
         remote: Option<&str>,
     ) -> Result<String, String> {
-        let storage = MeshStorage::init(base_root, node_id, mesh_name, namespaces, remote)
+        if let Ok(Some(existing)) = StorageApi::read_pointer(self, &self.project_root) {
+            let (mesh_id, mesh_dir, _) = existing;
+            return Err(format!(
+                "project already has a mesh pointer ({mesh_id} at {}); one mesh per project",
+                mesh_dir.display()
+            ));
+        }
+        // Omitted `namespace` = the current project namespace only (tools.rs
+        // init contract): the mesh is opt-in per namespace, and "share
+        // nothing" was never the intent — the first namespace a project owns
+        // is its own.
+        let default_ns: Vec<String> = if namespaces.is_empty() {
+            vec![self
+                .project_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default")
+                .to_string()]
+        } else {
+            namespaces.to_vec()
+        };
+        let storage = MeshStorage::init(base_root, node_id, mesh_name, &default_ns, remote)
             .await
             .map_err(|e| format!("{:#}", e))?;
         let mesh_id = storage.manifest().mesh_id.to_string();
@@ -637,6 +751,17 @@ impl StorageApi for MeshService {
 
     async fn push(&mut self) -> Result<String, String> {
         let storage = self.joined()?;
+        // A remote added after this process's initial open (e.g. a teammate's
+        // `join --remote` on the same checkout) must be visible without a
+        // restart: when the cached manifest says "no remote", re-read it from
+        // disk and adopt the fresher storage if a remote now exists.
+        if storage.manifest().remote.is_none() {
+            if let Ok(refreshed) = MeshStorage::open(storage.root()) {
+                if refreshed.manifest().remote.is_some() {
+                    *storage = refreshed;
+                }
+            }
+        }
         // Ordering matters: a mesh with no remote is a CONFIG error and must
         // surface as one even before its first commit. Only a configured
         // mesh gets the "nothing to publish yet" courtesy (a fresh init has
@@ -735,13 +860,20 @@ pub async fn handle_mesh_tool_call_with_base(name: &str, arguments: &Value, base
         "neurostrata_synaptic_mesh_init" => match arguments.get("name").and_then(|v| v.as_str()) {
             Some(mesh_name) => SynapticMeshCommands::Init {
                 name: mesh_name.to_string(),
+                // `namespace` accepts one string or an array of strings;
+                // omitted = the current project namespace (init_mesh's
+                // default), never "share nothing".
                 namespace: arguments
                     .get("namespace")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect()
+                    .and_then(|v| match v {
+                        Value::Array(items) => Some(
+                            items
+                                .iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect::<Vec<String>>(),
+                        ),
+                        Value::String(s) => Some(vec![s.to_string()]),
+                        _ => None,
                     })
                     .unwrap_or_default(),
                 remote: arguments
@@ -799,6 +931,66 @@ mod tests {
         let report = svc.status().await.expect("status after init");
         assert!(report.contains("platform-team"), "report: {report}");
         assert!(report.contains(&id), "report: {report}");
+    }
+
+    #[tokio::test]
+    async fn init_mesh_refuses_a_second_pointer_and_preserves_the_first() {
+        let base = scratch("idem-base");
+        let project = scratch("idem-proj");
+        let mut svc = MeshService::new(project.clone());
+        let first = svc
+            .init_mesh(&base, "node-idem", "first-team", &[], None)
+            .await
+            .expect("first init");
+        let (p_id, p_dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer readable")
+            .expect("pointer written after first init");
+
+        let second = svc.init_mesh(&base, "node-idem", "second-team", &[], None).await;
+        let err = second.expect_err("second init MUST refuse — one mesh per project");
+        assert!(
+            err.contains("one mesh per project"),
+            "the refusal carries the contract: {err}"
+        );
+        assert!(
+            err.contains(&first),
+            "the refusal names the first mesh id: {err}"
+        );
+
+        // The refusal overwrote nothing: the first pointer survives verbatim.
+        let (id, dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer still readable")
+            .expect("pointer preserved");
+        assert_eq!(id, p_id, "first mesh id preserved");
+        assert_eq!(dir, p_dir, "first mesh dir preserved");
+        assert_eq!(id, first);
+    }
+
+    /// The other half of the init contract: omitted `namespace` defaults to
+    /// the current project's own namespace — the mesh is created sharing the
+    /// project's namespace, never nothing.
+    #[tokio::test]
+    async fn init_mesh_with_no_namespaces_defaults_to_the_project_namespace() {
+        let base = scratch("nsdef-base");
+        let project = scratch("nsdef-proj");
+        let mut svc = MeshService::new(project.clone());
+        svc.init_mesh(&base, "node-nsdef", "nsdef-team", &[], None)
+            .await
+            .expect("init");
+        let expected_ns = project
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("scratch dir name")
+            .to_string();
+        let storage = svc.joined().expect("mesh joined");
+        assert_eq!(
+            storage.manifest().namespaces,
+            &[expected_ns],
+            "omitted namespace = the current project namespace: {:?}",
+            storage.manifest().namespaces
+        );
     }
 
     #[tokio::test]

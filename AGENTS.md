@@ -53,6 +53,11 @@ A statement of future/deferred work is a TASK, not a note:
 - Modal deferral: `we should also`, `later we need to`, `still need to`, `must also fix`, `need to follow up`, `filed follow-up`, `defer`/`deferred`.
 When you see one in user/agent speech, logs, or memory content, capture it with `neurostrata_task_create` (namespace, title) instead of letting it evaporate. The lexical detector surfaces these as `task_intent_signals` in `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
 
+## 3d. Automatic Graph-First Exploration & Subagent Context Propagation (MANDATORY)
+- **Auto-Retrieved Task Context:** `neurostrata_task_create` and `neurostrata_task_claim` automatically run a hybrid vector + 1-hop graph search on the task's title/description and return `auto_retrieved_context` and a ready-to-paste `subagent_prompt_injection` block.
+- **Graph-First Lookup Reflex:** Before using blind `grep`/`glob` or editing a file, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` to inspect `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
+- **Subagent Prompt Propagation:** Subagents start with a blank context window and no memory of `neurostrata_get_snapshot`. On session init, write the Graph-First rule into your active plan, and whenever you spawn ANY subagent (`subagent` / `Task`), paste the `subagent_prompt_injection` block from `neurostrata_task_claim` into the subagent's prompt and instruct it to query NeuroStrata before blind file searches.
+
 ## 3b. SynapticMesh (inter-instance memory — honesty rules)
 
 When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh status` tells you), some memory mutations are additionally mirrored to the team mesh. The rules an agent must not bend:
@@ -66,12 +71,15 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 
 ## 4. Bootstrapping & Ingestion
 - **Docs:** If `.NeuroStrata/docs/` is missing, call `neurostrata_bootstrap` (new project) or `neurostrata_task_setup` (existing project) and follow the returned instructions — they carry the AGENTS.md template and the first mandatory Goal.
+- **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) from environment and project markers and installs/wires the zero-dependency plugin bundle under `.NeuroStrata/plugins/<harness>/` with zero user involvement.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
-## 5. Global Database Constraints (Safety)
+## 5. Global Database & Daemon Security Constraints (Safety)
 - **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
 - **No Bulk Deletes:** Only delete specific memory IDs, one at a time, via the CLI (`neurostrata-mcp delete`) when explicitly correcting a hallucination — deletion is deliberately absent from the MCP surface.
+- **Daemon Caller-Path Authority (`J6` / `neurostrata-p1ex`):** Every caller-supplied filesystem path on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` is canonicalized via `check_caller_path` and must resolve inside `startup_root` or an explicit `allowed_external_dirs` entry in `~/.config/neurostrata/config.json`.
+- **Dual Git Hooks (`pre-push` + `pre-commit`):** `neurostrata-mcp hooks install` (and `hook_hygiene` on `neurostrata_get_snapshot`) automatically installs/refreshes both `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus all detected CLI/terminal harness plugins (`neurostrata-lf3p`).
 
 ## 6. Global Infrastructure & Tooling Constraints
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.

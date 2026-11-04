@@ -7,10 +7,10 @@
 //! exact moment someone stops trusting it -- the opposite of what an audit
 //! trail should do.
 //!
-//! Scope in 1.8.0: **metadata-only, no retrieval change.** Writing the
-//! tombstone is the whole of it; no read path filters on `archived` yet, so an
-//! archived row still surfaces in `search_memory` exactly as before. The
-//! filter is a follow-up task.
+//! Scope in 1.8.0: archived rows ARE excluded from retrieval. Every read
+//! surface filters on the tombstone via `is_archived`, so an archived row no
+//! longer surfaces in `search_memory` by default; callers that need
+//! tombstoned rows back must pass `include_archived: true` on the search.
 
 use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 use crate::traits::{MemoryPayload, VectorStore};
@@ -139,6 +139,7 @@ pub async fn archive_memory(
         ));
     }
 
+    let now_ts = chrono::Utc::now().timestamp();
     payload
         .metadata
         .as_object_mut()
@@ -148,12 +149,36 @@ pub async fn archive_memory(
         .metadata
         .as_object_mut()
         .expect("object checked above")
-        .insert(
-            "archived_at".to_string(),
-            serde_json::json!(chrono::Utc::now().timestamp()),
-        );
+        .insert("archived_at".to_string(), serde_json::json!(now_ts));
+    if payload.metadata.get("facets_bitemporal").is_some() {
+        crate::domain::retract_inferred_facets(&mut payload.metadata, now_ts);
+    }
     if let Err(e) = store.upsert(&namespace, &id, vector, payload).await {
         return ArchiveOutcome::Failed(format!("Failed to archive memory {}: {}", id, e));
+    }
+    if std::env::var_os("NEUROSTRATA_LEARNING_DIR").is_some() {
+        match crate::learning::recorder::LearningRecorder::open(
+            crate::learning::control::default_learning_dir(),
+            None,
+        )
+        .await
+        {
+            Ok(recorder) => {
+                let outcome = crate::learning::observation::LearningOutcome {
+                    outcome_id: format!("archive-{}-{}", now_ts, id),
+                    occurred_at: now_ts,
+                    namespace: namespace.clone(),
+                    connection_id: None,
+                    task_id: None,
+                    target_ids: vec![id.clone()],
+                    kind: crate::learning::observation::LearningOutcomeKind::MemoryArchived,
+                };
+                if let Err(e) = recorder.record_outcome(&outcome).await {
+                    tracing::warn!("learning outcome record failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("learning recorder open failed: {e}"),
+        }
     }
 
     // Class M (Task 12): the tombstone's sync record goes through

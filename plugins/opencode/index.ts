@@ -18,7 +18,7 @@
  *   masked by a silent local fallback.
  */
 
-import type { ToolCall, ToolResult, PluginContext } from "@opencode/plugin";
+const Plugin = { define: <T>(def: T): T => def };
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -68,6 +68,22 @@ const DEFAULT_CONFIG: PluginConfig = {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+/**
+ * First argument-carrying object among the candidates.
+ *
+ * Hosts disagree on where payload args live (`input.input` vs `input.args`);
+ * `asRecord` folds a miss to `{}`, so the `??` chain must compare the raw
+ * values and skip misses outright.
+ */
+function firstRecord(...candidates: unknown[]): Record<string, unknown> {
+  for (const candidate of candidates) {
+    if (typeof candidate === "object" && candidate !== null) {
+      return candidate as Record<string, unknown>;
+    }
+  }
+  return {};
 }
 
 function asString(value: unknown): string | undefined {
@@ -399,6 +415,31 @@ function initialStatus(): AdapterStatus {
 
 let status: AdapterStatus = initialStatus();
 
+/**
+ * Session/task tracking between host tool calls and guard validation.
+ *
+ * The guard needs `active_task_id`, but a host passes `write`/`edit` args
+ * that carry none of it. Task mutations (`claim`/`update`/`complete`) whose
+ * arguments carry `id` / `session_id` are the only reliable source.
+ */
+let activeSessionId: string | null = null;
+let activeTaskId: string | null = null;
+
+/**
+ * Mutations since the heavyweight channels were last touched (a note on the
+ * active task, a full claim, or completion). The guard consumes this through
+ * `neurostrata_guard_validate`'s `mutations_since_note` argument to pin the
+ * Breath prompt.
+ */
+let mutationsSinceNote = 0;
+
+/** Reset the tracked session/task state (test hook). */
+export function resetState(): void {
+  activeSessionId = null;
+  activeTaskId = null;
+  mutationsSinceNote = 0;
+}
+
 /** The adapter's current state. A degraded core is visible here. */
 export function adapterStatus(): AdapterStatus {
   return { ...status, missingTools: [...status.missingTools] };
@@ -469,11 +510,197 @@ export function detectTaskIntentsLocal(text: string): TaskIntentSignal[] {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// File-touch prefetch (design §4.5): LRU dedup + injected-memory dedup
+// ──────────────────────────────────────────────────────────────────────
+
+/** LRU cap: how many recently touched (`namespace:path`) keys are kept. */
+export const PREFETCH_LRU_CAP = 128;
+
+/** Output budget: one file-touch recall injects at most this many chars. */
+export const PREFETCH_MAX_CHARS = 2048;
+
+/**
+ * Recently touched file paths, keyed `namespace:path`, in LRU order
+ * (oldest first). Bounded so a long session cannot grow without bound.
+ */
+export const prefetchedPaths = new Map<string, number>();
+
+/** `(memory_id:valid_from)` keys already injected this session. */
+export const injectedMemoryIds = new Set<string>();
+
+function recordPrefetchedPath(key: string): void {
+  prefetchedPaths.set(key, Date.now());
+  if (prefetchedPaths.size > PREFETCH_LRU_CAP) {
+    const oldest = prefetchedPaths.keys().next().value;
+    if (oldest !== undefined) prefetchedPaths.delete(oldest);
+  }
+}
+
+function touchPrefetchedPath(key: string): void {
+  // Re-insertion moves the key to the newest end of the LRU order.
+  prefetchedPaths.delete(key);
+  recordPrefetchedPath(key);
+}
+
+/** One governing memory as `memories_for_file` returns it. */
+export interface FileMemoryHit {
+  id: string;
+  valid_from: string;
+  memory_type: string;
+  content: string;
+}
+
+/**
+ * Read the `memories_for_file` answer.
+ *
+ * The core wraps the body in a content-array answer like every other tool,
+ * and the array of governing memories arrives as `hits` or `memories`.
+ */
+export function parseFileMemoryHits(text: string): FileMemoryHit[] {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) {
+    throw new Error(
+      `memories_for_file returned no JSON body: ${text.slice(0, 200)}`,
+    );
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(
+      `memories_for_file returned an unreadable body: ${String(err)}`,
+    );
+  }
+
+  const raw = Array.isArray(body.hits)
+    ? body.hits
+    : Array.isArray(body.memories)
+      ? body.memories
+      : [];
+
+  const out: FileMemoryHit[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const hit = item as Record<string, unknown>;
+    const id = asString(hit.id) ?? asString(hit.memory_id);
+    const valid_from = asString(hit.valid_from) ?? "";
+    if (!id) continue; // a hit without an id cannot be deduped — never inject
+    out.push({
+      id,
+      valid_from,
+      memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? "memory",
+      content:
+        asString(hit.content) ??
+        asString(hit.text) ??
+        asString(hit.summary) ??
+        "",
+    });
+  }
+  return out;
+}
+
+function formatFileMemorySnippet(hit: FileMemoryHit): string {
+  const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
+  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
+}
+
+/** Cap the recalled snippets so one file touch can never flood context. */
+function capSnippets(snippets: string[]): string[] {
+  let total = 0;
+  const out: string[] = [];
+  for (const snippet of snippets) {
+    if (total >= PREFETCH_MAX_CHARS) break;
+    const room = PREFETCH_MAX_CHARS - total;
+    out.push(snippet.length > room ? snippet.slice(0, room) : snippet);
+    total += Math.min(snippet.length, room) + 1; // + join newline
+  }
+  return out;
+}
+
+/**
+ * Recall governing memories when a file is touched (design §4.5).
+ *
+ * Each `namespace:path` key is prefetched at most once per LRU window;
+ * each memory is injected at most once per `(id, valid_from)` key. Never
+ * increments `access_count` — this is a read-only recall.
+ */
+export async function prefetchMemoriesForFile(
+  namespace: string,
+  filePath: string,
+): Promise<string[]> {
+  const path = filePath.trim();
+  if (path === "") return [];
+
+  const key = `${namespace}:${path}`;
+  if (prefetchedPaths.has(key)) {
+    touchPrefetchedPath(key);
+    return [];
+  }
+
+  // Record the LRU entry only after the recall actually succeeded: a
+  // disconnected or failed call must never permanently suppress prefetch
+  // for this file within the LRU window.
+  if (!mcpClient) return [];
+
+  const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+    namespace,
+    path,
+    limit: 5,
+  });
+  recordPrefetchedPath(key);
+
+  const out: string[] = [];
+  for (const hit of parseFileMemoryHits(text)) {
+    const dedupKey = `${hit.id}:${hit.valid_from}`;
+    if (injectedMemoryIds.has(dedupKey)) continue;
+    injectedMemoryIds.add(dedupKey);
+    out.push(formatFileMemorySnippet(hit));
+  }
+  return capSnippets(out);
+}
+
+export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+
+export function buildSubagentContextHeader(
+  namespace: string,
+  taskId: string | null,
+): string {
+  const taskLabel = taskId ?? "unclaimed (claim a task first)";
+  return (
+    `${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
+    `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+    `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`
+  );
+}
+
+export function injectSubagentPrompt(
+  target: Record<string, unknown>,
+  namespace: string,
+  taskId: string | null,
+): boolean {
+  const raw = typeof target.prompt === "string" ? target.prompt : null;
+  if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER)) return false;
+  target.prompt = buildSubagentContextHeader(namespace, taskId) + raw;
+  return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Plugin Entry Point
 // ──────────────────────────────────────────────────────────────────────
 
 let config: PluginConfig = DEFAULT_CONFIG;
-let mcpClient: NeuroStrataMCPClient;
+let mcpClient!: NeuroStrataMCPClient;
+
+/**
+ * Test hook: drop the cached MCP client so un-initialized code paths (like
+ * `fetchContextPlan` before `initialize` ran) can be exercised.
+ */
+export function resetClientForTesting(): void {
+  mcpClient = undefined as any;
+  resetState();
+}
 
 /**
  * The plugin context, captured on initialize.
@@ -482,16 +709,16 @@ let mcpClient: NeuroStrataMCPClient;
  * `initialize`'s parameter. Capturing it here is what makes `ctx` reachable
  * from them at all.
  */
-let pluginCtx: PluginContext | null = null;
+let pluginCtx: any | null = null;
 
-function requireCtx(): PluginContext {
+function requireCtx(): any {
   if (!pluginCtx) {
     throw new Error("NeuroStrata plugin used before initialize()");
   }
   return pluginCtx;
 }
 
-export async function initialize(ctx: PluginContext): Promise<void> {
+export async function initialize(ctx: any): Promise<void> {
   pluginCtx = ctx;
   config = resolveConfig(ctx.config);
 
@@ -511,17 +738,173 @@ export async function initialize(ctx: PluginContext): Promise<void> {
     lastError: undefined,
   });
 
-  // Register tool wrappers for mutating tools: write, edit, bash
-  ctx.tools.wrap("write", wrapMutatingTool);
-  ctx.tools.wrap("edit", wrapMutatingTool);
-  ctx.tools.wrap("bash", wrapMutatingTool);
+  // Register hooks before mutating tools (write, edit, bash).
+  // V2 API: ctx.tool.hook("execute.before", ...) fires before each tool call.
+  await ctx.tool.hook("execute.before", async (input: any) => {
+    const toolName = input?.tool;
 
-  // Register turn hook for intent detection
-  ctx.conversation.onTurnEnd(onTurnEnd);
+    // File-touch recall (§4.5): on read/write/edit touching a file, prefetch
+    // the governing memories. Fail-soft: prefetch never blocks the tool, and
+    // `read` is never guard-validated.
+    if (toolName === "read" || toolName === "write" || toolName === "edit") {
+      const args = asRecord(input?.input);
+      const altArgs = asRecord(input?.args);
+      const filePath =
+        asString(args.filePath) ??
+        asString(args.path) ??
+        asString(altArgs.filePath) ??
+        asString(altArgs.path);
+      if (filePath) {
+        try {
+          const snippets = await prefetchMemoriesForFile(
+            config.namespace,
+            filePath,
+          );
+          if (snippets.length > 0) {
+            console.info(
+              `[NeuroStrata] File-touch recall for ${filePath}\n${snippets.join("\n")}`,
+            );
+          }
+        } catch (err) {
+          setStatus({ state: "degraded", lastError: String(err) });
+          console.warn("[NeuroStrata] File-touch prefetch failed", {
+            file: filePath,
+            error: String(err),
+          });
+        }
+      }
+    }
+
+    if (
+      toolName === "subagent" ||
+      toolName === "Task" ||
+      toolName === "task" ||
+      toolName === "dispatch_agent"
+    ) {
+      if (input?.input && typeof input.input === "object") {
+        injectSubagentPrompt(
+          input.input as Record<string, unknown>,
+          config.namespace,
+          activeTaskId,
+        );
+      }
+      if (input?.args && typeof input.args === "object") {
+        injectSubagentPrompt(
+          input.args as Record<string, unknown>,
+          config.namespace,
+          activeTaskId,
+        );
+      }
+    }
+
+    // Session/task tracking (F10): task mutations carry the `id` and
+    // `session_id` guard validation needs for the mutating write/edit calls
+    // that follow. Best-effort — a malformed payload never blocks the tool.
+    if (
+      toolName === "neurostrata_task_claim" ||
+      toolName === "neurostrata_task_update" ||
+      toolName === "neurostrata_task_complete"
+    ) {
+      const payloadArgs = firstRecord(input?.input, input?.args);
+      const sessionId =
+        asString(payloadArgs.session_id) ??
+        asString(input?.session_id) ??
+        asString(input?.sessionID);
+      if (sessionId) activeSessionId = sessionId;
+      const taskId = asString(payloadArgs.id);
+      // Heavyweight turn: a note, claim, or completion satisfies the Breath
+      // prompt, so the mutation counter starts over.
+      if (
+        toolName === "neurostrata_task_claim" ||
+        toolName === "neurostrata_task_complete" ||
+        payloadArgs.note !== undefined
+      ) {
+        mutationsSinceNote = 0;
+      }
+      if (toolName === "neurostrata_task_complete") {
+        activeTaskId = null;
+      } else if (taskId) {
+        activeTaskId = taskId;
+      }
+    }
+
+    // Guard validation stays on the mutating tools only.
+    if (toolName !== "write" && toolName !== "edit" && toolName !== "bash") return;
+    const call: any = {
+      name: toolName,
+      args: firstRecord(input?.input, input?.args),
+      session_id:
+        asString(input?.session_id) ??
+        asString(input?.sessionID) ??
+        activeSessionId ??
+        undefined,
+    };
+    // Run guard validation (fail closed).
+    if (!config.strictMode) {
+      // Executed without validation: it is still a mutation.
+      mutationsSinceNote++;
+      return;
+    }
+    const actionType = toolName;
+    const payload = JSON.stringify(call.args);
+    const cwd = process.cwd();
+    const { session_id, active_task_id, worktree } = callState(call);
+    try {
+      const text = await mcpClient.callTool("neurostrata_guard_validate", {
+        namespace: config.namespace,
+        session_id,
+        active_task_id,
+        worktree,
+        action_type: actionType,
+        payload,
+        cwd,
+        is_mutating: true,
+        use_sandbox: false,
+        mutations_since_note: mutationsSinceNote,
+      });
+      const result = parseGuardValidate(text);
+      if (result.verdict === "reject") {
+        const reason =
+          result.reasons.join("; ") ||
+          result.constraints.join("; ") ||
+          result.bucket;
+        console.warn("[NeuroStrata] Guard rejected mutating tool", {
+          actionType,
+          session_id,
+          active_task_id,
+          worktree,
+          reason,
+          rule_ids: result.rule_ids,
+        });
+        throw new Error(`Zero-Action Start violation: ${reason}`);
+      }
+    } catch (err) {
+      const message = String(err);
+      // Re-throw guard rejections as-is: `String(new Error(...))` prepends
+      // "Error: ", so a startsWith check missed policy rejections and
+      // flipped the adapter to "unavailable" on a plain policy answer.
+      if (
+        message.includes("Zero-Action Start violation:") ||
+        message.includes("Guard rejected")
+      ) {
+        throw err;
+      }
+      setStatus({ state: "unavailable", lastError: message });
+      console.error("[NeuroStrata] Guard validation failed", { error: message });
+      throw new Error(
+        `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
+      );
+    }
+    // Guard passed and the tool is about to execute: count the mutation.
+    mutationsSinceNote++;
+  });
+
+  // Intent detection turn hook is best-effort in V2 (no direct conversation hook);
+  // onTurnEnd remains exported for callers/tests.
 
   await negotiateCapabilities();
 
-  ctx.logger.info("NeuroStrata OpenCode plugin initialized", {
+  console.info("[NeuroStrata] OpenCode plugin initialized", {
     namespace: config.namespace,
     endpoint: config.endpoint,
     authenticated: status.authenticated,
@@ -548,7 +931,7 @@ async function negotiateCapabilities(): Promise<void> {
       lastError: undefined,
     });
     if (missing.length > 0) {
-      requireCtx().logger.warn(
+      console.warn(
         "NeuroStrata core does not expose the tools this shim needs",
         { missing },
       );
@@ -558,68 +941,11 @@ async function negotiateCapabilities(): Promise<void> {
       state: "unavailable",
       lastError: String(err),
     });
-    requireCtx().logger.warn(
+    console.warn(
       "NeuroStrata core is unreachable; the shim is degraded",
       { error: String(err) },
     );
   }
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Tool Wrapper: guard_validate before write/edit
-// ──────────────────────────────────────────────────────────────────────
-
-async function wrapWriteEdit(
-  call: ToolCall,
-  next: (call: ToolCall) => Promise<ToolResult>,
-): Promise<ToolResult> {
-  if (!config.strictMode) {
-    return next(call);
-  }
-
-  const actionType = call.name; // "write" or "edit"
-  const payload = JSON.stringify(call.args);
-  const cwd = process.cwd();
-
-  try {
-    const text = await mcpClient.callTool("neurostrata_guard_validate", {
-      namespace: config.namespace,
-      action_type: actionType,
-      payload,
-      cwd,
-      use_sandbox: false, // semantic-only for speed; sandbox opt-in
-    });
-
-    const result = parseGuardValidate(text);
-    if (result.verdict === "reject") {
-      const reason =
-        result.reasons.join("; ") ||
-        result.constraints.join("; ") ||
-        result.bucket;
-      requireCtx().logger.warn("Guard rejected write/edit", {
-        actionType,
-        reason,
-        rule_ids: result.rule_ids,
-      });
-      return {
-        success: false,
-        error: `Zero-Action Start violation: ${reason}`,
-        data: { guard_verdict: result, degraded: false },
-      };
-    }
-  } catch (err) {
-    const message = String(err);
-    setStatus({ state: "unavailable", lastError: message });
-    requireCtx().logger.error("Guard validation failed", { error: message });
-    // Fail closed: a guard that cannot answer is not a guard that passed.
-    return {
-      success: false,
-      error: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
-      data: { degraded: true, state: status.state },
-    };
-  }
-
-  return next(call);
 }
 
 /**
@@ -627,81 +953,30 @@ async function wrapWriteEdit(
  * state shows Unpreflighted/BreathRequired (no active task claim or note
  * missing after 5+ mutations).
  */
-function callState(call: ToolCall): {
+function callState(call: any): {
   session_id: string;
   active_task_id: string | null;
   worktree: string;
 } {
   const args = asRecord(call.args);
   return {
-    session_id: asString(args.session_id) ?? "unknown",
-    active_task_id: asString(args.active_task_id) ?? null,
+    // Fall back to the session/task tracked from task mutations: a
+    // write/edit payload rarely carries either field itself.
+    session_id:
+      asString(call.session_id) ??
+      asString(args.session_id) ??
+      activeSessionId ??
+      "unknown",
+    active_task_id: asString(args.active_task_id) ?? activeTaskId,
     worktree: asString(args.worktree) ?? process.cwd(),
   };
-}
-
-async function wrapMutatingTool(
-  call: ToolCall,
-  next: (call: ToolCall) => Promise<ToolResult>,
-): Promise<ToolResult> {
-  if (!config.strictMode) {
-    return next(call);
-  }
-
-  const actionType = call.name;
-  const payload = JSON.stringify(call.args);
-  const cwd = process.cwd();
-  const { session_id, active_task_id, worktree } = callState(call);
-
-  try {
-    const text = await mcpClient.callTool("neurostrata_guard_validate", {
-      namespace: config.namespace,
-      session_id,
-      active_task_id,
-      worktree,
-      action_type: actionType,
-      payload,
-      cwd,
-      is_mutating: true,
-      use_sandbox: false,
-    });
-
-    const result = parseGuardValidate(text);
-    if (result.verdict === "reject") {
-      const reason =
-        result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
-      requireCtx().logger.warn("Guard rejected mutating tool", {
-        actionType,
-        session_id,
-        active_task_id,
-        worktree,
-        reason,
-        rule_ids: result.rule_ids,
-      });
-      return {
-        success: false,
-        error: `Zero-Action Start violation: ${reason}`,
-        data: { guard_verdict: result, degraded: false },
-      };
-    }
-  } catch (err) {
-    const message = String(err);
-    setStatus({ state: "unavailable", lastError: message });
-    requireCtx().logger.error("Guard validation failed", { error: message });
-    return {
-      success: false,
-      error: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
-      data: { degraded: true, state: status.state },
-    };
-  }
-  return next(call);
 }
 
 // ──────────────────────────────────────────────────────────────────────
 // Turn Hook: intent detection + nudge
 // ──────────────────────────────────────────────────────────────────────
 
-async function onTurnEnd(turn: {
+export async function onTurnEnd(turn: {
   role: "user" | "assistant";
   content: string;
 }): Promise<void> {
@@ -720,7 +995,7 @@ async function onTurnEnd(turn: {
 
   const markerList = signals.map((signal) => signal.marker).join(", ");
   const nudge = `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`;
-  requireCtx().conversation.injectSystemMessage(nudge);
+  console.info("[NeuroStrata] " + nudge);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -728,3 +1003,23 @@ async function onTurnEnd(turn: {
 // resolver, the wire helpers, the verdict parser and the adapter status are
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
+
+export async function fetchContextPlan(opts: {
+  namespace: string;
+  query?: string;
+  file_path?: string;
+  max_items?: number;
+  max_bytes?: number;
+  format?: "json" | "text";
+}): Promise<string> {
+  if (!mcpClient) throw new Error("NeuroStrata MCP client not initialized");
+  return await mcpClient.callTool("neurostrata_context_plan", opts);
+}
+
+export default Plugin.define({
+  id: "neurostrata",
+  async setup(ctx: any) {
+    await initialize(ctx);
+    return;
+  },
+});

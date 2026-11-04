@@ -22,9 +22,26 @@ use crate::synaptic_mesh::outbox::{
 };
 use crate::traits::MemoryPayload;
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
+
+/// Whether a memory is a derived artifact (KGE vectors, community labels,
+/// inferred edges) that must stay local/versioned derived data and never
+/// cross the mesh. The `derived` marker is accepted in every shape it is
+/// written in: boolean `true`, integer `1`, or the strings `"true"`/`"1"`
+/// (case-insensitive).
+fn is_derived_metadata(meta: &JsonValue) -> bool {
+    meta.get("derived")
+        .map(|v| {
+            v.as_bool().unwrap_or(false)
+                || v.as_i64() == Some(1)
+                || v.as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("true") || s.trim() == "1")
+        })
+        .unwrap_or(false)
+}
 
 /// Tees shareable mutations into the outbox and wakes the worker.
 pub struct MeshOutbox {
@@ -172,8 +189,13 @@ impl MeshOutbox {
         if !is_shareable_memory_type(&payload.memory_type) {
             return None;
         }
+        // Derived artifacts (KGE vectors, community labels, inferred edges)
+        // stay local/versioned derived data and never cross the mesh.
+        if is_derived_metadata(&payload.metadata) {
+            return None;
+        }
         Some(OutboxEntry {
-            stable_op_id: uuid::Uuid::new_v4(),
+            stable_op_id: uuid::Uuid::now_v7(),
             op: op.to_string(),
             id: id.to_string(),
             namespace: namespace.to_string(),
@@ -206,7 +228,7 @@ mod tests {
             "neurostrata-mesh-outbox-sub-{}-{}-{}",
             std::process::id(),
             tag,
-            uuid::Uuid::new_v4()
+            uuid::Uuid::now_v7()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -255,7 +277,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("created-db", outbox_dir.clone(), wake.clone()).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -300,7 +322,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("nonshareable-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -335,8 +357,8 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("superseded-db", outbox_dir.clone(), wake).await;
 
-        let old_id = uuid::Uuid::new_v4().to_string();
-        let new_id = uuid::Uuid::new_v4().to_string();
+        let old_id = uuid::Uuid::now_v7().to_string();
+        let new_id = uuid::Uuid::now_v7().to_string();
         for (id, metadata) in [
             (
                 &old_id,
@@ -389,7 +411,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("archived-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -430,7 +452,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("structural-ingest-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -467,7 +489,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("structural-ns-db", outbox_dir.clone(), wake).await;
 
-        let id = format!("src::{}", uuid::Uuid::new_v4());
+        let id = format!("src::{}", uuid::Uuid::now_v7());
         store
             .upsert(
                 "ns",
@@ -508,7 +530,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("procedure-def-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -537,6 +559,47 @@ mod tests {
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1, "a procedure definition is shareable");
         assert_eq!(pending[0].memory_type, "procedure");
+    }
+
+    /// Derived rows (`metadata.derived` in any documented shape -- boolean
+    /// `true`, integer `1`, or the strings `"true"`/`"1"`) never enter the
+    /// outbox: KGE vectors, community labels, and inferred edges stay local -
+    /// and versioned-derived data (F4).
+    #[tokio::test]
+    async fn a_derived_row_is_not_captured_in_any_marker_shape() {
+        for derived in [serde_json::json!("true"), serde_json::json!(1), serde_json::json!(true)] {
+            let dir = scratch("derived");
+            let outbox_dir = dir.join("mesh");
+            let wake = Arc::new(Notify::new());
+            let (bus, store) = wired("derived-db", outbox_dir.clone(), wake).await;
+
+            let id = uuid::Uuid::now_v7().to_string();
+            store
+                .upsert(
+                    "ns",
+                    &id,
+                    vec![0.0; TEST_DIMENSIONS],
+                    payload("rule", serde_json::json!({ "eligibility": "shareable", "derived": derived })),
+                )
+                .await
+                .unwrap();
+
+            bus.emit(
+                ThalamicPulse::Created {
+                    id,
+                    namespace: "ns".to_string(),
+                    kind: "rule".to_string(),
+                },
+                &RecursionToken::root(),
+            );
+            tokio::time::sleep(DISPATCH_WAIT).await;
+
+            let outbox = Outbox::open(&outbox_dir).unwrap();
+            assert!(
+                outbox.pending().unwrap().is_empty(),
+                "a derived row must not cross the mesh, marker shape: {derived}"
+            );
+        }
     }
 
     /// The subscriber's outbox directory is a sibling of the mesh checkout, so
@@ -578,11 +641,15 @@ impl MeshOutbox {
                 if payload.user_id == "auto-ingestor" || sr.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                     continue;
                 }
+                // Derived artifacts (KGE vectors, community labels, inferred
+                // edges) stay local/versioned derived data, mirroring `entry()`.
+                if is_derived_metadata(&payload.metadata) {
+                    continue;
+                }
                 // Eligibility gate (worker also re-checks, but skip early).
+                // Default is private; only shareable records are published.
                 if payload.metadata.get("eligibility").and_then(|v| v.as_str()) != Some("shareable") {
-                    // Default is private; only shareable records are published.
-                    // But we don't know the mesh policy here, so only skip if
-                    // explicitly private/absent. The worker will filter anyway.
+                    continue;
                 }
 
                 // Check if mesh file exists.
@@ -594,7 +661,7 @@ impl MeshOutbox {
 
                 // Build an outbox entry.
                 let entry = OutboxEntry {
-                    stable_op_id: uuid::Uuid::new_v4(),
+                    stable_op_id: uuid::Uuid::now_v7(),
                     op: OP_CREATED.to_string(),
                     id: sr.id.clone(),
                     namespace: ns.clone(),

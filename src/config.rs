@@ -320,8 +320,61 @@ pub struct Config {
     #[serde(default)]
     pub allowed_external_dirs: Vec<PathBuf>,
 
+    /// Maximum Levenshtein distance for fuzzy lexical clauses, clamped 0..=2.
+    #[serde(default = "default_lexical_fuzzy_max_distance")]
+    pub lexical_fuzzy_max_distance: usize,
+
+    /// Hybrid scoring weights (vector, graph, symbol). Must sum to 1.0.
+    /// Defaults (0.5, 0.3, 0.2) per spec §6.2.
+    #[serde(default = "default_hybrid_weights")]
+    pub hybrid_weights: (f32, f32, f32),
+
+    #[serde(default)]
+    pub storage_hygiene: crate::storage::snapshot::StorageHygieneConfig,
+
+    #[serde(default)]
+    pub rag_chat: crate::rag_chat::RagChatConfig,
+
+    #[serde(default)]
+    pub multimodal: crate::multimodal::MultimodalConfig,
+
+    #[serde(default)]
+    pub federation_allowed_hosts: Vec<String>,
+
+    #[serde(default)]
+    pub mesh_signing_key_path: Option<PathBuf>,
+
+    #[serde(default = "default_metrics_ring_capacity")]
+    pub metrics_ring_capacity: usize,
+
+    #[serde(default = "default_metrics_ewma_alpha")]
+    pub metrics_ewma_alpha: f64,
+
+    #[serde(default = "default_metrics_flush_interval_secs")]
+    pub metrics_flush_interval_secs: u64,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+fn default_metrics_ring_capacity() -> usize {
+    1024
+}
+
+fn default_metrics_ewma_alpha() -> f64 {
+    0.2
+}
+
+fn default_metrics_flush_interval_secs() -> u64 {
+    60
+}
+
+fn default_hybrid_weights() -> (f32, f32, f32) {
+    (0.5, 0.3, 0.2)
+}
+
+fn default_lexical_fuzzy_max_distance() -> usize {
+    2
 }
 
 impl Config {
@@ -390,6 +443,16 @@ impl Config {
                 project_contexts: HashMap::new(),
                 store: StoreConfig::default(),
                 allowed_external_dirs: Vec::new(),
+                lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
+                hybrid_weights: default_hybrid_weights(),
+                storage_hygiene: crate::storage::snapshot::StorageHygieneConfig::default(),
+                rag_chat: crate::rag_chat::RagChatConfig::default(),
+                multimodal: crate::multimodal::MultimodalConfig::default(),
+                federation_allowed_hosts: Vec::new(),
+                mesh_signing_key_path: None,
+                metrics_ring_capacity: default_metrics_ring_capacity(),
+                metrics_ewma_alpha: default_metrics_ewma_alpha(),
+                metrics_flush_interval_secs: default_metrics_flush_interval_secs(),
                 extra: HashMap::new(),
             };
 
@@ -408,6 +471,13 @@ impl Config {
         Self::load_from(&config_path)
     }
 
+    /// Load from the default path WITHOUT creating a default config file
+    /// (unlike `from_default_path`, which materializes one when missing).
+    pub fn load() -> Result<Self> {
+        let path = Self::default_path()?;
+        Self::load_from(&path)
+    }
+
     pub fn load_from(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;
@@ -416,6 +486,7 @@ impl Config {
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
         }
+        config.lexical_fuzzy_max_distance = config.lexical_fuzzy_max_distance.min(2);
 
         Ok(config)
     }
@@ -882,6 +953,16 @@ mod tests {
             project_contexts: HashMap::new(),
             store: StoreConfig::default(),
             allowed_external_dirs: Vec::new(),
+            lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
+            hybrid_weights: default_hybrid_weights(),
+            storage_hygiene: crate::storage::StorageHygieneConfig::default(),
+            rag_chat: crate::rag_chat::RagChatConfig::default(),
+            multimodal: crate::multimodal::MultimodalConfig::default(),
+            federation_allowed_hosts: Vec::new(),
+            mesh_signing_key_path: None,
+            metrics_ring_capacity: default_metrics_ring_capacity(),
+            metrics_ewma_alpha: default_metrics_ewma_alpha(),
+            metrics_flush_interval_secs: default_metrics_flush_interval_secs(),
             extra: HashMap::new(),
         };
 

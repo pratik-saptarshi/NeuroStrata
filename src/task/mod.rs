@@ -7,9 +7,12 @@
 //! sections 1 through 3 and 6 through 8.
 
 pub mod gate;
+pub mod harness_plugins;
 pub mod intake;
 pub mod intent;
 pub mod machine;
+pub mod precheck;
+pub mod receipt;
 pub mod wiring;
 
 use crate::judgment::DeduplicationChecker;
@@ -18,6 +21,8 @@ use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+
+static TASK_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<crate::receipts::store::ReceiptStore>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::receipts::store::ReceiptStore::new()));
 
 // ── small helpers shared by every handler ──────────────────────────────────
 
@@ -372,6 +377,143 @@ async fn store_new_task(
     Ok((id, payload))
 }
 
+/// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
+/// graph edges for a task, and format a ready-to-paste subagent prompt block.
+pub async fn build_task_graph_context(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    vector: &[f32],
+    payload: &MemoryPayload,
+) -> (Value, String) {
+    let raw_hits = store
+        .search(namespace, vector.to_vec(), 12, false, false)
+        .await
+        .unwrap_or_default();
+    let mut hits_json = Vec::new();
+    let mut prompt_lines = Vec::new();
+    for r in raw_hits {
+        if r.id == task_id
+            || r.payload.memory_type == "task"
+            || crate::registry::is_registry_row(&r.payload.metadata)
+            || crate::handlers::archive_memory::is_archived(&r.payload)
+        {
+            continue;
+        }
+        let snippet: String = r.payload.content.chars().take(140).collect();
+        let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
+        let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
+        let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
+        let depends_on = r.payload.metadata.get("depends_on").cloned().unwrap_or(Value::Null);
+        prompt_lines.push(format!(
+            "  - [{}] `{}` ({}): {}",
+            r.payload.memory_type,
+            r.id,
+            if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
+            snippet.replace('\n', " ")
+        ));
+        hits_json.push(json!({
+            "id": r.id,
+            "memory_type": r.payload.memory_type,
+            "location": r.payload.location,
+            "snippet": snippet,
+            "calls": calls,
+            "imports": imports,
+            "governs": governs,
+            "depends_on": depends_on,
+            "evidence": r.evidence,
+        }));
+        if hits_json.len() >= 5 {
+            break;
+        }
+    }
+    let hits_block = if prompt_lines.is_empty() {
+        "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
+    } else {
+        prompt_lines.join("\n")
+    };
+    let subagent_prompt = format!(
+        "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
+         - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
+         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}\n\
+         - Mandatory Graph-First Lookup Rule: Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` (or `neurostrata-mcp` CLI) to inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`).",
+        namespace, task_id, payload.content, hits_block
+    );
+    (Value::Array(hits_json), subagent_prompt)
+}
+
+/// Record a graph or memory lookup against any active `in_progress` task in
+/// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
+/// root is known.
+pub async fn record_graph_query(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+) {
+    let ns = crate::server::resolve_namespace(store, namespace).await;
+    let Ok(rows) = store.list(&ns, None, None).await else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
+    let mut project_root: Option<String> = None;
+    for r in &rows {
+        if project_root.is_none() && crate::registry::is_registry_row(&r.payload.metadata) {
+            if let Some(p) = r.payload.metadata.get("project_root").and_then(|v| v.as_str()) {
+                project_root = Some(p.to_string());
+            }
+        }
+        if project_root.is_none() && r.payload.memory_type == "directory" {
+            if let Some(p) = r.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
+                if std::path::Path::new(p).join(".git").exists() {
+                    project_root = Some(p.to_string());
+                }
+            }
+        }
+        if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
+            if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
+                let obj = task_obj_mut(&mut payload);
+                let count = obj.get("graph_queries_count").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                obj.insert("graph_queries_count".to_string(), json!(count));
+                obj.insert("graph_queried".to_string(), json!(true));
+                let mut recent: Vec<String> = obj
+                    .get("recent_queries")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                recent.push(entry_str.clone());
+                if recent.len() > 10 {
+                    let drop_n = recent.len() - 10;
+                    recent.drain(0..drop_n);
+                }
+                obj.insert("recent_queries".to_string(), json!(recent));
+                let _ = store.upsert(&ns, &r.id, vec, payload).await;
+            }
+        }
+    }
+    if let Some(root) = project_root {
+        let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
+        if let Some(parent) = ledger_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut doc: Value = std::fs::read_to_string(&ledger_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
+        if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
+            arr.push(json!({
+                "ts": now,
+                "tool": tool_name,
+                "query": query_hint,
+            }));
+            if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
+                let _ = std::fs::write(&ledger_path, serialized);
+            }
+        }
+    }
+}
+
 /// Secret scan over a task write's caller-supplied strings, in the
 /// add_memory refusal shape: the scanner's verdict text is the refusal.
 /// A task write is a store write, so it meets the same scanner.
@@ -519,11 +661,19 @@ pub async fn handle_task_create(
     )
     .await
     {
-        Ok((id, payload)) => encode(&json!({
-            "id": id,
-            "namespace": namespace,
-            "task": task_summary(&id, &payload),
-        })),
+        Ok((id, payload)) => {
+            let vector = emb.embed(&payload.content).await.unwrap_or_default();
+            let (hits_json, subagent_prompt) = build_task_graph_context(
+                &store, &namespace, &id, &vector, &payload,
+            ).await;
+            encode(&json!({
+                "id": id,
+                "namespace": namespace,
+                "task": task_summary(&id, &payload),
+                "auto_retrieved_context": hits_json,
+                "subagent_prompt_injection": subagent_prompt,
+            }))
+        }
         Err(e) => e,
     }
 }
@@ -546,7 +696,7 @@ static CLAIM_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()
 /// honest atomicity mechanism.
 fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let registry = CLAIM_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut map = registry.lock().expect("claim lock registry poisoned");
+    let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|_, lock| lock.strong_count() > 0);
     if let Some(lock) = map.get(task_id).and_then(Weak::upgrade) {
         return lock;
@@ -624,7 +774,15 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             );
             // Live = updated within the staleness window. Stale = the holder
             // probably went away, so the claim is up for grabs (section 5.3).
-            let live = age.map(|a| a <= gate::STALE_AFTER_SECS).unwrap_or(false);
+            let live = age
+                .map(|a| a <= gate::STALE_AFTER_SECS)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
+                        id
+                    );
+                    false
+                });
             if live {
                 return format!(
                     "ERROR: task {} is claimed by {} (session '{}') and that claim is live (last update {}s ago). Two live sessions on one task duplicate work: ask them to release it (neurostrata_task_update with status 'open'), or claim it yourself after {} minutes without an update.",
@@ -693,9 +851,27 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // ever fire for an out-of-process claim writer, and none exists — every
     // claim enters through this handler in the daemon process.)
 
-    if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
+    if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
         return e;
     }
+    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
+    {
+        let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        r.record(crate::receipts::store::Receipt {
+            session_id: session.clone(),
+            task_id: id.clone(),
+            event_id,
+            outcome: "claimed".to_string(),
+            exposed_ids: vec![format!("{}:{}", namespace, id)],
+            worktree: binding.worktree,
+            head_sha: binding.head_sha,
+            dirty_tree_hash: binding.dirty_tree_hash,
+        });
+    }
+    let (hits_json, subagent_prompt) = build_task_graph_context(
+        &store, &namespace, &id, &vector, &task.payload,
+    ).await;
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -703,6 +879,8 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         "claimed": true,
         "transition": { "from": from.as_str(), "to": "in_progress" },
         "task": task_summary(&id, &task.payload),
+        "auto_retrieved_context": hits_json,
+        "subagent_prompt_injection": subagent_prompt,
     }))
 }
 
@@ -841,6 +1019,39 @@ pub async fn handle_task_update(
                     obj.remove("assignee");
                     obj.remove("session_id");
                     task = moved;
+                }
+                // Claiming through task_update must not hollow the machine:
+                // an InProgress task with no holder fails the Open/InProgress
+                // invariant, and task_update may be the only claim action a
+                // session makes. So Open -> InProgress stamps the caller's
+                // claim while it moves.
+                else if from == Status::Open && to == Status::InProgress {
+                    let mut moved = moved;
+                    let caller_session = arg_str(&args, "session_id")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string());
+                    let obj = task_obj_mut(&mut moved.payload);
+                    let unclaimed = obj
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    if unclaimed {
+                        if let Some(session) = &caller_session {
+                            obj.insert("session_id".to_string(), json!(session));
+                        }
+                        if obj
+                            .get("assignee")
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim().is_empty())
+                            .unwrap_or(true)
+                        {
+                            if let Some(a) = assignee.clone().or_else(|| caller_session.clone()) {
+                                obj.insert("assignee".to_string(), json!(a));
+                            }
+                        }
+                    }
+                    task = moved;
                 } else {
                     task = moved;
                 }
@@ -904,6 +1115,28 @@ pub async fn handle_task_update(
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
+    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("update-{}", id)).to_string();
+    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
+        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
+    });
+    {
+        let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
+        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        r.record(crate::receipts::store::Receipt {
+            session_id: session_for_receipt,
+            task_id: id.clone(),
+            event_id,
+            outcome: "updated".to_string(),
+            exposed_ids: vec![format!("{}:{}", namespace, id)],
+            worktree: binding.worktree,
+            head_sha: binding.head_sha,
+            dirty_tree_hash: binding.dirty_tree_hash,
+        });
+    }
+    let graph_queries_count = task.payload.metadata.get("task").and_then(|t| t.get("graph_queries_count")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let graph_lookup_nudge = if graph_queries_count == 0 {
+        Some("Graph-First Lookup: run neurostrata_memories_for_file / neurostrata_related / neurostrata_search_memory before editing files.")
+    } else { None };
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -911,6 +1144,8 @@ pub async fn handle_task_update(
         "transition": transition,
         "renamed": rename_note,
         "task": task_summary(&id, &task.payload),
+        "graph_queries_count": graph_queries_count,
+        "graph_lookup_nudge": graph_lookup_nudge,
     }))
 }
 
@@ -1083,6 +1318,7 @@ pub async fn handle_task_complete(
     let namespace_arg = required_str(&args, "namespace")?;
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
     crate::domain::validate_namespace(&namespace)?;
+    precheck::normalize_and_precheck_namespace(&*store, &namespace).await?;
 
     let (task, vector) = load_task(&store, &namespace, &id).await?;
     // The clock the gate reads with: a lesson row that has been retired is
@@ -1096,7 +1332,10 @@ pub async fn handle_task_complete(
         ));
     }
 
-    let reason = arg_str(&args, "reason").unwrap_or("").to_string();
+    let reason = arg_str(&args, "reason")
+        .or_else(|| arg_str(&args, "close_reason"))
+        .unwrap_or("")
+        .to_string();
     let link_memory_id = arg_str(&args, "link_memory_id").map(|s| s.to_string());
     let memory = args.get("memory").cloned();
 
@@ -1115,7 +1354,13 @@ pub async fn handle_task_complete(
     {
         full_text.push_str(mem_content);
     }
-    let has_follow_up = args.get("follow_up_tasks").is_some();
+    // A passed-but-empty list is defer, not compliance: `follow_up_tasks: []`
+    // is not an explicit follow-up plan.
+    let has_follow_up = args
+        .get("follow_up_tasks")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
     if !full_text.is_empty() {
         use crate::task::intent::detect_task_intents;
         let signals = detect_task_intents(&full_text);
@@ -1394,7 +1639,7 @@ pub async fn handle_task_complete(
                     .get("register_domain")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                match crate::registry::check_domain(&store, &emb, &namespace, &raw, register_domain)
+                match crate::registry::check_domain(&store, &namespace, &raw, register_domain)
                     .await
                 {
                     Ok(check) => {
@@ -1458,8 +1703,8 @@ pub async fn handle_task_complete(
                 .as_ref()
                 .map(|u| u.id.clone())
                 .or(report.linked_existing_id.clone())
-                .unwrap_or_default();
-            inline_lesson = Some(lesson_id);
+                .filter(|s| !s.is_empty());
+            inline_lesson = lesson_id;
         }
     }
 
@@ -1498,15 +1743,63 @@ pub async fn handle_task_complete(
         })?;
     }
 
+    // The completing session travels into the "done" history entry: without
+    // it the claim/exclusivity trail stops at the finish line.
+    let caller_session = arg_str(&args, "session_id")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            task.task_field("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+
     // With the edge in place the ExtractionRequired guard is satisfied.
     let ctx = Ctx {
         reason: reason.clone(),
         extraction_edge_exists: true,
         actor,
-        session: String::new(),
+        session: caller_session.unwrap_or_default(),
     };
-    let completed = apply(&task, Status::Done, &ctx).map_err(|e| format!("ERROR: {}", e))?;
+    let mut completed = apply(&task, Status::Done, &ctx).map_err(|e| format!("ERROR: {}", e))?;
+    if !reason.trim().is_empty() {
+        if let Some(meta) = completed.payload.metadata.as_object_mut() {
+            if let Some(t) = meta.get_mut("task").and_then(|v| v.as_object_mut()) {
+                t.insert("close_reason".to_string(), json!(reason.trim()));
+            }
+        }
+    }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("complete-{}", id)).to_string();
+    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
+        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
+    });
+    {
+        let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
+        // Bind the completion receipt to the worktree state captured right now
+        // (AC5): retention verification later re-checks this binding.
+        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        r.record(crate::receipts::store::Receipt {
+            session_id: session_for_receipt.clone(),
+            task_id: binding.task_id.clone(),
+            event_id: event_id.clone(),
+            outcome: "completed".to_string(),
+            exposed_ids: vec![format!("{}:{}", namespace, id)],
+            worktree: binding.worktree,
+            head_sha: binding.head_sha,
+            dirty_tree_hash: binding.dirty_tree_hash,
+        });
+        // AC5: the completion receipt must be retained and verifiable — ask
+        // the retention gate right here so a lost receipt is caught on the spot.
+        let retention_ok = crate::retention::gate::verify_task_receipt_retention(
+            &r,
+            &session_for_receipt,
+            &id,
+            &event_id,
+        );
+        if !retention_ok {
+            tracing::warn!("AC5 receipt retention check failed for task {}", id);
+        }
+    }
 
     // M3: spawn follow-up tasks now that the parent is done. Each inherits
     // the caller's user/agent defaults and carries spawned_from + related_to.
@@ -1591,7 +1884,64 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         return e;
     }
     match gate::run(&store, &namespace).await {
-        Ok(report) => encode(&report.validate_json()),
+        Ok(report) => {
+            let mut json = report.validate_json();
+            // F13: dangling-edge report (warn-only, never blocks gate).
+            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+                .downcast_ref::<crate::store::LadybugStore>()
+            {
+                match ls.dangling_edges(&namespace).await {
+                    Ok(edges) => {
+                        let count = edges.len();
+                        let samples: Vec<_> = edges.into_iter().take(5).collect();
+                        if let Some(obj) = json.as_object_mut() {
+                            obj.insert("dangling_edges".to_string(), serde_json::json!({
+                                "total": count,
+                                "samples": samples,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("dangling_edges query failed for '{namespace}': {e}");
+                    }
+                }
+                let sw = ls.shape_warnings(&namespace).await;
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("shape_warnings".to_string(), serde_json::Value::Array(sw));
+                }
+                let ow = ls.ontology_warnings(&namespace).await;
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("ontology_warnings".to_string(), serde_json::Value::Array(ow));
+                }
+                // Enrichment state surface (F12/F14/F24), warn-first.
+                let rid = crate::registry::registry_row_id(&namespace);
+                match crate::traits::VectorStore::get(ls, &namespace, &rid).await {
+                    Ok(Some((_, reg_payload))) => {
+                        let es = crate::registry::enrichment_state(&reg_payload.metadata);
+                        if let Some(obj) = json.as_object_mut() {
+                            obj.insert("enrichment_state".to_string(), es.clone());
+                            if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
+                                let warnings = obj
+                                    .entry("warnings".to_string())
+                                    .or_insert_with(|| serde_json::json!([]));
+                                if let Some(arr) = warnings.as_array_mut() {
+                                    arr.push(
+                                        serde_json::json!({"kind":"enrichment_failed","state":es}),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "enrichment registry get failed for '{namespace}:{rid}': {e}"
+                        );
+                    }
+                }
+            }
+            encode(&json)
+        }
         Err(e) => format!("ERROR: could not evaluate the task gate: {}", e),
     }
 }
@@ -1630,6 +1980,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
 
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
     out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
+    out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
     if claimed.is_empty() && ready.is_empty() {
         out.push_str("No tasks are claimed or ready in this namespace.\n");
         return out;
@@ -1672,31 +2023,43 @@ fn agents_template(namespace: &str) -> String {
     format!(
         r#"# Agent Rules — {ns}
 
+## 0. The Prime Directive: Never Defer Anything
+No task, feature, or implementation may be left in a "deferred", "todo",
+"stub", "phase-2", or "later" state. Every open item must be either completed
+and committed in this session or filed as a tracked task via
+`neurostrata_task_create` with assignee and description.
+
 ## 1. Zero-Action Start (mandatory)
+Pre-flight every session with `neurostrata_get_snapshot` (`namespace: "{ns}"`).
 No code or file edits until a task exists AND is claimed by this session:
 1. `neurostrata_task_list` with `ready: true` to pick up existing work, or
 2. `neurostrata_task_create` (namespace, title) then `neurostrata_task_claim`
    (id, namespace, assignee, session_id).
-Never use TodoWrite, TaskCreate, or markdown TODO lists: tasks live in
+Never use TodoWrite, TaskCreate, `bd`, or markdown TODO lists: tasks live in
 NeuroStrata, not in the repo.
 
 ## 2. Session completion (all three, in order)
 1. `neurostrata_task_complete` on every claimed task. It is the only entrance
-   to `done`, and it forces extraction: pass `memory.content` (what did this
-   task teach? what rule does it prove?) or `link_memory_id`. An inline
+   to `done`, and it forces extraction (Lock 2): pass `memory.content` (what did
+   this task teach? what rule does it prove?) or `link_memory_id`. An inline
    `memory.metadata` is persisted exactly as add_memory persists one -- pass
-   `source` there for a rule that must carry provenance.
-2. `neurostrata-mcp task gate {ns}` must exit 0.
+   `source` and `governs` there for a rule that must carry provenance.
+2. `neurostrata-mcp task gate {ns} --strict` must exit 0 (Lock 1).
 3. `git pull --rebase` then `git push` (the pre-push hook runs the gate).
 
-## 3. Mid-task state
-Progress notes go on the task: `neurostrata_task_update` with `note` appends
-to history. The task record IS Tier-3 task memory -- recover a session with
-`neurostrata_task_list` + `neurostrata_get_memory`, not log archaeology.
+## 3. Mid-task state & Episodic Buffer (Lock 3 — Breath prompt)
+Every 3–5 mutation steps, pause and append a state summary on the task via
+`neurostrata_task_update` (`note` appends to history). Maintain a running
+conversational transcript via `neurostrata_append_log`. The task record IS
+Tier-3 task memory -- recover a session with `neurostrata_task_list` +
+`neurostrata_get_memory`, not log archaeology.
 
-## 4. Memory
-Architectural rules, decisions, and fixes -> `neurostrata_add_memory`.
-Pre-flight every new task with `neurostrata_get_snapshot` first.
+## 4. Memory & Automatic Graph-First Propagation
+Architectural rules, decisions, and fixes -> `neurostrata_add_memory`
+(correct outdated rules via `neurostrata_supersede_memory`; never bulk-delete).
+- **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
+- **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
+- **Zero-Touch Harness Plugin Auto-Install & Hooks:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`), installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, and self-heals both `.git/hooks/pre-push` and `.git/hooks/pre-commit`.
 
 ## 5. Task vs procedure (do not confuse)
 A `task` is a unit of work that finishes (it must reach `done` via
@@ -1727,6 +2090,11 @@ When you see one in user/agent speech, logs, or memory content, capture it
 with `neurostrata_task_create` (namespace, title) instead of letting it
 evaporate. The lexical detector surfaces these as `task_intent_signals` in
 `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
+
+## 7. SynapticMesh, Security & Infrastructure Constraints
+- **SynapticMesh Honesty:** Only `eligibility: "shareable"` rule/fact/procedure definitions cross the mesh (stripped of local runtime counters). Private rows are sovereign; preserve mesh conflicts visibly and never force-push the mesh repo.
+- **Daemon Caller-Path Authority (`J6`):** Caller-supplied filesystem paths on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` must reside within the project root or `allowed_external_dirs` in `~/.config/neurostrata/config.json`.
+- **Tooling & Safety:** Never delete the shared LadybugDB directory or tables. Always use `podman` (never `docker`), strict JSON/JSON Schema, and non-interactive CLI flags.
 "#,
         ns = namespace
     )
@@ -1751,6 +2119,7 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
+    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -1848,6 +2217,7 @@ pub async fn handle_bootstrap(
             { "path": ".NeuroStrata/docs/.gitkeep", "overwrite": false, "content": "" }
         ],
         "first_task": { "id": task_id, "title": title },
+        "harness_plugins": harness_plugins,
         "tasks_created": tasks_created,
         "hooks": { "install_command": "neurostrata-mcp hooks install" },
         "instructions": instructions,
@@ -1934,12 +2304,12 @@ pub(crate) fn hook_sha256() -> String {
     };
     let mut hasher = Sha256::new();
     hasher.update(body.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
-/// True when `content` was written by NeuroStrata (contains the gate marker).
+/// True when `content` was written by NeuroStrata (contains the gate or pre-commit marker).
 pub(crate) fn is_ours_hook(content: &str) -> bool {
-    content.contains("NeuroStrata task gate")
+    content.contains("NeuroStrata task gate") || content.contains("NeuroStrata pre-commit hook")
 }
 
 /// True when `content` is a NeuroStrata hook whose embedded hash matches the
@@ -1954,9 +2324,6 @@ pub(crate) fn is_current_hook(content: &str) -> bool {
 
 /// The scaffolded `pre-commit` hook: records the module-query ledger and
 /// stamps `graph_queried` on the active task before any commit lands.
-/// Optional: only installed when `neurostrata-mcp hooks install --pre-commit`
-/// is run on a git repo. Non-git projects skip it; the git-free
-/// `.NeuroStrata/session_queries.json` path remains the primary mechanism.
 pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
@@ -1966,18 +2333,26 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # and the agent did NOT query NeuroStrata for that module, the hook emits a
 # warning (non-blocking) so the agent can verify against source before push.
 #
-# Install with:  neurostrata-mcp hooks install --pre-commit
+# Install with:  neurostrata-mcp hooks install
 # (git honors core.hooksPath; the hook text is one file, no drift.)
 
 NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 ROOT=$(git rev-parse --show-toplevel)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 
-# ── Collect touched modules from staged diff ─────────────────────────────────
-TouchedModules=$(git diff --name-only --cached | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+# ── Collect touched src/ modules from staged diff ────────────────────────────
+TouchedModules=$(git diff --name-only --cached | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
 if [ -z "$TouchedModules" ]; then
-    TouchedModules=$(git diff --name-only | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+    TouchedModules=$(git diff --name-only | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
 fi
+
+# ── Check each touched module against governing memories ─────────────────────
+for module in $TouchedModules; do
+    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+        echo "warning: module '$module' has no recorded NeuroStrata graph/memory lookup in this session" >&2
+        echo "  → call: neurostrata_memories_for_file or neurostrata_search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+    fi
+done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
@@ -1987,17 +2362,8 @@ fi
 for module in $TouchedModules; do
     TS=$(date +%s)
     ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER"; then
-        # Append to the queries array
-        sed -i 's/], "queries": \[\]/], "queries": [\n    '"$ENTRY"'\n  ]/' "$LEDGER" 2>/dev/null || true
-    fi
-done
-
-# ── Check each touched module against governing memories ─────────────────────
-for module in $TouchedModules; do
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded neurostrata_search_memory hit in this session" >&2
-        echo "  → call: neurostrata-mcp search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+        sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
     fi
 done
 
@@ -2022,6 +2388,12 @@ mkdir -p "$dest_dir"
 
 install -m 0755 "$src" "$dest_dir/pre-push"
 echo "Installed $dest_dir/pre-push"
+
+pre_commit_src="$root/scripts/hooks/pre-commit"
+if [ -f "$pre_commit_src" ]; then
+    install -m 0755 "$pre_commit_src" "$dest_dir/pre-commit"
+    echo "Installed $dest_dir/pre-commit"
+fi
 
 # Read-back only: report presence, never execute. Running it here would run
 # every project guard in PROJECT_GATES as a side effect of installing.
@@ -2074,9 +2446,41 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
+    let repo_ns = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    let _ = harness_plugins::auto_install_detected_plugins(root, repo_ns, None);
     let hooks_dir = git_hooks_dir(root);
     if !hooks_dir.is_dir() {
-        let _ = std::fs::create_dir_all(&hooks_dir);
+        if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
+            tracing::warn!("failed to create hooks dir {}: {e}", hooks_dir.display());
+        }
+    }
+    // Auto-install / refresh pre-commit hook if missing or stale.
+    let pre_commit_target = hooks_dir.join("pre-commit");
+    if !pre_commit_target.exists() {
+        if std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+            set_executable(&pre_commit_target);
+        }
+    } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
+        if pc_content.contains("NeuroStrata pre-commit hook") && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK {
+            if std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
+                && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
+            {
+                set_executable(&pre_commit_target);
+            }
+        }
+    }
+    let repo_scripts_hooks = root.join("scripts/hooks");
+    if repo_scripts_hooks.is_dir() {
+        let repo_pc = repo_scripts_hooks.join("pre-commit");
+        let needs_repo_pc = std::fs::read_to_string(&repo_pc)
+            .map(|c| c != SCAFFOLDED_PRE_COMMIT_HOOK)
+            .unwrap_or(true);
+        if needs_repo_pc && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+            set_executable(&repo_pc);
+        }
     }
     let target = hooks_dir.join("pre-push");
     let version = env!("CARGO_PKG_VERSION");
@@ -2095,8 +2499,12 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
         if is_current_hook(&content) {
             return String::new();
         }
-        // stale: back up + rewrite
-        let _ = std::fs::copy(&target, hooks_dir.join("pre-push.bak"));
+        // stale: back up + rewrite. A failed backup must not destroy the
+        // hook content -- rewriting without the .bak loses the only copy.
+        if let Err(e) = std::fs::copy(&target, hooks_dir.join("pre-push.bak")) {
+            tracing::warn!("failed to back up foreign pre-push hook: {e}");
+            return String::new();
+        }
         if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
             set_executable(&target);
             return format!("HOOKS: updated pre-push (stale -> v{})", version);
@@ -2112,7 +2520,9 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
 #[cfg(unix)]
 fn set_executable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
+        tracing::warn!("failed to set executable bit on {}: {e}", path.display());
+    }
 }
 
 #[cfg(not(unix))]
@@ -2127,9 +2537,36 @@ fn set_executable(_path: &std::path::Path) {}
 /// every push (FINDING-bootstrap-wiring-nudge fix round 1).
 fn hook_observable(root: &std::path::Path) -> bool {
     let hook = git_hooks_dir(root).join("pre-push");
-    std::fs::read_to_string(&hook)
-        .map(|s| s.contains("NeuroStrata task gate"))
+    let content = if hook.exists() {
+        match std::fs::read_to_string(&hook) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::debug!("hook_observable read failed for {}: {e}", hook.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    content
+        .filter(|s| s.contains("NeuroStrata task gate"))
+        .is_some()
+        && hook_executable(&hook)
+}
+
+/// A hook git will not run is not a gate: git executing a pre-push hook
+/// without the executable bit fails, so "installed" must require it too.
+#[cfg(unix)]
+fn hook_executable(hook: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(hook)
+        .map(|m| (m.permissions().mode() & 0o111) != 0)
         .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn hook_executable(_hook: &std::path::Path) -> bool {
+    true
 }
 
 /// The project guards an installed hook actually runs.
@@ -2181,10 +2618,18 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
     };
     let export_fresh: Option<bool> = {
         let export = root.join(".NeuroStrata").join("graph").join("graph.json");
-        match (
-            git,
-            std::fs::metadata(&export).and_then(|m| m.modified()).ok(),
-        ) {
+        let modified = match std::fs::metadata(&export) {
+            Ok(meta) => match meta.modified() {
+                Ok(mtime) => Some(mtime),
+                Err(e) => {
+                    tracing::warn!("failed to read export file mtime: {e}");
+                    None
+                }
+            },
+            // Not exported yet: metadata fails, no mtime to read.
+            Err(_) => None,
+        };
+        match (git, modified) {
             (false, _) => None,
             (true, None) => Some(false),
             (true, Some(mtime)) => {
@@ -2226,17 +2671,22 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
                     None
                 }
             }
-            wiring::RunsIn::AgentReminder => None,
         };
+        // Note: "no machine exists" is intentionally absent from RunsIn — a
+        // wire category the catalog never ships cannot claim coverage.
         if w.runs_in == wiring::RunsIn::ProjectPipeline && resolved.is_none() {
             uncovered.push(w.id);
         }
-        let mut entry = json!({
+        let entry = json!({
             "id": w.id,
             "runs_in": w.runs_in.as_str(),
             "blocks": w.blocks,
             "gate_point": resolved,
             "reason": w.reason,
+            // Field contract of docs/design-wiring-panel.md Q1: the schema key
+            // exists even when no reference implementation is shipped, so
+            // consumers read one stable shape.
+            "reference": None::<String>,
         });
         // Q5 honesty, the hard version: no per-guard `client_side` flag. Whether the
         // hook runs a given pipeline guard is read out of the hook body
@@ -2246,8 +2696,13 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         automatic.push(entry);
     }
 
+    // The closed `fires_on` enum guards what this panel may surface as a
+    // reminder: a wire whose trigger is outside `VALID_FIRES_ON` is outside
+    // the contract (the catalog test asserts the same invariant), so it is
+    // filtered here rather than advertised as a reminder.
     let reminders: Vec<Value> = wiring::REMINDER_WIRES
         .iter()
+        .filter(|r| wiring::is_valid_fires_on(r.fires_on))
         .map(|r| json!({ "id": r.id, "fires_on": r.fires_on, "text": r.text }))
         .collect();
 
@@ -2257,10 +2712,19 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         uncovered.push("task-gate");
     }
 
+    let core_ids: Vec<&str> = wiring::AUTOMATIC_WIRES
+        .iter()
+        .filter(|w| w.runs_in == wiring::RunsIn::Core)
+        .map(|w| w.id)
+        .collect();
+    let git_ids: Vec<&str> = wiring::AUTOMATIC_WIRES
+        .iter()
+        .filter(|w| w.runs_in == wiring::RunsIn::GitPrePush)
+        .map(|w| w.id)
+        .collect();
     let coverage = json!({
-        "core": ["task-close-lock", "claim-exclusivity", "stale-claim-expiry",
-                 "zero-action-start", "single-daemon-lock", "rule-honesty"],
-        "git-pre-push": if hook_installed { vec!["task-gate"] } else { Vec::<&str>::new() },
+        "core": core_ids,
+        "git-pre-push": if hook_installed { git_ids } else { Vec::<&str>::new() },
         "project-pipeline": pipeline_ids.clone(),
         "uncovered": uncovered,
     });
@@ -2275,7 +2739,9 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
     // install instruction becomes structurally impossible).
     let verified = json!({
         "hook_installed": hook_installed,
-        "status_healthy": true,
+        // Healthy means the gate actually runs on every push; a claim above
+        // the absence of the hook is the same lie the panel exists to kill.
+        "status_healthy": hook_installed,
         "export_fresh": export_fresh,
         "gate_point_resolved": gate_point.is_some(),
         // Read out of the installed hook's PROJECT_GATES, not assumed from
@@ -2500,7 +2966,8 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir(root.join(".git/hooks")) {
+    let hooks_dir = git_hooks_dir(root);
+    if let Ok(entries) = std::fs::read_dir(&hooks_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".sample") {
@@ -2672,6 +3139,7 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
+    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -2728,7 +3196,10 @@ pub async fn handle_task_setup(
     if let Some(beads_rel) = &scan.beads_path {
         let count = std::fs::read_to_string(root.join(beads_rel))
             .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to read beads file {}: {e}", root.join(beads_rel).display());
+                0
+            });
         let title = format!("Migrate {} beads issues into NeuroStrata tasks", count);
         let import_cmd = format!(
             "neurostrata-mcp task import {} --from-beads {}",
@@ -2771,8 +3242,9 @@ pub async fn handle_task_setup(
             .unwrap_or_default()
             .to_string();
         let mut similar: Vec<Value> = Vec::new();
-        if let Ok(vec) = emb.embed(&content).await {
-            if let Ok(hits) = store.search(&namespace, vec, 3, false, false).await {
+        match emb.embed(&content).await {
+            Ok(vec) => match store.search(&namespace, vec, 3, false, false).await {
+                Ok(hits) => {
                 for hit in hits {
                     let preview: String = hit.payload.content.chars().take(160).collect();
                     similar.push(json!({
@@ -2790,6 +3262,13 @@ pub async fn handle_task_setup(
                         }));
                     }
                 }
+                }
+                Err(e) => {
+                    tracing::warn!("rule similarity search failed for '{namespace}': {e}");
+                }
+            },
+            Err(e) => {
+                tracing::warn!("rule similarity embed failed for '{namespace}': {e}");
             }
         }
         if let Some(obj) = r.as_object_mut() {
@@ -2862,6 +3341,37 @@ pub async fn handle_task_setup(
         }
     }
 
+    let rid = crate::registry::registry_row_id(&namespace);
+    let mut prev_wires: Vec<String> = Vec::new();
+    let mut prev_fires: Vec<String> = Vec::new();
+    if let Ok(Some((reg_vec, mut reg_payload))) = store.get(&namespace, &rid).await {
+        if let Some(ds) = reg_payload.metadata.get("doctor_state") {
+            if let Some(arr) = ds.get("configured_wires").and_then(|v| v.as_array()) {
+                prev_wires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            }
+            if let Some(arr) = ds.get("configured_fires_on").and_then(|v| v.as_array()) {
+                prev_fires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            }
+        }
+        if let Some(obj) = reg_payload.metadata.as_object_mut() {
+            let mut ds = obj
+                .get("doctor_state")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            ds["configured_wires"] = json!(crate::task::wiring::known_wire_ids());
+            ds["configured_fires_on"] = json!(crate::task::wiring::VALID_FIRES_ON);
+            obj.insert("doctor_state".to_string(), ds);
+        }
+        let _ = store.upsert(&namespace, &rid, reg_vec, reg_payload).await;
+    }
+    let (new_auto, new_rem, new_fires) =
+        crate::task::wiring::compute_lifecycle_delta(&prev_wires, &prev_fires);
+    let lifecycle_delta = json!({
+        "new_automatic_wires": new_auto.iter().map(|w| w.id).collect::<Vec<_>>(),
+        "new_reminder_wires": new_rem.iter().map(|r| r.id).collect::<Vec<_>>(),
+        "new_fires_on_triggers": new_fires,
+    });
+
     encode(&json!({
         "namespace": namespace,
         "detected": {
@@ -2881,6 +3391,8 @@ pub async fn handle_task_setup(
         "instructions": instructions,
         "wiring": wiring_block,
         "verified": verified,
+        "lifecycle_delta": lifecycle_delta,
+        "harness_plugins": harness_plugins,
     }))
 }
 
@@ -2909,17 +3421,23 @@ pub async fn import_beads(
         .list(namespace, None, None)
         .await
         .map_err(|e| format!("ERROR: could not list '{}': {}", namespace, e))?;
-    let mut seen_bead_ids: HashSet<String> = rows
-        .iter()
-        .filter_map(|r| {
-            r.payload
-                .metadata
-                .get("task")
-                .and_then(|t| t.get("bead_id"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .collect();
+    let mut seen_bead_ids: HashSet<String> = HashSet::new();
+    let mut bead_to_task: HashMap<String, String> = HashMap::new();
+    for r in &rows {
+        if let Some(bead_id) = r
+            .payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get("bead_id"))
+            .and_then(|v| v.as_str())
+        {
+            seen_bead_ids.insert(bead_id.to_string());
+            // Already-imported beads map to their real NeuroStrata task id, so
+            // downstream beads can still translate their deps (the idempotent
+            // skip must not orphan these mappings).
+            bead_to_task.insert(bead_id.to_string(), r.id.clone());
+        }
+    }
     let mut existing_task_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
 
     struct Pending {
@@ -3045,6 +3563,9 @@ pub async fn import_beads(
     let mut allocations: Vec<Option<String>> = Vec::with_capacity(pending.len());
     for p in &pending {
         if seen_bead_ids.contains(&p.bead_id) {
+            if let Some(existing_task_id) = bead_to_task.get(&p.bead_id) {
+                id_map.insert(p.bead_id.clone(), existing_task_id.clone());
+            }
             allocations.push(None);
             summary.skipped_existing += 1;
             continue;
@@ -3139,6 +3660,19 @@ pub async fn import_beads(
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
+
+    /// R5: an "installed" hook must carry the executable bit, so fixtures
+    /// asserting `hook_installed: true` install it the way the installer does.
+    fn write_exec_hook(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
 
     // hook hash marker tests (Task 1)
     #[test]
@@ -3332,11 +3866,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             "#!/bin/bash\n# NeuroStrata task gate marker\n",
-        )
-        .unwrap();
+        );
 
         let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3454,11 +3987,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
         // install the scaffold exactly as the installer would
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
 
         let (wiring_block, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3492,7 +4024,7 @@ mod tests {
             "    # ./scripts/rules-gate.sh",
             "    ./scripts/rules-gate.sh\n    ./scripts/typecheck.sh",
         );
-        std::fs::write(root.join(".git").join("hooks").join("pre-push"), hook).unwrap();
+        write_exec_hook(&root.join(".git").join("hooks").join("pre-push"), &hook);
 
         let (_, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3513,11 +4045,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
 
         let (_, _, wire_instruction) = wiring_panel(&root, "MyProj");
         assert_eq!(
@@ -3591,11 +4122,10 @@ mod tests {
         git_in(&root, &["init", "-q"]);
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         git_in(&root, &["config", "core.hooksPath", ".githooks"]);
-        std::fs::write(
-            root.join(".githooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".githooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
 
         let (_, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3617,11 +4147,10 @@ mod tests {
         git_in(&root, &["init", "-q"]);
         // the gate that used to run
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
         // hooks moved, and nothing was installed at the new location
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         git_in(&root, &["config", "core.hooksPath", ".githooks"]);
@@ -3910,6 +4439,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
     fn ns_key_lowercases_and_sanitizes() {
         assert_eq!(ns_key("MyProj"), "myproj");
         assert_eq!(ns_key("NeuroStrata"), "neurostrata");
@@ -5674,7 +6204,7 @@ impl crate::traits::AsAny for ListHidingStore {
             store.clone(),
             "clean-ingest",
             None,
-        )
+            &[],)
         .await;
         assert!(outcome.is_ok(), "clean ingest succeeds: {:?}", outcome.err());
         // Merge integration: the generation pipeline scopes the published

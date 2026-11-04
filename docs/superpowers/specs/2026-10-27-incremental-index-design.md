@@ -1,0 +1,50 @@
+# Incremental Index — Add/Remove/Update Without Full Rebuild Design
+
+> Status: APPROVED & implemented (v1.14.3) — see src/parser/ingest.rs + src/domain.rs.
+> Task: `neurostrata-iwrn` (Incremental Index — Add/Remove/Update Without Full Rebuild Design).
+
+## 1. Problem
+
+Current index rebuilds on every change. Need incremental updates (add/remove/update single memories) without full rebuild; uses `emrz` file-level hash reuse.
+
+## 2. Goal
+
+Incremental index updates for LadybugDB; single-node add/remove/update in O(log N); triggers on `staged_publication` commit.
+
+## 3. Constraints
+
+- Deterministic: same mutations → same index state.
+- No LLM.
+- Library hygiene: `oxrdf` for RDF projection; `sha2` for hashing; no `oxirs-core`/`scirs2`/`horned-owl`.
+- Backward compatible: full rebuild still works.
+- Warn-first: index inconsistency warnings, not fatal.
+
+## 4. Scope
+
+- Add: insert single memory + edges.
+- Remove: mark memory + edges deleted; cleanup on next full rebuild.
+- Update: remove old + add new atomically.
+
+## 5. Approach
+
+- Use `emrz` hash reuse: unchanged files skip re-index.
+- Per-memory delta: `upsert`/`delete` in `LadybugStore`.
+- RDF projection delta: update `oxrdf` dataset incrementally.
+- Trigger: `staged_publication` commit (existing hook).
+
+## 6. Library evaluation
+- `oxrdf`: RDF projection updates (`9fnf`, `2hxl`).
+- `sha2`: file-level hash reuse (`yjah`, `emrz`).
+- `fastembed`: embeddings (`wtnn`).
+- No `oxirs-core`/`scirs2`/`horned-owl`.
+
+## 7. Per-namespace isolation
+- Index updates scoped per namespace; partial/full rebuild controlled per namespace.
+- References `neurostrata-9fnf` (canonical IRI/RDF projection), `yjah` (QueryBudget/transient inference), `2hxl` (OWL/RDFS reasoning), `4gb2` (RDF-star provenance), `emrz` (hash reuse), `wtnn` (embeddings), `jwoa` (retrieval budget).
+
+## 8. Interfaces / Files Touched (expected)
+
+- `src/store/ladybug.rs`: incremental upsert/delete.
+- `src/rdf/projection.rs`: delta updates.
+- `src/ingest/staged_publication.rs`: commit-time index update.
+- `Cargo.toml`: no new deps (`oxrdf`, `sha2` present).

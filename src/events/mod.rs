@@ -2,11 +2,17 @@
 //! used to depend on an agent remembering to do it happens because the write
 //! happened.
 //!
-//! This module is only the vocabulary -- what a pulse is, who may consume one,
-//! and the guard that stops a subscriber from reacting to its own write. The
-//! runtime that carries pulses to subscribers is added alongside the daemon
-//! wiring; until then nothing emits, and every type here is unreachable from
-//! `main`.
+//! This module is the vocabulary -- what a pulse is, who may consume one, and
+//! the guard that stops a subscriber from reacting to its own write -- plus
+//! the shipped subscribers. The runtime is live: `daemon.rs` and
+//! `server.rs` wire a `ThalamicBus` to the store and register the production
+//! subscribers (see `daemon.rs`'s `build_thalamic_bus`), and every remember /
+//! archive / delete surface emits `ThalamicPulse`s through it. Subscribers
+//! here do the bookkeeping the pulses imply: episodic-buffer pointers
+//! ([`EpisodicPointerEcho`]), the per-namespace export-freshness flag
+//! ([`ExportFreshnessDirty`], read by `export-graph`), the guard's audit rows
+//! ([`GuardEventLog`]), and the post-ingest relation normalization
+//! (`subscribers::PostIngestNormalize`).
 
 mod bus;
 mod event;
@@ -14,7 +20,7 @@ pub(crate) mod outbox;
 mod subscriber;
 pub(crate) mod subscribers;
 
-pub use self::bus::{SubscriberId, ThalamicBus};
+pub use self::bus::ThalamicBus;
 pub use self::event::ThalamicPulse;
 pub use self::outbox::{EventClass, EventOutbox, OutboxEntry, OutboxError};
 pub use self::subscriber::{
@@ -22,5 +28,6 @@ pub use self::subscriber::{
     SubscriberError,
 };
 pub use self::subscribers::{
-    check_export_freshness, EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog,
+    check_export_freshness, clear_export_freshness, EpisodicPointerEcho, ExportFreshnessDirty,
+    GuardEventLog,
 };

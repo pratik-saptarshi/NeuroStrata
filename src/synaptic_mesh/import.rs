@@ -46,7 +46,7 @@ use uuid::Uuid;
 use super::conflict::{self, ConflictKind};
 use super::manifest::Trust;
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
 };
 use super::storage::{remote_refs_present, run, run_ok, MeshStorage};
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
@@ -75,6 +75,9 @@ const RUNTIME_COUNTER_KEYS: [&str; 4] = [
 /// parsed, never applied — so an oversized JSON blob cannot force the daemon
 /// to materialize an arbitrarily large record.
 pub const MAX_RECORD_BYTES: usize = 1024 * 1024; // 1 MiB
+/// Per spec §5.5: maximum canonical N-Quads payload size and quad count.
+pub const MAX_RDF_QUADS_BYTES: usize = 512 * 1024; // 512 KiB
+pub const MAX_RDF_QUADS_COUNT: usize = 1000;
 
 /// What one replay pass did.
 #[derive(Debug, Clone)]
@@ -108,6 +111,14 @@ pub struct ApplyReport {
     /// §"Concurrent merge policy": "report combination"), never resolved by
     /// timestamp.
     pub combinations: Vec<String>,
+    /// Records whose Ed25519 signature verified cleanly.
+    pub verified_signed: usize,
+    /// Records accepted without a signature (warn-first Phase 1).
+    pub unsigned_accepted: usize,
+    /// Records rejected due to an invalid Ed25519 signature or DID/pubkey mismatch.
+    pub signature_rejected: usize,
+    /// Records rejected because `signer_did` is not in a non-empty `manifest.signers`.
+    pub unauthorized_signer: usize,
 }
 
 /// Where the accepted-head cursor lives for a mesh checkout: a sibling
@@ -252,6 +263,15 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
     if report.full_tree {
         out.push_str(" (full-tree reconciliation — no usable accepted-head cursor)");
     }
+    if report.verified_signed > 0
+        || report.signature_rejected > 0
+        || report.unauthorized_signer > 0
+    {
+        out.push_str(&format!(
+            ", signed {} / signature-rejected {} / unauthorized {}",
+            report.verified_signed, report.signature_rejected, report.unauthorized_signer
+        ));
+    }
     let head_len = report.head.len().min(7);
     if head_len > 0 {
         out.push_str(&format!(", head {}", &report.head[..head_len]));
@@ -318,6 +338,10 @@ pub async fn apply_changed(
         conflicted: 0,
         conflicted_ids: Vec::new(),
         combinations: Vec::new(),
+        verified_signed: 0,
+        unsigned_accepted: 0,
+        signature_rejected: 0,
+        unauthorized_signer: 0,
     };
 
     // Divergence detection (documented cursor strategy, §"Concurrent merge
@@ -339,6 +363,26 @@ pub async fn apply_changed(
     let import_trust = mesh.manifest().policy.imported_procedures_trust;
     let head_signature = head_commit_signature_state(root).await;
 
+    // The `(namespace, id)` pairs already presented as per-record `.json`
+    // candidates this pass. A record that arrived BOTH as a `.json` file
+    // and inside a `.bundle.zst` is applied exactly once — the `.json`
+    // candidate path is authoritative; the bundle copy is the duplicate.
+    // (`validate_record` enforces id == file stem, so the pair key aligns
+    // with the bundle comparison below.)
+    let json_candidate_ids: std::collections::HashSet<(String, String)> = paths
+        .iter()
+        .filter_map(|rel| classify_path(rel, served).ok().flatten())
+        .map(|c| (c.namespace, c.file_stem))
+        .collect();
+
+    // Bundle/RDF-patch artifacts are scanned before the candidate loop so a
+    // compressed drain bundle or an rdfpatch sidecar is accounted for on
+    // every replay pass (fail-soft; see `scan_bundles_and_patches`). The
+    // decoded bundle records are RETAINED: a record carried only inside a
+    // `.bundle.zst` is a replay candidate like any other, verified and
+    // applied below.
+    let bundled_records = scan_bundles_and_patches(root);
+
     for rel in paths {
         let candidate = match classify_path(&rel, served) {
             Ok(Some(c)) => c,
@@ -357,7 +401,7 @@ pub async fn apply_changed(
                 continue;
             }
         };
-        let record = match validate_record(&candidate, served, &raw) {
+        let mut record = match validate_record(&candidate, served, &raw) {
             Ok(r) => r,
             Err(reason) => {
                 report.ignored.push(format!("{rel}: {reason}"));
@@ -368,10 +412,35 @@ pub async fn apply_changed(
             report.ignored.push(format!("{rel}: {reason}"));
             continue;
         }
+        match verify_record_signature(&record, &mesh.manifest().signers) {
+            SignatureDisposition::Verified => {
+                report.verified_signed += 1;
+            }
+            SignatureDisposition::Unsigned => {
+                report.unsigned_accepted += 1;
+            }
+            SignatureDisposition::Invalid(reason) => {
+                report.signature_rejected += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+            SignatureDisposition::Unauthorized(reason) => {
+                report.unauthorized_signer += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+        }
+        // RDF patch sidecar attachment: a sibling `<id>.rdfpatch` next to
+        // the `.json` record is parsed (fail-soft) and attached AFTER
+        // signature verification, so canonical signing bytes over the
+        // `.json` record (patch is `skip_serializing_if = "Option::is_none"`)
+        // are unaffected.
+        if let Some(stream) = load_record_patch(&root.join(&rel)) {
+            record.patch = Some(stream);
+        }
         match apply_one(
             root,
             &mesh_id,
-            &candidate,
             record,
             store.clone(),
             emb.clone(),
@@ -401,6 +470,70 @@ pub async fn apply_changed(
         }
     }
 
+    // Bundle-only records: everything `scan_bundles_and_patches` decoded
+    // whose `(namespace, id)` did NOT arrive as a `.json` candidate this
+    // pass and whose namespace is served. Identical gates as the `.json`
+    // path — signature, then apply — so one decode, one apply, and the
+    // report counts the Disposition like any other candidate.
+    for (bundle_path, record) in bundled_records {
+        let id = record.id.to_string();
+        if !served.iter().any(|s| s == &record.namespace) {
+            continue;
+        }
+        if json_candidate_ids.contains(&(record.namespace.clone(), id.clone())) {
+            continue;
+        }
+        let rel = bundle_path.display().to_string();
+        match verify_record_signature(&record, &mesh.manifest().signers) {
+            SignatureDisposition::Verified => {
+                report.verified_signed += 1;
+            }
+            SignatureDisposition::Unsigned => {
+                report.unsigned_accepted += 1;
+            }
+            SignatureDisposition::Invalid(reason) => {
+                report.signature_rejected += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+            SignatureDisposition::Unauthorized(reason) => {
+                report.unauthorized_signer += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+        }
+        match apply_one(
+            root,
+            &mesh_id,
+            record,
+            store.clone(),
+            emb.clone(),
+            concurrent,
+            import_trust,
+            head_signature,
+        )
+        .await
+        {
+            Disposition::Applied => {
+                report.applied += 1;
+                report.applied_ids.push(id);
+            }
+            Disposition::AppliedCombination(reason) => {
+                report.applied += 1;
+                report.applied_ids.push(id);
+                report.combinations.push(format!("{rel}: {reason}"));
+            }
+            Disposition::Skipped => report.skipped_update_id += 1,
+            Disposition::Ignored(reason) => {
+                report.ignored.push(format!("{rel}: {reason}"));
+            }
+            Disposition::Conflicted(conflict_id) => {
+                report.conflicted += 1;
+                report.conflicted_ids.push(conflict_id);
+            }
+        }
+    }
+
     // Accept HEAD only after the whole batch was walked AND no unresolved
     // conflict paused integration. A crash before this line leaves the old
     // cursor: the next pass replays the same files and the update_id skip
@@ -419,8 +552,35 @@ pub async fn apply_changed(
 /// Read the accepted-head cursor for this checkout, iff it is intact, names
 /// this mesh's schema, and belongs to this mesh.
 pub fn load_cursor(mesh_root: &Path, mesh_id: &str) -> Option<String> {
-    let text = std::fs::read_to_string(cursor_file(mesh_root)).ok()?;
-    let doc: Value = serde_json::from_str(&text).ok()?;
+    let path = cursor_file(mesh_root);
+    if !path.exists() {
+        return None;
+    }
+    // A cursor that exists but cannot be READ or PARSED is corrupt state,
+    // not absence: warn loudly (an operator must see it) and fall through
+    // to the full-tree reconciliation the None caller applies.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or unreadable mesh cursor at {}: {} — falling back to full-tree reconciliation",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    let doc: Value = match serde_json::from_str(&text) {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or unreadable mesh cursor at {}: {} — falling back to full-tree reconciliation",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
     if doc["schema_version"].as_str() != Some(IMPORT_CURSOR_SCHEMA_VERSION) {
         return None;
     }
@@ -620,7 +780,7 @@ pub fn validate_record(
             MAX_RECORD_BYTES
         ));
     }
-    let record: MeshRecord =
+    let mut record: MeshRecord =
         serde_json::from_str(raw).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
     if record.schema_version != MESH_RECORD_SCHEMA_VERSION {
         return Err(format!(
@@ -668,6 +828,27 @@ pub fn validate_record(
             "runtime procedure counters are strictly local; a shared record must not carry them"
                 .to_string(),
         );
+    }
+    // Canonical RDF validation (§5.2f, Phase 1: warn-and-apply-fallback).
+    // If the record carries an rdf block, verify its canonical_hash,
+    // predicate allowlist, and subject agreement. On violation, report it
+    // as a diagnostic but do NOT refuse the record — Phase 1 accepts the
+    // valid JSON envelope and emits the violation for audit.
+    if let Some(ref rdf_block) = record.rdf {
+        if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
+            // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
+            // applied. The violation is tagged into metadata for audit.
+            tracing::warn!(
+                target: "neurostrata::import::rdf",
+                "canonical RDF violation on {} (ns={}) — Phase 1 apply-with-diagnostic: {}",
+                record.id, record.namespace,
+                violations.join("; ")
+            );
+            if let Some(obj) = record.metadata.as_object_mut() {
+                obj.insert("rdf_diagnostic_violations".to_string(), json!(violations));
+                obj.insert("rdf_diagnostic_phase".to_string(), json!("1"));
+            }
+        }
     }
     // Secret scan (J15, import leg): the same scanner every local write
     // path answers to, run over the record's content and metadata before
@@ -873,10 +1054,25 @@ fn classify_merge(
     // Both live (active/archived): gate the state change through the spec
     // transition table, then overlay the merge-table combinations.
     if cand_state != local_state {
+        // A legal transition gate in at least one direction is the
+        // precondition for ANY combination overlay — `archive + edit`
+        // only ever pairs Active with Archived, both of which connect
+        // through the state machine. When neither direction is legal the
+        // pair is a candidate-state the gate cannot accept at all
+        // (e.g. two live states a future vocabulary might introduce), and
+        // the merge table must refuse before decorating the decision.
+        let any_direction_legal = local_state.can_transition_to(cand_state)
+            || cand_state.can_transition_to(local_state);
         if content_changed {
-            return MergeDecision::ApplyCombination(
-                "archive + edit; edited content stays archived",
-            );
+            return if any_direction_legal {
+                MergeDecision::ApplyCombination(
+                    "archive + edit; edited content stays archived",
+                )
+            } else {
+                MergeDecision::Refuse(format!(
+                    "illegal transition {local_state} -> {cand_state}"
+                ))
+            };
         }
         // Same content, one side archived and the other restored: the spec's
         // "restore + archive" pair — unresolved only when concurrent.
@@ -1092,6 +1288,32 @@ enum ApplyShape {
     ArchivedCombination { edited: String },
 }
 
+/// Parse the sibling `<id>.rdfpatch` sidecar of a candidate record
+/// (`record_path` is the `.json` path inside the mesh checkout), if any.
+/// Fail-soft: an unreadable or invalid sidecar is a `tracing::warn!` and
+/// returns `None`; the record is still gated by ordinary replay validation.
+/// The caller attaches the stream AFTER `verify_record_signature`, so
+/// canonical signing bytes over the `.json` record are unaffected.
+fn load_record_patch(record_path: &Path) -> Option<crate::streaming::Stream> {
+    let patch_path = record_path.with_extension("rdfpatch");
+    if !patch_path.exists() {
+        return None;
+    }
+    match std::fs::read_to_string(&patch_path) {
+        Ok(text) => match crate::streaming::Stream::parse_patch(&text) {
+            Ok(deltas) => Some(crate::streaming::Stream { events: deltas }),
+            Err(e) => {
+                tracing::warn!("mesh rdf patch {} invalid: {e}", patch_path.display());
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("mesh rdf patch {} unreadable: {e}", patch_path.display());
+            None
+        }
+    }
+}
+
 /// Validate-and-apply one candidate against the store. `root` is the mesh
 /// checkout (its sibling `.conflicts` dir receives preserved variants);
 /// `concurrent` is true only on the full-tree reconciliation path.
@@ -1101,7 +1323,6 @@ enum ApplyShape {
 async fn apply_one(
     root: &Path,
     mesh_id: &str,
-    _candidate: &Candidate,
     record: MeshRecord,
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
@@ -1306,18 +1527,74 @@ async fn apply_effective(
             metadata.insert("trust".to_string(), json!(policy.to_string()));
         }
     }
-    metadata.insert(
-        "mesh".to_string(),
-        mesh_provenance(
-            mesh_id,
-            &record.update_id,
-            &record.lifecycle.created_by,
-            record.origin_mesh_epoch,
-            state,
-            superseded_by,
-            head_signature,
-        ),
+
+    // F7: an attached `.rdfpatch` sidecar (loaded after signature
+    // verification in the batch apply) is genuinely applied to the stored
+    // row here: `references` / `related_to` deltas land on the metadata
+    // arrays the edge tables read, fail-soft per delta, and the delta count
+    // is recorded so a no-op sidecar is distinguishable from an absent one.
+    if let Some(ref stream) = record.patch {
+        if !stream.is_empty() {
+            metadata.insert("rdf_patch_quad_count".to_string(), json!(stream.len()));
+            for delta in &stream.events {
+                let predicate = delta
+                    .predicate
+                    .trim_start_matches('<')
+                    .trim_end_matches('>');
+                let key = if predicate.ends_with("references") {
+                    "references"
+                } else if predicate.ends_with("related_to") {
+                    "related_to"
+                } else {
+                    continue;
+                };
+                let object = delta
+                    .object
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string();
+                let mut targets: Vec<String> = metadata
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match delta.op {
+                    crate::streaming::PatchOp::Add => {
+                        if !object.is_empty() && !targets.iter().any(|t| t == &object) {
+                            targets.push(object);
+                        }
+                    }
+                    crate::streaming::PatchOp::Delete => {
+                        targets.retain(|t| *t != object);
+                    }
+                }
+                metadata.insert(key.to_string(), json!(targets));
+            }
+        }
+    }
+    let mut mesh_prov = mesh_provenance(
+        mesh_id,
+        &record.update_id,
+        &record.lifecycle.created_by,
+        record.origin_mesh_epoch,
+        state,
+        superseded_by,
+        head_signature,
     );
+    if record.signature.is_some() {
+        if let Some(ref did) = record.signer_did {
+            if let Some(obj) = mesh_prov.as_object_mut() {
+                obj.insert("verified_signer_did".to_string(), json!(did));
+                obj.insert("signature_verified".to_string(), json!(true));
+            }
+        }
+    }
+    metadata.insert("mesh".to_string(), mesh_prov);
     apply_lifecycle_markers(
         &mut metadata,
         state,
@@ -1325,6 +1602,90 @@ async fn apply_effective(
         archived_at,
         tombstoned_at,
     );
+
+    // F20 concept_iri mesh mapping (C5): preserve concept_iri (already in metadata
+    // via allowlist) and map to receiver's local domain slug(s) when registry has
+    // matching concept_iri. Idempotent on replay.
+    let current_update_id = record.update_id.to_string();
+    let already_imported = match store.get(namespace, id).await {
+        Ok(found) => found
+            .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
+            .as_deref()
+            == Some(current_update_id.as_str()),
+        Err(e) => {
+            tracing::warn!("[neurostrata:mesh] store read failed for {id}: {e}");
+            false
+        }
+    };
+
+    if !already_imported {
+        if let Some(concept_val) = metadata.get("concept_iri").cloned() {
+            let iris: Vec<String> = match &concept_val {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                _ => vec![],
+            };
+            let rid = crate::registry::registry_row_id(namespace);
+            let entries = match store.get(namespace, &rid).await {
+                Ok(Some((_, rp))) => crate::registry::registry_domain_entries(&rp.metadata),
+                Ok(None) => vec![],
+                Err(e) => {
+                    tracing::warn!(
+                        "[neurostrata:mesh] registry row {rid} unreadable: {e}"
+                    );
+                    vec![]
+                }
+            };
+            let mut matched_slugs: Vec<String> = Vec::new();
+            for iri in &iris {
+                let matches: Vec<String> = entries
+                    .iter()
+                    .filter_map(|e| {
+                        if e.get("concept_iri").and_then(|v| v.as_str()) == Some(iri.as_str()) {
+                            e.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                match matches.len() {
+                    0 => {}
+                    1 => {
+                        if !matched_slugs.contains(&matches[0]) {
+                            matched_slugs.push(matches[0].clone());
+                        }
+                    }
+                    n => {
+                        // ambiguous
+                        tracing::warn!(
+                            "[neurostrata:mesh] ambiguous concept_iri {} matches {} local domains",
+                            iri, n
+                        );
+                    }
+                }
+            }
+            if !matched_slugs.is_empty() {
+                let mut existing: Vec<String> = match metadata.get("domain") {
+                    Some(Value::String(s)) => vec![s.clone()],
+                    Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    _ => vec![],
+                };
+                for s in &matched_slugs {
+                    if !existing.contains(s) {
+                        existing.push(s.clone());
+                    }
+                }
+                existing.sort();
+                existing.dedup();
+                let val = if existing.len() == 1 {
+                    json!(existing[0].clone())
+                } else {
+                    json!(existing)
+                };
+                metadata.insert("domain".to_string(), val);
+            }
+        }
+    }
 
     let payload = MemoryPayload {
         content: text,
@@ -1345,7 +1706,9 @@ async fn apply_effective(
     }
     // A successful apply supersedes any prior conflict registration (the
     // row is no longer suppressed).
-    let _ = conflict::clear_conflict(root, namespace, id);
+    if let Err(e) = conflict::clear_conflict(root, namespace, id) {
+        tracing::warn!("Failed to clear mesh conflict overlay for {namespace}::{id}: {e}");
+    }
     // Union the imported record's domain into the local registry (a cache).
     // A failure here is a warning, never a refusal: the row is already stored.
     if let Some(domain) = imported_domain {
@@ -1452,13 +1815,14 @@ async fn preserve_superseded_edit(
         created_by,
         source_rels,
         source_metadata,
+        import_trust,
         cand.origin_mesh_epoch,
     );
     let new_id = new_record.id.to_string();
     // No trust_stamp: `preserved_edit_record` is funnel code and has
-    // already set the preserved record's stamp ("untrusted") itself —
-    // the embryo this task generalizes. Stamping the manifest policy
-    // here would overwrite the funnel's own decision.
+    // already set the preserved record's stamp from `import_trust`
+    // (untrusted by default, the manifest policy when overridden) —
+    // stamping again here would only repeat the funnel's own decision.
     apply_effective(
         root,
         mesh_id,
@@ -1541,9 +1905,13 @@ fn local_relationships(payload: &MemoryPayload) -> Vec<Relationship> {
 /// The losing edit's own content/type/creator/relationships/metadata are
 /// carried forward; the record references the retired `original_id`
 /// (`relationships: [{kind: "references", target: original_id}]`, spec
-/// §"Concurrent merge policy"), surfaced in metadata too so the linkage is
-/// visible on the store row. Only `eligibility`, `trust` and `references` are
-/// (re)set on the metadata — every other key the edit carried survives.
+/// §"Concurrent merge policy"), surfaced in metadata as `references`
+/// alongside the edit's own reference links so the linkage is visible on
+/// the store row and no carried link is discarded. Only `eligibility`,
+/// `trust` and `references` are (re)set on the metadata — every other key
+/// the edit carried survives. `import_trust` is the trust the stored row
+/// carries (defaulting to untrusted, honoring the manifest's
+/// `imported_procedures_trust` when it is configured differently).
 fn preserved_edit_record(
     namespace: &str,
     original_id: &str,
@@ -1552,6 +1920,7 @@ fn preserved_edit_record(
     created_by: String,
     source_rels: Vec<Relationship>,
     source_metadata: Value,
+    import_trust: Trust,
     origin_mesh_epoch: u32,
 ) -> MeshRecord {
     let mut rels = source_rels;
@@ -1566,16 +1935,78 @@ fn preserved_edit_record(
         None => serde_json::Map::new(),
     };
     metadata.insert("eligibility".to_string(), json!("shareable"));
-    metadata.insert("trust".to_string(), json!("untrusted"));
-    metadata.insert("references".to_string(), json!([original_id]));
+    metadata.insert("trust".to_string(), json!(import_trust.to_string()));
+    // The edit's own reference links survive alongside the spec-mandated
+    // link to the retired original: dropping them would lose the losing
+    // edit's graph edges on the preserved row.
+    let mut refs: Vec<String> = vec![original_id.to_string()];
+    for r in &rels {
+        if !refs.contains(&r.target.to_string()) {
+            refs.push(r.target.to_string());
+        }
+    }
+    metadata.insert("references".to_string(), json!(refs));
+
+    // Build canonical RDF block for the preserved-edit record (spec §5.2c).
+    // Always emit: Phase 1 dual-write.
+    let created_at = chrono::Utc::now();
+    let content_str = match &content {
+        Value::String(s) => s.clone(),
+        other => match serde_json::to_string(other) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "preserved edit original_id={original_id}: non-serialisable content defaulted to empty: {e}"
+                );
+                String::new()
+            }
+        },
+    };
+    // Curated metadata for RDF projection
+    let eligibility = metadata.get("eligibility").and_then(|v| v.as_str());
+    let source = metadata.get("source").and_then(|v| v.as_str());
+    let tags: Vec<String> = metadata.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let concept_iri = metadata.get("concept_iri").and_then(|v| v.as_str());
+    let rdf_relationships: Vec<(String, String)> = rels.iter()
+        .map(|r| (r.kind.clone(), r.target.to_string()))
+        .collect();
+    let state_str = "active";
+    let id = Uuid::new_v4();
+    let update_id = Uuid::new_v4();
+    let (nquads_text, digest_str) = crate::rdf::dataset_canonical::build_mesh_canonical_nquads(
+        &id.to_string(),
+        namespace,
+        &memory_type,
+        state_str,
+        &created_at.to_rfc3339(),
+        &created_by,
+        None,
+        None,
+        None,
+        &content_str,
+        eligibility,
+        source,
+        &tags,
+        concept_iri,
+        &rdf_relationships,
+        &update_id.to_string(),
+        origin_mesh_epoch,
+        &import_trust.to_string(),
+        None,
+        None,
+        None,
+        None,
+    );
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
-        id: Uuid::new_v4(),
+        id,
         namespace: namespace.to_string(),
         memory_type,
         lifecycle: Lifecycle {
             state: LifecycleState::Active,
-            created_at: chrono::Utc::now(),
+            created_at,
             created_by,
             superseded_by: None,
             archived_at: None,
@@ -1583,14 +2014,234 @@ fn preserved_edit_record(
         },
         content,
         metadata: Value::Object(metadata),
+        rdf: Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: digest_str,
+            quads: nquads_text,
+        }),
         relationships: rels,
-        update_id: Uuid::new_v4(),
+        update_id,
         origin_mesh_epoch,
-        trust: Trust::Untrusted,
+        trust: import_trust,
+        signature: None,
+        signer_did: None,
+        public_key: None,
+        patch: None,
     }
 }
 
-// --- git plumbing (fail-soft, non-interactive; via storage.rs's funnel) ---
+/// Outcome of Ed25519 signature verification on a [`MeshRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureDisposition {
+    Verified,
+    Unsigned,
+    Invalid(String),
+    Unauthorized(String),
+}
+
+/// Verify optional Ed25519 signature + DID/pubkey consistency + manifest allowlist.
+pub fn verify_record_signature(
+    record: &MeshRecord,
+    signers: &[super::manifest::SignerEntry],
+) -> SignatureDisposition {
+    let has_sig = record.signature.is_some();
+    let has_did = record.signer_did.is_some();
+    let has_pub = record.public_key.is_some();
+    if !has_sig && !has_did && !has_pub {
+        return SignatureDisposition::Unsigned;
+    }
+    let (Some(sig_b64), Some(did), Some(pub_hex)) =
+        (&record.signature, &record.signer_did, &record.public_key)
+    else {
+        return SignatureDisposition::Invalid(
+            "partial signature fields: signature, signer_did, and public_key must all be present"
+                .to_string(),
+        );
+    };
+    let Ok(pub_bytes) = hex::decode(pub_hex) else {
+        return SignatureDisposition::Invalid("invalid hex in public_key".to_string());
+    };
+    if pub_bytes.len() != 32 {
+        return SignatureDisposition::Invalid("public_key must be 32 bytes".to_string());
+    }
+    // The signer DID must resolve to exactly the record's public key: a
+    // DID that cannot be parsed (or names a different key) is a mismatch.
+    match crate::did::public_key_from_did(did) {
+        Ok(did_pub) if did_pub == pub_bytes => {}
+        _ => {
+            return SignatureDisposition::Invalid(
+                "signer_did does not match public_key".to_string(),
+            );
+        }
+    }
+    let Ok(sig_bytes) = crate::did::decode_base64(sig_b64) else {
+        return SignatureDisposition::Invalid("invalid base64 in signature".to_string());
+    };
+    let payload_rdf = record.rdf.as_ref().map(|rdf_block| {
+        crate::did::signing_payload(
+            &rdf_block.quads,
+            &record.update_id.to_string(),
+            record.origin_mesh_epoch,
+        )
+    });
+    let payload_json = match serde_json::to_value(record) {
+        Ok(v) => match crate::did::canonical_signing_bytes(&v) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    "[neurostrata:mesh] canonical signing bytes unavailable for {}: {e}",
+                    record.id
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "[neurostrata:mesh] record {} not canonicalisable: {e}",
+                record.id
+            );
+            None
+        }
+    };
+
+    let verified = payload_rdf
+        .as_ref()
+        .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
+        .unwrap_or(false)
+        || payload_json
+            .as_ref()
+            .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
+            .unwrap_or(false);
+
+    if !verified {
+        return SignatureDisposition::Invalid("Ed25519 signature verification failed".to_string());
+    }
+
+    if !signers.is_empty()
+        && !signers
+            .iter()
+            .any(|s| &s.did == did && s.public_key.eq_ignore_ascii_case(pub_hex))
+    {
+        return SignatureDisposition::Unauthorized(format!(
+            "signer {did} is not in manifest.signers allowlist"
+        ));
+    }
+
+    SignatureDisposition::Verified
+}
+
+/// Decompress a zstd-compressed mesh record bundle with bounded output size.
+/// Used by [`read_compressed_bundle`]; additionally available for direct
+/// bundle decodes.
+pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String> {
+    let raw = crate::compression::zstd::decompress_mesh_bundle(
+        bytes,
+        crate::compression::zstd::DEFAULT_MESH_MAX_DECOMPRESSED_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
+    serde_json::from_slice(&raw).map_err(|e| e.to_string())
+}
+
+/// Read a compressed bundle from disk and decompress it.
+pub fn read_compressed_bundle(bundle_path: &Path) -> Result<Vec<MeshRecord>, String> {
+    let bytes = std::fs::read(bundle_path).map_err(|e| e.to_string())?;
+    decompress_record_bundle(&bytes)
+}
+
+/// Wire-up for the artifacts a mesh-worker may leave behind on the source
+/// node (spec: `NEUROSTRATA_MESH_BUNDLE_ZSTD` and
+/// `NEUROSTRATA_MESH_RDF_PATCH`). Called once per pulled checkout, before
+/// the replay pass. Fail-soft everywhere: a missing `bundles/` dir, an
+/// unreadable bundle, or an invalid patch is logged, never fatal.
+///
+/// Returns every `MeshRecord` decoded from a `bundles/*.bundle.zst`
+/// artifact, paired with its bundle path so the replay pass can report the
+/// source. The caller deduplicates against the `.json` candidate tree — a
+/// bundle is a replay candidate, not a debug log.
+fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)> {
+    let mut bundled_records: Vec<(PathBuf, MeshRecord)> = Vec::new();
+    let bundles_dir = mesh_root.join("bundles");
+    if bundles_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+                    if path.to_string_lossy().ends_with(".bundle.zst") {
+                        match read_compressed_bundle(&path) {
+                            Ok(records) => {
+                                tracing::debug!(
+                                    "mesh bundle {} decoded: {} record(s)",
+                                    path.display(),
+                                    records.len()
+                                );
+                                for record in records {
+                                    bundled_records.push((path.clone(), record));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // `.rdfpatch` sidecars written next to a `<id>.json` record file are
+    // validated with the streaming patch parser. A parse failure is a
+    // warning; the record itself is still gated by the ordinary replay
+    // validation.
+    if let Ok(nses) = std::fs::read_dir(mesh_root) {
+        for ns in nses.flatten() {
+            let ns_path = ns.path();
+            if !ns_path.is_dir() {
+                continue;
+            }
+            for subdir in ["memories", "procedures"] {
+                let dir = ns_path.join(subdir);
+                if !dir.is_dir() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("rdfpatch") {
+                            continue;
+                        }
+                        // "Alongside a record": the sibling `.json` must exist.
+                        if !path.with_extension("json").exists() {
+                            continue;
+                        }
+                        match std::fs::read_to_string(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|text| {
+                                crate::streaming::Stream::parse_patch(&text)
+                                    .map(|deltas| deltas.len())
+                                    .map_err(|e| e.to_string())
+                            }) {
+                            Ok(n) => {
+                                tracing::debug!(
+                                    "mesh rdf patch {} valid: {} delta(s)",
+                                    path.display(),
+                                    n
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("mesh rdf patch {} invalid: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bundled_records
+}
+
+// --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
 
 /// The checkout's dirty porcelain paths (`git status --porcelain`, run
 /// through storage.rs's funnel: non-interactive, async, DR-4-timed). An
@@ -1656,8 +2307,16 @@ pub async fn backfill_imported_procedure_trust(
                 .map(|m| m.is_object())
                 .unwrap_or(false);
             // List rows carry no vector; re-read the row to upsert it.
-            let Ok(Some((vector, mut payload))) = store.get(namespace, &row.id).await else {
-                continue;
+            let (vector, mut payload) = match store.get(namespace, &row.id).await {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "procedure trust backfill: re-read of {} in {namespace} failed: {e}",
+                        row.id
+                    );
+                    continue;
+                }
             };
             // The row may have gained a stamp between list and get.
             if payload
@@ -1675,11 +2334,19 @@ pub async fn backfill_imported_procedure_trust(
                 "trust".to_string(),
                 json!(if imported { "untrusted" } else { "local" }),
             );
-            if store.upsert(namespace, &row.id, vector, payload).await.is_ok() {
-                if imported {
-                    stamped_untrusted += 1;
-                } else {
-                    stamped_local += 1;
+            match store.upsert(namespace, &row.id, vector, payload).await {
+                Ok(_) => {
+                    if imported {
+                        stamped_untrusted += 1;
+                    } else {
+                        stamped_local += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "procedure trust backfill: upsert of {} in {namespace} failed: {e}",
+                        row.id
+                    );
                 }
             }
         }
@@ -1854,6 +2521,66 @@ mod tests {
     async fn row_count(store: &std::sync::Arc<dyn VectorStore>, ns: &str) -> usize {
         store.init(ns).await.unwrap();
         store.list(ns, None, None).await.unwrap().len()
+    }
+
+    /// Slice T fix: a record that exists ONLY inside a `.bundle.zst`
+    /// artifact is a replay candidate — the bundle decode is no longer
+    /// dropped after a debug log. This record has no `.json` sibling in the
+    /// record tree; the bundle is its only carrier, and it must land in the
+    /// store exactly like a committed `.json` record would.
+    #[tokio::test]
+    async fn bundle_only_record_is_imported_and_applied_into_the_store() {
+        let (_base, mesh) = mesh_with_commit("bundle-only").await;
+        let id = Uuid::new_v4();
+        let value = simple_rule(id, "shares via bundle only");
+        let record: MeshRecord = serde_json::from_value(value).unwrap();
+        let written = crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "test",
+            &[record],
+        )
+        .expect("bundle writes");
+        assert!(
+            written.to_string_lossy().ends_with("test.bundle.zst"),
+            "bundle artifact shape: {}",
+            written.display()
+        );
+        assert!(
+            !mesh
+                .root()
+                .join("probe")
+                .join("memories")
+                .join(format!("{id}.json"))
+                .exists(),
+            "fixture sanity: the record has NO `.json` sibling"
+        );
+        // The bundle artifact must be committed like any mesh content:
+        // an untracked file would trip the dirty-checkout guard.
+        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        let store = fresh_store("bundle-only").await;
+
+        let report =
+            apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+                .await
+                .expect("full-tree replay applies the bundle record");
+
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            1,
+            "the bundle-only record landed in the store"
+        );
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied from bundle");
+        assert_eq!(payload.content, "shares via bundle only");
     }
 
     // ---- contract tests ----------------------------------------------------
@@ -2704,10 +3431,16 @@ mod tests {
             },
             content: json!({ "text": text }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         }
     }
 
@@ -3122,10 +3855,16 @@ mod tests {
                 "rehearsal_script": "the replacement",
             }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         };
 
         let store = fresh_store("dirb-proc").await;
@@ -3169,9 +3908,14 @@ mod tests {
             json!(["read spec", "act"])
         );
 
-        // Original tags survive; the references link lands in metadata.
+        // Original tags survive; the references metadata carries the ORIGINAL
+        // id link first, then the edit's own carried reference (F5: the
+        // preserved edit no longer discards its reference links).
         assert_eq!(z.payload.metadata["tags"], json!(["mesh", "procedure"]));
-        assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
+        assert_eq!(
+            z.payload.metadata["references"],
+            json!([id.to_string(), referenced.to_string()])
+        );
 
         // The typed relationships carry the row's own references link forward
         // AND append the spec's references -> original_id link.
@@ -3183,6 +3927,7 @@ mod tests {
             local_origin(&local_payload),
             local_relationships(&local_payload),
             local_payload.metadata.clone(),
+            Trust::Untrusted,
             cand.origin_mesh_epoch,
         );
         assert!(
@@ -3246,10 +3991,16 @@ mod tests {
             },
             content: json!({ "text": "the replacement" }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         };
 
         let store = fresh_store("dirb-meta").await;
@@ -3286,13 +4037,14 @@ mod tests {
         assert_eq!(z.payload.metadata["eligibility"], json!("shareable"));
     }
 
-    /// Program Task 3 (fix round, M-2): under a Trusted manifest the
-    /// supersession candidate takes the manifest stamp, but the
-    /// preserved edit keeps the funnel's own "untrusted" — its apply
-    /// passes no stamp. This pins that threading: handing the preserved
-    /// record the manifest stamp turns this test red.
+    /// Program Task 3 (fix round, M-2), superseded 2026-11-02 (Slice X, F6):
+    /// under a Trusted manifest the supersession candidate AND the
+    /// preserved edit both take the manifest's `imported_procedures_trust`
+    /// stamp — `preserved_edit_record` now threads `import_trust` into its
+    /// metadata stamp (untrusted by default, the manifest policy when it
+    /// is configured differently). This pins that threading.
     #[tokio::test]
-    async fn preserved_edit_stays_untrusted_under_a_trusted_manifest() {
+    async fn preserved_edit_honors_the_manifest_policy_under_a_trusted_manifest() {
         let root = scratch("dirb-trusted");
         let mesh_id = "mesh-dirb".to_string();
         let namespace = "probe".to_string();
@@ -3341,10 +4093,16 @@ mod tests {
                 "rehearsal_script": "the replacement",
             }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         };
 
         let store = fresh_store("dirb-trusted").await;
@@ -3386,8 +4144,8 @@ mod tests {
             .expect("the preserved edit record");
         assert_eq!(
             z.payload.metadata["trust"],
-            json!("untrusted"),
-            "the preserved edit keeps the funnel's own stamp: {:?}",
+            json!("trusted"),
+            "the preserved edit honors the manifest policy stamp: {:?}",
             z.payload.metadata
         );
     }
@@ -3478,8 +4236,8 @@ mod tests {
         let (_base, mesh) = mesh_with_commit("topology").await;
         let id = Uuid::new_v4();
         let topology = json!({
-            "component": "api-gateway",
-            "target_system": "ledger-service",
+            "component": "apigateway",
+            "target_system": "ledgerservice",
             "channel": "mTLS",
             "credential_boundary": "eu-west-1 VPC",
             "reason": "the ledger accepts traffic only from inside the VPC",

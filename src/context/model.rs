@@ -45,13 +45,14 @@ macro_rules! state_enum {
 
         impl $name {
             /// Every state of this dimension, in declaration order.
+            /// Test-only (tests/context compiles `model.rs` via `#[path]`).
+            #[cfg(test)]
             pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
 
             /// The canonical token for this state.
             pub fn as_str(&self) -> &'static str {
                 match self {
-                    $( $name::$variant => $token, )+
-                }
+                    $( $name::$variant => $token, )+                }
             }
 
             /// Parse a canonical token.
@@ -225,13 +226,23 @@ pub struct SourceIdentity {
 /// once before rendering and once before host injection -- and both calls
 /// must see the same answer. A denial is not the same event as "not found",
 /// so the reason is part of the contract, not a debug field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// The default is [`EgressPolicy::allow`]: a request that never states a
+/// rule may plan normally, and denial is always an explicit, reasoned
+/// act ([`EgressPolicy::deny`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressPolicy {
     /// Whether egress is permitted.
     pub allowed: bool,
     /// Why egress was refused, when it was.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+impl Default for EgressPolicy {
+    fn default() -> Self {
+        Self::allow()
+    }
 }
 
 /// One planning request: what the host observed, and under which rules.
@@ -293,7 +304,12 @@ pub struct ContextPlan {
     pub event_id: String,
     /// The index generation the plan was built against.
     pub index_generation: u64,
-    /// The scope the plan was applied to (the namespace, in practice).
+    /// The scope the plan was applied to.
+    ///
+    /// The service stamps the request's authorized scope (its session id);
+    /// production hosts that own a namespace overwrite it with the effective
+    /// namespace after planning, which is why it is "the namespace" in
+    /// practice.
     pub applied_scope: String,
     /// The items to deliver.
     #[serde(default)]
@@ -332,6 +348,17 @@ impl AsRef<ContextPlan> for ContextPlan {
 }
 
 
+/// Result of a qualified lookup, distinguishing denial from not-found.
+/// Test-only: the `tests/privacy` crate compiles `model.rs` via `#[path]`
+/// and exercises the vocabulary; production never branches on it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupStatus {
+    Found,
+    NotFound,
+    Denied,
+}
+
 impl EgressPolicy {
     pub fn allow() -> Self {
         Self { allowed: true, reason: None }
@@ -348,10 +375,27 @@ impl EgressPolicy {
     }
 }
 
-/// Result of a qualified lookup, distinguishing denial from not-found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LookupStatus {
-    Found,
-    NotFound,
-    Denied,
+#[cfg(test)]
+mod all_states_tests {
+    use super::*;
+
+    /// The `ALL` slabs exist for the external `tests/context` DTO contract
+    /// test; this probe keeps them honest and consumed.
+    #[test]
+    fn all_state_slabs_are_non_empty() {
+        assert!(!SourceCurrency::ALL.is_empty());
+        assert!(!SemanticValidation::ALL.is_empty());
+        assert!(!Coverage::ALL.is_empty());
+        assert!(!DecisionLifecycle::ALL.is_empty());
+        assert!(!Degradation::ALL.is_empty());
+    }
+
+    /// `LookupStatus` is the tests/privacy egress vocabulary; keep it useful
+    /// here too: denial must never collapse into not-found.
+    #[test]
+    fn lookup_status_denial_is_distinct() {
+        assert_ne!(LookupStatus::Denied, LookupStatus::NotFound);
+        assert_ne!(LookupStatus::Denied, LookupStatus::Found);
+        assert_ne!(LookupStatus::NotFound, LookupStatus::Found);
+    }
 }

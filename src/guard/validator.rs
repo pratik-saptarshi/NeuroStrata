@@ -114,13 +114,45 @@ impl GuardValidator {
             let sandbox_result = self.sandbox.evaluate(action_type, payload, cwd).await;
 
             match sandbox_result {
-                Ok(verdict) => {
-                    // Extract constraints from rules for context
-                    let constraints: Vec<String> = matching_rules
-                        .iter()
-                        .filter(|r| r.status != "deprecated")
-                        .map(|r| r.constraint_text.clone())
-                        .collect();
+                Ok(mut verdict) => {
+                    // Extract constraints from the rules that FIRED, for
+                    // context. The candidates are a fallback, not the truth:
+                    // a sandbox verdict should name the constraints of the
+                    // triggering rules, never the whole candidate list.
+                    let constraints: Vec<String> = if fired.is_empty() {
+                        matching_rules
+                            .iter()
+                            .filter(|r| r.status != "deprecated")
+                            .map(|r| r.constraint_text.clone())
+                            .collect()
+                    } else {
+                        fired.iter().map(|r| r.constraint_text.clone()).collect()
+                    };
+
+                    match &mut verdict {
+                        ValidateVerdict::SandboxReject { constraints: ref mut c, .. } => {
+                            if c.is_empty() {
+                                *c = constraints;
+                            }
+                        }
+                        ValidateVerdict::DeterministicReject { constraints: ref mut c, .. } => {
+                            if c.is_empty() {
+                                *c = constraints;
+                            }
+                        }
+                        other => {
+                            // Pass verdicts carry no constraint field: the
+                            // triggered rules are logged, never silently
+                            // dropped.
+                            if !constraints.is_empty() {
+                                tracing::debug!(
+                                    rules = ?constraints,
+                                    "rules that fired alongside sandbox verdict {:?}",
+                                    other
+                                );
+                            }
+                        }
+                    }
 
                     return (verdict, rule_ids);
                 }
@@ -152,31 +184,37 @@ impl GuardValidator {
     /// AC2 — Check session + active task + worktree state before permitting
     /// mutating actions (write/edit/bash-mutating). Returns the legal
     /// transition message when blocked (Unpreflighted, no task claim,
-    /// or BreathRequired state requires a note).
-    pub fn guard_validate(
+    /// or BreathRequired state requires a note). The caller supplies how
+    /// many mutations have run since the last `task_update` note (the
+    /// Breath counter).
+    pub fn guard_validate_with_mutations(
         &self,
         session_id: &str,
         active_task_id: Option<&str>,
         worktree: &str,
         action_type: &str,
         is_mutating: bool,
+        mutations_since_note: usize,
     ) -> (bool, Option<String>) {
-        // If action is non-mutating, always permit (reads free).
-        if !is_mutating {
-            return (true, None);
-        }
-        // If no active task claim, block with transition message.
-        if active_task_id.is_none() {
-            return (false, Some(format!(
-                "Unpreflighted: claim task (session={}, worktree={}) before mutating; next legal transition: claim -> ContextLoaded -> TaskClaimed",
-                session_id, worktree
-            )));
-        }
-        (true, None)
+        crate::guard::fsm::evaluate_fsm_guard(
+            session_id,
+            active_task_id,
+            worktree,
+            action_type,
+            is_mutating,
+            mutations_since_note,
+        )
     }
 
     /// Check if a rule's trigger pattern matches the action
     fn matches_trigger(trigger_pattern: &str, action_type: &str, payload: &str) -> bool {
+        // An empty (or whitespace-only) trigger matches everything by
+        // containment, so it would fire on every action the store returns:
+        // a rule with no trigger is not a rule.
+        if trigger_pattern.trim().is_empty() {
+            return false;
+        }
+
         // A rule fires when its trigger pattern matches the action type (the
         // action type contains the pattern, not the reverse) or appears in the
         // payload. The previous implementation used `pattern.contains(action)`,

@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
+
 use crate::learning::observation::{
-    DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind, PayloadHash,
+    DecisionObservation, LearningOutcome, PayloadHash,
 };
 
 pub struct LearningRecorder {
@@ -32,9 +33,11 @@ impl LearningRecorder {
         let month = chrono::Local::now().format("%Y%m").to_string();
         let path = self.root.join(format!("observations-{}.jsonl", month));
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(value)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
+        // One write_all of line+newline: two separate writes can interleave
+        // with a concurrent appender and split the JSONL record.
+        let mut buf = serde_json::to_vec(value)?;
+        buf.push(b'\n');
+        f.write_all(&buf)?;
         f.flush()?;
         Ok(())
     }
@@ -43,18 +46,26 @@ impl LearningRecorder {
         let month = chrono::Local::now().format("%Y%m").to_string();
         let path = self.root.join(format!("outcomes-{}.jsonl", month));
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(value)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
+        let mut buf = serde_json::to_vec(value)?;
+        buf.push(b'\n');
+        f.write_all(&buf)?;
         f.flush()?;
         Ok(())
     }
 
-    pub async fn record_blob_hash(
-        &self,
-        _payload_hash: &PayloadHash,
-        _input: &crate::traits::MemoryPayload,
-    ) -> Result<()> {
+    pub async fn record_blob_hash(&self, payload_hash: &PayloadHash, input: &crate::traits::MemoryPayload) -> Result<()> {
+        let path = self.root.join("blob_index.jsonl");
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        let entry = serde_json::json!({
+            "connection_id": self.connection_id,
+            "payload_hash": payload_hash.0,
+            "memory_type": input.memory_type,
+            "user_id": input.user_id,
+        });
+        let mut buf = serde_json::to_vec(&entry)?;
+        buf.push(b'\n');
+        f.write_all(&buf)?;
+        f.flush()?;
         Ok(())
     }
 }
@@ -62,8 +73,10 @@ impl LearningRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learning::BlobStore;
+    use crate::learning::blob_store::BlobStore;
+    use crate::learning::observation::LearningContext;
     use crate::traits::MemoryPayload;
+    use futures::executor::block_on;
     use serde_json::json;
 
     #[test]

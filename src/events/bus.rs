@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
@@ -48,6 +48,7 @@ struct AtomicMetrics {
     outbox_append_failures: AtomicU64,
     outbox_attached: AtomicBool,
     outbox_attach_failed: AtomicBool,
+    subscriber_failures: AtomicU64,
 }
 
 /// The daemon's store, once attached. Until then the dispatcher substitutes an
@@ -59,6 +60,13 @@ struct AtomicMetrics {
 /// a subscriber that *does* read the store gets an explicit error naming the
 /// missing attachment instead of a panic or a write to nowhere.
 struct StoreNotAttached;
+
+/// The single static stand-in handed to every subscriber whose pulse runs
+/// before a store is attached: one allocation for the process, cloned per
+/// pulse, instead of a fresh `StoreNotAttached` allocated under the dispatcher
+/// on every such pulse (F9).
+static STORE_NOT_ATTACHED: LazyLock<Arc<dyn VectorStore>> =
+    LazyLock::new(|| Arc::new(StoreNotAttached));
 
 impl StoreNotAttached {
     fn err() -> anyhow::Error {
@@ -194,16 +202,7 @@ impl Queue {
         appended_classes: Vec<EventClass>,
         capacity: usize,
     ) -> bool {
-        // Poison disposition: the pulse cannot be queued, so it is
-        // reported as dropped (the caller's drop accounting stays honest)
-        // and the failure logged, never a panic.
-        let mut items = match lock_or_err(&self.items) {
-            Ok(items) => items,
-            Err(e) => {
-                tracing::error!(error = %e, "bus queue lock poisoned; pulse dropped");
-                return true;
-            }
-        };
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         items.push_back(QueuedPulse {
             event,
             appended_classes,
@@ -222,26 +221,11 @@ impl Queue {
     }
 
     fn pop(&self) -> Option<QueuedPulse> {
-        // Poison disposition: pop reports empty (the dispatcher parks and
-        // retries on the next push), with the failure logged.
-        match lock_or_err(&self.items) {
-            Ok(mut items) => items.pop_front(),
-            Err(e) => {
-                tracing::error!(error = %e, "bus queue lock poisoned; pop reports empty");
-                None
-            }
-        }
+        self.items.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
     }
 
     fn len(&self) -> usize {
-        // Poison disposition: the snapshot reports depth 0, logged.
-        match lock_or_err(&self.items) {
-            Ok(items) => items.len(),
-            Err(e) => {
-                tracing::error!(error = %e, "bus queue lock poisoned; depth reports 0");
-                0
-            }
-        }
+        self.items.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -488,16 +472,9 @@ impl ThalamicBus {
     /// registration is refused -- the failure is logged and
     /// `SubscriberId::MAX`, never a live id, is returned.
     pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId {
-        match lock_or_err(&self.subs) {
-            Ok(mut subs) => {
-                subs.push(Arc::from(sub));
-                subs.len() - 1
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "subscriber registry lock poisoned; registration refused");
-                SubscriberId::MAX
-            }
-        }
+        let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+        subs.push(Arc::from(sub));
+        subs.len() - 1
     }
 
     /// Publish one pulse. Never blocks and never fails the caller's storage
@@ -598,15 +575,11 @@ impl ThalamicBus {
         BusMetrics {
             events_emitted: self.metrics.events_emitted.load(Ordering::Relaxed),
             dispatcher_handled: self.metrics.dispatcher_handled.load(Ordering::Relaxed),
-            // Poison disposition: the snapshot reports 0 subscribers,
-            // with the failure logged.
-            subscribers: match lock_or_err(&self.subs) {
-                Ok(subs) => subs.len(),
-                Err(e) => {
-                    tracing::error!(error = %e, "subscriber registry lock poisoned; snapshot reports 0 subscribers");
-                    0
-                }
-            },
+            subscribers: self
+                .subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
             queue_depth: self.queue.len(),
             drops_oldest: self.metrics.drops_oldest.load(Ordering::Relaxed),
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
@@ -621,6 +594,7 @@ impl ThalamicBus {
                 .metrics
                 .outbox_attach_failed
                 .load(Ordering::Relaxed),
+            subscriber_failures: self.metrics.subscriber_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -709,7 +683,7 @@ async fn dispatch(
         let store: Arc<dyn VectorStore> = store
             .get()
             .cloned()
-            .unwrap_or_else(|| Arc::new(StoreNotAttached));
+            .unwrap_or_else(|| STORE_NOT_ATTACHED.clone());
         let ctx = SubscriberContext {
             store: store.as_ref(),
             namespace,
@@ -736,7 +710,7 @@ async fn dispatch(
         // other subscriber still sees the pulse here, exactly as before.
         let durable = outbox
             .lock()
-            .expect("outbox slot lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_some();
         for sub in registered.iter() {
             if durable {
@@ -762,6 +736,7 @@ async fn dispatch(
             match outcome {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(err))) => {
+                    metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(subscriber = sub.name(), "subscriber failed: {err:#}");
                 }
                 Ok(Err(payload)) => {
@@ -1533,6 +1508,57 @@ impl crate::traits::AsAny for RecordingStore {
         let m = bus.metrics();
         assert_eq!(m.events_emitted, 1);
         assert_eq!(m.dispatcher_handled, 1);
+    }
+
+    /// Returns `Err` on every pulse, on purpose: the dispatcher must log it,
+    /// count it on `BusMetrics::subscriber_failures`, and move on -- the same
+    /// disposition a panic gets, minus the watch-channel event (F2).
+    struct FailingSubscriber;
+
+    #[async_trait]
+    impl MemorySubscriber for FailingSubscriber {
+        fn name(&self) -> &'static str {
+            "failer"
+        }
+
+        async fn handle(
+            &self,
+            _event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &SubscriberContext<'_>,
+        ) -> Result<(), SubscriberError> {
+            Err(anyhow!("boom"))
+        }
+    }
+
+    #[tokio::test]
+    async fn subscriber_error_counts_a_failure() {
+        let bus = ThalamicBus::new(16);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran2 = ran.clone();
+        bus.register(Box::new(FailingSubscriber));
+        bus.register(Box::new(CountingSubscriber { counter: ran2 }));
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            bus.metrics().subscriber_failures,
+            1,
+            "an Err from a subscriber is one recorded failure: {:?}",
+            bus.metrics()
+        );
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            1,
+            "the dispatcher reaches the next subscriber after a failure"
+        );
     }
 
     /// The spec's degenerate bus: capacity 0 accepts nothing -- every pulse
@@ -2371,43 +2397,6 @@ impl crate::traits::AsAny for RecordingStore {
                 })
                 .join();
         });
-    }
-
-    #[test]
-    fn poisoned_queue_degrades_not_panics() {
-        let queue = Queue {
-            items: Mutex::new(VecDeque::new()),
-            notify: Notify::new(),
-        };
-        poison(&queue.items);
-        assert!(
-            queue.push(created_pulse(), Vec::new(), 4),
-            "a poisoned queue counts the unqueueable pulse as dropped"
-        );
-        assert!(queue.pop().is_none(), "a poisoned queue pops as empty");
-        assert_eq!(queue.len(), 0, "a poisoned queue reports depth 0");
-    }
-
-    #[test]
-    fn poisoned_registry_degrades_not_panics() {
-        // Outside a runtime the bus is headless (no dispatcher); register
-        // and metrics do not need one.
-        let bus = ThalamicBus::new(4);
-        poison(&bus.subs);
-        let id = bus.register(Box::new(SlowSubscriber {
-            log: Arc::new(Mutex::new(Vec::new())),
-            delay: Duration::from_millis(0),
-        }));
-        assert_eq!(
-            id,
-            SubscriberId::MAX,
-            "a poisoned registry returns the invalid id, logged, not a panic"
-        );
-        assert_eq!(
-            bus.metrics().subscribers,
-            0,
-            "a poisoned registry snapshots as zero subscribers"
-        );
     }
 
     #[tokio::test]

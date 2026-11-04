@@ -3,44 +3,61 @@
 
 mod attempt;
 mod buffer;
+mod compression;
 mod config;
-// The context DTOs are shipped ahead of the service that builds plans
-// (plan Task 2 of the agent-adoption plan). Nothing constructs them yet,
-// so the dead-code lint has no honest answer to give.
-#[allow(dead_code)]
 mod context;
 mod crash;
 mod daemon;
+mod did;
+mod digital_twin;
 mod domain;
 mod embed;
+mod fts;
+mod gliner;
+mod graphql;
+mod kge;
+mod community;
 mod events;
 mod graph_read;
 mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+mod lexical;
 mod model_downloader;
+mod mention;
+mod multimodal;
+mod ontology_grounding;
 mod learning;
 mod parser;
+mod rag_chat;
+mod rebac;
 mod recall_metrics;
 mod receipts;
+mod rdf;
 mod registry;
 mod search;
 mod secrets;
 mod server;
 mod setup;
 mod source_context;
+mod storage;
 mod store;
+mod streaming;
 mod synaptic_mesh;
 mod task;
 #[cfg(test)]
 mod test_support;
+mod telemetry;
+mod retention;
+mod diagnostic;
+mod time_series;
 mod tools;
 mod traits;
 mod util;
 
 use crate::traits::SearchResult;
-use crate::traits::{Embedder, VectorStore};
+use crate::traits::VectorStore;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -81,6 +98,14 @@ enum Commands {
 
         /// Optional path to the parser schema JSON file
         schema_path: Option<String>,
+
+        /// Preview ingestion without writing to the store or downloading models
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Dry-run mode: "estimate" or "presort"
+        #[arg(long, default_value = "estimate")]
+        dry_run_mode: String,
     },
 
     /// Export the memory graph to a JSON file
@@ -103,6 +128,20 @@ enum Commands {
         /// search and snapshot.
         #[arg(long)]
         include_archived: bool,
+
+        /// Clear export-freshness dirty flags before exporting
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Repair namespace hygiene (source, dangling refs, endpoint mismatches)
+    RepairHygiene {
+        /// The namespace to repair (optional when --all is passed)
+        namespace: Option<String>,
+
+        /// Repair all namespaces in the database
+        #[arg(long)]
+        all: bool,
     },
 
     /// Delete a memory from a namespace by ID
@@ -214,7 +253,9 @@ enum Commands {
     ///
     /// Exit 0: a healthy daemon is serving. Exit 1: no daemon and the lock is
     /// free -- safe to start one. Exit 2: the lock is held but nothing answers;
-    /// a daemon is busy or finishing, so do not start another.
+    /// a daemon is busy or finishing, so do not start another. Exit 3: the
+    /// daemon is running an older/stale build (its probe handshake did not
+    /// match), so it should be shut down and restarted.
     Status,
 
     /// Rebuild a database from a backup, into a file that does not exist yet
@@ -313,6 +354,79 @@ enum Commands {
         #[command(subcommand)]
         action: crate::synaptic_mesh::SynapticMeshCommands,
     },
+
+    /// Knowledge-graph embeddings: train TransE structural channel over
+    /// GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM 5 edge types.
+    /// Embeddings feed a capped secondary term into retrieval (≤15%) and power
+    /// review-only duplicate-candidate ranking (`neurostrata_find_duplicate_candidates`).
+    #[command(name = "kge")]
+    Kge {
+        #[command(subcommand)]
+        action: KgeCommands,
+    },
+
+    /// Storage hygiene, snapshot checksums, and WAL status
+    #[command(name = "storage")]
+    Storage {
+        #[command(subcommand)]
+        action: StorageCommands,
+    },
+
+    /// Local-first RAG chat over project memories
+    #[command(name = "chat")]
+    Chat {
+        #[command(subcommand)]
+        action: ChatCommands,
+    },
+
+    /// Time-series and episodic metrics query/list
+    #[command(name = "metrics")]
+    Metrics {
+        #[command(subcommand)]
+        action: MetricsCommands,
+    },
+
+    /// Local deduplication learning loop: status/pause/resume/rollback/reset/train
+    #[command(name = "learn")]
+    Learn {
+        #[command(subcommand)]
+        action: LearnCommands,
+    },
+
+    /// Curated read-only GraphQL query execution
+    #[command(name = "graphql")]
+    Graphql {
+        /// GraphQL query document
+        #[arg(short, long)]
+        query: String,
+        /// Target namespace
+        #[arg(short, long, default_value = "NeuroStrata")]
+        namespace: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum LearnCommands {
+    /// Show local deduplication learning status
+    Status,
+    /// Pause background candidate training
+    Pause,
+    /// Resume background candidate training
+    Resume,
+    /// Rollback active model to previous known-good version
+    Rollback,
+    /// Reset derived candidate datasets/models
+    Reset {
+        #[arg(long)]
+        purge_observations: bool,
+        #[arg(long)]
+        confirm_purge: bool,
+    },
+    /// Build deduplication dataset and train/evaluate a candidate version
+    Train {
+        #[arg(long, default_value = "v1.0.0-local")]
+        version: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -381,6 +495,74 @@ pub(crate) enum HooksCommands {
     /// (core.hooksPath honored): stamps session_queries.json and task.graph_queried
     /// when committing files in governed modules. Optional — only run on git repos.
     InstallPreCommit,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum KgeCommands {
+    /// Offline batch training of TransE structural embeddings over
+    /// 5 typed graph edges (GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM).
+    /// Writes artifact to `<db_path_parent>/kge/<scope>/` (model.bin + meta.json).
+    Train {
+        /// Train on a single namespace's subgraph (`kge/<ns>/`)
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Train on union of all namespaces' subgraphs (`kge/global/`)
+        #[arg(long)]
+        all: bool,
+        /// SGD epochs (default: 50)
+        #[arg(long, default_value_t = 50)]
+        epochs: u32,
+        /// Embedding dimension d (default: 64)
+        #[arg(long, default_value_t = 64)]
+        dim: u32,
+        /// Structural weight capped [0, 0.3] (default: 0.15)
+        #[arg(long, default_value_t = 0.15f32)]
+        kge_weight: f32,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum StorageCommands {
+    /// Report store size, WAL size, and snapshot hygiene status
+    Status,
+    /// Verify SHA-256 checksums of an exported snapshot directory
+    VerifySnapshot {
+        #[arg(short, long)]
+        dir: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum ChatCommands {
+    /// Ask a question over project memories using local-first RAG
+    Ask {
+        #[arg(short, long)]
+        namespace: String,
+        #[arg(short, long)]
+        question: String,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum MetricsCommands {
+    /// List active time-series metric series
+    List {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Query time-series samples for a metric
+    Query {
+        #[arg(short, long)]
+        namespace: String,
+        #[arg(short, long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
 }
 
 /// What a health probe actually found.
@@ -586,9 +768,15 @@ async fn fetch_daemon_info() -> Option<serde_json::Value> {
 /// Used by the proxy mode to locate the lock file before deciding whether
 /// to spawn a competing daemon.
 fn config_db_path() -> Option<String> {
-    Config::from_default_path()
-        .ok()
-        .map(|c| c.db_path.to_string_lossy().to_string())
+    match Config::load() {
+        // Config::load() is read-only: it never materializes a config file,
+        // which a congested-proxy probe has no business doing.
+        Ok(c) => Some(c.db_path.to_string_lossy().to_string()),
+        Err(e) => {
+            tracing::warn!("config_db_path failed to load config: {e}");
+            None
+        }
+    }
 }
 
 /// Where crash breadcrumbs go: a `crash` directory beside the database.
@@ -600,7 +788,7 @@ fn config_db_path() -> Option<String> {
 /// directory itself.
 fn crash_dir() -> std::path::PathBuf {
     if let Ok(config) = Config::from_default_path() {
-        if let Some(parent) = config.db_path.parent().and_then(|p| p.parent()) {
+        if let Some(parent) = config.db_path.parent() {
             return parent.join("crash");
         }
     }
@@ -732,9 +920,18 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
 
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
+    // Read-only status probes must not create the lock file: open_daemon_lock
+    // opens with .create(true), so an absent-but-unheld lock would be
+    // materialized just by asking about it.
+    if !daemon_lock_path(db_path).exists() {
+        return false;
+    }
     match open_daemon_lock(db_path) {
         Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-        Err(_) => false,
+        Err(e) => {
+            tracing::warn!("daemon_holds_lock probe failed for {}: {e}", db_path.display());
+            false
+        }
     }
 }
 
@@ -885,7 +1082,12 @@ fn install_pre_push_hook(
     // Back up any existing hook before overwriting (best-effort).
     if target.exists() {
         let backup = hooks_dir.join("pre-push.bak");
-        let _ = std::fs::copy(&target, &backup);
+        if let Err(e) = std::fs::copy(&target, &backup) {
+            eprintln!(
+                "Warning: failed to back up existing hook to {}: {e}",
+                backup.display()
+            );
+        }
     }
     std::fs::write(&target, crate::task::SCAFFOLDED_PRE_PUSH_HOOK)?;
     set_hook_executable(&target)?;
@@ -913,6 +1115,19 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
     let hooks_dir = crate::task::git_hooks_dir(root);
     if !hooks_dir.is_dir() { std::fs::create_dir_all(&hooks_dir)?; }
     let target = hooks_dir.join("pre-commit");
+    // A pre-existing hook we did not scaffold is the user's; back it up
+    // rather than silently destroying it by overwriting.
+    if target.exists() {
+        let existing = std::fs::read_to_string(&target)?;
+        if !crate::task::is_ours_hook(&existing) {
+            let backup = hooks_dir.join("pre-commit.bak");
+            std::fs::copy(&target, &backup)?;
+            eprintln!(
+                "Backed up an existing (foreign) pre-commit hook to {}",
+                backup.display()
+            );
+        }
+    }
     std::fs::write(&target, crate::task::SCAFFOLDED_PRE_COMMIT_HOOK)?;
     set_hook_executable(&target)?;
     Ok(target)
@@ -926,9 +1141,15 @@ fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
             Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
             Err(e) => format!("error: {}", e),
         };
-        let _ = file.set_len(0);
-        let _ = (&*file).write_all(report.as_bytes());
-        let _ = file.sync_all();
+        if let Err(e) = file.set_len(0) {
+            tracing::warn!("final checkpoint report truncate failed: {e}");
+        }
+        if let Err(e) = (&*file).write_all(report.as_bytes()) {
+            tracing::warn!("final checkpoint report write failed: {e}");
+        }
+        if let Err(e) = file.sync_all() {
+            tracing::warn!("final checkpoint report sync failed: {e}");
+        }
     }
 }
 
@@ -951,6 +1172,9 @@ impl ReadSource {
                     .json(&serde_json::json!({ "op": "namespaces" }))
                     .send()
                     .await?;
+                if !res.status().is_success() {
+                    anyhow::bail!("daemon /cli/read returned HTTP {}", res.status());
+                }
                 let v: serde_json::Value = res.json().await?;
                 Ok(serde_json::from_value(v["namespaces"].clone())?)
             }
@@ -966,11 +1190,150 @@ impl ReadSource {
                     .json(&serde_json::json!({ "op": "list", "namespace": namespace }))
                     .send()
                     .await?;
+                if !res.status().is_success() {
+                    anyhow::bail!("daemon /cli/read returned HTTP {}", res.status());
+                }
                 let v: serde_json::Value = res.json().await?;
                 Ok(serde_json::from_value(v["rows"].clone())?)
             }
         }
     }
+}
+
+fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
+    match crate::learning::control::apply_control(&req) {
+        Ok(res) => match serde_json::to_string_pretty(&res) {
+            Ok(out) => println!("{}", out),
+            Err(e) => eprintln!("learn control result serialize failed: {}", e),
+        },
+        Err(e) => {
+            eprintln!("learn control failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the dedup dataset, train a candidate, evaluate it fail-closed, and
+/// promote it when the real eval report carries numeric metrics.
+async fn run_learn_train(version: &str) -> anyhow::Result<()> {
+    let root = crate::learning::control::default_learning_dir();
+    let paths = crate::judgment::laya_onnx::LearningPaths::new(root.clone());
+    let mgr = crate::judgment::laya_onnx::LearningRuntimeManager::new(paths.clone());
+    let rt_state = mgr.ensure_ready().await;
+    let runtime = std::sync::Arc::new(mgr.runtime()?);
+    let model_cache = runtime.model_cache.clone();
+    let trainer = crate::learning::trainer::Trainer::new(runtime);
+
+    let mut job_state = trainer.transition(
+        &crate::learning::trainer::TrainingJobState::WaitingForData,
+        crate::learning::trainer::TrainingJobState::Training,
+    )?;
+
+    let policy = crate::learning::dataset::DistancePolicy::load_from(&paths.root_dir());
+    policy.save_to(&paths.root_dir())?;
+    let dataset_report = crate::learning::dataset::build_dedup_dataset(
+        &paths.root_dir(),
+        &paths.root_dir().join("dataset"),
+    )
+    .await?;
+
+    trainer.train_candidate(&version.to_string()).await?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::ProxyShadow,
+    )?;
+
+    // The builtin train path writes under runtime model_cache, not LearningPaths.
+    let candidate_dir = model_cache.join("candidates").join(version);
+    let eval_path = candidate_dir.join("eval_report.json");
+    let eval_raw = std::fs::read_to_string(&eval_path).map_err(|_| {
+        anyhow::anyhow!(
+            "no eval_report.json for candidate {} at {}; training did not produce a measurable artifact; evaluation refused (fail-closed)",
+            version,
+            eval_path.display()
+        )
+    })?;
+    let eval_report: crate::learning::trainer::EvaluationReport =
+        serde_json::from_str(&eval_raw).map_err(|e| {
+            anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
+        })?;
+    let score = trainer.evaluate_candidate(&eval_report)?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::GoldShadow,
+    )?;
+
+    let bundle = crate::learning::model_bundle::ModelBundle::load(&candidate_dir, "laya")?;
+
+    // Promote in the active manifest and persist it.
+    let manifest_path = paths.root_dir().join("active_manifest.json");
+    let mut manifest: crate::learning::trainer::ActiveManifest = if manifest_path.exists() {
+        match std::fs::read_to_string(&manifest_path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<crate::learning::trainer::ActiveManifest>(&raw)
+                    .map_err(|e| e.to_string())
+            })
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "active manifest at {} unreadable or unparseable, using defaults: {e}",
+                    manifest_path.display()
+                );
+                crate::learning::trainer::ActiveManifest::default()
+            }
+        }
+    } else {
+        crate::learning::trainer::ActiveManifest::default()
+    };
+    trainer.promote(&mut manifest, &version.to_string(), score)?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::Promoted,
+    )?;
+
+    std::fs::create_dir_all(paths.root_dir())?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    // Mirror promoted versions into status.json.
+    let mut status = crate::learning::control::load_status(&paths.root_dir());
+    status.active_version = manifest.active_version.clone();
+    status.previous_good_version = manifest.previous_good_version.clone();
+    status.candidate_version = None;
+    status.training_state = job_state;
+    status.runtime_state = match rt_state {
+        crate::judgment::laya_onnx::LayaReadiness::Ready => crate::judgment::laya_onnx::RuntimeState::Ready,
+        crate::judgment::laya_onnx::LayaReadiness::Degraded { .. } => crate::judgment::laya_onnx::RuntimeState::Unavailable,
+    };
+    status.latest_evaluation = Some(eval_report);
+    std::fs::write(
+        paths.root_dir().join("status.json"),
+        serde_json::to_string_pretty(&status)?,
+    )?;
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "version": version,
+            "rt_state": format!("{:?}", rt_state),
+            "score": score,
+            "active_version": manifest.active_version,
+            "previous_good_version": manifest.previous_good_version,
+            "checkpoint_path": bundle.checkpoint_path(),
+            "manifest_path": bundle.manifest_path(),
+            "dataset_report": dataset_report,
+            "train_jsonl": paths.train_jsonl(),
+            "proxy_eval_jsonl": paths.proxy_eval_jsonl(),
+            "base_model_dir": paths.base_model_dir(),
+            "candidate_dir": paths.candidate_dir(&version.to_string()),
+        })
+    );
+    Ok(())
 }
 
 async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()> {
@@ -1000,8 +1363,20 @@ async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()
         for b in namespaces.iter().skip(i + 1) {
             if a.eq_ignore_ascii_case(b) {
                 collisions += 1;
-                let a_len = read.list(a).await.map(|m| m.len()).unwrap_or(0);
-                let b_len = read.list(b).await.map(|m| m.len()).unwrap_or(0);
+                let a_len = match read.list(a).await {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        tracing::warn!("doctor list failed for '{a}': {e}");
+                        0
+                    }
+                };
+                let b_len = match read.list(b).await {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        tracing::warn!("doctor list failed for '{b}': {e}");
+                        0
+                    }
+                };
                 println!("Two spellings of one project:");
                 println!("  '{}' holds {} memories", a, a_len);
                 println!("  '{}' holds {} memories", b, b_len);
@@ -1110,6 +1485,17 @@ async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()
                 "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
             );
             println!("    to rank by. Counts start rising again from the next search.");
+        }
+        // F11: surface enrichment_state and ontology_warnings from registry row.
+        for memory in &memories {
+            if crate::registry::is_registry_row(&memory.payload.metadata) {
+                if let Some(es) = memory.payload.metadata.get("enrichment_state") {
+                    println!("  [{}] enrichment_state: {}", ns, es);
+                }
+                if let Some(ow) = memory.payload.metadata.get("ontology_warnings") {
+                    println!("  [{}] ontology_warnings: {}", ns, ow);
+                }
+            }
         }
         println!();
     }
@@ -1312,8 +1698,11 @@ mod tests {
             .find("Commands::Backup")
             .map(|offset| dedicated_start + offset)
             .expect("the Status arm is followed by the Backup arm");
+        // Main restructured dispatch so Status exits before the store
+        // opens; the later arm is unreachable (see its own comment), so
+        // the pin scans that unreachable arm instead of a `{` body.
         let fallback_start = source
-            .find("\n                    Commands::Status => {")
+            .find("\n                    Commands::Status => unreachable!")
             .expect("the fallback Status arm exists");
         let fallback_end = source[fallback_start..]
             .find("Commands::Ingest")
@@ -2212,11 +2601,11 @@ mod tests {
         assert_eq!(fact_vector, vec![0.125; dimensions]);
         assert_eq!(fact.content, "fact committed before unclean snapshot");
         assert_eq!(fact.memory_type, "fact");
-        assert_eq!(fact.metadata, json!({"stable": true}));
+        assert_eq!(fact.metadata, json!({"facets": [], "facets_bitemporal": [], "stable": true}));
         let (rule_vector, rule) = restored.get("wal-data", rule_id).await.unwrap().unwrap();
         assert_eq!(rule_vector, vec![0.25; dimensions]);
         assert_eq!(rule.content, "rule declaration");
-        assert_eq!(rule.metadata, json!({"governs": [fact_id]}));
+        assert_eq!(rule.metadata["governs"], json!([fact_id]));
         let graph = restored
             .export_graph(false, false, &std::collections::HashMap::new(), None)
             .await
@@ -2237,7 +2626,9 @@ mod tests {
         assert_eq!(stage_payload.user_id, "auto-ingestor");
         assert_eq!(stage_payload.memory_type, "file");
         assert_eq!(stage_payload.location, "src/pending.rs");
-        assert_eq!(stage_payload.metadata, json!({}));
+        // The staged row was upserted before the WAL capture, so restore
+        // replays it with main's facet enrichment.
+        assert_eq!(stage_payload.metadata, json!({"facets": [], "facets_bitemporal": []}));
         assert!(!restored.list_namespaces().await.unwrap().contains(&stage));
 
         let next_stage = format!(
@@ -2290,6 +2681,7 @@ mod tests {
                 source_id: Some(source_id),
                 exclude_superseded: true,
                 include_archived: true,
+                ..
             }) if path == "./graph.json" && source_id == "source-a"
         ));
     }
@@ -3999,7 +4391,9 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .on_thread_start(|| {
-            let _ = crash::install_alt_stack();
+            if let Err(e) = crash::install_alt_stack() {
+                tracing::warn!("install_alt_stack failed: {e}");
+            }
         })
         .build()?)
 }
@@ -4142,6 +4536,9 @@ async fn run() -> anyhow::Result<()> {
                 let config = Config::from_default_path()?;
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
+                if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
+                    tracing::debug!("DAEMON_LOCK was already initialized");
+                }
                 let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
                 let startup = resolve_startup(&config)?;
                 let embedder = embed::build_embedder_for(&startup.resolution.model)?;
@@ -4168,6 +4565,64 @@ async fn run() -> anyhow::Result<()> {
                 crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir).await?;
                 println!("Laya model '{}' fetched and verified to '{}'", model_id, target_dir);
             }
+            Commands::Learn { action } => match action {
+                LearnCommands::Status => {
+                    let status = crate::learning::control::load_status(
+                        &crate::learning::control::default_learning_dir(),
+                    );
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                }
+                LearnCommands::Pause => {
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Pause,
+                        purge_observations: false,
+                    });
+                }
+                LearnCommands::Resume => {
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Resume,
+                        purge_observations: false,
+                    });
+                }
+                LearnCommands::Rollback => {
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Rollback,
+                        purge_observations: false,
+                    });
+                }
+                LearnCommands::Reset {
+                    purge_observations,
+                    confirm_purge,
+                } => {
+                    if purge_observations {
+                        let config = Config::load().unwrap();
+                        let daemon_state = crate::daemon::daemon_status(&config.db_path);
+                        if matches!(daemon_state, crate::daemon::DaemonState::Running { .. }) {
+                            print_learn_control(crate::learning::control::LearningControlRequest {
+                                action: crate::learning::control::LearningControlAction::Reset,
+                                purge_observations: true,
+                            });
+                        } else {
+                            let result = crate::learning::control::purge_observations_offline(confirm_purge);
+                            match result {
+                                Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
+                                Err(e) => {
+                                    eprintln!("{}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    } else {
+                        print_learn_control(crate::learning::control::LearningControlRequest {
+                            action: crate::learning::control::LearningControlAction::Reset,
+                            purge_observations,
+                        });
+                    }
+                }
+                LearnCommands::Train { version } => {
+                    run_learn_train(&version).await?;
+                }
+            },
             Commands::Run { program, args } => {
                 // Deliberate, named, and it never touches the database.
                 match std::process::Command::new(&program).args(&args).status() {
@@ -4208,6 +4663,27 @@ async fn run() -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
+            Commands::Kge {
+                action: KgeCommands::Train {
+                    namespace,
+                    all,
+                    epochs,
+                    dim,
+                    kge_weight,
+                },
+            } => {
+                if !all && namespace.is_none() {
+                    anyhow::bail!("--namespace <ns> or --all is required");
+                }
+                if all && namespace.is_some() {
+                    anyhow::bail!("--namespace and --all are mutually exclusive");
+                }
+                if !(0.0..=0.3).contains(&kge_weight) {
+                    anyhow::bail!("--kge-weight must be in [0, 0.3]");
+                }
+                // Run TransE KGE training over the namespace graph (spec §5.4).
+                crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim), Some(kge_weight))?;
+            }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;
                 let db_path = config.db_path.clone();
@@ -4233,17 +4709,27 @@ async fn run() -> anyhow::Result<()> {
                 // A busy daemon may not answer this either. That is not a
                 // failure: the request is queued, so fall through to the wait.
                 if probe != DaemonProbe::Absent {
-                    if let Err(e) = client
+                    match client
                         .post("http://127.0.0.1:34343/shutdown")
                         .timeout(std::time::Duration::from_secs(10))
                         .send()
                         .await
                     {
-                        if e.is_connect() && !daemon_holds_lock(&db_path) {
-                            println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
-                            return Ok(());
+                        Ok(res) => {
+                            if !res.status().is_success() {
+                                let status = res.status();
+                                let body = res.text().await.unwrap_or_default();
+                                eprintln!("Shutdown refused by daemon (HTTP {}): {}", status, body);
+                                std::process::exit(1);
+                            }
                         }
-                        eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
+                        Err(e) => {
+                            if e.is_connect() && !daemon_holds_lock(&db_path) {
+                                println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
+                                return Ok(());
+                            }
+                            eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
+                        }
                     }
                 }
 
@@ -4262,8 +4748,17 @@ async fn run() -> anyhow::Result<()> {
                     if daemon_holds_lock(&db_path) {
                         saw_lock = true;
                     } else if saw_lock {
-                        let report =
-                            std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
+                        let report = match std::fs::read_to_string(daemon_lock_path(&db_path)) {
+                            Ok(report) => report,
+                            Err(e) => {
+                                tracing::debug!(
+                                    "the daemon's final checkpoint at {} could not be read: {}",
+                                    daemon_lock_path(&db_path).display(),
+                                    e
+                                );
+                                String::new()
+                            }
+                        };
                         if report == FINAL_CHECKPOINT_OK {
                             println!("Daemon stopped and checkpointed.");
                             return Ok(());
@@ -4330,7 +4825,7 @@ async fn run() -> anyhow::Result<()> {
                 match probe {
                     DaemonProbe::Responsive => {
                         println!("daemon: listening on 127.0.0.1:34343, answering");
-                        println!("lock: held");
+                        println!("lock: {}", if held { "held" } else { "free" });
                         // Runtime skew (round 3): the answering daemon may be
                         // running an OLDER build than the binary on disk -- the
                         // guinea pig re-verified a shipped fix through a
@@ -4562,13 +5057,24 @@ async fn run() -> anyhow::Result<()> {
                         }
                     };
 
+                    // BB-2: a malformed reply must never read as a clean gate.
+                    // The verdict is either a violations array, or the report
+                    // simply says the verdict is unavailable -- which flows
+                    // through the Err arm's strict-aware could-not-check exit.
+                    let outcome = outcome.and_then(|body| {
+                        body.get("violations")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "the daemon's gate reply was malformed (missing violations array): {}",
+                                    body
+                                )
+                            })
+                    });
+
                     match outcome {
-                        Ok(body) => {
-                            let violations = body
-                                .get("violations")
-                                .and_then(|v| v.as_array())
-                                .cloned()
-                                .unwrap_or_default();
+                        Ok(violations) => {
                             for violation in &violations {
                                 println!(
                                     "- [{}] {}: {}",
@@ -4645,7 +5151,20 @@ async fn run() -> anyhow::Result<()> {
                                         })
                                 })
                             }
-                            _ => None,
+                            Ok(resp) => {
+                                tracing::debug!(
+                                    "daemon /mcp task_validate answered HTTP {}; falling back to the direct report",
+                                    resp.status()
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "the /mcp task_validate request to the daemon failed: {}; falling back to the direct report",
+                                    e
+                                );
+                                None
+                            }
                         }
                     } else {
                         None
@@ -4704,10 +5223,15 @@ async fn run() -> anyhow::Result<()> {
                         let status = res.status();
                         let body = res.text().await.unwrap_or_default();
                         if !status.is_success() {
-                            eprintln!("Import failed: {}", body);
-                            std::process::exit(1);
+                            anyhow::bail!(
+                                "daemon /mcp task import returned HTTP {}: {}",
+                                status,
+                                body
+                            );
                         }
-                        serde_json::from_str(&body).unwrap_or_default()
+                        serde_json::from_str(&body).map_err(|e| {
+                            anyhow::anyhow!("invalid JSON from daemon /mcp task import: {e}")
+                        })?
                     } else {
                         let config = Config::from_default_path()?;
                         if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
@@ -4722,8 +5246,8 @@ async fn run() -> anyhow::Result<()> {
                                 embedder.embedder_id().to_string(),
                                 profiled_store_limits(&config)?,
                             )?);
-                        match crate::task::import_beads(
-                            vector_store,
+                        let res = match crate::task::import_beads(
+                            vector_store.clone(),
                             embedder.clone(),
                             &namespace,
                             &from_beads,
@@ -4735,7 +5259,13 @@ async fn run() -> anyhow::Result<()> {
                                 eprintln!("{}", e);
                                 std::process::exit(1);
                             }
+                        };
+                        if vector_store.is_dirty() {
+                            if let Err(e) = vector_store.checkpoint().await {
+                                tracing::warn!("task import checkpoint failed: {e}");
+                            }
                         }
+                        res
                     };
                     let get = |k: &str| summary_json.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                     println!(
@@ -4766,6 +5296,7 @@ async fn run() -> anyhow::Result<()> {
                     Ok(report) => {
                         if report.verified {
                             println!("Setup complete. Daemon healthy.");
+                            println!("Backup timer installed: {}", report.backup_installed);
                         } else if report.daemon_installed {
                             println!("Setup complete. Daemon installed but did not become healthy — see notes above.");
                         } else {
@@ -4781,9 +5312,13 @@ async fn run() -> anyhow::Result<()> {
             }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
-                    let root = git_toplevel()
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap();
+                    let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("ERROR: cannot determine git repository root or current working directory.");
+                            std::process::exit(1);
+                        }
+                    };
                     if !root.join(".git").exists() {
                         eprintln!(
                             "ERROR: {:?} is not a git repository; there is nowhere to install the pre-push hook.",
@@ -4793,8 +5328,16 @@ async fn run() -> anyhow::Result<()> {
                     }
                     match install_pre_push_hook(&root, force) {
                         Ok(target) => {
+                            let _ = install_pre_commit_hook(&root);
+                            let repo_ns = root
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("default");
+                            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
+                                &root, repo_ns, None,
+                            );
                             println!(
-                                "Installed the NeuroStrata task gate at {}.",
+                                "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
                                 target.display()
                             );
                             return Ok(());
@@ -4806,9 +5349,13 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 HooksCommands::InstallPreCommit => {
-                    let root = git_toplevel()
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap();
+                    let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("ERROR: cannot determine git repository root or current working directory.");
+                            std::process::exit(1);
+                        }
+                    };
                     if !root.join(".git").exists() {
                         eprintln!(
                             "ERROR: {:?} is not a git repository; there is nowhere to install the pre-commit hook.",
@@ -4861,6 +5408,32 @@ async fn run() -> anyhow::Result<()> {
                     None
                 };
 
+                // AW-C4: `--dry-run` is read-only — it never opens the store —
+                // so it runs even while the daemon holds the lock.
+                if let Commands::Ingest { dry_run: true, dir, namespace, schema_path, dry_run_mode } = &other {
+                    let dir_str = cli_ingest_root(dir);
+                    let dir_path_owned = std::path::PathBuf::from(&dir_str);
+                    let schema_str = if let Some(path) = schema_path {
+                        std::fs::read_to_string(path).unwrap_or_else(|e| {
+                            eprintln!("Failed to read schema from {}: {}", path, e);
+                            std::process::exit(1);
+                        })
+                    } else {
+                        include_str!("schema.json").to_string()
+                    };
+                    let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Failed to load schema: {}", e);
+                            return Err(e.into());
+                        }
+                    };
+                    let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                    println!("Namespace: {}", namespace);
+                    println!("{}", report);
+                    return Ok(());
+                }
+
                 if daemon_running {
                     // Read-only graph export is not a store mutation: it rides
                     // the daemon like backup does, instead of demanding a
@@ -4868,6 +5441,8 @@ async fn run() -> anyhow::Result<()> {
                     if let Commands::ExportGraph {
                         exclude_superseded,
                         include_archived,
+                        clear,
+                        source_id: cli_source_id,
                         ..
                     } = &other
                     {
@@ -4876,7 +5451,11 @@ async fn run() -> anyhow::Result<()> {
                             .expect("export graph target resolved before daemon dispatch");
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
+                        // AW-A2: `--source-id <id>` on the CLI scopes the
+                        // export just like the env var it falls back to.
+                        let source_id = cli_source_id
+                            .clone()
+                            .or_else(|| std::env::var("NEUROSTRATA_SOURCE_ID").ok());
                         let anchor_override = crate::source_context::scoped_anchor_override(
                             anchor_root.as_deref(),
                             source_id.as_deref(),
@@ -4890,7 +5469,8 @@ async fn run() -> anyhow::Result<()> {
                                     &(!exclude_superseded).to_string(),
                                 )
                                 .append_pair("include_archived", &include_archived.to_string())
-                                .append_pair("all", "true");
+                                .append_pair("all", "true")
+                                .append_pair("clear", &clear.to_string());
                             if let Some(anchor) = anchor_override.as_ref() {
                                 query
                                     .append_pair(
@@ -4936,6 +5516,97 @@ async fn run() -> anyhow::Result<()> {
                             run_list(&read, namespace).await?;
                             return Ok(());
                         }
+                        Commands::Delete { namespace, id } => {
+                            let res = daemon_operator_client()
+                                .post(format!("http://{DAEMON_ADDR}/delete"))
+                                .json(&serde_json::json!({ "namespace": namespace, "id": id }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("delete request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("Memory deleted successfully.");
+                                return Ok(());
+                            }
+                            eprintln!("Delete failed: {}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::Archive { namespace, id } => {
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/memory/archive"))
+                                .json(&serde_json::json!({ "namespace": namespace, "id": id }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("archive request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("{}", body);
+                                return Ok(());
+                            }
+                            eprintln!("{}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::Edit { namespace, id, new_namespace, content, location } => {
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/edit"))
+                                .json(&serde_json::json!({
+                                    "old_namespace": namespace,
+                                    "id": id,
+                                    "new_namespace": new_namespace,
+                                    "content": content,
+                                    "location": location,
+                                }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("edit request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("Successfully edited memory {}", id);
+                                return Ok(());
+                            }
+                            if status == reqwest::StatusCode::NOT_FOUND {
+                                eprintln!("No memory with id {} in namespace {}.", id, namespace);
+                                std::process::exit(1);
+                            }
+                            if status == reqwest::StatusCode::CONFLICT {
+                                eprintln!("{} was written by directory ingestion, so the next ingest would overwrite an edit. Change the file and ingest again instead.", id);
+                                std::process::exit(1);
+                            }
+                            eprintln!("Edit failed: {}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::SetMetadata { namespace, id, metadata } => {
+                            let new_metadata: serde_json::Value = serde_json::from_str(metadata).map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/set-metadata"))
+                                .json(&serde_json::json!({
+                                    "namespace": namespace,
+                                    "id": id,
+                                    "metadata": new_metadata,
+                                }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("set-metadata request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("Successfully updated metadata for memory {}", id);
+                                return Ok(());
+                            }
+                            if status == reqwest::StatusCode::NOT_FOUND {
+                                eprintln!("No memory with id {} in namespace {}.", id, namespace);
+                                std::process::exit(1);
+                            }
+                            if status == reqwest::StatusCode::CONFLICT {
+                                eprintln!("{} was written by directory ingestion and cannot be updated.", id);
+                                std::process::exit(1);
+                            }
+                            eprintln!("Set-metadata failed: {}", body);
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -4968,17 +5639,93 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 match other {
+                    Commands::Storage { action } => match action {
+                        StorageCommands::Status => {
+                            let out =
+                                crate::server::handle_storage_status(vector_store.clone()).await;
+                            println!("{}", out);
+                        }
+                        StorageCommands::VerifySnapshot { dir } => {
+                            match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
+                                Ok(report) => {
+                                    if report.valid {
+                                        println!("Verified snapshot in {}: valid", dir);
+                                    } else {
+                                        eprintln!(
+                                            "Snapshot verification failed: {:?}",
+                                            report.error
+                                        );
+                                        std::process::exit(1);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Snapshot verification failed: {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    },
+                    Commands::Chat { action } => match action {
+                        ChatCommands::Ask {
+                            namespace,
+                            question,
+                            top_k,
+                        } => {
+                            let embedder = build_embedder()?;
+                            let args = serde_json::json!({
+                                "namespace": namespace,
+                                "question": question,
+                                "top_k": top_k,
+                            });
+                            let out = crate::server::handle_chat_ask(
+                                &args,
+                                embedder.clone(),
+                                vector_store.clone(),
+                            )
+                            .await;
+                            println!("{}", out);
+                        }
+                    },
+                    Commands::Metrics { action } => match action {
+                        MetricsCommands::List { namespace } => {
+                            let args = serde_json::json!({ "namespace": namespace });
+                            let out =
+                                crate::server::handle_metrics_list(&args, vector_store.clone())
+                                    .await;
+                            println!("{}", out);
+                        }
+                        MetricsCommands::Query {
+                            namespace,
+                            kind,
+                            name,
+                            limit,
+                        } => {
+                            let args = serde_json::json!({
+                                "namespace": namespace,
+                                "kind": kind,
+                                "name": name,
+                                "limit": limit,
+                            });
+                            let out =
+                                crate::server::handle_metrics_query(&args, vector_store.clone())
+                                    .await;
+                            println!("{}", out);
+                        }
+                    },
+                    Commands::Graphql { query, namespace } => {
+                        let args = serde_json::json!({
+                            "query": query,
+                            "namespace": namespace,
+                        });
+                        let out =
+                            crate::server::handle_graphql_query(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                    }
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
                     }
-                    Commands::Laya { model, out_dir } => {
-                        let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
-                        let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
-                        let _ = crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(
-                            &model_id,
-                            &target_dir,
-                        )
-                        .await;
+                    Commands::Laya { .. } => {
+                        unreachable!("handled before store open")
                     }
                     Commands::Namespaces => {
                         run_namespaces(&read).await?;
@@ -4987,29 +5734,16 @@ async fn run() -> anyhow::Result<()> {
                         run_list(&read, &namespace).await?;
                     }
                     // Reached only through the fallback; the dedicated Status
-                    // arm exits before the store opens. Reported faithfully
-                    // anyway: the daemon is provably not running in this arm.
-                    Commands::Status => {
-                        println!("store: {:?}", config.db_path);
-                        println!("daemon: not running");
-                        println!(
-                            "lock: {}",
-                            if daemon_holds_lock(&config.db_path) {
-                                "held"
-                            } else {
-                                "free"
-                            }
-                        );
-                        println!(
-                            "status: down -- safe to start exactly one: neurostrata-mcp daemon"
-                        );
-                        std::process::exit(1);
-                    }
+                    // arm exits before the store opens.
+                    Commands::Status => unreachable!("handled before store open"),
                     Commands::Ingest {
                         dir,
                         namespace,
                         schema_path,
+                        dry_run: _,
+                        dry_run_mode: _,
                     } => {
+                        let embedder = build_embedder()?;
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -5021,28 +5755,46 @@ async fn run() -> anyhow::Result<()> {
                             include_str!("schema.json").to_string()
                         };
 
-                        if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                            println!(
-                                "Ingesting AST from {:?} into namespace '{}'",
-                                dir_path, namespace
-                            );
-                            crate::parser::ingest::ingest_directory(
-                                dir_path,
-                                &schema,
-                                embedder,
-                                vector_store,
-                                &namespace,
-                                // The CLI has nowhere to report progress to: it
-                                // is already printing each file as it goes.
-                                None,
-                            )
-                            .await?;
-                            println!("Ingestion complete.");
+                        let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("Failed to load schema: {}", e);
+                                return Err(e.into());
+                            }
+                        };
+                        // Opt-in pre-ingest hygiene: drop the ingester-owned
+                        // rows (and their lexical docs) so the rebuild starts
+                        // from a clean tree, then surface the generation
+                        // bookkeeping query alongside it.
+                        if std::env::var("NEUROSTRATA_CLEAR_BEFORE_INGEST").is_ok() {
+                            vector_store.clear_ingested(&namespace).await?;
+                            if let Err(e) = vector_store.generation_nodes(&namespace, 0).await {
+                                tracing::debug!("generation_nodes(0) probe note: {e}");
+                            }
                         }
+                        println!(
+                            "Ingesting AST from {:?} into namespace '{}'",
+                            dir_path, namespace
+                        );
+                        crate::parser::ingest::ingest_directory(
+                            dir_path,
+                            &schema,
+                            embedder,
+                            vector_store.clone(),
+                            &namespace,
+                            // The CLI has nowhere to report progress to: it
+                            // is already printing each file as it goes.
+                            None,
+                            &[],
+                        )
+                        .await?;
+                        println!("Ingestion complete.");
                     }
                     Commands::ExportGraph {
                         exclude_superseded,
                         include_archived,
+                        clear,
+                        source_id: cli_source_id,
                         ..
                     } => {
                         let target_path = graph_target
@@ -5063,6 +5815,12 @@ async fn run() -> anyhow::Result<()> {
                         // operator who has confirmed the export is current
                         // can flip the flag's `dirty` field to false; the
                         // gate trusts the flag, not its own clock.
+                        if clear {
+                            if let Err(e) = crate::events::clear_export_freshness(&*vector_store).await
+                            {
+                                eprintln!("Warning: failed to clear export freshness: {e}");
+                            }
+                        }
                         if let Err(why) =
                             crate::events::check_export_freshness(&*vector_store).await
                         {
@@ -5076,7 +5834,11 @@ async fn run() -> anyhow::Result<()> {
                         // the search and snapshot read surfaces use.
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
+                        // AW-A2: `--source-id <id>` on the CLI scopes the
+                        // export just like the env var it falls back to.
+                        let source_id = cli_source_id
+                            .clone()
+                            .or_else(|| std::env::var("NEUROSTRATA_SOURCE_ID").ok());
                         let anchor_override = crate::source_context::scoped_anchor_override(
                             anchor_root.as_deref(),
                             source_id.as_deref(),
@@ -5091,6 +5853,9 @@ async fn run() -> anyhow::Result<()> {
                             .await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
+                        if let Err(e) = crate::events::clear_export_freshness(&*vector_store).await {
+                            eprintln!("Warning: failed to clear export freshness: {e}");
+                        }
                     }
                     Commands::NormalizeMetadata { namespace } => {
                         use crate::store::ladybug::KnownIds;
@@ -5118,6 +5883,7 @@ async fn run() -> anyhow::Result<()> {
                             };
                             let mut metadata = payload.metadata.clone();
                             if !metadata.is_object() {
+                                skipped += 1;
                                 continue;
                             }
                             let mut changed = false;
@@ -5152,6 +5918,37 @@ async fn run() -> anyhow::Result<()> {
                             "Scanned {} memories, updated {} ({} skipped as ingested/code nodes).",
                             scanned, updated, skipped
                         );
+                    }
+                    Commands::RepairHygiene { namespace, all } => {
+                        use crate::store::ladybug::LadybugStore;
+                        let direct =
+                            crate::traits::VectorStore::as_any(vector_store.as_ref())
+                                .downcast_ref::<LadybugStore>()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("repair-hygiene requires LadybugStore backend")
+                                })?;
+                        if all {
+                            let namespaces = vector_store.list_namespaces().await?;
+                            let mut total_shape = 0usize;
+                            let mut total_dangling = 0usize;
+                            for ns in &namespaces {
+                                let (fixed_shape, fixed_dangling) =
+                                    direct.repair_namespace_hygiene(ns).await?;
+                                total_shape += fixed_shape;
+                                total_dangling += fixed_dangling;
+                            }
+                            println!(
+                                "Namespace hygiene repaired across {} namespaces: {} shape fixes, {} dangling fixes.",
+                                namespaces.len(),
+                                total_shape,
+                                total_dangling
+                            );
+                        } else {
+                            let ns = namespace.ok_or_else(|| anyhow::anyhow!("Provide <NAMESPACE> or --all"))?;
+                            let (fixed_shape, fixed_dangling) =
+                                direct.repair_namespace_hygiene(&ns).await?;
+                            println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
+                        }
                     }
                     Commands::Delete { namespace, id } => {
                         vector_store.delete(&namespace, &id).await?;
@@ -5227,6 +6024,7 @@ async fn run() -> anyhow::Result<()> {
                         content,
                         location,
                     } => {
+                        let embedder = build_embedder()?;
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -5250,6 +6048,7 @@ async fn run() -> anyhow::Result<()> {
                         content,
                         location,
                     } => {
+                        let embedder = build_embedder()?;
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,
@@ -5319,7 +6118,16 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::Setup { .. }
                     | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
-                    | Commands::Hooks { .. } => unreachable!(),
+                    | Commands::Kge { .. }
+                    | Commands::Hooks { .. }
+                    // THE OUTER match already handles Learn (src/main.rs ~2822);
+                    // this inner catch-all can never see it.
+                    | Commands::Learn { .. } => unreachable!(),
+                }
+                if vector_store.is_dirty() {
+                    if let Err(e) = vector_store.checkpoint().await {
+                        tracing::warn!("final CLI checkpoint failed: {e}");
+                    }
                 }
             }
         }

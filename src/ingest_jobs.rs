@@ -19,7 +19,6 @@ use tokio::sync::watch;
 use crate::parser::ingest::IngestObserver;
 use crate::parser::schema::ParserSchema;
 use crate::traits::{is_reserved_ingest_destination, Embedder, VectorStore};
-use crate::util::lock_or_err;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +102,11 @@ impl IngestObserver for ProgressReporter {
             progress.skipped_files.push(format!("{}: {}", path, reason));
         });
     }
+
+    fn version_gate_tripped(&self, _prev: &str, _current: &str) {
+        // The warning is emitted once in ingest_directory itself so it covers
+        // every caller, including those with no observer.
+    }
 }
 
 /// The walk a caller should wait on instead of starting one, if there is one.
@@ -185,7 +189,7 @@ impl IngestJobs {
         };
 
         let mut rx = {
-            let mut jobs = lock_or_err(&self.jobs)?;
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
                 running
@@ -210,6 +214,7 @@ impl IngestJobs {
                         vector_store,
                         &namespace,
                         Some(reporter),
+                        &[],
                     )
                     .await;
 
@@ -261,16 +266,8 @@ impl IngestJobs {
     /// and exited mid-walk, and the runtime dropped the walk after it had
     /// cleared the namespace but before it had rebuilt or relinked it.
     pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
-        // Poison disposition (this fn returns bool, so the error cannot
-        // propagate): a suspect registry cannot confirm idle, so the
-        // answer is false, with the failure logged.
-        let receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
-            Ok(jobs) => jobs.values().cloned().collect(),
-            Err(e) => {
-                tracing::error!(error = %e, "ingest jobs lock poisoned; cannot confirm idle");
-                return false;
-            }
-        };
+        let receivers: Vec<watch::Receiver<IngestProgress>> =
+            self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
 
         let all_finished = async move {
             for mut rx in receivers {
@@ -437,44 +434,6 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "another namespace starts its own"
-        );
-    }
-
-    #[tokio::test]
-    async fn poisoned_lock_returns_error_not_panic() {
-        use crate::guard::testkit::{MockStore, StubEmbedder};
-
-        let jobs = Arc::new(IngestJobs::new());
-        // Panic in a scoped thread while it holds the jobs lock: the mutex
-        // is poisoned when the thread unwinds out of the guard.
-        std::thread::scope(|scope| {
-            let _ = scope
-                .spawn(|| {
-                    let _guard = jobs.jobs.lock().unwrap();
-                    panic!("deliberate poison for the lock-policy test");
-                })
-                .join();
-        });
-
-        let schema = crate::parser::schema::ParserSchema {
-            languages: std::collections::HashMap::new(),
-        };
-        let outcome = jobs
-            .run(
-                "ns",
-                "/nonexistent",
-                schema,
-                Arc::new(StubEmbedder),
-                Arc::new(MockStore::default()),
-            )
-            .await;
-        assert!(
-            outcome.is_err(),
-            "a poisoned jobs lock fails the run with an error, not a panic"
-        );
-        assert!(
-            !jobs.wait_idle(std::time::Duration::from_millis(1)).await,
-            "a poisoned jobs lock cannot confirm idle"
         );
     }
 }

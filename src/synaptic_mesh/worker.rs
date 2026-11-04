@@ -25,8 +25,9 @@ use super::outbox::{
     is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED,
 };
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
 };
+use crate::rdf::build_mesh_canonical_nquads;
 use super::storage::MeshStorage;
 
 /// What one drain did. Fielded so the daemon's loop can log it and the tests
@@ -92,12 +93,23 @@ pub async fn drain_once(
     let policy = mesh.manifest().policy.clone();
     let epoch = mesh.manifest().epoch;
     let mut committed_ids: Vec<Uuid> = Vec::with_capacity(entries.len());
+    // The MeshRecords this drain actually wrote (Applied only) — the
+    // compressed-bundle opt-in (NEUROSTRATA_MESH_BUNDLE_ZSTD) serializes
+    // exactly these.
+    let mut committed_records: Vec<MeshRecord> = Vec::with_capacity(entries.len());
 
     for entry in &entries {
-        match apply_one(entry, mesh, node_id, &policy, epoch)? {
+        let (outcome, written) = match apply_one(entry, mesh, node_id, &policy, epoch) {
+            Ok(pair) => pair,
+            Err(e) => return Err(e),
+        };
+        match outcome {
             ApplyOutcome::Applied => {
                 report.applied += 1;
                 committed_ids.push(entry.stable_op_id);
+                if let Some(record) = written {
+                    committed_records.push(record);
+                }
             }
             ApplyOutcome::AlreadyApplied => {
                 report.already_applied += 1;
@@ -128,6 +140,28 @@ pub async fn drain_once(
         }
     }
 
+    // Compressed-bundle opt-in (spec: NEUROSTRATA_MESH_BUNDLE_ZSTD): the
+    // drained records also land in `<root>/bundles/drain-<ts>.bundle.zst`.
+    // Best-effort — a bundle write failure never fails the drain.
+    if !committed_records.is_empty()
+        && std::env::var("NEUROSTRATA_MESH_BUNDLE_ZSTD")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    {
+        if let Err(e) = write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            &format!("drain-{}", Utc::now().timestamp_millis()),
+            &committed_records,
+        ) {
+            tracing::warn!("SynapticMesh compressed bundle write failed: {e}");
+        }
+    }
+
     // Mark committed AFTER the commit: a crash before this line leaves the
     // entries pending, and the worker's idempotent apply makes the retry a
     // no-op (AlreadyApplied), never a duplicate commit.
@@ -137,13 +171,16 @@ pub async fn drain_once(
 }
 
 /// Apply one entry: classify (skip) or build + atomically write the record.
+/// On success returns the written record (only for `Applied` — a written
+/// file); the record is `None` for skip/already-applied/quarantine
+/// outcomes and is consumed by the caller's bundle tracking.
 fn apply_one(
     entry: &OutboxEntry,
     mesh: &MeshStorage,
     node_id: &str,
     policy: &super::manifest::MeshPolicy,
     epoch: u32,
-) -> Result<ApplyOutcome, String> {
+) -> Result<(ApplyOutcome, Option<MeshRecord>), String> {
     // ---- publish-side epoch quarantine (spec §"Deletion & erasure") ----
     // A record captured in an older epoch than the mesh's current one is from
     // a pre-purge outbox and must not be replayed into the new epoch. This is
@@ -152,35 +189,49 @@ fn apply_one(
     // inspect the old outbox. It is checked FIRST — an old-epoch entry is
     // quarantined whatever its other classifications would say.
     if entry.epoch < epoch {
-        return Ok(ApplyOutcome::Quarantined(format!(
-            "{}: old-epoch entry (epoch {} < manifest epoch {}); quarantined, not replayed",
-            entry.id, entry.epoch, epoch
-        )));
+        return Ok((
+            ApplyOutcome::Quarantined(format!(
+                "{}: old-epoch entry (epoch {} < manifest epoch {}); quarantined, not replayed",
+                entry.id, entry.epoch, epoch
+            )),
+            None,
+        ));
     }
     // ---- classification: a skip is a decision, never an error ----
     // Feedback guard: a row that already carries a `mesh` provenance marker was
     // imported FROM the mesh (slice 4 writes it) and must never be re-exported.
     if entry.metadata.get("mesh").is_some() {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // Unknown op: defensive — an op this worker doesn't recognise is skipped,
     // never exported as if it were a fresh `created`.
     if !matches!(entry.op.as_str(), OP_CREATED | OP_SUPERSEDED | OP_ARCHIVED) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // Defensive re-check of the type filter the subscriber already applied.
     if !is_shareable_memory_type(&entry.memory_type) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // Sharing boundary: when the policy requires it (default), only
     // `eligibility: shareable` records are published. Absent or `private`
     // reads as private.
     if policy.require_record_eligibility && !is_eligible(&entry.metadata) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
+    }
+    // ReBAC mesh boundary: restricted memories (`visible_to` without `*` or
+    // matching mesh peer principal) stay local and are never published.
+    let peer_principals: Vec<String> = mesh
+        .manifest()
+        .signers
+        .iter()
+        .map(|s| s.did.clone())
+        .collect();
+    if !crate::rebac::can_publish_to_mesh(&entry.metadata, &peer_principals) {
+        return Ok((ApplyOutcome::Skipped, None));
     }
     let id = match Uuid::parse_str(&entry.id) {
         Ok(id) => id,
-        Err(_) => return Ok(ApplyOutcome::Skipped),
+        Err(_) => return Ok((ApplyOutcome::Skipped, None)),
     };
     let superseded_by = match entry.op.as_str() {
         OP_SUPERSEDED => match entry
@@ -189,20 +240,36 @@ fn apply_one(
             .and_then(|s| Uuid::parse_str(s).ok())
         {
             Some(target) => Some(target),
-            None => return Ok(ApplyOutcome::Skipped),
+            None => return Ok((ApplyOutcome::Skipped, None)),
         },
         _ => None,
     };
 
     // ---- build + write ----
     let mut record = build_record(entry, id, superseded_by, node_id, epoch);
+
+    // Auto-sign if a local Ed25519 signing key exists.
+    let signing_key_path = std::env::var("NEUROSTRATA_MESH_SIGNING_KEY")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| mesh.root().join(".neurostrata-mesh").join("signing.key"));
+    if signing_key_path.exists() {
+        // A signing failure with the key present is a real fault (corrupt
+        // or unreadable key); committing an unsigned record silently would
+        // downgrade the mesh's trust surface, so fail the drain.
+        if let Err(e) = sign_record(&mut record, &signing_key_path) {
+            return Err(format!("SynapticMesh record signing failed: {e}"));
+        }
+    }
+
     let path = record_path(mesh, &record);
 
     if let Some(existing) = load_existing(&path)? {
         if existing.update_id == record.update_id {
             // Byte-identical apply already landed (crash between rename and
             // mark-committed). Idempotent: nothing to write, nothing to commit.
-            return Ok(ApplyOutcome::AlreadyApplied);
+            return Ok((ApplyOutcome::AlreadyApplied, None));
         }
         // A lifecycle transition (superseded/archived) re-exports the SAME
         // record: preserve the origin fields that must not drift with each
@@ -210,10 +277,52 @@ fn apply_one(
         record.lifecycle.created_at = existing.lifecycle.created_at;
         record.lifecycle.created_by = existing.lifecycle.created_by.clone();
         record.origin_mesh_epoch = existing.origin_mesh_epoch;
+
+        // Rebuild the canonical RDF block from the post-mutation record so
+        // the exported quads reflect the new lifecycle state (spec §5.2c).
+        // The existing block is the source of truth for every other field.
+        if let Some(ref existing_rdf) = existing.rdf {
+            if let Some(new_rdf) = rebuild_rdf_block(&record, existing_rdf) {
+                record.rdf = Some(new_rdf);
+            }
+        }
     }
 
+    // Oversized-record size cap: refuse records larger than 1 MiB to keep
+    // mesh files bounded and reviewable.
+    let serialized = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+    if serialized.len() > 1_048_576 {
+        return Err(format!("mesh record exceeds 1 MiB size cap ({} bytes)", serialized.len()));
+    }
     write_record(&path, &record)?;
-    Ok(ApplyOutcome::Applied)
+
+    // RDF patch sidecar (spec: NEUROSTRATA_MESH_RDF_PATCH opt-in): rebuild a
+    // Stream from the record's canonical N-Quads block and write its patch
+    // serialization next to the record file. Fail-soft.
+    if let Some(ref rdf_block) = record.rdf {
+        if std::env::var("NEUROSTRATA_MESH_RDF_PATCH").is_ok() {
+            if let Ok(stream) =
+                crate::streaming::Stream::from_nquads(&rdf_block.quads, crate::streaming::PatchOp::Add)
+            {
+                if !stream.is_empty() {
+                    let patch_path = path.with_extension("rdfpatch");
+                    match std::fs::write(&patch_path, stream.to_patch()) {
+                        Ok(()) => tracing::debug!(
+                            "SynapticMesh RDF patch ({} quads) written to {}",
+                            stream.len(),
+                            patch_path.display()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "SynapticMesh RDF patch write to {} failed: {e}",
+                            patch_path.display()
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((ApplyOutcome::Applied, Some(record)))
 }
 
 /// The record's eligibility gate: only a literal `eligibility: "shareable"`.
@@ -252,6 +361,93 @@ fn build_record(
         }
     }
 
+    // Build canonical RDF block (Phase 1 dual-write: always emit canonical payload)
+    let created_at_str = created_at(entry).to_rfc3339();
+    let archived_at_str = archived_at.as_ref().map(|dt| dt.to_rfc3339());
+    // Tombstone: not set on creation; an archive operation IS the tombstoning
+    // event, so an archived record carries the archive timestamp forward as
+    // its tombstone time (the publish-time update stamp).
+    let tombstoned_at = if matches!(state, LifecycleState::Archived) {
+        archived_at.clone()
+    } else {
+        None
+    };
+    let tombstoned_at_str = tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
+    let superseded_by_str = superseded_by.as_ref().map(|u| u.to_string());
+    let update_id_str = entry.stable_op_id.to_string();
+    let trust_val = trust_from(&entry.metadata).to_string();
+
+    // Extract curated metadata
+    let eligibility = entry.metadata.get("eligibility").and_then(|v| v.as_str());
+    let source = entry.metadata.get("source").and_then(|v| v.as_str());
+    let tags: Vec<String> = entry.metadata.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let concept_iri = entry.metadata.get("concept_iri").and_then(|v| v.as_str());
+
+    // Extract procedure definition fields (owned Strings so they outlive any
+    // further borrow; the def is dropped at the end of its if-block).
+    let (trigger, initial_fires, valid_to, rehearsal_script) = if entry.memory_type == "procedure" {
+        let def = procedure_definition(entry);
+        let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+        let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
+        let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
+        let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+        (trig, fires, vt, rs)
+    } else {
+        (None, None, None, None)
+    };
+
+    // Build relationships vec for RDF
+    let rdf_relationships: Vec<(String, String)> = relationships.iter()
+        .map(|r| (r.kind.clone(), r.target.to_string()))
+        .collect();
+
+    // Content string for RDF (stringified JSON for procedure, plain text for memory)
+    let content_str = match &content {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(&content).unwrap_or_default(),
+    };
+
+    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+        &id.to_string(),
+        &entry.namespace,
+        &entry.memory_type,
+        &format!("{:?}", state).to_lowercase(),
+        &created_at_str,
+        &node_id,
+        superseded_by_str.as_deref(),
+        archived_at_str.as_deref(),
+        tombstoned_at_str.as_deref(),
+        &content_str,
+        eligibility,
+        source,
+        &tags,
+        concept_iri,
+        &rdf_relationships,
+        &update_id_str,
+        epoch,
+        &trust_val,
+        trigger.as_deref(),
+        initial_fires,
+        valid_to.as_deref(),
+        rehearsal_script.as_deref(),
+    );
+
+    let patch_op = if matches!(state, LifecycleState::Archived | LifecycleState::Tombstoned) {
+        crate::streaming::PatchOp::Delete
+    } else {
+        crate::streaming::PatchOp::Add
+    };
+    let patch = match crate::streaming::Stream::from_nquads(&nquads_text, patch_op) {
+        Ok(stream) if !stream.is_empty() => Some(stream),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("SynapticMesh RDF patch build failed for update {update_id_str}: {e}");
+            None
+        }
+    };
+
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
         id,
@@ -263,17 +459,143 @@ fn build_record(
             created_by: node_id.to_string(),
             superseded_by,
             archived_at,
-            tombstoned_at: None,
+            tombstoned_at,
         },
         content,
         metadata: projected_metadata(&entry.metadata),
+        rdf: Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: digest_str,
+            quads: nquads_text,
+        }),
         relationships,
         // The record's revision id IS the outbox entry's idempotency key, so
         // re-applying an entry produces byte-identical output.
         update_id: entry.stable_op_id,
         origin_mesh_epoch: epoch,
         trust: trust_from(&entry.metadata),
+        signature: None,
+        signer_did: None,
+        public_key: None,
+        patch,
     }
+}
+
+/// Sign a [`MeshRecord`] in place using the Ed25519 keypair at `key_path`.
+pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), String> {
+    let (pkey, did, pubkey) = crate::did::load_or_generate_keypair(key_path)?;
+    record.signer_did = Some(did);
+    record.public_key = Some(hex::encode(&pubkey));
+    record.signature = None;
+    let payload = if let Some(ref rdf_block) = record.rdf {
+        crate::did::signing_payload(
+            &rdf_block.quads,
+            &record.update_id.to_string(),
+            record.origin_mesh_epoch,
+        )
+    } else {
+        let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
+        crate::did::canonical_signing_bytes(&val)?
+    };
+    let sig = crate::did::sign(&payload, &pkey)?;
+    record.signature = Some(crate::did::encode_base64(&sig));
+    Ok(())
+}
+
+/// Compress a batch of mesh records with zstd for bundle transport.
+/// Used by `write_compressed_bundle` under the drain-time
+/// `NEUROSTRATA_MESH_BUNDLE_ZSTD` opt-in and the bundle round-trip tests.
+pub fn compress_record_bundle(records: &[MeshRecord], level: i32) -> Result<Vec<u8>, String> {
+    let json_bytes = serde_json::to_vec(records).map_err(|e| e.to_string())?;
+    crate::compression::zstd::compress_mesh_bundle_with_level(&json_bytes, level)
+        .map_err(|e| e.to_string())
+}
+
+/// Write a compressed bundle to `<bundles_dir>/<bundle_name>.bundle.zst`.
+/// `bundles_dir` is the target directory directly (the mesh worker passes
+/// `<mesh_root>/bundles`).
+pub fn write_compressed_bundle(
+    bundles_dir: &Path,
+    bundle_name: &str,
+    records: &[MeshRecord],
+) -> Result<PathBuf, String> {
+    let bytes = compress_record_bundle(records, 3)?;
+    std::fs::create_dir_all(bundles_dir).map_err(|e| e.to_string())?;
+    let path = bundles_dir.join(format!("{}.bundle.zst", bundle_name));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Rebuild the canonical RDF block from a MeshRecord after lifecycle mutation.
+/// Uses the existing block only to preserve content/relationships (all come
+/// from the record itself); the lifecycle fields are taken from the record.
+fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBlock> {
+    let id_str = record.id.to_string();
+    let namespace = &record.namespace;
+    let memory_type = &record.memory_type;
+    let state_str = format!("{:?}", record.lifecycle.state).to_lowercase();
+    let created_at_str = record.lifecycle.created_at.to_rfc3339();
+    let created_by = &record.lifecycle.created_by;
+    let superseded_by_str = record.lifecycle.superseded_by.as_ref().map(|u| u.to_string());
+    let archived_at_str = record.lifecycle.archived_at.as_ref().map(|dt| dt.to_rfc3339());
+    // Tombstone the update stamp for an archive: the archive op IS the
+    // tombstoning event (the update timestamp), and an already-present
+    // tombstone wins.
+    let tombstoned_at = if record.lifecycle.state == LifecycleState::Archived {
+        record
+            .lifecycle
+            .archived_at
+            .clone()
+            .or_else(|| record.lifecycle.tombstoned_at.clone())
+    } else {
+        record.lifecycle.tombstoned_at.clone()
+    };
+    let tombstoned_at_str = tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
+    let content_str = match &record.content {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(&record.content).unwrap_or_default(),
+    };
+    let eligibility = record.metadata.get("eligibility").and_then(|v| v.as_str());
+    let source = record.metadata.get("source").and_then(|v| v.as_str());
+    let tags: Vec<String> = record.metadata.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let concept_iri = record.metadata.get("concept_iri").and_then(|v| v.as_str());
+    let rdf_relationships: Vec<(String, String)> = record.relationships.iter()
+        .map(|r| (r.kind.clone(), r.target.to_string()))
+        .collect();
+    let update_id_str = record.update_id.to_string();
+    let epoch = record.origin_mesh_epoch;
+    let trust_val = format!("{:?}", record.trust).to_lowercase();
+    // Procedure fields: read from content definition if procedure
+    let (trigger, initial_fires, valid_to, rehearsal_script) = if record.memory_type == "procedure" {
+        if let Some(def) = record.content.as_object() {
+            let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+            let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
+            let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
+            let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+            (trig, fires, vt, rs)
+        } else { (None, None, None, None) }
+    } else { (None, None, None, None) };
+
+    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+        &id_str, namespace, memory_type, &state_str,
+        &created_at_str, created_by,
+        superseded_by_str.as_deref(),
+        archived_at_str.as_deref(), tombstoned_at_str.as_deref(),
+        &content_str, eligibility, source, &tags, concept_iri,
+        &rdf_relationships, &update_id_str, epoch, &trust_val,
+        trigger.as_deref(), initial_fires, valid_to.as_deref(), rehearsal_script.as_deref(),
+    );
+    Some(RdfBlock {
+        // The rebuilt block retains the existing block's schema/format
+        // identifiers — a rebuilt block is the same projection, refreshed.
+        schema: existing.schema.clone(),
+        format: existing.format.clone(),
+        canonical_hash: digest_str,
+        quads: nquads_text,
+    })
 }
 
 /// The record's `metadata` object: the spec's curated subset. Eligibility is
@@ -292,6 +614,10 @@ fn projected_metadata(metadata: &Value) -> Value {
     }
     if let Some(tags) = metadata.get("tags") {
         out.insert("tags".to_string(), tags.clone());
+    }
+    // concept_iri is shareable (alignment across namespaces); domain/aliases stay private.
+    if let Some(concept_iri) = metadata.get("concept_iri") {
+        out.insert("concept_iri".to_string(), concept_iri.clone());
     }
     Value::Object(out)
 }
@@ -322,7 +648,10 @@ fn trust_from(metadata: &Value) -> Trust {
 }
 
 fn created_at(entry: &OutboxEntry) -> DateTime<Utc> {
-    DateTime::from_timestamp(entry.ts, 0).unwrap_or_else(Utc::now)
+    DateTime::from_timestamp(entry.ts, 0).unwrap_or_else(|| {
+        tracing::warn!("invalid outbox entry timestamp {}; falling back to Utc::now()", entry.ts);
+        Utc::now()
+    })
 }
 
 /// The archive timestamp: the tombstone the archive handler wrote, falling
@@ -401,7 +730,7 @@ mod tests {
             "neurostrata-mesh-worker-{}-{}-{}",
             std::process::id(),
             tag,
-            Uuid::new_v4()
+            Uuid::now_v7()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -462,7 +791,7 @@ mod tests {
     /// A `created` entry for a shareable `rule`.
     fn created(id: &str, metadata: serde_json::Value) -> OutboxEntry {
         OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_CREATED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -601,7 +930,7 @@ mod tests {
         let (mesh, outbox) = fixture("batch", None).await;
         for _ in 0..3 {
             outbox
-                .append(&created(&Uuid::new_v4().to_string(), shareable_metadata()))
+                .append(&created(&Uuid::now_v7().to_string(), shareable_metadata()))
                 .unwrap();
         }
         let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
@@ -649,7 +978,7 @@ mod tests {
         let (mesh, outbox) = fixture("procedure", None).await;
         let id = Uuid::new_v4();
         let entry = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_CREATED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -734,21 +1063,21 @@ mod tests {
     async fn eligibility_absenting_or_private_is_not_published_shareable_is() {
         let (mesh, outbox) = fixture("eligibility", None).await;
 
-        let shareable_id = Uuid::new_v4();
+        let shareable_id = Uuid::now_v7();
         outbox
             .append(&created(
                 &shareable_id.to_string(),
                 json!({ "eligibility": "shareable" }),
             ))
             .unwrap();
-        let private_id = Uuid::new_v4();
+        let private_id = Uuid::now_v7();
         outbox
             .append(&created(
                 &private_id.to_string(),
                 json!({ "eligibility": "private" }),
             ))
             .unwrap();
-        let absent_id = Uuid::new_v4();
+        let absent_id = Uuid::now_v7();
         outbox
             .append(&created(&absent_id.to_string(), json!({})))
             .unwrap();
@@ -773,7 +1102,7 @@ mod tests {
         let old_id = Uuid::new_v4();
         let new_id = Uuid::new_v4();
         let entry = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_SUPERSEDED.to_string(),
             id: old_id.to_string(),
             namespace: "ns".to_string(),
@@ -803,7 +1132,7 @@ mod tests {
         let (mesh, outbox) = fixture("archived", None).await;
         let id = Uuid::new_v4();
         let entry = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_ARCHIVED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -903,7 +1232,7 @@ mod tests {
         drain_once(&outbox, &mesh, "node-author").await.unwrap();
 
         let archive = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_ARCHIVED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -1107,5 +1436,54 @@ mod tests {
             "the published metadata is the curated envelope: {}",
             record.metadata
         );
+    }
+
+    #[tokio::test]
+    async fn apply_one_signs_record_when_signing_key_exists_and_bundle_roundtrip() {
+        let (mesh, outbox) = fixture("sign-bundle", None).await;
+        let id = Uuid::now_v7();
+        // Pre-create a valid Ed25519 signing key inside the mesh.
+        let key_dir = mesh.root().join(".neurostrata-mesh");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("signing.key");
+        let _ = crate::did::load_or_generate_keypair(&key_path).unwrap();
+
+        let entry = created(&id.to_string(), shareable_metadata());
+        outbox.append(&entry).unwrap();
+        drain_once(&outbox, &mesh, "node-author").await.unwrap();
+
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let text = std::fs::read_to_string(&path).expect("record exists");
+        let record: MeshRecord = serde_json::from_str(&text).unwrap();
+
+        // (a) DID-signed when local signing key exists.
+        assert!(
+            record.signature.as_ref().map_or(false, |s| !s.is_empty()),
+            "record must carry a non-empty signature"
+        );
+        let did = record.signer_did.as_ref().expect("signer_did must be set");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "signer_did should start with did:key:z6Mk, got: {}",
+            did
+        );
+
+        // (b) Compressed bundle round-trips losslessly.
+        let bundle_path = write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "test-bundle",
+            &[record.clone()],
+        )
+        .unwrap();
+        let roundtrip = crate::synaptic_mesh::import::read_compressed_bundle(&bundle_path).unwrap();
+        assert_eq!(roundtrip.len(), 1);
+        assert_eq!(roundtrip[0], record);
+
+        let loaded = &roundtrip[0];
+        assert!(loaded.patch.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
     }
 }

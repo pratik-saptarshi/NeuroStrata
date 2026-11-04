@@ -66,10 +66,17 @@ impl MeshStorage {
             namespaces: namespaces.to_vec(),
             policy: MeshPolicy::default(),
             remote: remote.map(str::to_string),
+            signers: Vec::new(),
         };
         write_manifest(&root, &manifest)?;
 
-        Ok(MeshStorage { root, manifest })
+        // AK-H1: the ignore rule goes in before the first `git add -A` so the
+        // private signing key can never enter history through the first
+        // commit.
+        let mesh = MeshStorage { root, manifest };
+        mesh.ensure_signing_key_ignored()?;
+
+        Ok(mesh)
     }
 
     /// Open an EXISTING mesh checkout. Refuses any manifest whose
@@ -110,7 +117,7 @@ impl MeshStorage {
         mesh_dir: &Path,
         remote: Option<&str>,
     ) -> Result<()> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("pointer dir could not be created at {}", parent.display())
@@ -129,7 +136,7 @@ impl MeshStorage {
 
     /// Read the project pointer. `Ok(None)` when the project has no mesh.
     pub fn read_pointer(project: &Path) -> Result<Option<(Uuid, PathBuf, Option<String>)>> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -168,7 +175,7 @@ impl MeshStorage {
     /// `leave()`: drop the project's link to the mesh. Idempotent — a project
     /// with no pointer is already left.
     pub fn remove_pointer(project: &Path) -> Result<()> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -190,6 +197,7 @@ impl MeshStorage {
     /// `Ok(false)` on a no-op (nothing changed) — an empty commit is a bug
     /// in the caller, never a fallback.
     pub async fn commit_all(&self, message: &str, node_id: &str) -> Result<bool> {
+        self.ensure_signing_key_ignored()?;
         run_ok(&self.root, &["add", "-A"]).await?;
         let staged = run(&self.root, &["status", "--porcelain"]).await?;
         if String::from_utf8_lossy(&staged.stdout).trim().is_empty() {
@@ -247,10 +255,56 @@ impl MeshStorage {
             ),
         }
     }
-}
 
-fn pointer_path(project: &Path) -> PathBuf {
-    project.join(POINTER_DIR_NAME).join(POINTER_FILE_NAME)
+    /// Keep the local Ed25519 signing key out of the published history.
+    ///
+    /// The default key path is `<mesh_root>/.neurostrata-mesh/signing.key`
+    /// (see `worker.rs`) and [`commit_all`] stages with `git add -A`, so
+    /// without an explicit ignore rule `git add -A` would publish the
+    /// private key into the team-shared history on the very next commit.
+    /// Both patterns are enforced because a mesh may hand its key a
+    /// different physical name through `NEUROSTRATA_MESH_SIGNING_KEY`.
+    /// Idempotent: existing lines are never duplicated or rewritten.
+    fn ensure_signing_key_ignored(&self) -> Result<()> {
+        let wanted = [".neurostrata-mesh/signing.key", "*.key"];
+        let path = self.root.join(".gitignore");
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("failed to read {}: {e}", path.display());
+                }
+                String::new()
+            }
+        };
+        let have: Vec<&str> = existing.lines().map(|l| l.trim()).collect();
+        let missing: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|w| !have.contains(w))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut text = existing;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("# Private Ed25519 signing material — never publish to the mesh history.\n");
+        for entry in &missing {
+            text.push_str(entry);
+            text.push('\n');
+        }
+        std::fs::write(&path, text).with_context(|| {
+            format!(".gitignore could not be written to {}", path.display())
+        })?;
+        Ok(())
+    }
+
+    /// The project-side pointer path: `<project>/.NeuroStrata/synaptic-mesh-ref`.
+    pub(crate) fn pointer_path(project: &Path) -> PathBuf {
+        project.join(POINTER_DIR_NAME).join(POINTER_FILE_NAME)
+    }
 }
 
 fn write_manifest(root: &Path, manifest: &MeshManifest) -> Result<()> {
@@ -831,5 +885,43 @@ mod tests {
             msg.contains("Needed a single revision"),
             "error must carry git's stderr verbatim, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_all_never_stages_or_commits_the_signing_key() {
+        let base = scratch("signing-key");
+        let mesh = init_under(&base).await;
+
+        // The key material exists before the first commit (a feasible local
+        // state: auto-sign has run or the operator pre-created the key).
+        let key_dir = mesh.root().join(".neurostrata-mesh");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join("signing.key"), "ed25519 private bytes").unwrap();
+
+        let memories = mesh.root().join("stripe-api").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
+        assert!(mesh.commit_all("first record with a local key", "node-key").await.unwrap());
+
+        let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
+        assert!(
+            gitignore.contains(".neurostrata-mesh/signing.key") && gitignore.contains("*.key"),
+            ".gitignore must carry the signing-key patterns, got: {gitignore:?}"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["ls-files", ".neurostrata-mesh/signing.key"]),
+            "",
+            "the signing key must never be staged or committed"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["check-ignore", "--quiet", ".neurostrata-mesh/signing.key"]),
+            "",
+            "check-ignore must flag the signing key"
+        );
+
+        // Idempotent: a second pass never duplicates or rewrites the rules.
+        let before = gitignore.clone();
+        mesh.ensure_signing_key_ignored().unwrap();
+        assert_eq!(std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(), before);
     }
 }
