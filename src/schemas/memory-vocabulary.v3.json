@@ -157,29 +157,6 @@
     },
     "directory": {
       "definition": "An ingested directory and structural container.",
-      "structural": true
-    },
-    "file": {
-      "definition": "An ingested non-Markdown file and code container.",
-      "structural": true
-    },
-    "markdown": {
-      "definition": "An ingested Markdown document node.",
-      "structural": true
-    },
-    "symbol": {
-      "definition": "An extracted code declaration or definition.",
-      "structural": false,
-      "fields": {
-        "mentions": {
-          "type": "array",
-          "items": "string",
-          "definition": "Symbol ids mentioned in content/location (auto-detected)."
-        }
-      }
-    },
-    "directory": {
-      "definition": "An ingested directory and structural container.",
       "structural": true,
       "fields": {
         "mentions": {
