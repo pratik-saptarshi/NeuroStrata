@@ -59,23 +59,48 @@ executes, the delta is **re-censused under Task 0.1** (divergence
 counts and any new primitives re-derived) and the pin is re-ruled —
 the delta is never silently absorbed into the sync.
 
-**Live delta at writing time (re-census seed, not part of the
-target):**
+**Live delta (re-census seed, not part of the target) — verified
+at 2026-11-07 23:43 UTC** by a fresh `git fetch upstream` in the
+correction session that produced this section's current text
+(the first version of this section recorded a one-commit delta
+with PR #62 still open; that was accurate when its evidence was
+gathered, but upstream moved before the document was delivered,
+and the review process caught it — the delta below replaces it):
 
-- Exactly **one** commit past the target: `581ae333a79460497be904c24122b93ecbead58c`
-  (upstream PR #61, "test(harness): read request before responding
-  in federation tests; raise daemon probe budget"), verified:
-  its sole parent is `8fdae4b`, and
-  `git diff --name-only 8fdae4b 581ae33` touches only
-  `src/daemon.rs` and `src/synaptic_mesh/federation.rs`, both in
-  test/harness code paths per its commit message. Test-harness
-  only; it changes no `src/` file count in the census diff
-  (154 differing `src/` files either way).
-- **Watch note:** upstream PR #62 (maintainer-side "Autonomous
-  Memory Control Plane") is **OPEN** — not in the target, not in
-  the live tip. If it merges before the sync executes, it becomes
-  part of the delta that must be re-censused under the rule above;
-  it is not pre-approved content for the sync.
+- Upstream `main` now sits at
+  **`fc0381d23106ff782130283e3e8966321b8a7152`**, exactly **4
+  commits past the target** (`git rev-list --count 8fdae4b..fc0381d`
+  → 4; the chain is linear, each commit's sole parent is the
+  previous one):
+  1. `581ae333a79460497be904c24122b93ecbead58c` — PR #61,
+     "test(harness): read request before responding in federation
+     tests; raise daemon probe budget" (test-harness only;
+     touches `src/daemon.rs` and `src/synaptic_mesh/federation.rs`
+     test code paths).
+  2. `7a79ad0fb54a88a62a08158bea68a229f9d7f0cb` — PR #62,
+     "feat: Autonomous Memory Control Plane (Waves 1–5)", merged
+     2026-11-07T21:11:04Z. (The earlier **watch note** on this PR
+     is discharged: it merged, and it is delta, not target.)
+  3. `8d290e7125b8fc09efa38ea7a7c2f95a9bccef58` — PR #63,
+     "feat(mesh): NeuroMesh near-real-time multi-agent cognitive
+     mesh transport" (commit dated 2026-11-07T22:33:31Z).
+  4. `fc0381d23106ff782130283e3e8966321b8a7152` — "release:
+     v1.17.0 — NeuroMesh real-time transport & Autonomous Memory
+     Control Plane" (commit dated 2026-11-07T22:42:29Z; tag
+     `v1.17.0` fetched with it).
+- Measured against the census base, the live tip is now 777
+  upstream-only commits with 161 differing `src/` files (445
+  files total) — versus 773 / 154 against the target. **§3's
+  conflict surface stays priced against the target**, as the
+  gate requires; these live-tip numbers are the re-census seed
+  for execution time, not a re-pricing.
+- **This is the SHA-pin rule operating as designed.** The target
+  stays `8fdae4b`; the delta is recorded, not absorbed. The
+  fork's mirror is unchanged by any of it: fork `main` was
+  re-verified in the same session at exactly
+  `8fdae4b745269b4097ecbf02a6375f0a0c3b792c`. If upstream moves
+  again before the sync executes, this subsection is re-derived
+  once more — that is the rule working, not a defect in it.
 
 ## 2. Path — forward-merge via the fork's own `main`
 
@@ -216,15 +241,37 @@ result, with file evidence, before the merge PR is called ready.
    machinery **is** the sync's purpose (it changes Task 2.6's sweep
    behavior — plan RC4). Honest-semantics governs failure surfacing,
    not a freeze on provider identity.
-2. **Fork fixes #43/#46 preserved.** The fork's fixes carried on
-   develop under PRs #43/#46 — in the mesh import/worker area —
-   must survive the merge. Concretely: `src/synaptic_mesh/import.rs`
-   (3,890 churn, conflicted) and `src/synaptic_mesh/worker.rs`
-   (1,563 churn, conflicted) are resolved **toward develop's fixed
-   behavior** wherever the two sides disagree on the fixed
-   behavior. This is the same flag the lane raised against PR #23
-   (§5): its `import.rs`/`worker.rs` versions carry live defects
-   that #43/#46 fixed on develop.
+2. **Upstream #43/#46 fixes adopted — direction: toward the
+   TARGET.** *(Corrected in review: the first version of this
+   item attributed #43/#46 to fork PRs on develop and directed
+   resolution toward develop. That was wrong in attribution and
+   reversed in direction; the verified record follows.)* #43 and
+   #46 are **upstream issues** (both CLOSED — #43: "bug(mesh):
+   bundle-only records are applied without `validate_record`
+   validation"; #46: "bug(mesh): records are signed before
+   lifecycle fields are preserved and RDF is rebuilt"). No PR
+   #43 or #46 exists on the fork or upstream (verified via `ghg`
+   reads in the correction session). The fixes landed
+   **upstream**: issue #43 → PR #53 MERGED ("fix(mesh): route
+   bundle-only records through validate_record and epoch_gate",
+   commit `7df9e41`); issue #46 → PR #51 MERGED ("fix(mesh): sign
+   records after lifecycle preservation and RDF rebuild", commit
+   `e2beea0`). Both commits are ancestors of the target and are
+   **not** ancestors of develop; the fork-port branches carrying
+   the same fix subjects are ancestors of neither. Content check:
+   `validate_bundle_record` appears **6× at the target** (all in
+   `src/synaptic_mesh/import.rs`), **0× on develop** and **0× on
+   PR #23's head**; develop's `import.rs` contains **zero**
+   `bundle` mentions at all — the bundle path does not exist on
+   develop (the target's `import.rs` has 313). Preservation rule
+   for the merge, therefore: in `src/synaptic_mesh/import.rs`
+   (3,890 churn, conflicted) and the signing/lifecycle code paths,
+   conflicts in the **bundle-gate (`validate_bundle_record`
+   routing) and sign-after-lifecycle-preservation behaviors
+   resolve toward the target-side fixed behavior**. Develop has
+   no competing fixed behavior to preserve here — it simply
+   lacks the path. (This reverses only these two behaviors;
+   §4.1's Laya honest-semantics direction is unchanged.)
 3. **`binaries/` policy ("binaries only for releases").** Commit
    `6ce7021` dropped vendored release binaries from develop, and
    its message instructs: upstream's tree carries `binaries/`, each
@@ -252,7 +299,10 @@ result, with file evidence, before the merge PR is called ready.
   (still present on the fork remote at writing time:
   `refs/heads/merge/main-into-develop-1bfc129`).
 - **Disposition under this resolution: superseded. It is not a
-  sync vehicle**, for three independent reasons:
+  sync vehicle**, for these reasons (the set as corrected in
+  review — an earlier version's third reason attributed fixes
+  to fork PRs #43/#46 on develop, which do not exist; §4.2 gives
+  the verified record):
   1. **Ceiling.** It merges upstream `main` @ `1bfc129` = **v1.15.0
      only**. It does not reach the target (§1) and lacks part of
      the analyzed set — v1.16.x, #56, #57, and the judgment
@@ -266,9 +316,13 @@ result, with file evidence, before the merge PR is called ready.
      The history is explained, but it is a record of a vehicle
      built against a tree that could not build from a fresh
      checkout.
-  3. **Live-defect flag.** Its `import.rs`/`worker.rs` versions
-     carry live defects that the fork's #43/#46 fixes on develop
-     correct (§4.2). Merging it would re-import the defects.
+  3. **It also lacks the #43/#46 fixes present at the target.**
+     Its tree, like develop, has no bundle path:
+     `validate_bundle_record` appears 0× on its head (`2c866d5`),
+     versus 6× at the target. Even as a partial vehicle it would
+     arrive without the upstream bundle-gate and
+     sign-after-preservation fixes (upstream PRs #53/#51) that
+     the target carries (§4.2).
 - **Its branch:** the resolution **recommends** retiring
   `merge/main-into-develop-1bfc129` — and executes nothing. Branch
   deletion follows Pratik's standing deletion rule: he names the
@@ -326,14 +380,35 @@ Install step (also in the hook's header comment):
 bash scripts/install-hooks.sh
 ```
 
-**Known limitation, recorded honestly:** git rewrites a remote
-URL through `url.<base>.insteadOf` config *before* invoking
-`pre-push`, and the hook sees the rewritten URL (verified in
-test 2c below). An `insteadOf` rule that rewrote an upstream URL
-to a local path would therefore bypass the guard. No such rule
-exists in this clone's config at writing time; the guard covers
-the configured-remote surface, which is the accidental-push risk
-it exists for.
+**Known limitations, recorded honestly:** (1) git rewrites a
+remote URL through `url.<base>.insteadOf` config *before*
+invoking `pre-push`, and the hook sees the rewritten URL
+(verified in test 2c below). An `insteadOf` rule that rewrote an
+upstream URL to a local path would therefore bypass the guard.
+No such rule exists in this clone's config at writing time; the
+guard covers the configured-remote surface, which is the
+accidental-push risk it exists for. (2) *Review residuals —
+unnormalized URL forms:* the guard normalizes case, scheme,
+userinfo, scp form, trailing slash and one trailing `.git` —
+and nothing else. Fed literally, these forms are **not**
+normalized and the guard passes them (exit 0, re-verified in the
+correction session): percent-encoded characters in the path
+(`%43ognilogical/…`, `Cognilogical%2FNeuroStrata`), a mid-path
+dot segment (`Cognilogical/./NeuroStrata`), a double `.git`
+suffix (`NeuroStrata.git.git`), a query string
+(`NeuroStrata.git?query=1`), and an extra path suffix
+(`NeuroStrata/extra`, `NeuroStrata.git/extra`). (A dot segment
+placed *before* the owner — `github.com/./Cognilogical/…` — is
+still rejected, incidentally, because the normalized path keeps
+the matching suffix; the residual is the mid-path forms.) These
+residuals are assessed **safe in practice**: none of them is a
+valid GitHub push endpoint for this repository as written —
+reaching upstream through one requires deliberately crafting
+the URL *and* a transport/server that normalizes it back into
+the real path — and the disclosed `insteadOf` bypass in (1) is
+strictly stronger than all of them. They are recorded here so
+the guard's exact surface is known; the hook is deliberately
+not extended to chase them.
 
 **Tests run at writing time (2026-11-07), and their actual
 outputs.** No test ever configured a remote pointing at the real
