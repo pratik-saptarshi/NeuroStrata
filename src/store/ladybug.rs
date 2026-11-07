@@ -5974,15 +5974,6 @@ impl VectorStore for LadybugStore {
 
                 conn.query(&insert_query)?;
             }
-            let insert_query = format!(
-                "MERGE (m:Memory {{id: '{}'}})
-                 ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-                 ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
-                safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-                safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
-            );
-
-            conn.query(&insert_query)?;
 
             // Emit shape warnings after successful row write.
             for w in &shape_warnings {
