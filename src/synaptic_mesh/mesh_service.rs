@@ -930,6 +930,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn init_mesh_refuses_a_second_pointer_and_preserves_the_first() {
+        let base = scratch("idem-base");
+        let project = scratch("idem-proj");
+        let mut svc = MeshService::new(project.clone());
+        let first = svc
+            .init_mesh(&base, "node-idem", "first-team", &[], None).await
+            .expect("first init");
+        let (p_id, p_dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer readable")
+            .expect("pointer written after first init");
+
+        let second = svc.init_mesh(&base, "node-idem", "second-team", &[], None).await;
+        let err = second.expect_err("second init MUST refuse — one mesh per project");
+        assert!(
+            err.contains("one mesh per project"),
+            "the refusal carries the contract: {err}"
+        );
+        assert!(
+            err.contains(&first),
+            "the refusal names the first mesh id: {err}"
+        );
+
+        // The refusal overwrote nothing: the first pointer survives verbatim.
+        let (id, dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer still readable")
+            .expect("pointer preserved");
+        assert_eq!(id, p_id, "first mesh id preserved");
+        assert_eq!(dir, p_dir, "first mesh dir preserved");
+        assert_eq!(id, first);
+    }
+
+    /// The other half of the init contract: omitted `namespace` defaults to
+    /// the current project's own namespace — the mesh is created sharing the
+    /// project's namespace, never nothing.
+    #[tokio::test]
+    async fn init_mesh_with_no_namespaces_defaults_to_the_project_namespace() {
+        let base = scratch("nsdef-base");
+        let project = scratch("nsdef-proj");
+        let mut svc = MeshService::new(project.clone());
+        svc.init_mesh(&base, "node-nsdef", "nsdef-team", &[], None).await
+            .expect("init");
+        let expected_ns = project
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("scratch dir name")
+            .to_string();
+        let storage = svc.joined().expect("mesh joined");
+        assert_eq!(
+            storage.manifest().namespaces,
+            &[expected_ns],
+            "omitted namespace = the current project namespace: {:?}",
+            storage.manifest().namespaces
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_service_finds_mesh_through_pointer() {
         let base = scratch("base2");
         let project = scratch("proj2");
