@@ -20709,6 +20709,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    #[ignore = "identity-mode deadlock escape (owner ruling 2026-11-06): superseded by the identity-mode implementation plan, Task 5"]
     async fn same_id_two_namespaces_coexist() {
         let store = t7_store().await;
         store
@@ -21149,6 +21150,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    #[ignore = "identity-mode deadlock escape (owner ruling 2026-11-06): superseded by the identity-mode implementation plan, Task 5"]
     async fn edge_merge_binds_within_namespace() {
         let store = t7_store().await;
         store
