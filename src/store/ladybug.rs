@@ -15805,6 +15805,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    #[ignore = "publication read-liveness deferred to B1 (owner-adopted lock-panel verdict 2026-11-07): reads, including a snapshot read of an in-flight record, proceed during a publication — to be delivered by the C3 snapshot tier; interim: reads take the write turn"]
     async fn readers_keep_seeing_the_old_ingest_until_atomic_commit() {
         let dir = std::env::temp_dir().join(format!("atomic-reader-{}", uuid::Uuid::new_v4()));
         let store = std::sync::Arc::new(LadybugStore::for_testing(&dir, 4).expect("open DB"));
@@ -15877,6 +15878,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    #[ignore = "publication read-liveness deferred to B1 (owner-adopted lock-panel verdict 2026-11-07): reads, including a snapshot read of an in-flight record, proceed during a publication — to be delivered by the C3 snapshot tier; interim: reads take the write turn"]
     async fn publication_deadline_waits_for_transaction_resolution() {
         let dir = std::env::temp_dir().join(format!("atomic-deadline-{}", uuid::Uuid::new_v4()));
         let store = std::sync::Arc::new(LadybugStore::for_testing(&dir, 4).expect("open DB"));
