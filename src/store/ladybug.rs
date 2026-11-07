@@ -6313,12 +6313,15 @@ impl VectorStore for LadybugStore {
                 // interpolates — it is a validated identifier
                 // (is_valid_relation_name above), never free text. In
                 // legacy mode the (id, namespace) property MATCH over
-                // escaped literals is kept.
+                // escaped literals is kept. Either way the edge carries
+                // the provenance stamp (source / valid_from / generation /
+                // extractor / evidence_id), on create and on match.
+                let evidence_id_safe = escape_ladybug_string(&evidence_id);
                 let edge_result: Result<()> = (|| {
                     if pk_ready {
                         let edge_query = format!(
-                            "MATCH (a:Memory {{pk: $apk}}), (b:Memory {{pk: $bpk}}) MERGE (a)-[:{}]->(b)",
-                            edge.rel_type
+                            "MATCH (a:Memory {{pk: $apk}}), (b:Memory {{pk: $bpk}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.evidence_id = '{}' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert', r.evidence_id = '{}'",
+                            edge.rel_type, safe_ns, edge_now, evidence_id_safe, safe_ns, edge_now, evidence_id_safe
                         );
                         let mut stmt = conn.prepare(&edge_query)?;
                         conn.execute(
@@ -6336,30 +6339,18 @@ impl VectorStore for LadybugStore {
                         )?;
                     } else {
                         let edge_query = format!(
-                            "MATCH (a:Memory {{id: '{}', namespace: '{}'}}), (b:Memory {{id: '{}', namespace: '{}'}}) MERGE (a)-[:{}]->(b)",
+                            "MATCH (a:Memory {{id: '{}', namespace: '{}'}}), (b:Memory {{id: '{}', namespace: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.evidence_id = '{}' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert', r.evidence_id = '{}'",
                             escape_ladybug_string(from_pair.0),
                             escape_ladybug_string(from_pair.1),
                             escape_ladybug_string(to_pair.0),
                             escape_ladybug_string(to_pair.1),
-                            edge.rel_type
+                            edge.rel_type, safe_ns, edge_now, evidence_id_safe, safe_ns, edge_now, evidence_id_safe
                         );
                         conn.query(&edge_query)?;
                     }
                     Ok(())
                 })();
                 if let Err(e) = edge_result {
-                let target_safe = escape_ladybug_string(&target);
-                let (from, to) = if edge.points_at_target {
-                    (safe_id.as_str(), target_safe.as_str())
-                } else {
-                    (target_safe.as_str(), safe_id.as_str())
-                };
-                let evidence_id_safe = escape_ladybug_string(&evidence_id);
-                let edge_query = format!(
-                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.evidence_id = '{}' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert', r.evidence_id = '{}'",
-                    from, to, edge.rel_type, safe_ns, edge_now, evidence_id_safe, safe_ns, edge_now, evidence_id_safe
-                );
-                if let Err(e) = conn.query(&edge_query) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
                         rel_type: edge.rel_type.to_string(),
                         declared_target: edge.target_id.clone(),
@@ -6373,7 +6364,6 @@ impl VectorStore for LadybugStore {
                     });
                     eprintln!("[neurostrata:write-shape] edge query error: {}", e);
                 }
-            }
             }
 
             // F6: stamp edge_sources provenance on the declaring row's metadata.
