@@ -7763,6 +7763,7 @@ impl VectorStore for LadybugStore {
                         wanted.entry(edge.rel_type).or_default().push(pair);
                     }
                 }
+                let active_gen = active_generation_of(conn, &namespace);
                 let mut created = 0;
                 for (rel_type, pairs) in &wanted {
                     created += create_missing_edges(
@@ -7770,9 +7771,7 @@ impl VectorStore for LadybugStore {
                         rel_type,
                         pairs,
                         &namespace,
-                        generation
-                            .parse::<u64>()
-                            .map_err(|e| anyhow::anyhow!("invalid staged generation number: {}", e))?,
+                        active_gen,
                         chrono::Utc::now().timestamp(),
                         "relink",
                     )?;
