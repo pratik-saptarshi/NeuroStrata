@@ -33,9 +33,6 @@ impl LearningRecorder {
         let month = chrono::Local::now().format("%Y%m").to_string();
         let path = self.root.join(format!("observations-{}.jsonl", month));
         let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(value)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
         // One write_all of line+newline: two separate writes can interleave
         // with a concurrent appender and split the JSONL record.
         let mut buf = serde_json::to_vec(value)?;
