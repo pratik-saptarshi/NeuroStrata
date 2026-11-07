@@ -7299,9 +7299,37 @@ impl VectorStore for LadybugStore {
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        // Cleared first: a write that lands while the engine is flushing must
-        // survive, and clearing afterwards would drop its mark.
-        let had_writes = self.dirty.take();
+        // Develop's coordination structure, under the merged tree's turn
+        // discipline (lock-panel verdict §6): the snapshot turn is taken
+        // first and owned by a blocking worker together with the
+        // cross-process writer lock, so aborting this future cannot
+        // release the snapshot exclusion while the operation is parked or
+        // in flight; the dirty flag is taken only after the locks, so a
+        // write that lands during the checkpoint marks it again. The
+        // cross-process lock is released when the worker returns, before
+        // the flush: the flush rides `with_conn` (the write turn), and a
+        // write queued behind this checkpoint holds that turn while it
+        // waits on the cross-process lock -- holding the lock across the
+        // flush would circular-wait. The CHECKPOINT statement itself
+        // executes inside the turn, via `with_conn`, like every other
+        // engine entry in this tree.
+        let snapshot_turn = self.snapshot_lock.clone().lock_owned().await;
+        let source = self.local_path.clone();
+        let dirty = self.dirty.clone();
+        let (snapshot_turn, had_writes) = tokio::task::spawn_blocking(
+            move || -> Result<(tokio::sync::OwnedMutexGuard<()>, bool)> {
+                let _cross_process_writer = acquire_database_writer_lock(&source)?;
+                // Clear after obtaining the cross-process writer lock. Any
+                // write that lands after the checkpoint marks dirty again.
+                let had_writes = dirty.take();
+                #[cfg(test)]
+                test_snapshot_operation_barrier(&source, "checkpoint");
+                Ok((snapshot_turn, had_writes))
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("checkpoint worker failed: {}", error))??;
+        let _snapshot_turn = snapshot_turn;
 
         // The duration and success of every real checkpoint is recorded so
         // `compute_storage_status` reports actual hygiene, not constants.
