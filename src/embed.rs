@@ -1496,6 +1496,18 @@ impl Embedder for RemoteEmbedder {
     fn embedder_id(&self) -> &str {
         &self.model_name
     }
+
+    fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "openai-compatible".into(),
+            model: self.api_model.clone(),
+            revision: "unknown".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
 }
 
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
