@@ -593,7 +593,7 @@ pub async fn handle_task_create(
         }
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = crate::domain::validate_namespace(&namespace) {
         return e;
     }
 
