@@ -305,7 +305,12 @@ impl SecretScanner {
 
     fn scan_value_inner(&self, value: &Value, location: &str, depth: usize) -> Option<Rejection> {
         if depth > MAX_DEPTH {
-            return None;
+            // Fail closed: a deep structure we cannot fully scan is rejected,
+            // not silently passed.
+            return Some(Rejection {
+                location: location.to_string(),
+                category: "max_depth_exceeded",
+            });
         }
         match value {
             Value::String(s) => self.scan_inner(s, location),
