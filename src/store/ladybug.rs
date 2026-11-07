@@ -3358,6 +3358,7 @@ impl LadybugStore {
     {
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
+            let hold_started = std::time::Instant::now();
             // The engine runs here, on a blocking-pool thread, and a fault
             // in it is the crash this daemon is known for. The crash handler
             // needs an alternate signal stack bigger than the one the
@@ -3376,6 +3377,7 @@ impl LadybugStore {
                 f(&conn)
             })();
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_write_turn_hold(hold_started.elapsed());
             (turn, outcome)
         })
         .await
@@ -3436,6 +3438,7 @@ impl LadybugStore {
         } else {
             None
         };
+        let hold_started = turn.is_some().then(std::time::Instant::now);
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -3452,6 +3455,9 @@ impl LadybugStore {
             // deadline drops, and the whole question is whether the work
             // outlives the caller that stopped waiting for it.
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(started) = hold_started {
+                note_write_turn_hold(started.elapsed());
+            }
             outcome
         })
         .await
@@ -10693,6 +10699,38 @@ pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 =
 pub static WRITES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Times the engine refused a second write transaction.
 pub static WRITE_COLLISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times a single write-turn hold ran past `WRITE_TURN_HOLD_WARN_THRESHOLD`.
+pub static WRITE_TURN_LONG_HOLDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The longest single write-turn hold observed, in milliseconds.
+pub static WRITE_TURN_LONGEST_HOLD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A write-turn hold longer than this is surfaced rather than silent.
+/// Healthy engine calls clear in milliseconds and the ordinary write
+/// deadline is 30s (`write_timeout`), so five seconds sits orders of
+/// magnitude above a healthy hold and well below the point where queued
+/// callers start timing out: an operator sees the wedge while it is still
+/// forming, not after it has become the daemon that looks dead while it is
+/// still listening (bead neurostrata-3fi.6). A large publication can
+/// legitimately cross it; the signal is a diagnostic, not an error.
+const WRITE_TURN_HOLD_WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Record one completed write-turn hold; surface it if it ran long.
+fn note_write_turn_hold(held: std::time::Duration) {
+    if held < WRITE_TURN_HOLD_WARN_THRESHOLD {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    WRITE_TURN_LONG_HOLDS.fetch_add(1, Relaxed);
+    WRITE_TURN_LONGEST_HOLD_MS.fetch_max(held.as_millis() as u64, Relaxed);
+    tracing::warn!(
+        "write turn held for {}ms (warn threshold {}ms): reads and writes queue behind it -- engine: {}",
+        held.as_millis(),
+        WRITE_TURN_HOLD_WARN_THRESHOLD.as_millis(),
+        engine_stats()
+    );
+}
 
 /// How many engine calls are inside lbug right now.
 pub fn engine_in_flight() -> u64 {
@@ -10705,12 +10743,14 @@ pub fn engine_in_flight() -> u64 {
 pub fn engine_stats() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     format!(
-        "{} in flight ({} started, {} finished), {} abandoned, {} collisions",
+        "{} in flight ({} started, {} finished), {} abandoned, {} collisions, {} long turn holds (longest {}ms)",
         engine_in_flight(),
         ENGINE_CALLS_STARTED.load(Relaxed),
         ENGINE_CALLS_FINISHED.load(Relaxed),
         WRITES_ABANDONED.load(Relaxed),
-        WRITE_COLLISIONS.load(Relaxed)
+        WRITE_COLLISIONS.load(Relaxed),
+        WRITE_TURN_LONG_HOLDS.load(Relaxed),
+        WRITE_TURN_LONGEST_HOLD_MS.load(Relaxed)
     )
 }
 
