@@ -764,6 +764,7 @@ mod ensure_ready_tests {
         }
     }
 
+    #[tokio::test]
     async fn learning_runtime_manager_ensure_ready_ready_when_model_onnx_present() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join(".cache").join("laya");
@@ -779,6 +780,7 @@ mod ensure_ready_tests {
         );
     }
 
+    #[tokio::test]
     async fn learning_runtime_manager_ensure_ready_ready_when_trainer_binary_present() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("laya-train"), b"#!/bin/sh\n").unwrap();

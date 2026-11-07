@@ -89,6 +89,7 @@ impl Default for TemperatureFitter {
 mod tests {
     use super::*;
 
+    #[test]
     fn test_cand_pairs() {
         let fitter = TemperatureFitter::new();
         let t = fitter.fit(&[(0.8, true), (0.2, false)]).expect("fit failed");
