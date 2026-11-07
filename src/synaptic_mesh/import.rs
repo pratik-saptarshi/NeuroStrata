@@ -860,6 +860,13 @@ fn validate_parsed_record(
             record.schema_version, MESH_RECORD_SCHEMA_VERSION
         ));
     }
+    // Namespace legality is the shared validator's call (DR-1, Task 8) —
+    // beside, not instead of, the served-namespace parity check below: a
+    // peer's namespace must be a legal name before it matters whether this
+    // node serves it.
+    if let Err(e) = crate::domain::validate_namespace(&record.namespace) {
+        return Err(e);
+    }
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
