@@ -109,8 +109,7 @@ pub async fn handle_synaptic_mesh_command(
                 name,
                 namespace,
                 remote.as_deref(),
-            )
-            .await,
+            ).await,
             |mesh_id| format!("mesh created: {mesh_id} — joined this project"),
         ),
         // `open_mesh` owns the whole adoption: it opens the repo AND writes
@@ -309,6 +308,7 @@ mod tests {
         }
     }
 
+
     /// The storage layer's own phrasing of "nothing is joined here". It must
     /// NOT equal the CLI's canonical message — the collapse is the contract.
     fn no_mesh_err() -> String {
@@ -350,6 +350,7 @@ mod tests {
             "no push attempted"
         );
     }
+
 
     #[tokio::test]
     async fn sync_enqueue_renders_push_failure_as_one_blocking_free_line() {

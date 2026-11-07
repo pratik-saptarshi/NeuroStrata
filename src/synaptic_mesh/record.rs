@@ -17,6 +17,19 @@ use uuid::Uuid;
 /// On-disk schema version. Bumping is a breaking change for older daemons.
 pub const MESH_RECORD_SCHEMA_VERSION: &str = "synaptic-mesh-record/v1";
 
+/// Optional RDF projection block for a mesh record (canonical N-Quads).
+///
+/// Per spec §5.2g: `RdfBlock { schema, format, canonical_hash, quads }`.
+/// `schema` = "neurostrata-rdf-record/v1", `format` = "n-quads",
+/// `canonical_hash` = "sha256:<hex>", `quads` = canonical N-Quads text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RdfBlock {
+    pub schema: String,
+    pub format: String,
+    pub canonical_hash: String,
+    pub quads: String,
+}
+
 /// A single mesh record (memory or procedure).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshRecord {
@@ -36,6 +49,10 @@ pub struct MeshRecord {
     /// Per-record metadata. `eligibility` and `trust` are the gate fields
     /// the mesh-worker consults at publish time.
     pub metadata: serde_json::Value,
+    /// Optional RDF projection (canonical N-Quads + SHA-256). None for
+    /// records that have not been projected yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdf: Option<RdfBlock>,
     pub relationships: Vec<Relationship>,
     /// Monotonic per-record id. Bumps on every accepted change. The pull
     /// diff uses `(id, update_id)` as the identity tuple; a record at the
@@ -49,6 +66,25 @@ pub struct MeshRecord {
     pub origin_mesh_epoch: u32,
     /// Local trust flag. Mirrors the spec's trust model.
     pub trust: super::manifest::Trust,
+    /// Optional Ed25519 signature.
+    ///
+    /// Records signed by current code carry a signature over the
+    /// canonical-JSON payload — the whole record (see `sign_record` in
+    /// `worker.rs`). Records signed by older code may carry a signature
+    /// over the RDF payload (canonical N-Quads + update_id +
+    /// origin_mesh_epoch) instead, which import verifies as RDF-only
+    /// (see `verify_record_signature` in `import.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Optional DID of the signing node (`did:key:z6Mk...` or `did:neurostrata:node:<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_did: Option<String>,
+    /// Optional hex-encoded 32-byte Ed25519 public key (`64` lowercase hex chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Optional streaming RDF delta patch (`neurostrata-rdf-patch/v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<crate::streaming::Stream>,
 }
 
 /// Lifecycle state and provenance for a mesh record.
@@ -167,10 +203,16 @@ mod tests {
             },
             content: serde_json::json!({"text": "fixture"}),
             metadata: serde_json::json!({"eligibility": "shareable"}),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::nil(),
             origin_mesh_epoch: 1,
             trust: super::super::manifest::Trust::Trusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         }
     }
 

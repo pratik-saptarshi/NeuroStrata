@@ -3,6 +3,7 @@
 **Date:** 2026-10-18
 **Status:** Draft for owner review; this document does not authorize
 implementation by itself.
+> Status: APPROVED & implemented (v1.14.3) — see src/source_context.rs.
 **Scope:** NeuroStrata Core anchor-root configuration and stable graph export
 for every client. No project-specific gate or memory repair.
 

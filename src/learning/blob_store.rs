@@ -21,6 +21,7 @@ impl BlobStore {
 
     pub fn put(&self, payload: &MemoryPayload) -> Result<PayloadHash> {
         use std::io::Write;
+        
         // SHA-256 of the content string
         let mut hasher = sha2::Sha256::default();
         hasher.update(payload.content.as_bytes());
@@ -29,6 +30,11 @@ impl BlobStore {
         lock_or_err(&self.cache)?.insert(id.clone(), payload.content.as_bytes().to_vec());
         eprintln!("BlobStore: stored hash {}", id.0);
         Ok(id)
+    }
+
+    /// Returns the cached payload bytes for a previously stored hash.
+    pub fn get(&self, hash: &PayloadHash) -> Option<Vec<u8>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).get(hash).cloned()
     }
 }
 
@@ -54,6 +60,17 @@ mod tests {
         let hash2 = store.put(&payload).expect("hash 2");
         assert_eq!(hash1, hash2, "same payload should reuse blob");
         assert!(hash1.0.starts_with("sha256:"));
+        // get() must return the cached payload bytes (poison-tolerant lock).
+        assert_eq!(
+            store.get(&hash1).as_deref(),
+            Some(payload.content.as_bytes()),
+            "get must return cached payload for a stored hash"
+        );
+        assert_eq!(
+            store.get(&PayloadHash("sha256:absent".to_string())),
+            None,
+            "get must return None for an unknown hash"
+        );
     }
 
     #[test]

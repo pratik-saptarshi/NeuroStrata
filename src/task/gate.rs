@@ -14,7 +14,7 @@
 use crate::task::machine::Status;
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 /// A blocking rule break: exactly the shape POST /tasks/gate returns.
@@ -46,6 +46,11 @@ pub struct Counts {
     /// Task rows the gate did not judge because they are retired history.
     /// Counted separately so the report never looks self-contradictory:
     /// `in_progress` may exceed the number of `in_progress` violations.
+    /// Every retired row still carries its underlying status bucket, so it is
+    /// also counted in `open`/`in_progress`/`blocked`/`done`; `retired` exists
+    /// so the report can disclose how much of those buckets is dead history
+    /// (`in_progress` may exceed the number of `in_progress` violations
+    /// without being self-contradictory).
     pub retired: usize,
 }
 
@@ -127,13 +132,12 @@ const MAX_CHAIN: usize = 32;
 
 /// The rows a row replaced, as ids. `supersedes` is written as one id, but a
 /// hand-edited row may carry a list, and a list is read as a list.
-fn superseded_ids(metadata: &Value) -> Vec<String> {
+/// The rows a row replaced, as borrowed ids. `supersedes` is written as one
+/// id, but a hand-edited row may carry a list, and a list is read as a list.
+pub(crate) fn superseded_ids<'a>(metadata: &'a Value) -> Vec<&'a str> {
     match metadata.get("supersedes") {
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str()).collect(),
         _ => Vec::new(),
     }
 }
@@ -173,28 +177,35 @@ pub(crate) fn live_successor<'a>(
 /// The ids one unit of work passed through: the row's own id, then the rows
 /// it replaced, then theirs.
 ///
-/// A lesson belongs to the work, not to one row id: the row that replaced a
-/// finished task is the same work under a new id, so the lesson extracted
-/// from the old id is its lesson too.
+/// The walk is a breadth-first traversal, not a single chain: `supersedes`
+/// may name several ids (a row that split its replaced work among successors),
+/// and every branch of the lineage is still the same work. Bounded and
+/// cycle-safe, because a loop in the lineage is data, not a hang.
 pub(crate) fn work_lineage(memories: &[SearchResult], id: &str) -> Vec<String> {
     let mut lineage: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut current = id.to_string();
+    // Borrowing ids: the queue holds references into `memories`, so visiting a
+    // node never clones its supersession list.
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    queue.push_back(id);
     while lineage.len() < MAX_CHAIN {
-        if !seen.insert(current.clone()) {
+        let Some(current) = queue.pop_front() else {
             break;
+        };
+        if !seen.insert(current.to_string()) {
+            continue;
         }
-        lineage.push(current.clone());
+        lineage.push(current.to_string());
         let Some(row) = memories.iter().find(|m| m.id == current) else {
-            break;
+            continue;
         };
-        let Some(next) = superseded_ids(&row.payload.metadata).into_iter().next() else {
-            break;
-        };
-        current = next;
+        for next in superseded_ids(&row.payload.metadata) {
+            queue.push_back(next);
+        }
     }
     lineage
 }
+
 
 /// Whether a live lesson discharges the given task: some row declares
 /// `metadata.extracted_from: ["<task id>"]`, where the task id is any id in
@@ -262,17 +273,25 @@ pub fn task_status(result: &SearchResult) -> Status {
 pub(crate) fn age_secs(meta: Option<&Value>, keys: &[&str], now: i64) -> Option<i64> {
     let meta = meta?;
     for key in keys {
-        if let Some(stamp) = meta
-            .get(key)
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|d| d.timestamp())
-        {
-            return Some(now - stamp);
+        let Some(s) = meta.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if s.is_empty() {
+            continue;
+        }
+        match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(stamp) => return Some(now - stamp.timestamp()),
+            // Silence is how a corrupt timestamp hides forever: a stamped
+            // clock that cannot be parsed is logged, then the next key is
+            // tried (a task with one bad and one good stamp still ages).
+            Err(_) => {
+                tracing::warn!("malformed RFC3339 timestamp '{}' in key '{}'", s, key);
+            }
         }
     }
     None
 }
+
 
 /// The whole gate: three blocking rules plus the advisory staleness list.
 pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
@@ -405,7 +424,8 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                 ),
             });
         }
-        if let Some(enf) = rule.get("enforcement").and_then(|e| e.as_str()) {
+        let enf = rule.get("enforcement").and_then(|e| e.as_str());
+        if let Some(enf) = enf {
             if !matches!(enf, "ENFORCED" | "PARTIAL" | "NOT_ENFORCED") {
                 report.violations.push(Violation {
                     id: row.id.clone(),
@@ -418,58 +438,102 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                 continue;
             }
         }
-        if let Some(enf) = rule.get("enforcement").and_then(|e| e.as_str()) {
-            match enf {
-                "ENFORCED" => {}
-                "PARTIAL" => {
-                    let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
-                    if guard.is_empty() || !known.contains(&guard) {
-                        report.violations.push(Violation {
-                            id: row.id.clone(),
-                            kind: "partial_without_guard",
-                            detail: format!(
-                                "rule '{}' claims PARTIAL but names no real guard.",
-                                content_short(&row.payload.content)
-                            ),
-                        });
-                        continue;
-                    }
-                }
-                "NOT_ENFORCED" => {
-                    let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
-                    if !guard.is_empty() {
-                        report.violations.push(Violation {
-                            id: row.id.clone(),
-                            kind: "not_enforced_with_guard",
-                            detail: format!(
-                                "rule '{}' claims NOT_ENFORCED but names a guard.",
-                                content_short(&row.payload.content)
-                            ),
-                        });
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if rule.get("enforcement").and_then(|e| e.as_str()) != Some("ENFORCED") {
-            continue;
-        }
+        // One enforcement decision per rule: the value is parsed once above,
+        // and exactly one arm below judges it.
         let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
-        if guard.is_empty() || !known.contains(&guard) {
-            report.violations.push(Violation {
-                id: row.id.clone(),
-                kind: "rule_overclaims_enforcement",
-                detail: format!(
-                    "rule '{}' claims ENFORCED but names no real guard; set enforcement honestly (PARTIAL/NOT_ENFORCED) or name an existing wire id in metadata.guard.",
-                    content_short(&row.payload.content)
-                ),
-            });
+        match enf {
+            Some("ENFORCED") => {
+                if guard.is_empty() || !known.contains(&guard) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "rule_overclaims_enforcement",
+                        detail: format!(
+                            "rule '{}' claims ENFORCED but names no real guard; set enforcement honestly (PARTIAL/NOT_ENFORCED) or name an existing wire id in metadata.guard.",
+                            content_short(&row.payload.content)
+                        ),
+                    });
+                    continue;
+                }
+                // A reminder wire never blocks anything: it is advice that
+                // fires on a trigger, not a machine. Citing one behind an
+                // ENFORCED claim is the same overclaim as citing a
+                // non-blocking automatic wire.
+                if crate::task::wiring::is_reminder_wire(guard) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "enforced_rule_advisory_guard",
+                        detail: format!(
+                            "rule '{}' claims ENFORCED but its guard '{}' is a REMINDER_WIRES reminder, which surfaces advice and never blocks. An ENFORCED rule must cite an AUTOMATIC_WIRES guard that hard-fails, or set enforcement honestly (PARTIAL/NOT_ENFORCED).",
+                            content_short(&row.payload.content), guard
+                        ),
+                    });
+                    continue;
+                }
+                // An automatic wire the rule cites must actually hard-fail:
+                // an advisory wire (`blocks == false`) warns and moves on, so
+                // it is a note behind an ENFORCED claim, not a machine.
+                if crate::task::wiring::is_automatic_wire(guard)
+                    && !crate::task::wiring::is_blocking_automatic_wire(guard)
+                {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "enforced_rule_advisory_guard",
+                        detail: format!(
+                            "rule '{}' claims ENFORCED but its guard '{}' is an advisory (non-blocking) wire; an ENFORCED rule cannot cite a wire that does not hard-fail as its sole guard. Name a blocking wire id, or set enforcement honestly (PARTIAL/NOT_ENFORCED).",
+                            content_short(&row.payload.content), guard
+                        ),
+                    });
+                }
+            }
+            Some("PARTIAL") => {
+                if guard.is_empty() || !known.contains(&guard) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "partial_without_guard",
+                        detail: format!(
+                            "rule '{}' claims PARTIAL but names no real guard.",
+                            content_short(&row.payload.content)
+                        ),
+                    });
+                }
+            }
+            Some("NOT_ENFORCED") => {
+                if !guard.is_empty() {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "not_enforced_with_guard",
+                        detail: format!(
+                            "rule '{}' claims NOT_ENFORCED but names a guard.",
+                            content_short(&row.payload.content)
+                        ),
+                    });
+                }
+            }
+            // Impossible at runtime (invalid values `continue` above) but the
+            // exhaustiveness checker cannot see that for `&str` literals.
+            Some(_) => {}
+            // A rule that names a machine without claiming enforcement has
+            // a wire with its power unassigned: nothing runs the guard.
+            None => {
+                // A rule that names a machine without claiming enforcement has
+                // a wire with its power unassigned: nothing runs the guard.
+                if !guard.trim().is_empty() {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "rule_guard_without_enforcement",
+                        detail: format!(
+                            "rule '{}' names metadata.guard '{}' but declares no enforcement value; a rule with a guard must also declare enforcement (\"ENFORCED\" or \"PARTIAL\"), or drop the guard.",
+                            content_short(&row.payload.content), guard
+                        ),
+                    });
+                }
+            }
         }
     }
 
     report
 }
+
 
 fn content_short(content: &str) -> String {
     content.chars().take(80).collect()
@@ -833,6 +897,50 @@ mod tests {
         assert!(report.violations.iter().any(|v| v.id == "rule-3"));
         assert!(!report.violations.iter().any(|v| v.id == "rule-2"));
         assert!(!report.violations.iter().any(|v| v.id == "rule-4"));
+    }
+
+    /// A reminder wire is advice, not a machine: an ENFORCED rule may not
+    /// cite one as its guard.
+    #[test]
+    fn an_enforced_rule_cannot_cite_a_reminder_wire_as_its_guard() {
+        let rows = vec![
+            row(
+                "rule-reminder-guard",
+                "rule",
+                "Always claim a task first",
+                json!({
+                    "enforcement": "ENFORCED",
+                    "guard": "task-first",
+                    "source": "owner 2026-10-08"
+                }),
+            ),
+            row(
+                "rule-automatic-guard",
+                "rule",
+                "Always use podman",
+                json!({
+                    "enforcement": "ENFORCED",
+                    "guard": "task-close-lock",
+                    "source": "owner 2026-10-08"
+                }),
+            ),
+        ];
+        let report = evaluate(&rows, NOW);
+        let bad: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "enforced_rule_advisory_guard")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(
+            bad,
+            vec!["rule-reminder-guard"],
+            "an ENFORCED rule citing a REMINDER_WIRES reminder overclaims"
+        );
+        assert!(!report
+            .violations
+            .iter()
+            .any(|v| v.id == "rule-automatic-guard"));
     }
 
     const NOW: i64 = 1_760_000_000;

@@ -84,7 +84,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "ns-mesh-acc-{tag}-{}-{}",
             std::process::id(),
-            Uuid::new_v4()
+            Uuid::now_v7()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -116,7 +116,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!(
             "ns-mesh-acc-db-{label}-{}-{}",
             std::process::id(),
-            Uuid::new_v4()
+            Uuid::now_v7()
         ));
         Arc::new(LadybugStore::for_testing(&db, 4).expect("open temp store"))
     }
@@ -161,7 +161,7 @@ mod tests {
 
     fn entry(op: &str, id: &str, content: &str, metadata: Value, memory_type: &str) -> OutboxEntry {
         OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: op.to_string(),
             id: id.to_string(),
             namespace: NS.to_string(),
@@ -194,8 +194,8 @@ mod tests {
             "team",
             &[NS.to_string()],
             Some(remote.to_str().unwrap()),
-        ).await
-        .unwrap();
+        )
+        .await.unwrap();
         a.commit_all("bootstrap", "node-a").await.unwrap();
         a.push().await.unwrap();
         let branch = git_out(a.root(), &["branch", "--show-current"]);
@@ -246,6 +246,11 @@ mod tests {
         let b_out = Outbox::open(&outbox_dir_for(b.root())).unwrap();
         let m1 = Uuid::new_v4();
         let m2 = Uuid::new_v4();
+        let (a, b) = joined_pair(&base, "disjoint").await;
+        let a_out = Outbox::open(&outbox_dir_for(a.root())).unwrap();
+        let b_out = Outbox::open(&outbox_dir_for(b.root())).unwrap();
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
 
         // A publishes first, and applies its own row to its local store
         // (the daemon's view lives in the sameLadybug store the real
@@ -337,7 +342,7 @@ mod tests {
         let base = scratch("acc-conflict");
         let (a, b) = joined_pair(&base, "conflict").await;
         let a_out = Outbox::open(&outbox_dir_for(a.root())).unwrap();
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
 
         // A publishes the original record.
         let first = entry(
@@ -444,7 +449,7 @@ mod tests {
         let base = scratch("acc-archived");
         let (a, b) = joined_pair(&base, "archived").await;
         let a_out = Outbox::open(&outbox_dir_for(a.root())).unwrap();
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let text = "the staged rollout rule";
 
         // A: create → push; B pulls and accepts.
@@ -561,6 +566,11 @@ mod tests {
         let rule_id = Uuid::new_v4();
         let proc_id = Uuid::new_v4();
         let private_id = Uuid::new_v4();
+        let (a, b) = joined_pair(&base, "recovery").await;
+        let a_out = Outbox::open(&outbox_dir_for(a.root())).unwrap();
+        let rule_id = Uuid::now_v7();
+        let proc_id = Uuid::now_v7();
+        let private_id = Uuid::now_v7();
 
         // A publishes a rule AND a procedure definition (no counters travel).
         let rule = entry(
@@ -585,6 +595,11 @@ mod tests {
             }),
             "procedure",
         );
+        publish(&a, &a_out, "node-a", proc.clone()).await;
+
+        // B accepts both, and holds one PRIVATE row (no provenance —
+        // someone's local note).
+        b.pull().await.unwrap();
         publish(&a, &a_out, "node-a", proc).await;
 
         // B accepts both, and holds one PRIVATE row (no provenance —
@@ -622,7 +637,7 @@ mod tests {
         // concurrent conflict (the merge table pins that; import.rs owns
         // those rows) — the recovery pass here proves the survival side,
         // not the conflict side.
-        let fresh_id = Uuid::new_v4();
+        let fresh_id = Uuid::now_v7();
         let added = entry(
             OP_CREATED,
             &fresh_id.to_string(),
@@ -736,8 +751,8 @@ mod tests {
         let base = scratch("acc-old-epoch");
         let (a, b) = joined_pair(&base, "old-epoch").await;
         let b_out = Outbox::open(&outbox_dir_for(b.root())).unwrap();
-        let s_id = Uuid::new_v4();
-        let t_id = Uuid::new_v4();
+        let s_id = Uuid::now_v7();
+        let t_id = Uuid::now_v7();
 
         // 1. B publishes S at epoch 1 and pushes; A pulls it.
         let s = entry(

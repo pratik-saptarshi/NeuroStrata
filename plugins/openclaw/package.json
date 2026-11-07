@@ -23,5 +23,36 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  "version": "1.14.3",
+  "description": "NeuroStrata client shim for OpenClaw — Zero-Action Start guard + task-intent nudge",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test.mjs"
+  },
+  "keywords": [
+    "neurostrata",
+    "openclaw",
+    "plugin",
+    "task-tracking",
+    "guard"
+  ],
+  "license": "MIT",
+  "peerDependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   }
 }

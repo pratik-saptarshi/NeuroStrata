@@ -4,7 +4,7 @@ use std::sync::Once;
 
 /// A legacy, process-provided project root scoped to one source identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScopedAnchorOverride {
+pub struct ScopedAnchorOverride {
     pub(crate) source_id: String,
     pub(crate) project_root: PathBuf,
 }
@@ -33,7 +33,7 @@ pub(crate) fn scoped_anchor_override(
     }
 
     Some(ScopedAnchorOverride {
-        source_id: source_id.to_string(),
+        source_id: source_id.trim().to_string(),
         project_root: root.to_path_buf(),
     })
 }
@@ -76,7 +76,7 @@ pub(crate) fn export_absolute_path(
     let source_id = *source_ids.iter().next().expect("one distinct source ID");
 
     let project_root = anchor_override
-        .filter(|anchor| anchor.source_id == source_id)
+        .filter(|anchor| anchor.source_id.trim() == source_id.trim())
         .map(|anchor| anchor.project_root.as_path())
         .or_else(|| {
             let marker = project_contexts.get(source_id)?;

@@ -66,20 +66,43 @@ impl ContextService {
         self.has_graph_read
     }
 
+    /// Build the shell of a plan for a request: scope from the request, no
+    /// items. The degradation is the honest capability report — `Supported`
+    /// only when a graph read is present, `Unsupported` when the service has
+    /// no capabilities — and a request whose egress policy denies is refused
+    /// up front (`Unavailable`, no items), never planned as content.
     pub fn plan<R>(&self, request: R) -> ContextPlan
     where
         R: AsRef<ContextRequest>,
     {
         let req = request.as_ref();
+        // Main: the egress policy travels with the request — enforce it
+        // before any plan is shaped. A denied request produces an empty
+        // denial shell, never implicitly `Supported` or planned content.
+        if let Err(reason) = req.policy.enforce() {
+            tracing::debug!(reason = %reason, "context plan denied by egress policy");
+            let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Unavailable);
+            plan.applied_scope = req.session_id.clone();
+            plan.items = Vec::new();
+            plan.truncation = false;
+            return plan;
+        }
+        // Develop: capability-based degradation.
         let degradation = if self.has_graph_read {
             Degradation::Supported
         } else {
             Degradation::Unsupported
         };
         let mut plan = ContextPlan::new(req.event_id.clone(), degradation);
-        plan.applied_scope = String::new();
+        plan.applied_scope = req.session_id.clone();
         plan.items = Vec::new();
         plan.truncation = false;
+        tracing::trace!(
+            epoch = req.context_epoch,
+            trigger = %req.trigger,
+            repo = %req.source.repo_id,
+            "planned context"
+        );
         plan
     }
 
@@ -112,12 +135,59 @@ impl ContextService {
     pub fn render_plan(plan: impl AsRef<ContextPlan>) -> String {
         Self::render(plan)
     }
+
+    pub fn plan_with_items<R>(
+        &self,
+        request: R,
+        candidates: Vec<super::model::ContextItem>,
+        budget: super::plan::Budget,
+        max_items: usize,
+    ) -> ContextPlan
+    where
+        R: AsRef<ContextRequest>,
+    {
+        let mut plan = self.plan(&request);
+        if request.as_ref().policy.enforce().is_err() {
+            // The egress policy denied this request; keep the denial shell
+            // (empty items, `Unavailable`) instead of upgrading it to
+            // `Supported` — no item may be delivered against refused egress.
+            return plan;
+        }
+        let total = candidates.len();
+        let mut deduped = super::plan::rank_dedup_budget(candidates, budget);
+        if deduped.len() > max_items {
+            deduped.truncate(max_items);
+        }
+        plan.truncation = total > deduped.len();
+        plan.items = deduped;
+        // A non-empty selection is fully supported even when `truncation` is
+        // set: the plan delivered the items it planned, while `truncation`
+        // records (and the debug log below surfaces) that the request was cut
+        // short by dedup, budget or `max_items`. An empty selection is a
+        // degraded plan — nothing survived to deliver.
+        plan.degradation = if !plan.items.is_empty() {
+            Degradation::Supported
+        } else {
+            Degradation::Partial
+        };
+        if plan.truncation {
+            tracing::debug!(
+                planned = total,
+                delivered = plan.items.len(),
+                "context plan truncated: {} of {} candidates delivered",
+                plan.items.len(),
+                total
+            );
+        }
+        plan
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::model::{ContextPlan, ContextRequest, Degradation, EgressPolicy, SourceIdentity};
+    use super::super::model::{ContextItem, ContextRequest, Degradation, EgressPolicy, SourceIdentity};
+    use super::super::plan::Budget;
 
     fn request() -> ContextRequest {
         ContextRequest {
@@ -127,6 +197,15 @@ mod tests {
             trigger: "file_touch".into(),
             source: SourceIdentity::default(),
             policy: EgressPolicy::default(),
+        }
+    }
+
+    fn item(id: &str, content: &str) -> ContextItem {
+        ContextItem {
+            id: id.into(),
+            memory_type: "rule".into(),
+            content: content.into(),
+            freshness: None,
         }
     }
 
@@ -145,6 +224,83 @@ mod tests {
         assert_eq!(plan.degradation, Degradation::Supported);
     }
 
+    /// Merged contract: an empty plan from a service with no capabilities is
+    /// `Unsupported` (the honest capability report), not `Partial`. Main's
+    /// `Partial`-for-empty survives in `plan_with_items`, where an empty
+    /// selection is a degraded-but-observable outcome; `plan()` itself has
+    /// no selection to degrade, so the capability answer governs.
+    #[test]
+    fn plan_degrades_partial_when_empty() {
+        let service = ContextService::new();
+        let plan = service.plan(&request());
+        assert_eq!(plan.degradation, Degradation::Unsupported);
+        assert!(plan.items.is_empty());
+        assert!(!plan.truncation);
+    }
+
+    /// A request whose egress policy denies never produces a deliverable
+    /// plan: `plan` refuses up front (`Unavailable`, no items), and
+    /// `plan_with_items` keeps that denial shell instead of upgrading it to
+    /// `Supported` even when candidates survived.
+    #[test]
+    fn denied_policy_never_yields_deliverable_plan() {
+        let service = ContextService::new();
+        let mut denied = request();
+        denied.policy = EgressPolicy::deny("egress refused");
+        let plan = service.plan(&denied);
+        assert_eq!(plan.degradation, Degradation::Unavailable);
+        assert!(plan.items.is_empty());
+
+        let with_items = service.plan_with_items(
+            &denied,
+            vec![item("i1", "c1")],
+            Budget::from(10_000usize),
+            10,
+        );
+        assert_eq!(with_items.degradation, Degradation::Unavailable);
+        assert!(with_items.items.is_empty());
+    }
+
+    #[test]
+    fn plan_with_items_rank_dedups_by_id_and_content() {
+        let service = ContextService::new();
+        let candidates = vec![
+            item("i1", "c1"),
+            item("i1", "c1-dup-id"),
+            item("i2", "c1"),
+            item("i3", "c3"),
+        ];
+        let plan = service.plan_with_items(&request(), candidates, Budget::from(10_000usize), 10);
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(plan.items[0].id, "i1");
+        assert_eq!(plan.items[1].id, "i3");
+        // Drops by dedup/budget also count toward `truncation` (total input >
+        // output), matching the long-standing contract.
+        assert!(plan.truncation);
+        assert_eq!(plan.degradation, Degradation::Supported);
+    }
+
+    #[test]
+    fn plan_with_items_budgets_out_expensive_items() {
+        let service = ContextService::new();
+        let candidates = vec![item("a", &"x".repeat(1000)), item("b", "tiny")];
+        // item "a" costs 1000/4+8 = 258 tokens > the 30-token budget; "b" fits.
+        let plan = service.plan_with_items(&request(), candidates, Budget::from(30usize), 10);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].id, "b");
+    }
+
+    #[test]
+    fn plan_with_items_truncates_to_max_items() {
+        let service = ContextService::new();
+        let candidates: Vec<ContextItem> = (0..5)
+            .map(|i| item(&format!("i{}", i), &format!("content-{}", i)))
+            .collect();
+        let plan = service.plan_with_items(&request(), candidates, Budget::from(10_000usize), 3);
+        assert_eq!(plan.items.len(), 3);
+        assert!(plan.truncation);
+    }
+
     #[test]
     fn render_works() {
         let plan = ContextPlan::new("evt", Degradation::Unsupported);
@@ -152,3 +308,4 @@ mod tests {
         assert!(text.contains("context-plan"));
     }
 }
+

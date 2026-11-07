@@ -1,4 +1,4 @@
-use crate::config::{DedupProviderMode, DeduplicationConfig};
+use crate::config::{DeduplicationConfig, DedupProviderMode};
 use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
@@ -46,7 +46,10 @@ fn tighten_token_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(metadata) = std::fs::metadata(path) {
         if metadata.permissions().mode() & 0o077 != 0 {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .inspect_err(|e| {
+                    tracing::warn!("failed to tighten token file permissions on {}: {e}", path.display());
+                });
         }
     }
 }
@@ -63,6 +66,9 @@ fn load_or_create_token_file(path: &Path) -> String {
     let token = generate_token();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("failed to create token file directory {}: {e}", dir.display());
+        }
     }
     #[cfg(unix)]
     {
@@ -79,12 +85,18 @@ fn load_or_create_token_file(path: &Path) -> String {
             .and_then(|mut f| f.write_all(token.as_bytes()));
         if created.is_err() {
             let _ = std::fs::write(path, &token);
+            if let Err(e) = std::fs::write(path, &token) {
+                tracing::warn!("failed to write token file {}: {e}", path.display());
+            }
             tighten_token_permissions(path);
         }
     }
     #[cfg(not(unix))]
     {
         let _ = std::fs::write(path, &token);
+        if let Err(e) = std::fs::write(path, &token) {
+            tracing::warn!("failed to write token file {}: {e}", path.display());
+        }
     }
     token
 }
@@ -114,12 +126,21 @@ pub(crate) fn load_or_create_operator_token() -> String {
 /// when no usable token is there. Creation is the daemon's job; clients
 /// only read.
 pub(crate) fn read_token_file(name: &str) -> Option<String> {
-    let content = std::fs::read_to_string(token_config_dir().join(name)).ok()?;
-    let trimmed = content.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
+    match std::fs::read_to_string(token_config_dir().join(name)) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to read daemon token file {}: {e}", name);
+            }
+            None
+        }
     }
 }
 
@@ -152,6 +173,15 @@ fn is_loopback_host(value: &str) -> bool {
         value.split(':').next().unwrap_or(value)
     };
     matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost")
+}
+
+/// Whether an `Origin` header value names this machine. Only a loopback
+/// authority passes: an Origin without a scheme/authority separator (e.g.
+/// `null`) and any non-loopback authority are refused. The scheme itself is
+/// not checked -- the rebinding defense is the hostname, same as Host.
+fn is_allowed_origin(origin: &str) -> bool {
+    let authority = origin.split("://").nth(1).unwrap_or(origin);
+    is_loopback_host(authority)
 }
 
 fn forbidden(body: &'static str) -> axum::response::Response {
@@ -198,22 +228,26 @@ async fn auth_middleware(
     let headers = req.headers();
 
     // Rules 1-2 bind every route, /health included: a rebinding page is
-    // refused before any handler runs.
-    if let Some(host) = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-    {
-        if !is_loopback_host(host) {
-            return forbidden("forbidden -- Host must name loopback");
+    // refused before any handler runs. A header that is not valid UTF-8 is
+    // treated as a foreign host/origin, never silently skipped.
+    if let Some(raw_host) = headers.get(axum::http::header::HOST) {
+        match raw_host.to_str() {
+            Ok(host) => {
+                if !is_loopback_host(host) {
+                    return forbidden("forbidden -- Host must name loopback");
+                }
+            }
+            Err(_) => return forbidden("forbidden -- Host must name loopback"),
         }
     }
-    if let Some(origin) = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-    {
-        let authority = origin.split("://").nth(1).unwrap_or(origin);
-        if !is_loopback_host(authority) {
-            return forbidden("forbidden -- Origin must name loopback");
+    if let Some(raw_origin) = headers.get(axum::http::header::ORIGIN) {
+        match raw_origin.to_str() {
+            Ok(origin) => {
+                if !is_allowed_origin(origin) {
+                    return forbidden("forbidden -- Origin must name loopback");
+                }
+            }
+            Err(_) => return forbidden("forbidden -- Origin must name loopback"),
         }
     }
 
@@ -371,6 +405,11 @@ struct GraphQuery {
     /// Optional, source-scoped compatibility override from the CLI.
     anchor_root: Option<String>,
     source_id: Option<String>,
+    /// CLI `--clear`: flip export-freshness dirty flags to clean before
+    /// exporting, so an operator-confirmed export is not refused by the
+    /// freshness gate.
+    #[serde(default)]
+    pub clear: bool,
 }
 
 pub async fn start_daemon(
@@ -398,7 +437,7 @@ pub async fn start_daemon(
 /// bus when no daemon is running to ask.
 pub(crate) const BUS_CAPACITY: usize = 10_000;
 
-/// Build the daemon's thalamic bus: the bounded queue and the three v1
+/// Build the daemon's thalamic bus: the bounded queue and the four production
 /// subscribers, wired to the store the daemon opened.
 ///
 /// The store is attached *before* any subscriber registers: a registered
@@ -421,6 +460,9 @@ pub(crate) fn build_thalamic_bus(
     bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
     bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
     bus.register(Box::new(GuardEventLog::new(dimensions)));
+    bus.register(Box::new(
+        crate::events::subscribers::PostIngestNormalize::new(),
+    ));
     bus
 }
 
@@ -454,7 +496,7 @@ pub(crate) fn resolve_project_root() -> PathBuf {
     }
 }
 
-/// The caller-path policy (Task 2 re-file / J6): may the daemon act on
+/// The caller-path policy (Task 2 re-file / J6 / `neurostrata-p1ex`): may the daemon act on
 /// this caller-supplied path? Canonicalize-then-check, following the
 /// guard sandbox's pattern: an existing path is judged by its canonical
 /// form (so a symlink planted inside the root that points outside it is
@@ -590,8 +632,8 @@ const MESH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// If the served project is joined to a mesh, register the mesh-outbox
 /// subscriber and spawn the drain loop plus the session-start/periodic pull
 /// triggers. No mesh → nothing is registered, so
-/// the bus stays at its three v1 subscribers (the daemon tests assert exactly
-/// three). The mesh is resolved through the project-side pointer — the same
+/// the bus stays at its four production subscribers (the daemon tests assert
+/// exactly four). The mesh is resolved through the project-side pointer — the same
 /// path `MeshService` uses — so "joined" means the same thing here as at the
 /// CLI. This is the *only* daemon-side touch the mesh publish path needs.
 fn wire_mesh_publish(
@@ -636,10 +678,8 @@ fn wire_mesh_publish(
     let store_for_drain = vector_store.clone();
     tokio::spawn(mesh_drain_loop(project_root.clone(), wake, store_for_drain));
 
-    // Session start (spec §Triggers): ONE best-effort pull + validation on
-    // its own spawned task — never blocking startup and never crashing it.
-    // Each git subprocess inside the pull is capped at the storage funnel's
-    // DR-4 timeout (30 s), so a hung remote cannot wedge the pull forever.
+    // Session start (spec §Triggers): ONE best-effort pull + validation,
+    // never blocking startup beyond a 5s timeout and never crashing it.
     tokio::spawn(session_start_mesh_pull(
         project_root.clone(),
         vector_store.clone(),
@@ -673,20 +713,38 @@ fn wire_mesh_publish(
 /// subcommand, killed on expiry), which is the bound that actually binds;
 /// the pull itself runs on a spawned task, so a slow remote delays only
 /// the pull's own report.
+/// The 5s ceiling spec §Triggers puts on a session-start pull: fail-soft
+/// both over time (timeout) and on outcome (errors logged, never propagated).
+const MESH_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One throttled (≤5s) best-effort pull for the given project: resolves the
+/// pointer, runs the slice-4 import/replay, and reports — errors that would
+/// wedge startup become log lines. Returns the report (or `None` on
+/// timeout) so the caller decides the logging level.
 async fn pull_mesh_once(
     project_root: &Path,
     vector_store: &Arc<dyn VectorStore>,
     embedder: &Arc<dyn Embedder>,
 ) -> Option<String> {
     let arguments = serde_json::json!({ "project_root": project_root.display().to_string() });
-    Some(
+    match tokio::time::timeout(
+        MESH_PULL_TIMEOUT,
         crate::synaptic_mesh::import::handle_mesh_pull(
             &arguments,
             vector_store.clone(),
             embedder.clone(),
-        )
-        .await,
+        ),
     )
+    .await
+    {
+        Ok(report) => Some(report),
+        Err(_) => {
+            tracing::warn!(
+                "mesh pull timed out after 5s; session start is unaffected — try `neurostrata-mcp mesh pull`"
+            );
+            None
+        }
+    }
 }
 
 /// The session-start trigger body: run the throttled pull once and record
@@ -758,6 +816,9 @@ fn auto_pull_interval_for_policy(
 /// through the storage funnel as a timed async subprocess (DR-4), so a hung
 /// git can stall a drain only up to the funnel timeout, never the executor
 /// forever.
+/// entry (the `Notify` edge). A drain is synchronous git + file I/O, so it is
+/// called directly rather than awaited — the mesh repo is tiny and the
+/// interval is seconds, so it never meaningfully blocks the executor.
 async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>, store: Arc<dyn VectorStore>) {
     let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -784,6 +845,14 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
     let mesh_dir = match MeshStorage::read_pointer(project_root) {
         Ok(Some((_mesh_id, dir, _remote))) => dir,
         _ => return,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                "mesh pointer read failed for {}: {e}",
+                project_root.display()
+            );
+            return;
+        }
     };
     let node_id = resolve_node_id();
     let mesh = match MeshStorage::open(&mesh_dir) {
@@ -806,13 +875,15 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
     // R9: source-to-mesh reconciliation — re-emit any shareable memory in the
     // store that has no corresponding mesh record file. Closes the lossy-bus
     // loss window: dropped pulses are re-discovered on the next drain.
-    let _ = crate::events::subscribers::mesh_outbox::MeshOutbox::reconcile(
+    if let Err(e) = crate::events::subscribers::mesh_outbox::MeshOutbox::reconcile(
         store.as_ref(),
         &mesh_dir,
         &outbox,
         &namespaces,
         epoch,
-    ).await;
+    ).await {
+        tracing::warn!("mesh outbox reconcile failed: {e}");
+    }
     match drain_once(&outbox, &mesh, &node_id).await {
         Ok(report) if report.pending_seen > 0 => {
             tracing::debug!(
@@ -825,6 +896,9 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
             );
             for line in &report.quarantined_entries {
                 tracing::warn!(entry = %line, "mesh outbox entry quarantined (old epoch)");
+            }
+            if let Some(err) = &report.bundle_error {
+                tracing::warn!(error = %err, "mesh compressed bundle write failed during drain");
             }
         }
         Ok(_) => {}
@@ -859,7 +933,17 @@ pub(crate) async fn start_daemon_on(
             match DeduplicationChecker::new(config) {
                 Ok(checker) => {
                     tracing::info!("Memory deduplication enabled with judgment model");
-                    Some(Arc::new(checker))
+                    let checker = Arc::new(checker);
+                    // One-shot provider health probe at startup; the result only
+                    // informs the log (baseline write path stays allowed).
+                    tokio::spawn({
+                        let probe = checker.clone();
+                        async move {
+                            let healthy = probe.health_check().await;
+                            tracing::debug!(healthy, "Dedup judgment provider health probe");
+                        }
+                    });
+                    Some(checker)
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize deduplication checker: {}", e);
@@ -949,6 +1033,12 @@ pub(crate) async fn start_daemon_on(
         .route("/cli/read", post(handle_cli_read))
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/bus/metrics", post(handle_bus_metrics))
+        .route("/sparql", post(handle_http_sparql))
+        .route("/graphql", post(handle_http_graphql))
+        .route("/chat/ask", post(handle_http_chat_ask))
+        .route("/storage/status", get(handle_http_storage_status).post(handle_http_storage_status))
+        .route("/learning/status", get(handle_http_learning_status))
+        .route("/learning/control", post(handle_http_learning_control))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -966,6 +1056,15 @@ pub(crate) async fn start_daemon_on(
     // caller still waiting on the response (bead neurostrata-3fi.6.4). Out here
     // a failure costs a retry instead of a request, and the write is already in
     // the log either way.
+    // Read-only hygiene knobs: load without materializing a config file.
+    let hygiene: crate::storage::StorageHygieneConfig = match crate::config::Config::load() {
+        Ok(c) => c.storage_hygiene,
+        Err(e) => {
+            tracing::warn!("periodic hygiene failed to load Config, using default: {e}");
+            Default::default()
+        }
+    };
+
     let periodic_store = vector_store.clone();
     // Stopped before the final checkpoint, not aborted: a checkpoint it has
     // already started runs on a blocking thread that abort cannot reach, and the
@@ -974,6 +1073,7 @@ pub(crate) async fn start_daemon_on(
     let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;
         let mut failures: u32 = 0;
+        let mut wal_warned = false;
 
         loop {
             tokio::select! {
@@ -988,6 +1088,29 @@ pub(crate) async fn start_daemon_on(
 
             match periodic_store.checkpoint().await {
                 Ok(()) => {
+                    // Post-checkpoint hygiene: flush buffered time-series
+                    // metrics into the MemoryMetric table and warn once per
+                    // WAL-growth excursion past the configured threshold.
+                    let ls = crate::traits::VectorStore::as_any(periodic_store.as_ref())
+                        .downcast_ref::<crate::store::LadybugStore>();
+                    if let Some(ls) = ls {
+                        if let Err(e) = ls.flush_metrics().await {
+                            tracing::warn!("periodic flush_metrics failed: {e}");
+                        }
+                        match crate::storage::compute_storage_status(ls.local_path(), &hygiene)
+                        {
+                            status if status.wal_warn_threshold_exceeded => {
+                                if !wal_warned {
+                                    eprintln!(
+                                        "WARNING: the WAL has grown to {} bytes, beyond the configured warn threshold ({}). Checkpoints remove it; growth between checkpoints is what needs watching.",
+                                        status.wal_bytes, hygiene.wal_warn_bytes
+                                    );
+                                    wal_warned = true;
+                                }
+                            }
+                            _ => wal_warned = false,
+                        }
+                    }
                     if failures > 0 {
                         eprintln!(
                             "Checkpoint succeeded after {} failed attempts; those writes are on disk now.",
@@ -1023,6 +1146,7 @@ pub(crate) async fn start_daemon_on(
             if let Ok(mut slot) = recorded_cause.lock() {
                 *slot = why;
             }
+            *recorded_cause.lock().unwrap_or_else(|e| e.into_inner()) = why;
         })
         .await?;
 
@@ -1038,7 +1162,9 @@ pub(crate) async fn start_daemon_on(
     }
 
     let _ = stop_periodic.send(true);
-    let _ = periodic.await;
+    if let Err(e) = periodic.await {
+        tracing::warn!("periodic checkpoint task join error: {e}");
+    }
 
     // The whole point of stopping gracefully: get everything on disk before exit.
     // A checkpoint needs every transaction to drain, and detached work such as
@@ -1090,8 +1216,9 @@ async fn handle_get_graph(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let requested = query.namespace.unwrap_or_else(|| "global".to_string());
     let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
-    let config = crate::config::Config::from_default_path()
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let project_contexts = crate::config::Config::load()
+        .map(|c| c.project_contexts)
+        .unwrap_or_default();
     let anchor_root = query.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, query.source_id.as_deref());
@@ -1100,16 +1227,25 @@ async fn handle_get_graph(
     // For now, let's just use export_graph (which gets everything) and filter by namespace
     // In a real refactor, we would add get_graph_by_namespace to VectorStore.
     // Wait! VectorStore has export_graph() returning the whole graph!
+    if query.clear {
+        if let Err(e) = crate::events::clear_export_freshness(state.vector_store.as_ref()).await {
+            eprintln!("Warning: failed to clear export freshness: {e}");
+        }
+    }
+
+    // VectorStore exposes no namespaced graph read, so this serves
+    // `export_graph()` (the whole graph) and filters by namespace. Adding a
+    // `get_graph_by_namespace` to VectorStore would drop the filter step.
     let data = state
         .vector_store
         .export_graph(
             query.include_superseded.unwrap_or(false),
             query.include_archived.unwrap_or(false),
-            &config.project_contexts,
+            &project_contexts,
             anchor_override.as_ref(),
         )
         .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| { tracing::warn!("handle_get_graph export_graph failed: {e}"); axum::http::StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if query.all.unwrap_or(false) {
         return Ok(Json(data));
@@ -1203,9 +1339,13 @@ async fn handle_ingest(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::to_value(progress).unwrap_or_else(
-        |_| serde_json::json!({ "state": "finished" }),
-    )))
+    let progress_value = serde_json::to_value(&progress).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize ingest progress: {e}"),
+        )
+    })?;
+    Ok(Json(progress_value))
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
@@ -1236,6 +1376,9 @@ struct ExportGraphReq {
     include_archived: Option<bool>,
     anchor_root: Option<String>,
     source_id: Option<String>,
+    /// CLI `--clear`: clean the export-freshness flags before exporting.
+    #[serde(default)]
+    clear: bool,
 }
 
 async fn handle_export_graph(
@@ -1246,18 +1389,25 @@ async fn handle_export_graph(
     // decides whether this daemon may write there, BEFORE any use
     // (Task 2 re-file / J6 — this route postdates the original filing).
     let target = caller_path_refusal(&state, &req.target)?;
-    let config = crate::config::Config::from_default_path()
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let project_contexts = crate::config::Config::load()
+        .map(|c| c.project_contexts)
+        .unwrap_or_default();
     let anchor_root = req.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, req.source_id.as_deref());
 
+    if req.clear {
+        if let Err(e) = crate::events::clear_export_freshness(state.vector_store.as_ref()).await {
+            eprintln!("Warning: failed to clear export freshness: {e}");
+        }
+    }
+
     let data = state
         .vector_store
         .export_graph(
-            req.exclude_superseded.unwrap_or(false),
+            !req.exclude_superseded.unwrap_or(false),
             req.include_archived.unwrap_or(false),
-            &config.project_contexts,
+            &project_contexts,
             anchor_override.as_ref(),
         )
         .await
@@ -1294,7 +1444,13 @@ async fn handle_tasks_import(
     )
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(serde_json::to_string(&summary).unwrap_or_default())
+    let summary_json = serde_json::to_string(&summary).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize import summary: {e}"),
+        )
+    })?;
+    Ok(summary_json)
 }
 
 #[derive(serde::Deserialize)]
@@ -1306,6 +1462,9 @@ struct ReadReq {
 /// Read-only CLI proxy (guinea-pig BUG-8): `doctor`, `list` and `namespaces`
 /// run while the daemon holds the store, through this route, without a second
 /// engine ever opening the database.
+/// Read-only CLI proxy (guinea-pig BUG-8): `list` and `namespaces` run while
+/// the daemon holds the store, through this route, without a second engine ever
+/// opening the database. (`doctor` uses /health and /cli/read.)
 async fn handle_cli_read(
     State(state): State<AppState>,
     Json(req): Json<ReadReq>,
@@ -1354,6 +1513,10 @@ fn checkpoint_backoff(failures: u32) -> std::time::Duration {
 enum ShutdownCause {
     /// Windows kills the process roughly five seconds after this, whatever it
     /// is doing.
+    /// is doing. The runtime only constructs it from the Windows console-close
+    /// signal; on non-Windows prod builds the variant (and its budget arms)
+    /// are compiled out, and it exists there only for the budget tests.
+    #[cfg(any(windows, test))]
     ConsoleClosing,
     /// Everything else: /shutdown, Ctrl-C, SIGTERM. Nothing outside is counting
     /// down, so it can wait out a busy engine.
@@ -1362,6 +1525,7 @@ enum ShutdownCause {
 
 fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
     match cause {
+        #[cfg(any(windows, test))]
         ShutdownCause::ConsoleClosing => std::time::Duration::from_secs(4),
         ShutdownCause::Requested => std::time::Duration::from_secs(60),
     }
@@ -1372,6 +1536,7 @@ fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
 /// mid-walk leaves the namespace cleared and only partly rebuilt.
 fn ingest_wait_budget(cause: ShutdownCause) -> std::time::Duration {
     match cause {
+        #[cfg(any(windows, test))]
         ShutdownCause::ConsoleClosing => std::time::Duration::ZERO,
         ShutdownCause::Requested => std::time::Duration::from_secs(300),
     }
@@ -1441,7 +1606,7 @@ async fn handle_memory_archive(
 async fn handle_edit(
     State(state): State<AppState>,
     Json(req): Json<EditReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
     // The operator's repair path: an in-place rewrite that keeps the id and
     // keeps no history. Agents get neurostrata_supersede_memory instead, which
     // is additive. Editing stays here, behind a human, because it destroys.
@@ -1460,14 +1625,20 @@ async fn handle_edit(
     )
     .await
     {
-        Ok(crate::server::EditOutcome::Edited) | Ok(crate::server::EditOutcome::NotFound) => {
-            Ok("OK")
+        Ok(crate::server::EditOutcome::Edited) => Ok("OK"),
+        Ok(crate::server::EditOutcome::NotFound) => {
+            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
         }
         // The next ingest of that namespace would overwrite the edit.
-        Ok(crate::server::EditOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
+        Ok(crate::server::EditOutcome::Ingested) => {
+            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the edit".to_string()))
+        }
         Err(e) => {
             eprintln!("edit of {} in {} failed: {}", req.id, old_namespace, e);
-            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("edit of {} in {} failed: {}", req.id, old_namespace, e),
+            ))
         }
     }
 }
@@ -1482,16 +1653,23 @@ struct SetMetadataReq {
 async fn handle_set_metadata(
     State(state): State<AppState>,
     Json(req): Json<SetMetadataReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
     match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata).await
     {
-        Ok(crate::server::MetadataOutcome::Updated)
-        | Ok(crate::server::MetadataOutcome::NotFound) => Ok("OK"),
-        Ok(crate::server::MetadataOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
+        Ok(crate::server::MetadataOutcome::Updated) => Ok("OK"),
+        Ok(crate::server::MetadataOutcome::NotFound) => {
+            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
+        }
+        Ok(crate::server::MetadataOutcome::Ingested) => {
+            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the metadata".to_string()))
+        }
         Err(e) => {
             eprintln!("set-metadata of {} in {} failed: {}", req.id, namespace, e);
-            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("set-metadata of {} in {} failed: {}", req.id, namespace, e),
+            ))
         }
     }
 }
@@ -1525,7 +1703,9 @@ async fn handle_mcp(
 /// follows has to be quick.
 async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("ctrl_c signal listener failed: {e}");
+        }
         eprintln!("Received Ctrl-C, shutting down.");
     };
 
@@ -1538,6 +1718,17 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
         let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
             Ok(s) => s,
             Err(_) => return std::future::pending::<ShutdownCause>().await,
+            Err(_) => {
+                tracing::warn!("signal registration failed: could not register shutdown signal listener");
+                return std::future::pending::<ShutdownCause>().await
+            },
+        };
+        let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!("signal registration failed: could not register shutdown signal listener");
+                return std::future::pending::<ShutdownCause>().await
+            },
         };
         tokio::select! {
             _ = close.recv() => eprintln!("Console is closing, shutting down."),
@@ -1551,7 +1742,10 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
         let mut term =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
-                Err(_) => return std::future::pending::<ShutdownCause>().await,
+                Err(_) => {
+                tracing::warn!("signal registration failed: could not register shutdown signal listener");
+                return std::future::pending::<ShutdownCause>().await
+            },
             };
         term.recv().await;
         eprintln!("Received SIGTERM, shutting down.");
@@ -1579,6 +1773,10 @@ async fn handle_info(State(state): State<AppState>) -> Json<serde_json::Value> {
         "exe_len": state.build.exe_len,
         "pid": state.build.pid,
         "started_at": state.build.started_at,
+        // R26: surface the sandbox image and probe so operators can see the
+        // security posture of this daemon at a glance.
+        "sandbox_image": crate::guard::sandbox::SANDBOX_IMAGE,
+        "sandbox_available": crate::guard::sandbox::probe_podman_available(),
     }))
 }
 
@@ -1603,14 +1801,18 @@ async fn handle_bus_metrics(State(state): State<AppState>) -> impl axum::respons
 
 async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
     // A second caller finds None here; stopping twice is not an error.
+    // A second caller finds None here; stopping twice is not an error. The
+    // mutex is poison-tolerant so a panicked holder cannot wedge /shutdown.
     let sender = state
         .shutdown
         .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     match sender {
         Some(tx) => {
-            let _ = tx.send(());
+            if tx.send(()).is_err() {
+                tracing::debug!("shutdown oneshot receiver already dropped");
+            }
             "Shutting down"
         }
         None => "Already shutting down",
@@ -1623,6 +1825,16 @@ async fn handle_validate(
 ) -> Result<Json<crate::guard::ValidateResponse>, (axum::http::StatusCode, String)> {
     // Use sandbox if podman is available
     let use_sandbox = true;
+    // The caller's identity is genuinely consumed, not just carried: trace it
+    // so every verdict can be tied back to the requesting agent.
+    tracing::debug!(
+        orchestrator_id = %request.orchestrator_id,
+        action_type = %request.action_type,
+        "validating guard action"
+    );
+
+    // Use sandbox if podman is available (R26: probe, never assume)
+    let use_sandbox = crate::guard::sandbox::probe_podman_available();
 
     let (verdict, rule_ids) = state
         .guard_validator
@@ -1678,6 +1890,165 @@ async fn handle_tasks_gate(
     Ok(Json(report.gate_json()))
 }
 
+async fn handle_http_sparql(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    // `{"federated": true}` names this daemon as a remote SPARQL peer: route
+    // to the federation handler on the underlying LadybugStore. Security per
+    // deployment: served-host/namespace allowlists and peers come from env,
+    // and everything outside the allowlists is denied.
+    if req.get("federated").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let config = crate::rdf::federation::FederationConfig {
+            served_namespaces: env_csv("NEUROSTRATA_SPARQL_SERVED_NAMESPACES"),
+            served_hosts: env_csv("NEUROSTRATA_SPARQL_SERVED_HOSTS"),
+            service_peers: env_peers("NEUROSTRATA_SPARQL_SERVICE_PEERS"),
+            ..Default::default()
+        };
+        let report = match (
+            crate::traits::VectorStore::as_any(state.vector_store.as_ref())
+                .downcast_ref::<crate::store::ladybug::LadybugStore>(),
+            req.get("query").and_then(|v| v.as_str()),
+            req.get("namespace").and_then(|v| v.as_str()),
+        ) {
+            (Some(ladybug), Some(query_str), Some(namespace)) => {
+                let host = headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .map(std::borrow::ToOwned::to_owned);
+                crate::rdf::federation::handle_remote_sparql_request(
+                    query_str,
+                    namespace,
+                    host.as_deref(),
+                    None,
+                    &config,
+                    ladybug,
+                )
+                .await
+            }
+            (None, _, _) | (_, None, _) | (_, _, None) => {
+                Err(crate::rdf::federation::FederationError::Denied(
+                    "federated query requires a LadybugStore backend, a query, and a namespace"
+                        .into(),
+                ))
+            }
+        };
+        let body = match report {
+            Ok(r) => serde_json::json!({
+                "ok": true,
+                "body": r.body,
+                "solution_count": r.solution_count,
+                "truncated": r.truncated,
+                "timed_out": r.timed_out,
+                "warnings": r.warnings,
+            }),
+            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+        };
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        );
+    }
+    let body = crate::server::handle_sparql_query(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+fn env_csv(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `url,namespace,token_env;url,namespace,token_env` — outbound SERVICE peers.
+fn env_peers(name: &str) -> Vec<crate::rdf::federation::SparqlServicePeer> {
+    std::env::var(name)
+        .map(|v| {
+            v.split(';')
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| {
+                    let segs: Vec<&str> = p.split(',').map(str::trim).collect();
+                    crate::rdf::federation::SparqlServicePeer {
+                        endpoint_url: segs.first().unwrap_or(&"").to_string(),
+                        remote_namespace: segs.get(1).unwrap_or(&"").to_string(),
+                        bearer_token_env: segs.get(2).unwrap_or(&"").to_string(),
+                    }
+                })
+                .filter(|p| !p.endpoint_url.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn handle_http_graphql(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_graphql_query(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_chat_ask(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_chat_ask(
+        &req,
+        state.embedder.clone(),
+        state.vector_store.clone(),
+    )
+    .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_storage_status(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_storage_status(state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_learning_status() -> (axum::http::StatusCode, axum::Json<crate::learning::status::LearnStatus>) {
+    let status = crate::learning::control::load_status(&crate::learning::control::default_learning_dir());
+    (axum::http::StatusCode::OK, axum::Json(status))
+}
+
+async fn handle_http_learning_control(
+    axum::Json(req): axum::Json<crate::learning::control::LearningControlRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    match crate::learning::control::apply_control(&req) {
+        Ok(res) => match serde_json::to_value(res) {
+            Ok(value) => (axum::http::StatusCode::OK, axum::Json(value)),
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+            ),
+        },
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"ok": false, "error": e})),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1686,6 +2057,7 @@ mod tests {
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
+
 
     #[test]
     fn the_first_retry_comes_quickly() {
@@ -1951,16 +2323,17 @@ impl crate::traits::AsAny for RecordingStore {
     /// the subscribers would dispatch against the bus's inert stand-in and
     /// this store would record nothing at all.
     #[tokio::test]
-    async fn daemon_builds_a_bus_of_three_subscribers_wired_to_its_store() {
+    async fn daemon_builds_a_bus_of_four_subscribers_wired_to_its_store() {
         const DIMENSIONS: usize = 42;
         let store = Arc::new(RecordingStore::default());
         let bus = build_thalamic_bus(store.clone(), DIMENSIONS, scratch_root("wiring"));
 
-        // Step 1's subject: exactly the three v1 subscribers are registered.
+        // Step 1's subject: exactly the four production subscribers are
+        // registered (the v1 trio plus post_ingest_normalize).
         let m = bus.metrics();
         assert_eq!(
-            m.subscribers, 3,
-            "the daemon bus must carry the three v1 subscribers: {m:?}"
+            m.subscribers, 4,
+            "the daemon bus must carry the four production subscribers: {m:?}"
         );
 
         bus.emit(
@@ -2157,7 +2530,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// The init-order drill (Step 6): a request that lands immediately after
     /// the daemon starts serving must find the bus already registered -- the
     /// bus is built before the HTTP server binds, so the first
-    /// `POST /bus/metrics` of the process reports all three subscribers. If
+    /// `POST /bus/metrics` of the process reports all four subscribers. If
     /// startup served before finishing the bus, this is the request that
     /// would catch it, at the same endpoint Step 7 curls against the live
     /// daemon.
@@ -2238,7 +2611,7 @@ impl crate::traits::AsAny for RecordingStore {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = response.text().await.unwrap();
         assert!(
-            body.contains("\"subscribers\":3"),
+            body.contains("\"subscribers\":4"),
             "the first request after start must see the fully wired bus, got: {body}"
         );
 
@@ -2709,7 +3082,7 @@ impl crate::traits::AsAny for RecordingStore {
             "one shape, one source: the route and the CLI must report the same fields"
         );
         assert_eq!(
-            from_route["subscribers"], 3,
+            from_route["subscribers"], 4,
             "and the route still reads the daemon's own wired bus: {body}"
         );
 
@@ -2800,7 +3173,7 @@ impl crate::traits::AsAny for RecordingStore {
         let base = format!("http://{addr}");
         let bare = reqwest::Client::new();
         let mut serving = false;
-        for _ in 0..3000 {
+        for _ in 0..500 {
             if bare
                 .get(format!("{base}/health"))
                 .send()
@@ -3283,6 +3656,7 @@ impl crate::traits::AsAny for RecordingStore {
                 include_archived: None,
                 anchor_root: None,
                 source_id: None,
+                clear: false,
             }),
         )
         .await
@@ -3326,5 +3700,41 @@ impl crate::traits::AsAny for RecordingStore {
             "the handler answers with the ingest progress: {}",
             out.0
         );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonState {
+    Running { since: String },
+    Stopped,
+}
+
+pub fn daemon_status(db_path: &std::path::Path) -> DaemonState {
+    if daemon_holds_lock_local(db_path) {
+        DaemonState::Running { since: "active".to_string() }
+    } else {
+        DaemonState::Stopped
+    }
+}
+
+fn daemon_lock_path_local(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.to_path_buf();
+    path.push(".daemon.lock");
+    path
+}
+
+fn daemon_holds_lock_local(db_path: &std::path::Path) -> bool {
+    if !daemon_lock_path_local(db_path).exists() {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(daemon_lock_path_local(db_path))
+    {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
     }
 }

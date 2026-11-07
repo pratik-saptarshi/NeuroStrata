@@ -2,21 +2,24 @@
   "name": "@neurostrata/opencode-plugin",
   "version": "0.1.0",
   "description": "NeuroStrata client shim for OpenCode — Zero-Action Start guard + task-intent nudge",
+  "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": ["index.ts", "dist", "cli-hook.mjs", "README.md"],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs",
+    "dev": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch",
+    "test": "node --test test.mjs",
     "lint": "eslint src --ext .ts"
   },
   "keywords": ["neurostrata", "opencode", "plugin", "task-tracking", "guard"],
   "license": "MIT",
   "peerDependencies": {
-    "@opencode/plugin": "^1.0.0"
+    "@opencode/plugin": "^2.0.0"
   },
   "devDependencies": {
-    "@opencode/plugin": "^1.0.0",
+    "@opencode/plugin": "^2.0.0",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0",
     "vitest": "^1.0.0"

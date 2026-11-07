@@ -111,6 +111,72 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
   state are all violations of this directive. They must be resolved or formally retired
   with extracted memory before this session claims completion.
 
+## 3d. Automatic Graph-First Exploration & Subagent Context Propagation (MANDATORY)
+- **Auto-Retrieved Task Context:** `neurostrata_task_create` and `neurostrata_task_claim` automatically run a hybrid vector + 1-hop graph search on the task's title/description and return `auto_retrieved_context` and a ready-to-paste `subagent_prompt_injection` block.
+- **Graph-First Lookup Reflex:** Before using blind `grep`/`glob` or editing a file, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` to inspect `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
+- **Subagent Prompt Propagation:** Subagents start with a blank context window and no memory of `neurostrata_get_snapshot`. On session init, write the Graph-First rule into your active plan, and whenever you spawn ANY subagent (`subagent` / `Task`), paste the `subagent_prompt_injection` block from `neurostrata_task_claim` into the subagent's prompt and instruct it to query NeuroStrata before blind file searches.
+
+## 3b. SynapticMesh (inter-instance memory — honesty rules)
+
+When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh status` tells you), some memory mutations are additionally mirrored to the team mesh. The rules an agent must not bend:
+
+- **What is shared vs not:** `rule`/`fact`/`procedure` *definitions* cross the mesh only when they carry `eligibility: shareable` — and procedure definitions travel WITHOUT their runtime counters (`remaining_fires`, `performance_count`, `last_performed_at`, `last_episodic_pointer` are strictly local; a shared record carrying any of them is refused on receipt). Tasks, `structural` rows, embeddings, and private rows never travel.
+- **Private rows are sovereign:** never edit, overwrite, or "refresh" a row that carries mesh provenance you did not write, and never import over a private row that owns an id. Conflicts between mesh variants are preserved, never silently resolved — if `mesh status` reports unresolved conflicts, stop synthesizing over that id and say so.
+- **Honesty rules for the mesh surfaces:**
+  - **Explicit-zero status lines:** when there is nothing pending/unresolved, `mesh status` and sync replies say `0`/`no pending`, never noise or silence — a blank field is a lie an operator cannot debug.
+  - **Fail-soft everywhere:** a rejected/unreachable mesh remote queues work locally and reports one flattened line; it never blocks the source push, never exits the hook non-zero, never blocks a local query.
+  - **Never force-push the mesh:** the mesh repo is `--ff-only` pull discipline and regular pushes only. Divergent history is an operator decision; an agent who force-pushes has deleted a teammate's accepted record. Recovery is print-only (`mesh recover`), never `reset --hard`.
+
+## 4. Bootstrapping & Ingestion
+- **Docs:** If `.NeuroStrata/docs/` is missing, call `neurostrata_bootstrap` (new project) or `neurostrata_task_setup` (existing project) and follow the returned instructions — they carry the AGENTS.md template and the first mandatory Goal.
+- **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) from environment and project markers and installs/wires the zero-dependency plugin bundle under `.NeuroStrata/plugins/<harness>/` with zero user involvement.
+- **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
+
+## 5. Global Database & Daemon Security Constraints (Safety)
+- **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
+- **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
+- **No Bulk Deletes:** Only delete specific memory IDs, one at a time, via the CLI (`neurostrata-mcp delete`) when explicitly correcting a hallucination — deletion is deliberately absent from the MCP surface.
+- **Daemon Caller-Path Authority (`J6` / `neurostrata-p1ex`):** Every caller-supplied filesystem path on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` is canonicalized via `check_caller_path` and must resolve inside `startup_root` or an explicit `allowed_external_dirs` entry in `~/.config/neurostrata/config.json`.
+- **Dual Git Hooks (`pre-push` + `pre-commit`):** `neurostrata-mcp hooks install` (and `hook_hygiene` on `neurostrata_get_snapshot`) automatically installs/refreshes both `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus all detected CLI/terminal harness plugins (`neurostrata-lf3p`).
+
+## 6. Global Infrastructure & Tooling Constraints
+- **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
+- **Data Formats:** ALWAYS prefer strict JSON and JSON Schema over YAML, TOML, or their derivatives.
+- **Non-Interactive Shells:** ALWAYS use non-interactive flags (e.g., `cp -f`, `rm -rf`, `apt-get -y`) to avoid hanging the agent on confirmation prompts.
+
+## 7. Cost Management & Async Delegation
+- **Role:** The primary agent acts as Knowledge Manager, Architect, and Orchestrator.
+- **Offloading Work:** Aggressively offload "work" (coding, refactoring) to `NeuroStrata-Task-Agent` OR capture it asynchronously as a Goal (`neurostrata_task_create`) to avoid blocking the chat.
+- **Synchronous vs Asynchronous:** Only use the `Task` tool synchronously if the user explicitly asks for the work to be completed right now. Otherwise, create a task to capture requirements.
+- **Exceptions:** The primary agent may only make direct file edits for trivial, one-off changes (fixing typos, renaming a variable).
+
+## 8. Core Engineering Mandates
+- **Conventions:** Rigorously adhere to existing project conventions (formatting, naming, frameworks).
+- **Libraries/Frameworks:** NEVER assume a library is available. Verify in configuration files first.
+- **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
+- **Paths:** Always use absolute paths when using file system tools.
+
+## 0. The Prime Directive: Never Defer Anything (Ruling 2026-10-25)
+- **This is the highest-priority rule.** No task, feature, or implementation may be
+  left in a "deferred", "todo", "stub", "phase-2", or "later" state. If it cannot be
+  completed in the current session, it must be filed as a concrete tracked task with
+  an owner, description, and next action — and the current work must not proceed until
+  the deferred item is resolved or explicitly, formally retired.
+- **If you are about to leave something unfinished, STOP.** The work is not done until
+  `neurostrata_task_complete` succeeds and the task gate passes (Lock 2). There are no
+  "we'll come back to this" exits.
+- **Every open item is exactly one of:** (a) completed and committed to `git`, or
+  (b) a tracked task with assignee + deadline, named on a task row, with blockers
+  documented. Nothing else survives past this session.
+- **"We will know later" is not an answer.** If a mechanism would only pay off with
+  more usage, instrument it and name the metric — do not postpone the mechanism.
+  Any incomplete implementation must be extracted as a memory before this session
+  ends, or filed as a tracked task.
+- **Prior compliance failures.** The Laya `judge_duplicates` stub (error "not available"),
+  the training loop (`train_candidate` error), and the `ensure_ready` → `Unavailable`
+  state are all violations of this directive. They must be resolved or formally retired
+  with extracted memory before this session claims completion.
+
 <!-- lean-ctx-compression -->
 OUTPUT STYLE: expert-terse
 - Telegraph format: subject-verb-object, drop articles/prepositions

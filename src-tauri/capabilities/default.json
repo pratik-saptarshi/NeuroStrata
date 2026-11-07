@@ -15,6 +15,10 @@
         { "url": "^vscode://.*" },
         { "url": "^cursor://.*" },
         { "url": "^https?://.*" }
+        { "url": "^obsidian://.*" },
+        { "url": "^https?://.*" },
+        { "url": "^file://.*" },
+        { "url": "^/.*" }
       ]
     }
   ]

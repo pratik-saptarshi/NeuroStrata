@@ -9,6 +9,15 @@
 
 pub mod cli;
 pub mod conflict;
+// and the MCP tool schemas. Slice 3 landed the publish path: the durable
+// outbox and the mesh-worker that drains it. The implemented surface covers
+// init, status, push, pull/replay, conflict preservation, and lifecycle
+// enforcement, so a peer's tombstones and shared records arrive without
+// clobbering local history.
+
+
+
+pub mod federation;
 pub mod import;
 pub mod manifest;
 pub mod mesh_service;

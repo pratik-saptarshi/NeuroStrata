@@ -44,6 +44,17 @@ Retrieval is one deterministic pipeline. No LLM, no rank fusion, no keyword inde
 4. **Ordering and rendering.** Direct matches sort first on their real boosted distance; expansion rows follow in their admission order, and the discriminator is the evidence kind, not a magic score constant (`:496-499`, `:525-537`). The store returns its primaries plus their bounded expansions without a second truncation (`:539-541`), and the server asks for five primaries and renders everything it gets back (`src/server.rs:2026-2035`, `:2056`).
 
 **Exact-identifier recall — the known gap, and the recommendation (NOT IMPLEMENTED).** Relying solely on dense vector embeddings *is* poor at finding exact variable names, acronyms, or specific syntax: a memory whose text is an exact identifier — a function name, an env var, a config key, an error string — is found only if its *embedding* lands near the query. The adjudicated recommendation for closing that gap is a **narrow deterministic `CONTAINS` / symbol-id match** — reusing the relation and `symbol` rows the store already holds — rather than a Tantivy + RRF build: it adds no dependency, no index to operate, and no second ranking rule to keep auditable (`docs/designs/2026-10-20-argon-k3-panel-verdicts.md` §5, Phase 4). **This is a recommendation only. It is not implemented, and no part of the shipped retrieval path performs exact-token matching today.**
+### 6. Deterministic Retrieval — Three Surfaces, Not One Fused Pipeline
+*Inspired by human dual-process theory (verbatim token recall + conceptual gist + associative spreading activation).*
+
+`neurostrata_search_memory` offers three **alternative** retrieval surfaces, selected with the `mode` argument (`vector` — the default, `lexical`, `lexical-inhouse`). They are not stages of one pipeline and their scores are never combined: the caller picks one surface per call.
+
+1. **Vector surface (default) — LadybugDB HNSW (`src/store/ladybug.rs`):** Active, non-archived, non-conflicting Engrams are scanned via 768-dimensional HNSW cosine distance (`NomicEmbedTextV15`) with §3's capped Neural Gain boost (`min(usage_gain + source_gain, 0.5 * d)`) and a decision-shape boost, both subtracted from the raw distance.
+2. **Lexical surfaces — Tantivy (`src/lexical.rs`) and the in-house BM25 (`src/fts/mod.rs`):** `mode: lexical` runs the disk-backed Tantivy full-text index; `mode: lexical-inhouse` runs a deterministic 5-field BM25 scorer over `Content` / `Symbol` / `Location` / `Namespace` / `MemoryType` with domain-ontology expansion and `valid_to` retirement visibility. Both score exact identifiers, function names, config keys, file paths, and error codes.
+3. **Temporal proximity boost (`src/graph_read/temporal.rs`):** A query carrying a temporal expression (`2026-10-28`, `recent`, `last week`) has `temporal_proximity_boost` subtracted from the score, so chronologically aligned memories surface first. The boost applies inside the chosen surface — it is not a fusion across surfaces.
+4. **Bounded directed-graph expansion (`src/store/ladybug.rs`):** Primary hits expand across `RELATES_TO`, `CONTAINS`, `GOVERNS`, `DEPENDS_ON` and `EXTRACTED_FROM` (including episode siblings reached through their shared task) in a bounded walk with per-family caps. Each expanded node carries its explicit provenance path (`EvidenceKind`) and is ranked by the number of distinct originating primaries that reach it. Tree-sitter AST (`calls`, `imports`) edges reach the same neighborhood through `neurostrata_memories_for_file` (`include_ast_edges`).
+
+**What does not exist:** there is no Reciprocal Rank Fusion, no Personalized PageRank, and no neural cross-encoder reranker in the search path — there is no `src/rerank.rs`, no `src/reranker.rs`, and no FlashRank dependency.
 
 ### 7. 3-Tier Stratification (Contextual Hierarchy)
 *Inspired by the division of Working Memory vs. Long-Term Memory.*
@@ -59,6 +70,7 @@ An AI's memory and task state must never decouple. Goals (tracked work) are Engr
 ### 9. Extended Cognition Workspace (Human-AI Symbiosis)
 *Inspired by the extended mind thesis.*
 Memory is not locked in a black-box database. The memory graph the AI uses can be exported (`/export-graph`) and inspected in the shipped Web UI, so human developers can audit the same cognitive graph the AI relies on. No Obsidian integration — and no component named NeuroVault — ships in this tree.
+Memory is not locked in a black-box database: the graph is inspectable through the web UI (`web-ui/`), the CLI graph export (`neurostrata-mcp export-graph`), and the RDF/SPARQL surface (`neurostrata_sparql_query`, `neurostrata_export_canonical_rdf`). **The planned NeuroVault Obsidian mirror — a bidirectional Markdown vault that a human can curate — is not implemented yet**: there is no `src/obsidian.rs`, no `neurostrata_sync_obsidian` tool, and no `obsidian-sync` command. It is tracked by NeuroStrata task `neurostrata-dlag`; see `docs/ops/obsidian.md`.
 
 ### 10. Asynchronous Delegation (Orchestrator-Worker Pattern)
 *Inspired by the brain's division of labor across specialized regions.*
@@ -97,3 +109,15 @@ Design provenance: **Anthropic/Kimi verdict** (`docs/design-mesh-verdict-kimi.md
 ## Cognitive-name glossary
 
 See `README.md` § Biological Nomenclature ↔ Engineering Primitives for the canonical table — one table, one set of name conventions, no drift. The 1.8.0 additions appended to that table are the `ThalamicBus`, `ThalamicPulse`, `ExportFreshnessDirty`, `GuardEventLog`, `EpisodicPointerEcho`, `RecursionToken`, and `Procedural Memory` rows.
+### 15. Symbolic Reasoning, Community Topology & World-Model Simulation
+*Inspired by neocortical symbolic reasoning, topological modularity, and prefrontal mental simulation.*
+
+Beyond associative recall, NeuroStrata embeds four higher-order cognitive faculties directly in the binary:
+- **W3C Semantic Web Reasoning (`src/rdf/`):** Projects graph nodes into RDF triples (`oxrdf` / `oxttl`), executes SPARQL 1.1 queries (`neurostrata_sparql_query`), materializes transitive RDFS/OWL closure over `subPropertyOf` and subclasses (`src/rdf/ontology.rs`, `src/rdf/reasoning.rs`), and validates every write against versioned Turtle SHACL shapes (`src/schemas/shacl/`). The closure is computed inside the store and the SPARQL console — there is no separate `neurostrata_owl_reason` MCP tool.
+- **Leiden Community Detection (`src/community.rs`):** Continuously partitions densely connected memory and AST nodes into modular communities with thematic summaries.
+- **TransE Knowledge Graph Embeddings (`src/kge.rs`):** Learns relational translation vectors (`h + r ≈ t`) over graph triples (`neurostrata_kge_train`) to predict missing links and structural analogies.
+- **Digital Twin State Modeling (`src/digital_twin/`):** Maintains versioned state vectors inside the memory store (`neurostrata_twin_set`, `neurostrata_twin_get`, `neurostrata_twin_list`) and compares versions structurally (`neurostrata_twin_diff`), so an agent can inspect and compare recorded state before mutating production systems. There is no `neurostrata_twin_simulate` or `neurostrata_twin_rollback` tool.
+
+## Cognitive-name glossary
+
+See [`docs/science/nomenclature.md`](science/nomenclature.md) for the canonical translation table mapping every biological term to its Rust systems-engineering primitive.
