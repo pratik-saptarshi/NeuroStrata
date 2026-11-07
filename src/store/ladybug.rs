@@ -5696,6 +5696,18 @@ impl VectorStore for LadybugStore {
         if payload.metadata.is_object() {
             let now_ts = chrono::Utc::now().timestamp();
             crate::domain::materialize_facets_bitemporal(&payload.memory_type, &mut payload.metadata, now_ts);
+            // Owner ruling 2026-11-07 (Fork F): exact metadata preservation
+            // wins over the unconditional facets stamp — when materialization
+            // yields no facets and no bitemporal history, leave the writer's
+            // metadata untouched instead of stamping empty keys onto it.
+            let facets_empty = matches!(payload.metadata.get("facets"), Some(Value::Array(a)) if a.is_empty());
+            let entries_empty = matches!(payload.metadata.get("facets_bitemporal"), Some(Value::Array(a)) if a.is_empty());
+            if facets_empty && entries_empty {
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.remove("facets");
+                    obj.remove("facets_bitemporal");
+                }
+            }
         }
 
         // Write-side concept_iri stamping (F20): if metadata.concept_iri absent
