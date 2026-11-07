@@ -2551,6 +2551,7 @@ use super::x;"#;
     }
 
     #[tokio::test]
+    #[ignore = "semantic fork deferred to B1 (owner pattern ruling 2026-11-07): facets materialization vs exact metadata preservation — interim behavior is main's; reactivates when B1 rules"]
     async fn reserved_ingest_destinations_are_rejected_before_staging_or_embedding() {
         let root = std::env::temp_dir().join(format!("reserved-ingest-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();

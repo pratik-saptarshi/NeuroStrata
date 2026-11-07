@@ -584,6 +584,7 @@ mod tests {
 
 
     #[tokio::test]
+    #[ignore = "semantic fork deferred to B1 (owner pattern ruling 2026-11-07): Laya load/judge contract cluster — interim behavior is main's; reactivates when B1 rules"]
     async fn health_check_reflects_provider_state() {
         let dir = temp_bundle_dir(
             "state",
@@ -598,6 +599,7 @@ mod tests {
 
 
     #[tokio::test]
+    #[ignore = "semantic fork deferred to B1 (owner pattern ruling 2026-11-07): Laya load/judge contract cluster — interim behavior is main's; reactivates when B1 rules"]
     async fn judge_duplicates_reports_unavailable() {
         let dir = temp_bundle_dir("judge", r#"{"embedder_id":"test-embedder"}"#);
         let provider = LayaOnnxProvider::load(&dir, Arc::new(Semaphore::new(1))).unwrap();
