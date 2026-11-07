@@ -8137,16 +8137,16 @@ mod tests {
             // A stub id like 'mem-file' never matches, so the file node id must be
             // the path itself. GOVERNS then yields the rule as a hit.
             conn.query(
-                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
+                "CREATE (m:Memory {pk: 'seed-pk:src/lib.rs', id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
             )?;
             conn.query(&format!(
-                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+                "MATCH (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
             ))?;
             conn.query(
-                "CREATE (m:Memory {id: 'mem-related', namespace: 'probe', content: 'r', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'src/other.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+                "CREATE (m:Memory {pk: 'seed-pk:mem-related', id: 'mem-related', namespace: 'probe', content: 'r', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'src/other.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
             )?;
             conn.query(&format!(
-                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'mem-related'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+                "MATCH (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'mem-related'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
             ))?;
             Ok(())
         })
@@ -8203,10 +8203,10 @@ mod tests {
             .expect("ladybug store");
         lb.with_conn(move |conn| {
             conn.query(
-                "CREATE (m:Memory {id: 'mem-file', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
+                "CREATE (m:Memory {pk: 'seed-pk:mem-file', id: 'mem-file', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
             )?;
             conn.query(&format!(
-                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'mem-file'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+                "MATCH (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'mem-file'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
             ))?;
             Ok(())
         })

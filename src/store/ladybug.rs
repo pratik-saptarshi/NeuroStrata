@@ -16894,7 +16894,7 @@ eurostrata\src\daemon.rs",
         store.init("probe").await.expect("create the schema");
 
         let row = format!(
-            "CREATE (m:Memory {{id: 'rule', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+            "CREATE (m:Memory {{pk: 'seed-pk:rule', id: 'rule', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
             escape_ladybug_string(r#"{"governs": ["src/never-ingested.rs"]}"#)
         );
         store
@@ -21538,7 +21538,8 @@ eurostrata\src\daemon.rs",
 
         let seed = |id: &str, location: &str, memory_type: &str, metadata: &str| {
             format!(
-                "CREATE (m:Memory {{id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: '{}', agent_name: 'a', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                "CREATE (m:Memory {{pk: '{}', id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: '{}', agent_name: 'a', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                escape_ladybug_string(&memory_pk("probe", id)),
                 escape_ladybug_string(id),
                 memory_type,
                 escape_ladybug_string(location),
@@ -21547,7 +21548,7 @@ eurostrata\src\daemon.rs",
         };
         let edge = |rel: &str, a: &str, b: &str| {
             format!(
-                "MERGE (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{} {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)",
+                "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{} {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)",
                 escape_ladybug_string(a),
                 escape_ladybug_string(b),
                 rel
@@ -21696,11 +21697,13 @@ eurostrata\src\daemon.rs",
         for i in 0..25 {
             let rel_id = format!("mem-fanout-rel-{i}");
             let caller_id = format!("mem-fanout-caller-{i}");
+            let rel_pk = escape_ladybug_string(&memory_pk("probe", &rel_id));
+            let caller_pk = escape_ladybug_string(&memory_pk("probe", &caller_id));
             let create_rel = format!(
-                "CREATE (m:Memory {{id: '{rel_id}', namespace: 'probe', content: '{long_content}', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'other.rs', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+                "CREATE (m:Memory {{pk: '{rel_pk}', id: '{rel_id}', namespace: 'probe', content: '{long_content}', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'other.rs', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
             );
             let create_caller = format!(
-                "CREATE (m:Memory {{id: '{caller_id}', namespace: 'probe', content: '{long_content}', user_id: 'u', memory_type: 'symbol', agent_name: 'a', location: 'caller.rs#function:c{i}@1', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+                "CREATE (m:Memory {{pk: '{caller_pk}', id: '{caller_id}', namespace: 'probe', content: '{long_content}', user_id: 'u', memory_type: 'symbol', agent_name: 'a', location: 'caller.rs#function:c{i}@1', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
             );
             let edge_rel = edge("RELATES_TO", "mem-rule-a", &rel_id);
             let edge_caller = edge("DEPENDS_ON", &caller_id, "mem-sym-foo");
