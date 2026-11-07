@@ -141,7 +141,6 @@ mod tests {
         // Requires mock VectorStore and Embedder
     }
 
-
     /// Composite Rec #4: row conversion applies the similarity cutoff and the
     /// rule-type filter. A rule row below `MIN_CONSTRAINT_SIMILARITY` must not
     /// become a match, or loosely related memories would fire the guard as
@@ -174,7 +173,6 @@ mod tests {
         assert_eq!(rules[0].status, "active");
     }
 
-
     fn rule_row(id: &str, score: f32, memory_type: &str) -> SearchResult {
         SearchResult {
             id: id.to_string(),
@@ -198,7 +196,6 @@ mod tests {
             evidence: None,
         }
     }
-
 }
 /// Turn raw search rows into guard rules, dropping every row that either
 /// cannot prove it is a rule (rule types only) or sits below the similarity

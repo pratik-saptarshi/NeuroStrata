@@ -206,7 +206,6 @@ pub(crate) fn work_lineage(memories: &[SearchResult], id: &str) -> Vec<String> {
     lineage
 }
 
-
 /// Whether a live lesson discharges the given task: some row declares
 /// `metadata.extracted_from: ["<task id>"]`, where the task id is any id in
 /// the task's work lineage.
@@ -291,7 +290,6 @@ pub(crate) fn age_secs(meta: Option<&Value>, keys: &[&str], now: i64) -> Option<
     }
     None
 }
-
 
 /// The whole gate: three blocking rules plus the advisory staleness list.
 pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
@@ -533,7 +531,6 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
 
     report
 }
-
 
 fn content_short(content: &str) -> String {
     content.chars().take(80).collect()

@@ -29,11 +29,6 @@ pub use self::outbox::{EventClass, EventOutbox, OutboxEntry, OutboxError};
 // ([`GuardEventLog`]), and the post-ingest relation normalization
 // (`subscribers::PostIngestNormalize`).
 
-
-
-
-
-
 pub use self::subscriber::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
     SubscriberError,

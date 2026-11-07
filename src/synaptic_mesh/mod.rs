@@ -15,8 +15,6 @@ pub mod conflict;
 // enforcement, so a peer's tombstones and shared records arrive without
 // clobbering local history.
 
-
-
 pub mod federation;
 pub mod import;
 pub mod manifest;
