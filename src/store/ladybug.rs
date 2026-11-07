@@ -2672,7 +2672,7 @@ impl LadybugStore {
         let _cross_process_writer =
             tokio::task::spawn_blocking(move || acquire_database_writer_lock(&db_path)).await??;
         let live_stages: HashSet<String> = self
-            .with_conn(read_stage_provenance)
+            .with_conn_holding_write_turn(read_stage_provenance)
             .await?
             .into_iter()
             .map(|(namespace, _)| namespace)
@@ -2684,7 +2684,7 @@ impl LadybugStore {
                 continue;
             }
             let has_rows = self
-                .with_conn({
+                .with_conn_holding_write_turn({
                     let namespace = namespace.clone();
                     move |conn| {
                         let safe = escape_ladybug_string(&namespace);
@@ -3399,6 +3399,30 @@ impl LadybugStore {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
+        self.with_conn_inner(f, true).await
+    }
+
+    /// `with_conn` for a caller that already holds `write_lock` (stage-lease
+    /// recovery in `remove_orphan_stage_lease_sidecars` is the one such
+    /// caller): the write turn's exclusion is already in force for this
+    /// caller, so the read must not acquire the turn again — `write_lock`
+    /// is not re-entrant, and re-acquiring it deadlocks the caller against
+    /// itself. The read stays race-free for the reason the gate below
+    /// exists: while the caller holds the turn (and, in recovery, the
+    /// cross-process writer lock), no other writer can be inside the engine.
+    async fn with_conn_holding_write_turn<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        self.with_conn_inner(f, false).await
+    }
+
+    async fn with_conn_inner<T, F>(&self, f: F, take_turn: bool) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
         let db = self.db.clone();
         // Held across the engine call on purpose: lbug's C++
         // DictionaryColumn::scan / BufferManager::optimisticRead segfaults
@@ -3407,7 +3431,11 @@ impl LadybugStore {
         // writer holds the turn. As in `write_owning_turn`, the guard lives
         // inside the blocking task, so a dropped await cannot release it
         // while a statement is still running.
-        let turn = Arc::clone(&self.write_lock).lock_owned().await;
+        let turn = if take_turn {
+            Some(Arc::clone(&self.write_lock).lock_owned().await)
+        } else {
+            None
+        };
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
             let _turn = turn;
