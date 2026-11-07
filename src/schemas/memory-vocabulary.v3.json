@@ -146,7 +146,14 @@
     },
     "task": {
       "definition": "A tracked unit of work with a status. Reaches 'done' only through neurostrata_task_complete, which requires an extracted memory (Lock 2).",
-      "structural": false
+      "structural": false,
+      "fields": {
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
+        }
+      }
     },
     "directory": {
       "definition": "An ingested directory and structural container.",
@@ -162,7 +169,6 @@
     },
     "symbol": {
       "definition": "An extracted code declaration or definition.",
-      "structural": false
       "structural": false,
       "fields": {
         "mentions": {
