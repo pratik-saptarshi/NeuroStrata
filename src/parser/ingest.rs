@@ -1343,6 +1343,35 @@ pub async fn ingest_directory(
         }
     }
 
+    // Remember the generation this publish would supersede. The relink after
+    // the flip is a separate store call, so if it fails the pointer is rolled
+    // back onto this generation (and the new one discarded) before the error
+    // is returned: publish + relink succeed or fail together, as they did
+    // when both lived inside the fork's single publish transaction.
+    let previous_generation = match vector_store
+        .active_generation(namespace, &source_key)
+        .await
+    {
+        Ok(previous) => previous,
+        Err(e) => {
+            if let Err(abort) = vector_store
+                .abort_generation(namespace, &source_key, generation)
+                .await
+            {
+                eprintln!(
+                    "Failed to abort staging generation {} of namespace {}: {}",
+                    generation, namespace, abort
+                );
+            }
+            return Err(anyhow::anyhow!(
+                "stored the nodes of namespace {} but could not read the active generation before publishing generation {}: {}",
+                namespace,
+                generation,
+                e
+            ));
+        }
+    };
+
     // Atomically flip the active pointer onto this generation. Only now are its
     // nodes reachable; the previous generation remains as history.
     if let Err(e) = vector_store
@@ -1374,16 +1403,41 @@ pub async fn ingest_directory(
     //
     // A failure here fails the ingest rather than warning about it: reporting
     // success would hand back a graph whose rules reach none of their code.
-    let linked = vector_store
-        .relink_edges(namespace, &source_key)
-        .await
-        .map_err(|e| {
-        anyhow::anyhow!(
-            "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
-            namespace,
-            e
-        )
-    })?;
+    let linked = match vector_store.relink_edges(namespace, &source_key).await {
+        Ok(linked) => linked,
+        Err(e) => {
+            // The new generation is live but its rule edges are not: roll the
+            // pointer back onto the previous generation and discard this one,
+            // so the failed ingest leaves the store exactly as it found it.
+            if let Err(rollback) = vector_store
+                .publish_generation(namespace, &source_key, previous_generation)
+                .await
+            {
+                return Err(anyhow::anyhow!(
+                    "stored the nodes of namespace {} but could not relink the edges its memories declare ({}), and rolling the active pointer back to generation {} also failed ({}); generation {} is live without its rule edges",
+                    namespace,
+                    e,
+                    previous_generation,
+                    rollback,
+                    generation
+                ));
+            }
+            if let Err(abort) = vector_store
+                .abort_generation(namespace, &source_key, generation)
+                .await
+            {
+                eprintln!(
+                    "Failed to discard generation {} of namespace {} after relink rollback: {}",
+                    generation, namespace, abort
+                );
+            }
+            return Err(anyhow::anyhow!(
+                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; the previous generation was restored, ingest again to retry: {}",
+                namespace,
+                e
+            ));
+        }
+    };
     println!(
         "Relinked {} declared edges in namespace {}",
         linked, namespace
