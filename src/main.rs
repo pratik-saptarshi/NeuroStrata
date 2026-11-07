@@ -1347,29 +1347,44 @@ mod tests {
     }
 
     /// T19, Gate 0 Home β: the elected log home is the watchdog's
-    /// data-home file -- home `/home/op` resolves to
-    /// `/home/op/.local/share/neurostrata/daemon.log`, asserted
-    /// component by component.
+    /// data-home file -- the home resolves to
+    /// `<home>/.local/share/neurostrata/daemon.log`, asserted
+    /// component by component. The fixture home is absolute on the
+    /// host platform: a bare `/home/op` is rooted but not absolute
+    /// on Windows (no drive or UNC prefix), and the expected path
+    /// is derived by the same joins the resolver performs, so the
+    /// elected join is pinned on every platform (PR #27, Codex P2).
     #[test]
     fn daemon_log_path_matches_the_elected_home() {
-        let path = daemon_log_path_for(std::path::Path::new("/home/op"));
+        #[cfg(windows)]
+        let home = std::path::Path::new(r"C:\Users\op");
+        #[cfg(not(windows))]
+        let home = std::path::Path::new("/home/op");
+        let path = daemon_log_path_for(home);
         assert!(path.is_absolute(), "{path:?}");
-        let names: Vec<String> = path
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(name) => {
-                    Some(name.to_string_lossy().into_owned())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            names,
-            ["home", "op", ".local", "share", "neurostrata", "daemon.log"]
+        let normal_names = |path: &std::path::Path| -> Vec<String> {
+            path.components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(name) => {
+                        Some(name.to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut expected_names = normal_names(home);
+        expected_names.extend(
+            [".local", "share", "neurostrata", "daemon.log"]
+                .into_iter()
+                .map(String::from),
         );
+        assert_eq!(normal_names(&path), expected_names);
         assert_eq!(
             path,
-            std::path::Path::new("/home/op/.local/share/neurostrata/daemon.log")
+            home.join(".local")
+                .join("share")
+                .join("neurostrata")
+                .join("daemon.log")
         );
     }
 
