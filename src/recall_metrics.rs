@@ -128,9 +128,6 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
             return;
         }
     };
-    let mut guard = RECENTLY_RECALLED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     let deque = map.entry(namespace.to_string()).or_default();
     for id in ids {
@@ -156,9 +153,6 @@ pub fn record_promotion(namespace: &str, id: &str) -> bool {
             return false;
         }
     };
-    let mut guard = RECENTLY_RECALLED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let found = if let Some(map) = guard.as_mut() {
         if let Some(deque) = map.get_mut(namespace) {
             let before = deque.len();
