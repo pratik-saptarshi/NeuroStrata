@@ -5189,10 +5189,6 @@ impl VectorStore for LadybugStore {
                 dimensions
             );
             let mut created_fresh = true;
-            let create_node_table = format!(
-                "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
-                dimensions
-            );
 
             if let Err(e) = conn.query(&create_node_table) {
                 if !e.to_string().contains("already exists") {
