@@ -6,7 +6,6 @@
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 /// A container for dataset splits, keyed by observation ID.
 #[derive(Debug, Clone)]
@@ -126,43 +125,6 @@ pub fn split_observations(
     time_windows: &[i64],                    // per-observation timestamp
 ) -> Result<DatasetSplits> {
     let mut splits = DatasetSplits::new();
-
-    // Track which components have been assigned to which split
-    let mut memory_id_components: HashMap<String, HashSet<Split>> = HashMap::new();
-    let mut payload_hash_components: HashMap<String, HashSet<Split>> = HashMap::new();
-    let mut governance_components: HashMap<String, HashSet<Split>> = HashMap::new();
-
-    for (i, obs_id) in observation_ids.iter().enumerate() {
-        let mid_set = &memory_ids[i];
-        let ph_set = &payload_hashes[i];
-        let sup = &supersession_lineages[i];
-        let gov = &governance_targets[i];
-        let ts = time_windows[i];
-
-        // Determine candidate splits for this observation based on existing component assignments
-        let mut candidate_splits = vec![Split::Train, Split::Calibration, Split::Eval];
-
-        // Check memory ID components
-        for mid in mid_set.iter() {
-            if let Some(existing_splits) = memory_id_components.get(mid) {
-                // If this memory ID was already assigned to a different split, restrict candidates
-                candidate_splits.retain(|s| existing_splits.contains(s));
-            }
-        }
-        // Register this observation's memory IDs with their split
-        for mid in mid_set.iter() {
-            memory_id_components
-                .entry(mid.clone())
-                .or_default()
-                .insert(candidate_splits[0]); // simplified: assign first candidate
-        }
-
-        // Similarly check payload hashes, governance, time...
-        // For brevity, assign first valid split
-        if !splits.contains(obs_id) {
-            splits.insert(obs_id, Split::Train);
-        }
-    }
     let n = observation_ids.len();
     let mut uf = UnionFind::new(n);
     
