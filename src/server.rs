@@ -3859,18 +3859,19 @@ mod tests {
     use crate::guard::testkit::MockStore;
 
     /// Serializes the tests in this module that create, rewrite, or
-    /// delete the real daemon token file: they share one path on disk,
-    /// so parallel test threads would race each other's token. CI runs
-    /// the suite with --test-threads=1, but the lock keeps local
-    /// parallel runs deterministic too.
-    static TOKEN_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// delete the real daemon token file against every other test that
+    /// touches the credential files: the daemon tests spawn daemons
+    /// that create the files at startup and reread them at shutdown,
+    /// so the lock is the crate-wide one in `crate::test_support`, not
+    /// a module-local static — a local lock would leave the daemon
+    /// tests outside it. CI runs the suite with --test-threads=1, but
+    /// the lock keeps local parallel runs deterministic too.
     fn token_file_test_lock() -> std::sync::MutexGuard<'static, ()> {
         // A poisoned lock means an earlier token test panicked while
         // holding it; its guard already restored the file on drop, so
         // recovering the guard is safe and keeps one failure from
         // cascading into the other token tests.
-        TOKEN_FILE_TEST_LOCK
+        crate::test_support::TOKEN_FILE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
