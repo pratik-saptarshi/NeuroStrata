@@ -2280,6 +2280,14 @@ pub async fn handle_bootstrap(
     if let Some(desc) = &project_description {
         task_meta.insert("description".to_string(), json!(desc));
     }
+    // Task 6: the caller-supplied project_description is stored as task
+    // metadata, so it meets the same scanner before the insert below —
+    // in the shape task_create scans with (title as content, the
+    // assembled metadata as the values).
+    let scan_meta = json!({ "fields": task_meta.clone(), "links": Map::new() });
+    if let Some(rejection) = scan_for_task_create(title, &scan_meta) {
+        return rejection;
+    }
     let (task_id, _) = match store_new_task(
         &store,
         &emb,
