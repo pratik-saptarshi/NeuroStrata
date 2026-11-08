@@ -60,17 +60,19 @@ counts and any new primitives re-derived) and the pin is re-ruled —
 the delta is never silently absorbed into the sync.
 
 **Live delta (re-census seed, not part of the target) — verified
-at 2026-11-07 23:43 UTC** by a fresh `git fetch upstream` in the
-correction session that produced this section's current text
+at 2026-11-08 08:41 UTC** by a fresh `git fetch upstream` in the
+refresh session that produced this section's current text
 (the first version of this section recorded a one-commit delta
 with PR #62 still open; that was accurate when its evidence was
 gathered, but upstream moved before the document was delivered,
-and the review process caught it — the delta below replaces it):
+and the review process caught it — a correction then recorded a
+four-commit delta at `fc0381d`, and upstream has moved once more
+since; the delta below replaces that as well):
 
 - Upstream `main` now sits at
-  **`fc0381d23106ff782130283e3e8966321b8a7152`**, exactly **4
-  commits past the target** (`git rev-list --count 8fdae4b..fc0381d`
-  → 4; the chain is linear, each commit's sole parent is the
+  **`51be592335b4b447252af198b375836bc7246f8d`**, exactly **5
+  commits past the target** (`git rev-list --count 8fdae4b..51be592`
+  → 5; the chain is linear, each commit's sole parent is the
   previous one):
   1. `581ae333a79460497be904c24122b93ecbead58c` — PR #61,
      "test(harness): read request before responding in federation
@@ -88,10 +90,17 @@ and the review process caught it — the delta below replaces it):
      v1.17.0 — NeuroMesh real-time transport & Autonomous Memory
      Control Plane" (commit dated 2026-11-07T22:42:29Z; tag
      `v1.17.0` fetched with it).
-- Measured against the census base, the live tip is now 777
+  5. `51be592335b4b447252af198b375836bc7246f8d` —
+     "feat(guard,snapshot,plugins): surface global & pinned golden
+     rules at startup and guard validation (neurostrata-0wle)"
+     (commit dated 2026-11-08T00:17:46Z).
+- Measured against the census base, the live tip is now 778
   upstream-only commits with 161 differing `src/` files (445
-  files total) — versus 773 / 154 against the target. **§3's
-  conflict surface stays priced against the target**, as the
+  files total) — versus 773 / 154 against the target. (The
+  `src/` and total counts are unchanged from the `fc0381d`
+  measurement: every file the newest commit touches was
+  already in the differing set against the census base.)
+  **§3's conflict surface stays priced against the target**, as the
   gate requires; these live-tip numbers are the re-census seed
   for execution time, not a re-pricing.
 - **This is the SHA-pin rule operating as designed.** The target
