@@ -5475,7 +5475,7 @@ impl VectorStore for LadybugStore {
             let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory)";
             conn.query(create_governs_table).ok();
 
-            // Vocabulary v2: extraction edges (memory -> task) behind Lock 2.
+            // Vocabulary v10: extraction edges (memory -> task) behind Lock 2.
             let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory)";
             conn.query(create_extracted_table).ok();
 
