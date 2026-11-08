@@ -12970,17 +12970,24 @@ async fn handle_search_memory(
         let conflicts = crate::domain::detect_conflicts(&results);
         let mut report = render_search_results(&results);
         if include_references {
-            let refs: Vec<serde_json::Value> = results
-                .iter()
-                .filter_map(|r| {
-                    r.payload
+            // F6: `edge_sources` is synthesized by `get` at read time and
+            // is never present on search-result payloads; fetch each
+            // result's provenance through that same read surface so the
+            // citations are identical to a direct read's. Fail-soft: a
+            // result that no longer resolves contributes no citation.
+            let mut refs: Vec<serde_json::Value> = Vec::new();
+            for r in &results {
+                if let Ok(Some((_, fetched))) = store.get(namespace, &r.id).await {
+                    if let Some(a) = fetched
                         .metadata
                         .get("edge_sources")
                         .and_then(|v| v.as_array())
                         .filter(|a| !a.is_empty())
-                        .map(|a| serde_json::json!({"id": r.id, "edge_sources": a}))
-                })
-                .collect();
+                    {
+                        refs.push(serde_json::json!({"id": r.id, "edge_sources": a}));
+                    }
+                }
+            }
             if !refs.is_empty() {
                 report.push_str(&format!(
                     "\n\nedge_references: {}",
@@ -13212,17 +13219,22 @@ async fn handle_search_memory(
                     let conflicts = crate::domain::detect_conflicts(&results);
                     let mut report = render_search_results(&results);
                     if include_references {
-                        let refs: Vec<serde_json::Value> = results
-                            .iter()
-                            .filter_map(|r| {
-                                r.payload
+                        // F6: as in search above — provenance is fetched
+                        // through `get`, the read surface that synthesizes
+                        // `edge_sources`; it is never on result payloads.
+                        let mut refs: Vec<serde_json::Value> = Vec::new();
+                        for r in &results {
+                            if let Ok(Some((_, fetched))) = store.get(namespace, &r.id).await {
+                                if let Some(a) = fetched
                                     .metadata
                                     .get("edge_sources")
                                     .and_then(|v| v.as_array())
                                     .filter(|a| !a.is_empty())
-                                    .map(|a| serde_json::json!({"id": r.id, "edge_sources": a}))
-                            })
-                            .collect();
+                                {
+                                    refs.push(serde_json::json!({"id": r.id, "edge_sources": a}));
+                                }
+                            }
+                        }
                         if !refs.is_empty() {
                             report.push_str(&format!(
                                 "\n\nedge_references: {}",

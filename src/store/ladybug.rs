@@ -3967,6 +3967,210 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
     parse_edge_specs(&payload).0
 }
 
+/// The payload-derived half of one F6 `edge_sources` provenance entry: the
+/// declaring record's file, content hash and line span, and the evidence id
+/// composed from them. Every input is a stored field of the declaring
+/// record itself, so the upsert edge write (which records the evidence id
+/// on the edge row) and the read-time synthesis (which rebuilds the whole
+/// entry) derive identical values from the same constructor.
+struct EdgeProvenanceFields {
+    file: Option<String>,
+    content_hash: Option<String>,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+    evidence_id: String,
+}
+
+fn edge_provenance_fields(id: &str, payload: &MemoryPayload) -> EdgeProvenanceFields {
+    let file = payload
+        .metadata
+        .get("absolute_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if payload.location.trim().is_empty() {
+                None
+            } else {
+                Some(payload.location.clone())
+            }
+        });
+    let content_hash = payload
+        .metadata
+        .get("file_sha256")
+        .or_else(|| payload.metadata.get("span_sha256"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(payload.content.as_bytes());
+            Some(hex::encode(hasher.finalize()))
+        });
+    let (line_start, line_end) = match (if payload.location_lines.trim().is_empty() { None } else { Some(payload.location_lines.as_str()) })
+        .or_else(|| payload.metadata.get("location_lines").and_then(|v| v.as_str()))
+    {
+        Some(s) if !s.trim().is_empty() => {
+            let parts: Vec<&str> = s.split('-').collect();
+            let start = parts.first().and_then(|p| p.trim().parse::<i64>().ok());
+            let end = parts
+                .get(1)
+                .and_then(|p| p.trim().parse::<i64>().ok())
+                .or(start);
+            (start, end)
+        }
+        _ => (None, None),
+    };
+    let evidence_id = match (&file, &content_hash) {
+        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.len().min(12)]),
+        (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
+        _ => id.to_string(),
+    };
+    EdgeProvenanceFields {
+        file,
+        content_hash,
+        line_start,
+        line_end,
+        evidence_id,
+    }
+}
+
+/// One F6 `edge_sources` entry for a resolved declaration, in the exact
+/// shape main's retired upsert stamp persisted and its consumers read.
+fn edge_source_entry(
+    id: &str,
+    payload: &MemoryPayload,
+    edge: &EdgeSpec,
+    resolved_target: &str,
+) -> serde_json::Value {
+    let fields = edge_provenance_fields(id, payload);
+    serde_json::json!({
+        "declaring_id": id,
+        "rel_type": edge.rel_type,
+        "declaration_index": edge.declaration_index,
+        "declared_target": edge.target_id,
+        "resolved_target": resolved_target,
+        "logical_target": crate::parser::generation::logical_path_of(resolved_target),
+        "orientation": if edge.points_at_target { "self_to_target" } else { "target_to_self" },
+        "file": fields.file,
+        "content_hash": fields.content_hash,
+        "line_start": fields.line_start,
+        "line_end": fields.line_end,
+        "evidence_id": fields.evidence_id,
+        "extractor": "upsert",
+    })
+}
+
+/// The target one declaration resolves to, replaying upsert's resolution
+/// decision read-only: the qualified branch (exact lookup, then the
+/// own-namespace prefix strip) and the unqualified branch
+/// (`resolve_target_on_write`). Returns the resolution itself so the
+/// caller can distinguish `Missing` — the one outcome upsert acts on
+/// further (stub materialisation) — from `Ambiguous`/`Failed`, which
+/// defer at write time and yield no entry here either.
+fn resolve_declaration(
+    conn: &Connection,
+    namespace: &str,
+    declared: &str,
+) -> crate::traits::TargetResolution {
+    if declared.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        match exact_target_exists(conn, declared) {
+            Ok(true) => crate::traits::TargetResolution::Resolved(declared.to_string()),
+            Ok(false) => {
+                if let Some(stripped) = declared.strip_prefix(&format!(
+                    "{}{}",
+                    namespace,
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                )) {
+                    match resolve_target_on_write(conn, namespace, stripped) {
+                        resolved @ crate::traits::TargetResolution::Resolved(_) => resolved,
+                        _ => crate::traits::TargetResolution::Missing,
+                    }
+                } else {
+                    crate::traits::TargetResolution::Missing
+                }
+            }
+            Err(e) => crate::traits::TargetResolution::Failed(e.to_string()),
+        }
+    } else {
+        resolve_target_on_write(conn, namespace, declared)
+    }
+}
+
+/// F6 `edge_sources`, synthesized at read time (owner ruling 2026-11-07:
+/// exact preservation via read-time synthesis). The representation is
+/// never persisted; it is rebuilt from data that IS stored — the record's
+/// own declarations (`edge_specs` over its stored metadata, the same
+/// extraction upsert runs) and the resolution of each declaration against
+/// the stored graph (the same resolver upsert runs) — with the entry
+/// fields computed by the shared constructor the upsert edge write uses.
+///
+/// Totality: every declaration shape upsert accepts is covered.
+/// Declarations that resolve at write time resolve identically here
+/// (same pure extraction, same resolver, same stored rows). The one
+/// write-time outcome that is an act of creation rather than a lookup —
+/// a `GOVERNS` declaration from a `rule` whose unqualified target is
+/// missing, which materialises a stub file node and resolves to it — is
+/// reproduced by the stub witness below: materialisation is a MERGE
+/// keyed on the deterministic stub id, so the entry exists exactly when
+/// that row does. Divergence from the retired stamp is confined to graph
+/// state that changed after the write (a target since deleted, a stub
+/// since retired by a publish): the synthesis reports the resolution
+/// that holds now, which is the same current-state semantics
+/// `dangling_edges` already exposes.
+fn synthesize_edge_sources(
+    conn: &Connection,
+    namespace: &str,
+    id: &str,
+    payload: &MemoryPayload,
+) -> Vec<serde_json::Value> {
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for edge in edge_specs(&payload.metadata) {
+        // F18 endpoint role, identical to upsert's gate: a GOVERNS
+        // declaration from a source that may not govern never resolves.
+        if edge.rel_type == "GOVERNS"
+            && !(payload.memory_type == "rule"
+                || payload.memory_type == "fact"
+                || payload.memory_type == "context")
+        {
+            continue;
+        }
+        let target = match resolve_declaration(conn, namespace, &edge.target_id) {
+            crate::traits::TargetResolution::Resolved(found) => found,
+            crate::traits::TargetResolution::Missing
+                if edge.rel_type == "GOVERNS"
+                    && payload.memory_type == "rule"
+                    && !edge
+                        .target_id
+                        .contains(crate::parser::ingest::NAMESPACE_SEPARATOR) =>
+            {
+                // Stub witness: at write time this shape materialises the
+                // stub node and resolves to its id. A read must not create
+                // rows; the entry is reproduced iff the stub row the write
+                // created (a MERGE on this exact id) is still stored.
+                let stub_id = crate::parser::ingest::qualified_id(
+                    namespace,
+                    &crate::parser::ingest::normalize_node_path(&edge.target_id),
+                );
+                match exact_target_exists(conn, &stub_id) {
+                    Ok(true) => stub_id,
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        entries.push(edge_source_entry(id, payload, &edge, &target));
+    }
+    // Dedupe identical entries, preserving first occurrence (the retired
+    // stamp's exact dedupe).
+    let mut deduped: Vec<serde_json::Value> = Vec::new();
+    for e in &entries {
+        if !deduped.iter().any(|d| d == e) {
+            deduped.push(e.clone());
+        }
+    }
+    deduped
+}
+
 /// Memory types written with a zero vector. They describe where something
 /// lives, or record that a machine operation happened, not what it says, so
 /// they carry no meaning for a similarity search: directory ingestion's nodes,
@@ -5655,6 +5859,15 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
+        // F6 (owner ruling 2026-11-07): `edge_sources` is a system-owned,
+        // read-time-synthesized key — it is never persisted. Drop any
+        // incoming value (a pre-ruling stamp artifact read back through
+        // `get` by a read-modify-write caller, or a caller-supplied key)
+        // so stored metadata stays exactly what the writer wrote; `get`
+        // synthesizes the representation on read.
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.remove("edge_sources");
+        }
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
         {
             let ids = self.mention_symbol_ids(&namespace).await;
@@ -6053,8 +6266,6 @@ impl VectorStore for LadybugStore {
             let mut deferred_edges = Vec::new();
             let edge_now = chrono::Utc::now().timestamp();
 
-            // F6: collect resolved edge provenance entries to stamp on the row.
-            let mut resolved_edge_entries: Vec<serde_json::Value> = Vec::new();
 
             // Materialise the edges this memory declares. A target that does not exist
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
@@ -6200,78 +6411,13 @@ impl VectorStore for LadybugStore {
                 }
                 // F18: GOVERNS source must be rule even when target missing/stubbed.
                 // (handled above for resolved targets; missing targets skip role check)
-                // F6: stamp edge provenance for this resolved declaration.
-                let evidence_id = {
-                    let declared = edge.target_id.clone();
-                    let resolved = target.clone();
-                    let logical = crate::parser::generation::logical_path_of(&resolved).to_string();
-                    let orientation = if edge.points_at_target {
-                        "self_to_target"
-                    } else {
-                        "target_to_self"
-                    }
-                    .to_string();
-                    let file = payload
-                        .metadata
-                        .get("absolute_path")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            if payload.location.trim().is_empty() {
-                                None
-                            } else {
-                                Some(payload.location.clone())
-                            }
-                        });
-                    let content_hash = payload
-                        .metadata
-                        .get("file_sha256")
-                        .or_else(|| payload.metadata.get("span_sha256"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(payload.content.as_bytes());
-                            Some(hex::encode(hasher.finalize()))
-                        });
-                    let (line_start, line_end) = match (if payload.location_lines.trim().is_empty() { None } else { Some(payload.location_lines.as_str()) })
-                        .or_else(|| payload.metadata.get("location_lines").and_then(|v| v.as_str()))
-                    {
-                        Some(s) if !s.trim().is_empty() => {
-                            let parts: Vec<&str> = s.split('-').collect();
-                            let start = parts.first().and_then(|p| p.trim().parse::<i64>().ok());
-                            let end = parts
-                                .get(1)
-                                .and_then(|p| p.trim().parse::<i64>().ok())
-                                .or(start);
-                            (start, end)
-                        }
-                        _ => (None, None),
-                    };
-                    let evidence_id = match (&file, &content_hash) {
-                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.len().min(12)]),
-                        (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
-                        _ => id.clone(),
-                    };
-                    let entry = serde_json::json!({
-                        "declaring_id": id,
-                        "rel_type": edge.rel_type,
-                        "declaration_index": edge.declaration_index,
-                        "declared_target": declared,
-                        "resolved_target": resolved,
-                        "logical_target": logical,
-                        "orientation": orientation,
-                        "file": file,
-                        "content_hash": content_hash,
-                        "line_start": line_start,
-                        "line_end": line_end,
-                        "evidence_id": evidence_id,
-                        "extractor": "upsert",
-                    });
-                    resolved_edge_entries.push(entry);
-                    evidence_id
-                };
+                // F6: the edge row below carries this declaration's
+                // evidence id (computed from the declaring record's own
+                // stored fields by the shared constructor). The full
+                // provenance entry is no longer stamped onto the row's
+                // metadata; `synthesize_edge_sources` rebuilds it at read
+                // time from the same inputs (owner ruling 2026-11-07).
+                let evidence_id = edge_provenance_fields(&id, &payload).evidence_id;
                 if !is_valid_relation_name(edge.rel_type) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
                         rel_type: edge.rel_type.to_string(),
@@ -6387,47 +6533,6 @@ impl VectorStore for LadybugStore {
                         skipped: "this edge materialization".to_string(),
                     });
                     eprintln!("[neurostrata:write-shape] edge query error: {}", e);
-                }
-            }
-
-            // F6: stamp edge_sources provenance on the declaring row's metadata.
-            if !resolved_edge_entries.is_empty() {
-                // Dedupe identical entries.
-                let mut deduped: Vec<serde_json::Value> = Vec::new();
-                for e in &resolved_edge_entries {
-                    if !deduped.iter().any(|d| d == e) {
-                        deduped.push(e.clone());
-                    }
-                }
-                // Build edge_sources array and merge into metadata.
-                let edge_sources = serde_json::json!(deduped);
-                // Read current metadata, merge edge_sources, write back.
-                let read_q = format!(
-                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.metadata",
-                    escape_ladybug_string(&namespace),
-                    escape_ladybug_string(&id)
-                );
-                if let Ok(mut res) = conn.query(&read_q) {
-                    if let Some(row) = res.next() {
-                        if let lbug::Value::String(meta_str) = &row[0] {
-                            if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                                if let Some(obj) = meta.as_object_mut() {
-                                    obj.insert("edge_sources".to_string(), edge_sources);
-                                    let new_meta = serde_json::to_string(&meta).unwrap_or_default();
-                                    let safe_new_meta = escape_ladybug_string(&new_meta);
-                                    let update_q = format!(
-                                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
-                                        escape_ladybug_string(&namespace),
-                                        escape_ladybug_string(&id),
-                                        safe_new_meta
-                                    );
-                                    if let Err(e) = conn.query(&update_q) {
-                                        tracing::warn!("edge_sources provenance update failed for '{namespace}:{id}': {e}");
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
 
@@ -8148,18 +8253,34 @@ impl VectorStore for LadybugStore {
 
 
 
-                return Ok(Some((
-                    vec,
-                    MemoryPayload {
-                        content,
-                        user_id: uid,
-                        memory_type,
-                        agent_name: Some(agent_name),
-                        location,
-                        location_lines,
-                        metadata: metadata_val,
-                    },
-                )));
+                let mut payload = MemoryPayload {
+                    content,
+                    user_id: uid,
+                    memory_type,
+                    agent_name: Some(agent_name),
+                    location,
+                    location_lines,
+                    metadata: metadata_val,
+                };
+
+                // F6 (owner ruling 2026-11-07): `edge_sources` is never
+                // persisted; synthesize it at read time from the record's
+                // stored declarations and current resolution state. A key
+                // already in storage is a pre-ruling stamp artifact and is
+                // superseded — the returned metadata carries the synthesis,
+                // or no key at all, never the stored stamp. (No migration:
+                // storage converges on the record's next upsert, which no
+                // longer writes the key.)
+                let entries = synthesize_edge_sources(conn, &namespace, &id, &payload);
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    if entries.is_empty() {
+                        obj.remove("edge_sources");
+                    } else {
+                        obj.insert("edge_sources".to_string(), Value::Array(entries));
+                    }
+                }
+
+                return Ok(Some((vec, payload)));
             }
 
             Ok(None)
