@@ -1,0 +1,79 @@
+name: CI relink crash probe (scratch)
+
+# Disposable probe for PR #29's FIX18 corroboration. Loops the relink
+# rollback test once per process in the native GCC 15 runner
+# environment, where the lbug C++ assertion (null
+# lbug::common::ValueVector dereference) fires intermittently, to
+# either capture the abort with its assertion output or prove a clean
+# 100-iteration sweep. Not a gate. Do not merge the branch carrying
+# this file.
+
+on:
+  push:
+    branches: [scratch/ci-relink-probe-20261108]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: relink crash probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      # lbug (LadybugDB) compiles a C++ core with CMake (same check as ci.yml).
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      # Same fresh-checkout diagnostic as ci.yml's test job.
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
+      - name: Build test binary
+        shell: bash
+        run: cargo test --locked --bin neurostrata-mcp --no-run
+
+      - name: Relink crash probe (100 iterations)
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p probe-logs
+          for i in $(seq 1 100); do
+            log="probe-logs/iter-$i.log"
+            if cargo test --locked --bin neurostrata-mcp -- --exact parser::ingest::tests::a_failed_relink_rolls_back_to_the_previous_generation --test-threads=1 >"$log" 2>&1; then
+              echo "iteration $i: pass"
+            else
+              status=$?
+              echo "::error::probe aborted at iteration $i (exit $status)"
+              echo "=== tail of $log ==="
+              tail -n 100 "$log"
+              echo "ABORTED at iteration $i" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+          echo "100/100 clean" >> "$GITHUB_STEP_SUMMARY"
+          echo "probe complete: 100/100 clean"
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: relink-probe-logs
+          path: probe-logs/
+          if-no-files-found: warn
