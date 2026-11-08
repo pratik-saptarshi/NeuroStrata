@@ -21542,14 +21542,28 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn rollback_drill_old_merge_against_dual_namespace_store() {
         let store = t7_store().await;
-        store
-            .upsert("ns-a", "shared-id", vec![0.0; 4], t7_payload("content-a"))
-            .await
-            .unwrap();
-        store
-            .upsert("ns-b", "shared-id", vec![0.0; 4], t7_payload("content-b"))
-            .await
-            .unwrap();
+        // Seed the dual-namespace precondition directly: the production
+        // upsert's Rec #14 cross-namespace guard refuses the second
+        // same-id write, so the precondition cannot be built through it.
+        // The raw CREATEs supply the derived pks, with the same property
+        // set the upsert of `t7_payload` would have written.
+        let seed = |namespace: &str, content: &str| {
+            format!(
+                "CREATE (m:Memory {{pk: '{}', id: 'shared-id', namespace: '{}', content: '{}', user_id: 'agent', memory_type: 'fact', agent_name: 'unknown', location: '', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})",
+                escape_ladybug_string(&memory_pk(namespace, "shared-id")),
+                escape_ladybug_string(namespace),
+                escape_ladybug_string(content)
+            )
+        };
+        for row in [seed("ns-a", "content-a"), seed("ns-b", "content-b")] {
+            store
+                .with_conn(move |conn| {
+                    conn.query(&row)?;
+                    Ok(())
+                })
+                .await
+                .expect("seed dual-namespace precondition");
+        }
 
         // The drill: an old binary's upsert statement, verbatim shape,
         // against a store where the id legitimately exists twice. Which
