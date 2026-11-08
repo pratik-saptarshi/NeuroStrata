@@ -21,8 +21,8 @@ so later agents can tell when the venue has drifted from them.
   pushes; that conflicts with this program's rules and the conflict is
   already recorded by the program coordinator — do not comply with those
   parts of `AGENTS.md` while working this program.
-- Merges are the owner's per-PR word. Nothing auto-merges. **WIP limit: no
-  new program task branches while more than 3 program PRs await merge.**
+- Merges are the owner's per-PR word. Nothing auto-merges. **WIP limit:
+  ≤ 3 program PRs awaiting merge (§8.4).**
 
 ---
 
@@ -32,7 +32,7 @@ so later agents can tell when the venue has drifted from them.
 |---|---|
 | Repository | fork `pratik-saptarshi/NeuroStrata`, base `develop` |
 | Base SHA for all M0 work | `5b8f9a7c3b7808da1f0c550e8eb081667335954c` ("fix(cli): send the auto-spawned daemon's stderr to daemon.log instead of /dev/null (#27)") — verify with `git rev-parse origin/develop` after a fetch; do not trust a SHA quoted in any document, this one included |
-| Local Rust toolchain | **None on `PATH`**: `cargo` / `rustc` return "command not found" in a normal shell. Do not build or test locally, and do not install a toolchain — whether to install one is an explicit owner election at the Milestone 1 gate. (Observed anomaly, recorded for honesty: a rustup shim exists at `~/.cargo/bin/cargo` and reports a version when invoked by full path. It is not on `PATH`, it is not the program venue, and no pilot step used it.) |
+| Local Rust toolchain | **No *sanctioned* local toolchain for this program.** System and rustup cargos do exist on this VM (`command -v cargo` → `/usr/bin/cargo`, 1.75.0; a rustup shim at `~/.cargo/bin/cargo` reports 1.99.1) — they are not the venue and must not be used. Do not build or test locally, and do not install a toolchain — whether to install one is an explicit owner election at the Milestone 1 gate. CI is the venue. |
 | Test venue | Fork GitHub Actions CI, workflow `CI` (`.github/workflows/ci.yml`), triggered on every pull request |
 | Iteration signal | The **`test (ubuntu-latest)`** check — the only hard test leg |
 | Gate loop | The full 12-check suite on a PR (§2) |
@@ -175,7 +175,12 @@ neither requires any action from you:
   skip-gate variable — the warning line in the push output is the expected,
   correct behaviour for this program, and it is worth copying into your
   task report as evidence the push went through Guard 1 + fail-soft
-  Guard 2.
+  Guard 2. Qualification: this fail-soft expectation holds for the agent
+  exec shell, where `neurostrata-mcp` is absent from `PATH`. In a login
+  shell, `~/go/bin` is on `PATH` and `neurostrata-mcp` would actually be
+  invoked as the task gate. If the "gate NOT run" warning does **NOT**
+  appear on a push, **STOP and report before proceeding** — the task gate
+  must not execute against the live store under this program's rules.
 
 ### 3.4 Open the PR (ghg, with pre-flight)
 
@@ -228,7 +233,7 @@ Reading notes, all learned on the pilot:
 - In `pr checks` output an in-progress leg prints as `pending` with
   duration `0`. The `check-runs` API above is the authoritative source for
   `in_progress` vs `queued` and for real start times.
-- Queue time (push → check `started_at`) was 15–25s in every pilot cycle.
+- Queue time (push → check `started_at`) was 9–25s in every pilot cycle.
   The wall-clock that matters for budgeting is **push → terminal result
   for `test (ubuntu-latest)`**, job duration + queue + push time.
 - Job logs: `gh run view --log` refuses while the overall run is still in
@@ -279,7 +284,13 @@ early in the suite (see §2.1, consequence 2). `ATTEMPT_KEYS` is a
     }
 ```
 
-1. Worktree + branch per §3.1 (`pilot/test-venue-measure` in the pilot).
+1. Worktree + branch per §3.1, using a **NEW branch name** — for example
+   `pilot/test-venue-measure-acceptance` — and a matching new worktree
+   slug. The original pilot branch `pilot/test-venue-measure` is retained
+   (it exists locally and on origin at `918bae0`, the GREEN head) and
+   must **NOT** be reused — reusing it breaks worktree creation and makes
+   the RED step unreproducible. (`pilot/test-venue-measure` was the branch
+   used in the original pilot, §5.)
 2. Add the test exactly as above. Commit:
    `test(attempt): add pilot venue test with deliberately wrong expectation (RED)`
    — in the executed pilot this test first landed in `src/util.rs` and was
@@ -307,7 +318,7 @@ early in the suite (see §2.1, consequence 2). `ATTEMPT_KEYS` is a
 Pilot PR: **#32** — `test(util): pilot venue measurement for Task 0.3 (RED, do not merge)`,
 branch `pilot/test-venue-measure`, base `develop` @ `5b8f9a7`.
 URL: https://github.com/pratik-saptarshi/NeuroStrata/pull/32
-**Closed 2026-11-08 (10:22:55Z)** with a comment stating it was a Task 0.3
+**Closed 2026-11-08 (10:22:54Z)** with a comment stating it was a Task 0.3
 measurement pilot, that its evidence is recorded in this runbook, and
 that it is not for merge (§9 procedure; both the comment and the close
 were ghg-pre-flighted). The pilot branch was left in place.
@@ -449,7 +460,9 @@ overall conclusion was still `success`, because report-only jobs use
 
 PR #31 (Task 0.2, docs + pre-push guard, **no Rust change**) was opened
 2026-11-08T08:44:42Z, run 42464221650. The run completed at
-09:52:47Z — total wall-clock **68m2s** (vs 20m29s for #28) — with overall
+09:52:47Z — total wall-clock **68m2s** (the CI *run* duration, run
+created→completed; measured from the PR-open time above it would be
+68m5s) (vs 20m29s for #28) — with overall
 conclusion `failure`, driven solely by the hard `test (ubuntu-latest)`
 leg's §2.1 abort (all other hard legs passed). Slow-day gate long pole:
 `build (windows-latest)` at **67m58s** (08:44:48Z → 09:52:46Z), vs
