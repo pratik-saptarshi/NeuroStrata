@@ -83,6 +83,7 @@ mod unix_impl {
         // Best effort: a directory that cannot be created must not stop the
         // process from starting, so the failure is not returned.
         let _ = std::fs::create_dir_all(crash_dir);
+        std::fs::create_dir_all(crash_dir)?;
 
         // Stored as a C string because the handler copies the bytes into a
         // stack buffer: it cannot allocate, and it cannot hold a borrow of
@@ -91,7 +92,13 @@ mod unix_impl {
             Ok(path) => {
                 // Leaked on purpose: the handler reads it while the process
                 // is dying, and freeing it then would be a use-after-free.
-                let _ = CRASH_DIR.set(path);
+                if CRASH_DIR.set(path).is_err() && CRASH_DIR.get().map(|c| c.as_bytes()) != Some(crash_dir.as_os_str().as_bytes()) {
+                    tracing::debug!(
+                        "crash dir already initialized to {:?}; keeping it instead of {:?}",
+                        CRASH_DIR.get().map(|c| String::from_utf8_lossy(c.as_bytes())),
+                        crash_dir
+                    );
+                }
             }
             Err(_) => {
                 return Err(std::io::Error::new(
@@ -225,6 +232,10 @@ mod unix_impl {
             libc::raise(sig);
             // Belt and braces: raise() with the default disposition and
             // the signal unblocked does not return.
+            libc::raise(sig);
+            // Belt and braces: SA_RESETHAND on the installed sigaction means
+            // the disposition is already SIG_DFL by the time the handler
+            // runs, so the re-raise with the signal unblocked does not return.
             libc::_exit(128 + sig);
         }
     }
@@ -363,12 +374,20 @@ mod unix_impl {
     /// be broken, the unwinder may fail. None of that is allowed to stop
     /// the crash from happening.
     fn append_backtrace(path: &[u8], backtrace: &std::backtrace::Backtrace) {
-        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-            use std::io::Write;
-            let _ = writeln!(file, "\n--- backtrace ---");
-            let _ = writeln!(file, "{}", backtrace);
-            let _ = file.flush();
+        // Raw open/write like the rest of the handler: OpenOptions::open is
+        // not async-signal-safe and OpenOptions (Rust std) itself allocates.
+        let text = format!("\n--- backtrace ---\n{}\n", backtrace);
+        // SAFETY: `path` is a NUL-terminated path (see write_minimal_report).
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr() as *const libc::c_char,
+                libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            write_all(fd, text.as_bytes());
+            // SAFETY: `fd` was opened above and is now closed exactly once.
+            unsafe { libc::close(fd) };
         }
     }
 

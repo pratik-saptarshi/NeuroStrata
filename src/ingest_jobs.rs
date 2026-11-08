@@ -103,6 +103,10 @@ impl IngestObserver for ProgressReporter {
             progress.skipped_files.push(format!("{}: {}", path, reason));
         });
     }
+    fn version_gate_tripped(&self, _prev: &str, _current: &str) {
+        // The warning is emitted once in ingest_directory itself so it covers
+        // every caller, including those with no observer.
+    }
 }
 
 /// The walk a caller should wait on instead of starting one, if there is one.
@@ -185,7 +189,7 @@ impl IngestJobs {
         };
 
         let mut rx = {
-            let mut jobs = lock_or_err(&self.jobs)?;
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
                 running
@@ -210,6 +214,7 @@ impl IngestJobs {
                         vector_store,
                         &namespace,
                         Some(reporter),
+                        &[],
                     )
                     .await;
 
@@ -271,6 +276,8 @@ impl IngestJobs {
                 return false;
             }
         };
+        let receivers: Vec<watch::Receiver<IngestProgress>> =
+            self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
 
         let all_finished = async move {
             for mut rx in receivers {

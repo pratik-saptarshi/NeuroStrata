@@ -1,6 +1,5 @@
 use crate::traits::UpsertReport;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -27,17 +26,10 @@ pub struct MemoryWriteReport {
     pub linked_existing_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbedderDistancePolicy {
-    pub embedder_id: String,
-    pub hint_max_raw_distance: f32,
-    pub source_report_hash: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DedupDecisionPolicy {
-    pub distance_by_embedder: BTreeMap<String, EmbedderDistancePolicy>,
-}
+// `EmbedderDistancePolicy`/`DedupDecisionPolicy` were removed: the policy in
+// force is encoded in `DeduplicationConfig` + `model_may_block` (production +
+// test-verified: only a Gold-calibrated, currently-active model may block a
+// bare standalone add; inline task extraction never model-blocks).
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +38,8 @@ pub enum CalibrationTier {
     Gold,
 }
 
+/// Whether a model with this identity may gate (block) a memory write.
+/// Compiled and used in production: `LayaOnnxProvider::may_block` calls this.
 pub fn model_may_block(
     calibration_tier: CalibrationTier,
     model_version: &str,

@@ -50,6 +50,10 @@ fn git_output(root: &str, args: &[&str]) -> Option<String> {
 /// determined (no git, no remote) fall back to canonical filesystem paths and
 /// `"unknown"` rather than failing: a context request must always be
 /// answerable, and an honest "unknown" is better than a panic.
+///
+/// The stable source key derivation (`repo|checkout|worktree` composite) lives
+/// in `parser::ingest::source_key_for`; context code shares it verbatim, so
+/// `SourceIdentity` fields here must remain keyed the same way.
 pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceIdentity {
     let path = path.as_ref();
     let root = project_root.as_ref();
@@ -69,6 +73,22 @@ pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceId
     let repo_id = git_output(root, &["remote", "get-url", "origin"])
         .unwrap_or_else(|| root_canonical.clone());
     let checkout_id = root_canonical.clone();
+    // Linked worktrees share one common checkout: `--git-common-dir` points
+    // every worktree at the main repository's git dir, so they agree on
+    // `checkout_id` while `worktree_id` keeps them distinct. The path git
+    // reports may be relative to `root` (e.g. `".git"`), so resolve it
+    // against `root` before canonicalizing.
+    let checkout_id = git_output(root, &["rev-parse", "--git-common-dir"])
+        .map(|p| {
+            let p_path = Path::new(&p);
+            let full = if p_path.is_absolute() {
+                p_path.to_path_buf()
+            } else {
+                root_path.join(p_path)
+            };
+            canonical(full.to_str().unwrap_or(&p))
+        })
+        .unwrap_or_else(|| root_canonical.clone());
     let worktree_id = root_canonical;
     let revision = git_output(root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = git_output(root, &["status", "--porcelain"])
@@ -96,6 +116,17 @@ pub fn resolve_source(path: impl AsRef<str>, project_root: impl AsRef<str>) -> S
 pub fn source_key(project_root: impl AsRef<str>) -> String {
     canonical(project_root.as_ref())
 }
+/// Cross-scope authorization helpers.
+pub fn same_namespace(current: &str, target: &str) -> bool {
+    current == target
+}
+
+pub fn cross_scope_authorized(current: &str, target: &str, authorized: &[String]) -> bool {
+    if same_namespace(current, target) {
+        return true;
+    }
+    authorized.iter().any(|a| a == target)
+}
 
 #[cfg(test)]
 mod tests {
@@ -119,14 +150,3 @@ mod tests {
 }
 
 
-/// Cross-scope authorization helpers.
-pub fn same_namespace(current: &str, target: &str) -> bool {
-    current == target
-}
-
-pub fn cross_scope_authorized(current: &str, target: &str, authorized: &[String]) -> bool {
-    if same_namespace(current, target) {
-        return true;
-    }
-    authorized.iter().any(|a| a == target)
-}

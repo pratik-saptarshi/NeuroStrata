@@ -17,7 +17,9 @@ fn get_config_path() -> PathBuf {
     let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push(".config");
     path.push("NeuroStrata");
-    fs::create_dir_all(&path).ok();
+    if let Err(e) = fs::create_dir_all(&path) {
+        eprintln!("Failed to create NeuroStrata config directory {}: {e}", path.display());
+    }
     path.push("selected-project");
     path
 }
@@ -32,7 +34,9 @@ fn load_config() -> Config {
 
 fn save_config(config: &Config) {
     if let Some(ref path) = config.last_project_path {
-        let _ = fs::write(get_config_path(), path);
+        if let Err(e) = fs::write(get_config_path(), path) {
+            eprintln!("Failed to write project path to config: {e}");
+        }
     }
 }
 
@@ -60,17 +64,6 @@ fn save_project_path(path: String) {
     save_config(&config);
 }
 
-/// A client for talking to the daemon, with the timeout stated rather than
-/// inherited.
-///
-/// `reqwest::blocking::Client::new()` applies a THIRTY SECOND timeout of its
-/// own -- the blocking client does this, the async client does not -- and every
-/// call here used to take it. A directory ingest of a real repository runs
-/// longer than that, so the GUI was aborting its own ingest partway through:
-/// the daemon saw the client disconnect, dropped the request with it, and
-/// stopped mid-walk without ever reaching relink_edges. What the user saw was a
-/// graph frozen half-built with no GOVERNS edges, a daemon still answering
-/// /health, and no error anywhere (bead neurostrata-zbw).
 /// Read one of the daemon's token files (`daemon.token`,
 /// `operator.token`) from the daemon's config directory.
 ///
@@ -91,6 +84,19 @@ fn daemon_token_file(name: &str) -> Option<String> {
     }
 }
 
+/// A client for talking to the daemon, with the timeout stated rather than
+/// inherited.
+///
+/// `reqwest::blocking::Client::new()` applies a THIRTY SECOND timeout of its
+/// own -- the blocking client does this, the async client does not -- and every
+/// call here used to take it. A directory ingest of a real repository runs
+/// longer than that, so the GUI was aborting its own ingest partway through:
+/// the daemon saw the client disconnect, dropped the request with it, and
+/// stopped mid-walk without ever reaching relink_edges. What the user saw was a
+/// graph frozen half-built with no GOVERNS edges, a daemon still answering
+/// /health, and no error anywhere (bead neurostrata-zbw). The caller states
+/// the timeout it needs (`daemon_client(INGEST_TIMEOUT)` for the long walk)
+/// instead of silently inheriting the 30-second default.
 fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client, String> {
     // The daemon requires its bearer on every route but /health; attach
     // it as a default header so every backend call authenticates.
@@ -111,6 +117,20 @@ fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Clie
         .map_err(|e| e.to_string())
 }
 
+/// Base URL of the NeuroStrata daemon's HTTP surface.
+///
+/// The port is overridable via `NEUROSTRATA_DAEMON_PORT` so tests and
+/// side-cars can point the app at a daemon that is not the default; an
+/// empty or unset variable falls back to the fixed default port.
+fn daemon_base_url() -> String {
+    let port = std::env::var("NEUROSTRATA_DAEMON_PORT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "34343".to_string());
+    format!("http://127.0.0.1:{port}")
+}
+
 /// Ingestion walks and embeds a whole repository, which is minutes of work on a
 /// large one.
 const INGEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
@@ -127,7 +147,7 @@ fn ensure_daemon() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    if client.get("http://127.0.0.1:34343/health").send().is_err() {
+    if client.get(&format!("{}/health", daemon_base_url())).send().is_err() {
         // Not running, spawn it
         println!("MCP Daemon not running. Starting it...");
 
@@ -234,7 +254,7 @@ fn ingest_ast(project_path: String) -> Result<String, String> {
     let namespace = namespace_for(&project_path);
 
     let client = daemon_client(INGEST_TIMEOUT)?;
-    let resp = client.post("http://127.0.0.1:34343/ingest")
+    let resp = client.post(format!("{}/ingest", daemon_base_url()))
         .json(&serde_json::json!({
             "dir": project_path,
             "namespace": namespace
@@ -257,14 +277,17 @@ fn delete_memory(namespace: String, id: String) -> Result<String, String> {
     // /delete is destructive-class on the daemon: it additionally
     // requires the operator token (Task 1, DR-5). The backend holds it
     // as a first-party same-UID client; the web-ui never sees it.
-    let mut request = client.post("http://127.0.0.1:34343/delete")
+    // A missing token file is an explicit authorization failure, not a
+    // silent unauthenticated request the daemon would have to refuse.
+    let operator = daemon_token_file("operator.token").ok_or_else(|| {
+        "operator.token is missing; cannot authorize delete_memory".to_string()
+    })?;
+    let request = client.post(format!("{}/delete", daemon_base_url()))
         .json(&serde_json::json!({
             "namespace": namespace,
             "id": id
-        }));
-    if let Some(operator) = daemon_token_file("operator.token") {
-        request = request.header("x-neurostrata-operator", operator);
-    }
+        }))
+        .header("x-neurostrata-operator", operator);
     let resp = request
         .send()
         .map_err(|e| e.to_string())?;
@@ -287,7 +310,7 @@ fn edit_memory(
     ensure_daemon()?;
 
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.post("http://127.0.0.1:34343/edit")
+    let resp = client.post(format!("{}/edit", daemon_base_url()))
         .json(&serde_json::json!({
             "old_namespace": old_namespace,
             "id": id,
@@ -315,7 +338,7 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
     }
     
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.get("http://127.0.0.1:34343/graph")
+    let resp = client.get(format!("{}/graph", daemon_base_url()))
         .query(&[("namespace", namespace_filter)])
         .send()
         .map_err(|e| e.to_string())?;
@@ -354,7 +377,6 @@ fn main() {
 
             app.set_menu(menu)?;
 
-            let _handle = app.handle().clone();
             app.on_menu_event(move |app, event| {
                 println!("Menu event triggered: {:?}", event.id());
                 if event.id() == "open_project" {

@@ -20,6 +20,13 @@ pub struct SetupReport {
 pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
     let bin_path = std::env::current_exe().context("cannot determine current_exe")?;
     let script_path = repo_path.join("scripts").join("backup.sh");
+    // systemd ExecStart and launchd ProgramArguments require absolute paths;
+    // a relative repo_path (e.g. `./`) would otherwise leak into the units.
+    let canonical_repo = std::fs::canonicalize(repo_path).unwrap_or_else(|e| {
+        tracing::debug!("failed to canonicalize {}: {e}", repo_path.display());
+        repo_path.to_path_buf()
+    });
+    let script_path = canonical_repo.join("scripts").join("backup.sh");
 
     if !script_path.exists() {
         anyhow::bail!(
@@ -31,11 +38,11 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
 
     #[cfg(target_os = "linux")]
     {
-        run_setup_linux(&bin_path, &script_path, repo_path)
+        run_setup_linux(&bin_path, &script_path)
     }
     #[cfg(target_os = "macos")]
     {
-        run_setup_macos(&bin_path, &script_path, repo_path)
+        run_setup_macos(&bin_path, &script_path)
     }
     #[cfg(target_os = "windows")]
     {
@@ -50,7 +57,7 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
 // ═══ Linux (systemd, user-level) ═══════════════════════════════════════════
 
 #[cfg(target_os = "linux")]
-fn run_setup_linux(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupReport> {
+fn run_setup_linux(bin: &Path, script: &Path) -> Result<SetupReport> {
     let unit_dir = unit_dir_linux()?;
     fs::create_dir_all(&unit_dir).with_context(|| format!("create {}", unit_dir.display()))?;
 
@@ -92,7 +99,7 @@ fn run_setup_linux(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
         println!("  NOTE: daemon did not become healthy; check journal above.");
     }
 
-    Ok(SetupReport { daemon_installed: true, backup_installed: true, verified })
+    Ok(SetupReport { daemon_installed: true, backup_installed: verified, verified })
 }
 
 #[cfg(target_os = "linux")]
@@ -200,7 +207,7 @@ fn backup_timer_template() -> String {
 // ═══ macOS (launchd agent + timer) ═══════════════════════════════════════
 
 #[cfg(target_os = "macos")]
-fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupReport> {
+fn run_setup_macos(bin: &Path, script: &Path) -> Result<SetupReport> {
     use std::fs;
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let launchd_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
@@ -217,6 +224,14 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
     println!("Wrote:");
     println!("  {}", daemon_plist.display());
     println!("  {}", backup_plist.display());
+
+    // Unload first so a re-run of setup is idempotent (load -w on an already
+    // loaded agent is a no-op and leaves a stale definition active).
+    if let Err(e) = std::process::Command::new("launchctl")
+        .args(["unload", "-w", &daemon_plist.to_string_lossy()])
+        .status() {
+        tracing::debug!("launchctl unload failed: {e}");
+    }
 
     // Load / reload agent
     let load = std::process::Command::new("launchctl")
@@ -243,6 +258,18 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
             eprintln!("launchctl load backup timer failed — timer not started");
         }
     }
+    let timer_started = if verified {
+        let timer_load = std::process::Command::new("launchctl")
+            .args(["load", "-w", &backup_plist.to_string_lossy()])
+            .status();
+        let ok = timer_load.map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            eprintln!("launchctl load backup timer failed — timer not started");
+        }
+        ok
+    } else {
+        false
+    };
 
     println!();
     println!("Next:");
@@ -255,7 +282,7 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
 
     Ok(SetupReport {
         daemon_installed: true,
-        backup_installed: verified,
+        backup_installed: timer_started,
         verified,
     })
 }
@@ -301,6 +328,16 @@ fn macos_backup_plist(script: &Path) -> String {
     <key>Hour</key><integer>12</integer>
     <key>Minute</key><integer>0</integer>
   </dict>
+  <key>StartCalendarInterval</key><array>
+    <dict>
+      <key>Hour</key><integer>0</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>12</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+  </array>
   <key>StandardErrorPath</key><string>/tmp/neurostrata-backup.log</string>
 </dict></plist>
 "#,
@@ -351,19 +388,25 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     }
 
     // Configure service properties
-    std::process::Command::new(&nssm_exe)
+    let app_dir_status = std::process::Command::new(&nssm_exe)
         .args([
             "set", service_name, "AppDirectory", &repo.display().to_string(),
         ])
         .status()
         .context("nssm set AppDirectory")?;
-    std::process::Command::new(&nssm_exe)
+    if !app_dir_status.success() {
+        anyhow::bail!("nssm set AppDirectory exited with {:?}", app_dir_status.code());
+    }
+    let start_flag_status = std::process::Command::new(&nssm_exe)
         .args([
             "set", service_name, "Start", "SERVICE_AUTO_START",
         ])
         .status()
         .context("nssm set Start")?;
-    std::process::Command::new(&nssm_exe)
+    if !start_flag_status.success() {
+        anyhow::bail!("nssm set Start exited with {:?}", start_flag_status.code());
+    }
+    let restart_status = std::process::Command::new(&nssm_exe)
         .args([
             "set", service_name, "Restart", "on-failure",
             "RestartSec", "5",
@@ -375,6 +418,17 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
         .args(["start", service_name])
         .status()
         .context("nssm start NeuroStrata")?;
+    if !restart_status.success() {
+        anyhow::bail!("nssm set Restart exited with {:?}", restart_status.code());
+    }
+
+    let start_status = std::process::Command::new(&nssm_exe)
+        .args(["start", service_name])
+        .status()
+        .context("nssm start NeuroStrata")?;
+    if !start_status.success() {
+        anyhow::bail!("nssm start NeuroStrata exited with {:?}", start_status.code());
+    }
 
     println!("NSSM service '{}' installed and started.", service_name);
     println!("Next: services.msc (look for NeuroStrata) or `sc query NeuroStrata`");

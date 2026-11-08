@@ -4,3 +4,18 @@
 //! `related` traversal.
 pub mod memories_for_file;
 pub mod related;
+
+/// Deterministic hybrid (graph + vector) lookups beside the vector store.
+pub mod hybrid;
+
+/// Bounded time-window reasoning over relationship validity windows.
+pub mod temporal;
+
+/// Deterministic weighted ordering of `related` neighbours.
+pub mod prioritized;
+
+/// Cross-namespace boundary policy for `related` hops.
+pub mod traversal;
+
+/// Bounded, transient domain/tag propagation from seed nodes.
+pub mod propagate;

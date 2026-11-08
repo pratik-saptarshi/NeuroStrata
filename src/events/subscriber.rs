@@ -215,6 +215,9 @@ pub struct BusMetrics {
     /// `POST /bus/metrics` instead of looking like a healthy bus that was
     /// simply never asked to attach an outbox.
     pub outbox_attach_failed: bool,
+    /// Subscriber invocations that returned `Err` to the dispatcher: logged,
+    /// counted, and never propagated to the caller of the storage write.
+    pub subscriber_failures: u64,
 }
 
 #[cfg(test)]

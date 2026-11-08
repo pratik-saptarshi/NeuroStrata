@@ -74,6 +74,11 @@ pub struct MemoryPayload {
 /// takes: absent, JSON null, and a blank string all read as unsourced, while a
 /// non-empty string ("owner 2026-10-08") or a structured object
 /// ({kind, ref, captured_at}) read as sourced.
+/// takes: absent, JSON null, and a blank string all read as unsourced, while
+/// a non-empty string ("owner 2026-10-08") or a non-empty JSON object
+/// ({kind, ref, captured_at}) read as sourced. Numbers, booleans, and arrays
+/// carry no provenance semantics, so they read as unsourced too (`{"source":
+/// 42}` is not an origin).
 ///
 /// The task gate fails rules without one and the search ranker rewards them.
 /// They must agree on that line, so both call this rather than each carrying a
@@ -82,7 +87,10 @@ pub struct MemoryPayload {
 pub fn has_source(metadata: &Value) -> bool {
     metadata
         .get("source")
-        .map(|s| !s.is_null() && (s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(true)))
+        .map(|s| {
+            s.as_str().is_some_and(|x| !x.trim().is_empty())
+                || s.as_object().is_some_and(|o| !o.is_empty())
+        })
         .unwrap_or(false)
 }
 
@@ -124,6 +132,8 @@ pub struct SearchEvidence {
     pub kind: EvidenceKind,
     pub path: Vec<EvidenceEdge>,
     pub explanation: String,
+    #[serde(default)]
+    pub derivation: Vec<String>,
 }
 
 /// Returns true when the evidence carries a DirectMatch — the shared
@@ -132,7 +142,8 @@ pub struct SearchEvidence {
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
     evidence.as_ref().map_or(false, |evs| {
-        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
+        evs.iter()
+            .any(|e| e.kind == EvidenceKind::DirectMatch)
     })
 }
 
@@ -146,6 +157,13 @@ pub enum DomainMatchMode {
     Vector,
 }
 
+/// Search mode: Default (existing pipeline) or Hybrid (normalized distances).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Default,
+    Hybrid,
+}
+
 /// The outcome of a domain-filtered search.
 #[derive(Debug, Clone)]
 pub struct DomainSearchOutcome {
@@ -154,6 +172,15 @@ pub struct DomainSearchOutcome {
     /// Set true when the FETCH_MULTIPLIER budget was exhausted and more
     /// candidates remain — callers must paginate to avoid losing matches.
     pub incomplete: bool,
+}
+
+/// The outcome of an in-house lexical search.
+#[derive(Debug, Clone)]
+pub struct LexicalSearchOutcome {
+    pub results: Vec<SearchResult>,
+    /// True when a requested domain filter actually selected the rows.
+    /// False covers both "no filter asked for" and the documented fallback.
+    pub domain_filter_applied: bool,
 }
 
 /// What an attempt to move a memory between namespaces found.
@@ -306,7 +333,18 @@ pub trait VectorStore: Send + Sync + AsAny {
     async fn init(&self, namespace: &str) -> Result<()>;
 
     /// Downcast support for store-specific capabilities (e.g., IntakeStore).
-    fn as_any(&self) -> &dyn std::any::Any;
+    ///
+    /// Delegates through `AsAny` so implementors declare the cast once; the
+    /// supertrait method is the single definition the calls resolve into.
+    fn as_any(&self) -> &dyn std::any::Any {
+        crate::traits::AsAny::as_any(self)
+    }
+
+    /// Access store-specific intake capabilities without downcasting to a
+    /// concrete type. Returns `None` for stores that do not support intake.
+    fn as_intake_store(&self) -> Option<&dyn IntakeStore> {
+        None
+    }
 
     /// Insert or update a memory with its associated vector and metadata.
     async fn upsert(
@@ -407,6 +445,9 @@ pub trait VectorStore: Send + Sync + AsAny {
         _source_key: &str,
         _generation: u64,
     ) -> Result<()> {
+        tracing::warn!(
+            "VectorStore::publish_generation default no-op called for '{_namespace}:{_source_key}' gen {_generation}"
+        );
         Ok(())
     }
 
@@ -419,6 +460,9 @@ pub trait VectorStore: Send + Sync + AsAny {
         _source_key: &str,
         _generation: u64,
     ) -> Result<()> {
+        tracing::warn!(
+            "VectorStore::abort_generation default no-op called for '{_namespace}:{_source_key}' gen {_generation}"
+        );
         Ok(())
     }
 
@@ -500,6 +544,8 @@ pub trait VectorStore: Send + Sync + AsAny {
         include_tasks: bool,
         include_archived: bool,
         _domains: &[String],
+        _query_text: Option<&str>,
+        _exact: bool,
     ) -> Result<DomainSearchOutcome> {
         let results = self
             .search(namespace, vector, limit, include_tasks, include_archived)
@@ -509,6 +555,31 @@ pub trait VectorStore: Send + Sync + AsAny {
             mode: DomainMatchMode::Vector,
             incomplete: false,
         })
+    }
+
+    /// Search with the in-house multi-field lexical engine.
+    ///
+    /// The default implementation refuses instead of returning an empty list:
+    /// a backend that cannot do lexical search must not look like a namespace
+    /// with no matching memories.
+    async fn search_lexical(
+        &self,
+        _namespace: &str,
+        _query: &str,
+        _limit: usize,
+        _include_tasks: bool,
+        _include_archived: bool,
+        _domains: &[String],
+        _principal: &str,
+        _fuzzy_max_distance: usize,
+    ) -> Result<LexicalSearchOutcome> {
+        anyhow::bail!("lexical-inhouse search is not supported by this store")
+    }
+
+    /// Rebuild the in-house lexical index from the store of record. Returns the
+    /// number of documents indexed.
+    async fn rebuild_lexical_index(&self, _namespace: Option<&str>) -> Result<usize> {
+        anyhow::bail!("lexical-inhouse search is not supported by this store")
     }
 
     /// Write a self-contained snapshot of the store into `dir`.
@@ -571,6 +642,10 @@ pub trait GraphRead: Send + Sync {
     /// is clamped to `[1, MAX_LIMIT]`. `cursor` resumes a page only when its
     /// fingerprint and generation still match the current query and store, so
     /// retirement/privacy are rechecked on every page.
+    /// retirement/privacy are rechecked on every page. `cross_namespace` is
+    /// the boundary policy: same-namespace hops are always allowed, and a
+    /// cross-namespace hop requires an explicit opt-in (plus an optional
+    /// target allowlist).
     async fn related(
         &self,
         namespace: &str,
@@ -581,6 +656,7 @@ pub trait GraphRead: Send + Sync {
         memory_types: &[String],
         limit: usize,
         cursor: Option<&RelatedCursor>,
+        cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
     ) -> Result<RelatedResult>;
 }
 
@@ -640,13 +716,14 @@ mod tests {
     #[test]
     fn memory_vocabulary_v7_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 8);
+        assert_eq!(v["vocabulary_version"], 10);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
         assert!(rels.contains_key("RELATES_TO"));
         assert!(rels.contains_key("EXTRACTED_FROM"));
-        assert_eq!(rels.len(), 4);
+        assert!(rels.contains_key("DEPENDS_ON"));
+        assert_eq!(rels.len(), 5);
         assert_eq!(rels["GOVERNS"]["direction"], "directed");
         assert_eq!(rels["CONTAINS"]["direction"], "directed");
         assert_eq!(rels["RELATES_TO"]["direction"], "undirected");
@@ -818,6 +895,7 @@ mod tests {
                 kind: EvidenceKind::DirectMatch,
                 path: vec![],
                 explanation: "test".into(),
+                derivation: vec![],
             }]),
         };
         let json = serde_json::to_value(&sr).unwrap();
@@ -852,6 +930,7 @@ mod tests {
                 },
             ],
             explanation: "explanation".into(),
+            derivation: vec![],
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["kind"], "governs_2hop");
@@ -865,6 +944,10 @@ mod tests {
     /// the field legitimately takes has to land on the right side of it, and a
     /// blank has to be indistinguishable from absent -- otherwise padding a rule
     /// with `"source": ""` would satisfy neither.
+    /// the field legitimately takes has to land on the right side of it: a
+    /// blank has to be indistinguishable from absent (padding with
+    /// `"source": ""` must not satisfy the gate), and number/boolean/array
+    /// sources carry no provenance.
     #[test]
     fn has_source_covers_every_shape_the_field_takes() {
         for absent in [json!({}), json!({ "kind": "rule" })] {
@@ -876,21 +959,26 @@ mod tests {
         }
         for blank in [
             json!({ "source": null }),
+            json!({ "source": {} }),
             json!({ "source": "" }),
             json!({ "source": "  " }),
+            json!({ "source": 42 }),
+            json!({ "source": true }),
+            json!({ "source": [] }),
+            json!({ "source": ["a"] }),
         ] {
             assert!(
                 !has_source(&blank),
-                "blank source is not provenance: {}",
+                "shapeless source is not provenance: {}",
                 blank
             );
         }
         for real in [
             json!({ "source": "owner 2026-10-08" }),
             json!({ "source": { "kind": "derived", "ref": "task-wiot", "captured_at": "2026-10-09" } }),
-            json!({ "source": ["a"] }),
         ] {
             assert!(has_source(&real), "real source is provenance: {}", real);
         }
     }
+
 }

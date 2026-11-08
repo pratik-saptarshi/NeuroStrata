@@ -469,6 +469,75 @@ function initialStatus(): AdapterStatus {
 
 let status: AdapterStatus = initialStatus();
 
+/**
+ * Session/task tracking between turn content and guard validation.
+ *
+ * OpenClaw exposes no tool-call hook, so task mutations are observed
+ * best-effort from turn content mentioning `neurostrata_task_claim`,
+ * `neurostrata_task_update` or `neurostrata_task_complete`, with the
+ * `id` / `session_id` parameters the payload carries.
+ */
+let activeSessionId: string | null = null;
+let activeTaskId: string | null = null;
+
+/**
+ * Mutations since the heavyweight channels were last touched (a note on the
+ * active task, a claim, or a completion). The guard consumes this through
+ * `neurostrata_guard_validate`'s `mutations_since_note` argument to pin the
+ * Breath prompt.
+ */
+let mutationsSinceNote = 0;
+
+/** Reset the tracked session/task state (test hook). */
+export function resetState(): void {
+  activeSessionId = null;
+  activeTaskId = null;
+  mutationsSinceNote = 0;
+}
+
+/**
+ * Read the `id` / `session_id` a task-mutation payload carries from turn
+ * content. Handles both JSON (`"id": "x"`) and call-ish (`id = "x"`)
+ * spellings; both `session_id` and camelCase `sessionID` are accepted.
+ */
+function extractTrackingFromText(text: string): {
+  taskId: string | undefined;
+  sessionId: string | undefined;
+} {
+  const id = /(?<![\w-])id["'\s]*[:=]\s*["']([^"']+)["']/.exec(text)?.[1];
+  const sessionId =
+    /session[_\s-]?id["'\s]*[:=]\s*["']([^"']+)["']/i.exec(text)?.[1] ?? undefined;
+  return { taskId: id, sessionId };
+}
+
+/** Update the tracked session/task state from a turn, best-effort. */
+function trackFromTurn(turn: ConversationTurn): void {
+  const lower = turn.content.toLowerCase();
+  const isClaimOrComplete =
+    lower.includes("neurostrata_task_claim") ||
+    lower.includes("neurostrata_task_update") ||
+    lower.includes("neurostrata_task_complete");
+  if (!isClaimOrComplete) return;
+
+  const { taskId, sessionId } = extractTrackingFromText(turn.content);
+  if (sessionId) activeSessionId = sessionId;
+  // Heavyweight turn: a note, claim, or completion satisfies the Breath
+  // prompt, so the mutation counter starts over. Best-effort: the turn text
+  // is the only source openclaw exposes, so a bare "note" mention counts.
+  if (
+    lower.includes("neurostrata_task_claim") ||
+    lower.includes("neurostrata_task_complete") ||
+    (lower.includes("neurostrata_task_update") && lower.includes("note"))
+  ) {
+    mutationsSinceNote = 0;
+  }
+  if (lower.includes("neurostrata_task_complete")) {
+    activeTaskId = null;
+  } else if (taskId) {
+    activeTaskId = taskId;
+  }
+}
+
 /** The adapter's current state. A degraded core is visible here. */
 export function adapterStatus(): AdapterStatus {
   return { ...status, missingTools: [...status.missingTools] };
@@ -537,11 +606,185 @@ export function detectTaskIntentsLocal(text: string): TaskIntentSignal[] {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// File-touch prefetch (design §4.5): LRU dedup + injected-memory dedup
+// ──────────────────────────────────────────────────────────────────────
+
+/** LRU cap: how many recently touched (`namespace:path`) keys are kept. */
+export const PREFETCH_LRU_CAP = 128;
+
+/** Output budget: one file-touch recall injects at most this many chars. */
+export const PREFETCH_MAX_CHARS = 2048;
+
+/**
+ * Recently touched file paths, keyed `namespace:path`, in LRU order
+ * (oldest first). Bounded so a long session cannot grow without bound.
+ */
+export const prefetchedPaths = new Map<string, number>();
+
+/** `(memory_id:valid_from)` keys already injected this session. */
+export const injectedMemoryIds = new Set<string>();
+
+function recordPrefetchedPath(key: string): void {
+  prefetchedPaths.set(key, Date.now());
+  if (prefetchedPaths.size > PREFETCH_LRU_CAP) {
+    const oldest = prefetchedPaths.keys().next().value;
+    if (oldest !== undefined) prefetchedPaths.delete(oldest);
+  }
+}
+
+function touchPrefetchedPath(key: string): void {
+  prefetchedPaths.delete(key);
+  recordPrefetchedPath(key);
+}
+
+/** One governing memory as `memories_for_file` returns it. */
+export interface FileMemoryHit {
+  id: string;
+  valid_from: string;
+  memory_type: string;
+  content: string;
+}
+
+/**
+ * Read the `memories_for_file` answer: the array arrives as `hits` or
+ * `memories` between the first `{` and the last `}` of the content text.
+ */
+export function parseFileMemoryHits(text: string): FileMemoryHit[] {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) {
+    throw new Error(
+      `memories_for_file returned no JSON body: ${text.slice(0, 200)}`,
+    );
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(
+      `memories_for_file returned an unreadable body: ${String(err)}`,
+    );
+  }
+
+  const raw = Array.isArray(body.hits)
+    ? body.hits
+    : Array.isArray(body.memories)
+      ? body.memories
+      : [];
+
+  const out: FileMemoryHit[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const hit = item as Record<string, unknown>;
+    const id = asString(hit.id) ?? asString(hit.memory_id);
+    const valid_from = asString(hit.valid_from) ?? "";
+    if (!id) continue; // a hit without an id cannot be deduped — never inject
+    out.push({
+      id,
+      valid_from,
+      memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? "memory",
+      content:
+        asString(hit.content) ??
+        asString(hit.text) ??
+        asString(hit.summary) ??
+        "",
+    });
+  }
+  return out;
+}
+
+function formatFileMemorySnippet(hit: FileMemoryHit): string {
+  const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
+  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
+}
+
+/** Cap the recalled snippets so one file touch can never flood context. */
+function capSnippets(snippets: string[]): string[] {
+  let total = 0;
+  const out: string[] = [];
+  for (const snippet of snippets) {
+    if (total >= PREFETCH_MAX_CHARS) break;
+    const room = PREFETCH_MAX_CHARS - total;
+    out.push(snippet.length > room ? snippet.slice(0, room) : snippet);
+    total += Math.min(snippet.length, room) + 1; // + join newline
+  }
+  return out;
+}
+
+/**
+ * Recall governing memories when a file is touched (design §4.5).
+ *
+ * Each `namespace:path` key is prefetched at most once per LRU window;
+ * each memory is injected at most once per `(id, valid_from)` key. Never
+ * increments `access_count` — this is a read-only recall.
+ */
+export async function prefetchMemoriesForFile(
+  namespace: string,
+  filePath: string,
+): Promise<string[]> {
+  const path = filePath.trim();
+  if (path === "") return [];
+
+  const key = `${namespace}:${path}`;
+  if (prefetchedPaths.has(key)) {
+    touchPrefetchedPath(key);
+    return [];
+  }
+
+  // Record the LRU entry only after the recall actually succeeded: a
+  // disconnected or failed call must never permanently suppress prefetch
+  // for this file within the LRU window.
+  if (!mcpClient) return [];
+
+  const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+    namespace,
+    path,
+    limit: 5,
+  });
+  recordPrefetchedPath(key);
+
+  const out: string[] = [];
+  for (const hit of parseFileMemoryHits(text)) {
+    const dedupKey = `${hit.id}:${hit.valid_from}`;
+    if (injectedMemoryIds.has(dedupKey)) continue;
+    injectedMemoryIds.add(dedupKey);
+    out.push(formatFileMemorySnippet(hit));
+  }
+  return capSnippets(out);
+}
+
+export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+
+export function buildSubagentContextHeader(
+  namespace: string,
+  taskId: string | null,
+): string {
+  const taskLabel = taskId ?? "unclaimed (claim a task first)";
+  return (
+    `${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
+    `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+    `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`
+  );
+}
+
+export function injectSubagentPrompt(
+  target: Record<string, unknown>,
+  namespace: string,
+  taskId: string | null,
+): boolean {
+  const raw = typeof target.prompt === "string" ? target.prompt : null;
+  if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER)) return false;
+  target.prompt = buildSubagentContextHeader(namespace, taskId) + raw;
+  return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Plugin Entry Point
 // ──────────────────────────────────────────────────────────────────────
 
 let config: PluginConfig = DEFAULT_CONFIG;
-let mcpClient: NeuroStrataMCPClient;
+let mcpClient!: NeuroStrataMCPClient;
 
 /**
  * The plugin context, captured on initialize.
@@ -636,7 +879,28 @@ async function negotiateCapabilities(): Promise<void> {
 // ──────────────────────────────────────────────────────────────────────
 
 async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
+  // File-touch recall (§4.5): before guarding the operation, prefetch the
+  // memories governing this file and inject them as a system message.
+  // Fail-soft: file recall must never block or break the file operation.
+  if (op.path && op.path.trim() !== "") {
+    try {
+      const snippets = await prefetchMemoriesForFile(config.namespace, op.path);
+      if (snippets.length > 0) {
+        requireCtx().conversation.injectSystemMessage(
+          `[NeuroStrata] Governing memories for ${op.path}:\n${snippets.join("\n")}`,
+        );
+      }
+    } catch (err) {
+      requireCtx().logger.warn("File-touch prefetch failed", {
+        path: op.path,
+        error: String(err),
+      });
+    }
+  }
+
   if (!config.strictMode) {
+    // Executed without validation: it is still a mutation.
+    mutationsSinceNote++;
     return { allowed: true };
   }
 
@@ -652,10 +916,15 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
   try {
     const text = await mcpClient.callTool("neurostrata_guard_validate", {
       namespace: config.namespace,
+      session_id: activeSessionId ?? "unknown",
+      active_task_id: activeTaskId,
+      worktree: cwd,
       action_type: actionType,
       payload,
       cwd,
+      is_mutating: true,
       use_sandbox: false,
+      mutations_since_note: mutationsSinceNote,
     });
 
     const result = parseGuardValidate(text);
@@ -666,6 +935,9 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
         result.bucket;
       requireCtx().logger.warn("Guard rejected file operation", {
         actionType,
+        session_id: activeSessionId ?? "unknown",
+        active_task_id: activeTaskId,
+        worktree: cwd,
         reason,
         rule_ids: result.rule_ids,
       });
@@ -688,6 +960,8 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
     };
   }
 
+  // Allowed: the operation executes, so it counts as a mutation.
+  mutationsSinceNote++;
   return { allowed: true };
 }
 
@@ -696,6 +970,10 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
 // ──────────────────────────────────────────────────────────────────────
 
 async function onTurnEnd(turn: ConversationTurn): Promise<void> {
+  // Session/task tracking for guard validation (F15): runs before intent
+  // detection so a rejected turn still updates the tracked state.
+  trackFromTurn(turn);
+
   if (!config.intentDetection.enabled) return;
   if (turn.role === "system") return; // don't re-process our own nudges
 

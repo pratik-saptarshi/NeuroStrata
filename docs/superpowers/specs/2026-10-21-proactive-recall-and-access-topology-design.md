@@ -331,7 +331,7 @@ Ordered. Each step is independently testable.
 
 ## 10. Dependencies, sequencing, deferrals
 
-**Lands first relative to this spec's own rule rows:** `neurostrata-bzdn` — the `rule-honesty` hardening plus the legacy backfill (NeuroStrata: 86 rule rows, 84 missing `enforcement`; keywest.health: 137 rows, 137 missing `enforcement`, 102 missing `source`). The dependency is one-directional and narrow: the hardening must land before a rule row written under §4.4 is written, because the tightened contract is what the row must satisfy. It does not gate the mechanism — the recall, the domain filter and the vocabulary bump are implementable against `b3904d8` without it.
+**Lands first relative to this spec's own rule rows:** `neurostrata-bzdn` — the `rule-honesty` hardening plus the legacy backfill (NeuroStrata: 86 rule rows, 84 missing `enforcement`; dogfood-app: 137 rows, 137 missing `enforcement`, 102 missing `source`). The dependency is one-directional and narrow: the hardening must land before a rule row written under §4.4 is written, because the tightened contract is what the row must satisfy. It does not gate the mechanism — the recall, the domain filter and the vocabulary bump are implementable against `b3904d8` without it.
 
 **Already landed and orthogonal:** `c446b2c` — episode siblings via `EXTRACTED_FROM` (`EvidenceKind::EpisodeSibling`, `src/store/ladybug.rs:246-249`, `:398-463`).
 
