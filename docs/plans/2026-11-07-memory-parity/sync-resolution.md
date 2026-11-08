@@ -484,13 +484,13 @@ outputs.** No test ever configured a remote pointing at the real
 3. *Installed in the main clone.* `scripts/install-hooks.sh` was
    run from this worktree; because the installer resolves the
    hooks directory via `git rev-parse --git-common-dir`, that one
-   run installed the hook for the whole clone at
-   **`/home/hatch/workspace/repos/NeuroStrata/.git/hooks/pre-push`**
+   run installed the hook for the whole clone at the main
+   clone's **`.git/hooks/pre-push`**
    (verified byte-identical to this branch's
    `scripts/hooks/pre-push` via `cmp`; a second installer run
    reported "Already installed (identical)"). The main clone's
    `upstream` remote exists —
-   `git -C ~/workspace/repos/NeuroStrata remote get-url upstream`
+   `git -C <main-clone> remote get-url upstream`
    → `https://github.com/Cognilogical/NeuroStrata.git` — and
    rejection there is demonstrated by invoking the **installed**
    hook with that URL as a fabricated argument, **not** by a real
