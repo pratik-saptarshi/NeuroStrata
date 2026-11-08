@@ -3883,20 +3883,85 @@ mod tests {
         home.join(".config").join("neurostrata").join("daemon.token")
     }
 
+    /// Writes a token file atomically at 0600 on Unix: the bytes go to
+    /// a uniquely named sibling temp file opened with mode 0o600, then
+    /// rename over the target, so a replacement token never exists at
+    /// looser permissions -- a plain create under the usual umask 022
+    /// would leave the daemon credential 0644, readable by other users.
+    /// On non-Unix a plain write is used.
+    fn write_token_file_atomically(
+        path: &std::path::Path,
+        contents: &str,
+    ) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let dir = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "token path has no parent directory",
+                )
+            })?;
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "token path has no file name",
+                    )
+                })?;
+            let tmp_path = dir.join(format!("{file_name}.tmp-{}", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            file.write_all(contents.as_bytes())?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, contents)
+        }
+    }
+
     /// Save/restore guard for the real daemon token file: snapshots its
-    /// contents (or its absence) on creation and puts them back on
-    /// drop, panic included, so a token test never leaves the
-    /// operator's credential created, rewritten, or deleted behind it.
+    /// contents (or its absence) and, on Unix, its permissions on
+    /// creation and puts them back on drop, panic included, so a token
+    /// test never leaves the operator's credential created, rewritten,
+    /// deleted, or loosened to wider permissions behind it.
     struct TokenFileGuard {
         path: std::path::PathBuf,
         saved: Option<String>,
+        #[cfg(unix)]
+        saved_mode: Option<u32>,
     }
 
     impl TokenFileGuard {
         fn new() -> Self {
             let path = daemon_token_path();
             let saved = std::fs::read_to_string(&path).ok();
-            Self { path, saved }
+            #[cfg(unix)]
+            let saved_mode = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&path)
+                    .ok()
+                    .map(|metadata| metadata.permissions().mode() & 0o7777)
+            };
+            Self {
+                path,
+                saved,
+                #[cfg(unix)]
+                saved_mode,
+            }
         }
 
         fn remove(&self) {
@@ -3904,10 +3969,7 @@ mod tests {
         }
 
         fn write(&self, token: &str) {
-            if let Some(dir) = self.path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            std::fs::write(&self.path, token).unwrap();
+            write_token_file_atomically(&self.path, token).unwrap();
         }
     }
 
@@ -3915,7 +3977,20 @@ mod tests {
         fn drop(&mut self) {
             match &self.saved {
                 Some(contents) => {
-                    let _ = std::fs::write(&self.path, contents);
+                    if write_token_file_atomically(&self.path, contents).is_ok() {
+                        // The atomic write creates the file at 0600;
+                        // re-apply the captured original permissions so
+                        // the restored file has exactly its original
+                        // mode, whatever that was.
+                        #[cfg(unix)]
+                        if let Some(mode) = self.saved_mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &self.path,
+                                std::fs::Permissions::from_mode(mode),
+                            );
+                        }
+                    }
                 }
                 None => {
                     let _ = std::fs::remove_file(&self.path);
@@ -4076,6 +4151,48 @@ mod tests {
                 "Bearer stage1-token-b".to_string()
             ],
             "each request must carry the token the file held when it was forwarded"
+        );
+    }
+
+    /// The guard's restore must preserve the token file's permissions,
+    /// not just its contents (Codex P1 on PR #30): a restore that
+    /// recreates the operator's 0600 credential through a plain write
+    /// leaves it 0644 under umask 022, readable by other users. The
+    /// outer guard snapshots the true original state; the inner guard
+    /// is exercised against a known 0600 original whose file is then
+    /// deleted and recreated through `guard.write` -- the creation
+    /// path that used to come back 0644.
+    #[cfg(unix)]
+    #[test]
+    fn token_file_guard_restores_contents_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = token_file_test_lock();
+        // Snapshots the operator's true token state; dropped last --
+        // on assertion panic too -- so this test leaves the real file
+        // exactly as it found it, contents and permissions.
+        let outer = TokenFileGuard::new();
+        let path = daemon_token_path();
+
+        // Establish the known "original" the inner guard will snapshot.
+        outer.write("token-file-guard-original");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let guard = TokenFileGuard::new();
+        guard.remove();
+        guard.write("token-file-guard-overwritten");
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "token-file-guard-original",
+            "the guard must restore the original token contents"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the guard must restore the token file at its original 0600 \
+             permissions, not the umask default"
         );
     }
 
