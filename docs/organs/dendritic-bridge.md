@@ -1,6 +1,3 @@
-# Dendritic Bridge — External Embedder + Local Fallback
-
-> **Why you care:** Bring your own embedders or stay offline — graceful degradation is explicit, never silent.
 # Dendritic Bridge — Hybrid Retrieval & Embedding Pipeline
 
 > **Why you care:** Pure vector search misses exact symbol names (`check_caller_path`), while pure keyword search misses conceptual rules. The Dendritic Bridge offers three deterministic retrieval surfaces — a dense HNSW vector index, a disk-backed Tantivy full-text index, and an in-house BM25 scorer — plus a bounded graph expansion, so you can pick the surface that matches the question instead of paying for a reranking pipeline that does not exist.

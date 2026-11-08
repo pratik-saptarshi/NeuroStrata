@@ -1,6 +1,3 @@
-# Crash Recovery
-
-> Breadcrumbs in `~/.config/NeuroStrata/crash/` with backtrace; core dump is admin-only.
 # Crash Recovery & WAL Integrity
 
 > **Why you care:** An unexpected power loss, OOM kill, or terminal crash never silently corrupts your cognitive graph — NeuroStrata records structured crash breadcrumbs, verifies the write-ahead log (WAL) on startup, and provides deterministic recovery tools.

@@ -1,6 +1,3 @@
-# Security — OWASP Top-10 LLM Hardening
-
-> Loopback daemon, secret scrubbing, Cypher injection escaping, no destructive MCP surfaces.
 # Security Architecture & OWASP LLM Top-10 Hardening
 
 > **Why you care:** Giving an AI agent persistent memory and tool access should never open a backdoor into your machine or leak secrets into an embedding store. NeuroStrata enforces defense-in-depth across network binding, path traversal, fail-closed secret rejection, query escaping, and destructive-tool isolation.

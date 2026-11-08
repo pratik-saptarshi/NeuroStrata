@@ -1,8 +1,3 @@
-# SynapticGraph — Dual-Track Bi-Temporal Graph Memory
-
-> **Why you care:** Memory is a graph, not a pile of text — your agent remembers not just facts, but the relationships between rules and source files.
-
-Full design and retrieval behavior covered in spec §2 and README line 17 correction.
 # SynapticGraph — Dual-Track Bi-Temporal Graph & Semantic Reasoning Engine
 
 > **Why you care:** Memory is a relational graph, not a flat pile of text chunks. SynapticGraph connects architectural rules directly to the source files, AST symbols, tasks, and ontological shapes they govern—while preserving an immutable bi-temporal audit trail of every change.

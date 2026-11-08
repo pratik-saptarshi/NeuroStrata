@@ -1,6 +1,3 @@
-# Prefrontal Cortex — Podman-Sandboxed Behavioral Guard
-
-> **Why you care:** Your agent can't run `rm -rf /` because a stored rule intercepts the action, matches it semantically, and returns a named verdict before execution.
 # Prefrontal Cortex — Semantic Action Guard & Behavioral Validation
 
 > **Why you care:** Prompt instructions like *"Never run docker"* or *"Never drop production tables"* fail the moment context compacts. The Prefrontal Cortex turns stored architectural rules into an active interceptor (`neurostrata_guard_validate`) that evaluates candidate agent actions semantically and returns a deterministic verdict before execution.

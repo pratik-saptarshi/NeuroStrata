@@ -1,6 +1,3 @@
-# Central Executive — Goal Lifecycle + Done-Funnel
-
-> **Why you care:** Work isn't "done" until it taught the brain something — experience is forced into long-term memory before a goal can close.
 # Central Executive — Goal Lifecycle, State Machine & The 3 Soft Locks
 
 > **Why you care:** Work is not closed until the agent learns from it — experience is forced into long-term memory before a goal can transition to `done`. The Central Executive enforces that single non-negotiable rule through a four-state machine guarded by three soft locks, plus an auto-retrieved context block injected into every spawned subagent.

@@ -1,6 +1,3 @@
-# Why Traditional AI Memory Fails — NeuroStrata Fixes
-
-> **Why you care:** Standard RAG buries critical rules in long context and loses them — NeuroStrata forces the agent to read only what it needs.
 # Why Traditional AI Agent Memory Fails — And How NeuroStrata Fixes It
 
 > **Why you care:** Standard RAG and flat Markdown files (`AGENTS.md`, `MEMORY.md`, `TODO.md`) fail predictably on real codebases. NeuroStrata replaces passive text reminders with binary-enforced cognitive machinery.

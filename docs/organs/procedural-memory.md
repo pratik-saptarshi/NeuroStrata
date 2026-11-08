@@ -1,6 +1,3 @@
-# Procedural Memory — Knowing-How with Rehearsal Budget
-
-> **Why you care:** A procedure survives disuse via a finite rehearsal count — not lost when it stops being used.
 # Procedural Memory — Triggered Habits with Rehearsal Budgets
 
 > **Why you care:** Not all knowledge is a static rule or a one-off task. Repeatable engineering habits (like post-migration checklists or pre-release audits) need to fire on specific triggers, track how many times they have been rehearsed, and retire cleanly once ingrained.

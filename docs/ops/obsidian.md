@@ -1,6 +1,3 @@
-# Obsidian
-
-No Obsidian plugin ships with NeuroStrata. This page previously announced a "Visual Memory UI" plugin that reads the embedded LadybugDB directly from disk; no such plugin exists in this tree, and no code in `src/` references Obsidian. The only plugins shipped are the client shims under `plugins/` — `@neurostrata/openclaw-plugin` and `@neurostrata/opencode-plugin`.
 # Obsidian & NeuroVault — Not Yet Implemented
 
 > **Why you care (intent, not shipped):** The vision is for your AI's memory to be human-curatable rather than trapped in an opaque binary blob. The planned feature would mirror the NeuroStrata cognitive graph bidirectionally with a local Markdown vault and generate interactive JSON Canvas spatial maps. **This feature is not yet implemented.**

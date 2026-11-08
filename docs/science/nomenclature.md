@@ -1,6 +1,3 @@
-# Biological Nomenclature ↔ Engineering Primitives
-
-> Translation table: SynapticGraph, Engram, Prefrontal Cortex, Central Executive, Dendritic Bridge, Thalamic Bus, etc.
 # Biological Nomenclature ↔ Systems Engineering Primitives
 
 > **Why you care:** Every neuroscience term in NeuroStrata maps 1-to-1 to a concrete Rust module, data structure, and systems-engineering responsibility—never vague metaphor.

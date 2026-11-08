@@ -1,6 +1,3 @@
-# CLI Reference — Pointer to advanced admin & graph exploration
-
-> MCP surface has no destructive tools; CLI commands handle edit/delete/move/restore.
 # 💻 NeuroStrata CLI Reference (`neurostrata-mcp`)
 
 NeuroStrata provides a standalone compiled CLI binary (`neurostrata-mcp`) alongside its HTTP/stdio MCP daemon mode for direct administration, graph inspection, task-gate verification, team mesh synchronization, and local model lifecycle management.

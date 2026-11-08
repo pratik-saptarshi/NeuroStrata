@@ -1,6 +1,3 @@
-# SynapticMesh — Git-Transport Team Memory
-
-> **Why you care:** Team memories travel over plain git — no broker, conflicts preserved loudly, private rows never stomped.
 # SynapticMesh — Brokerless Git Team Memory Synchronization
 
 > **Why you care:** Team memories travel over standard Git — no SaaS broker, no central database server, sovereign private rows are never overwritten, and conflicting edits are preserved visibly rather than silently clobbered.

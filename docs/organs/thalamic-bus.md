@@ -1,6 +1,3 @@
-# Thalamic Bus — Typed Pulses + Export-Freshness Gate
-
-> **Why you care:** Every write triggers bookkeeping — your graph export refuses to skip stale data.
 # Thalamic Bus — In-Process Typed Event Bus & Freshness Gate
 
 > **Why you care:** Every memory write, task transition, and AST ingestion triggers background bookkeeping automatically — keeping indexes normalized, enrichment telemetry accurate, and preventing stale graph exports.

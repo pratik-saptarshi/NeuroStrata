@@ -1,8 +1,3 @@
-# Tri-Strata — Global / Domain / Task Namespace Model
-
-> **Why you care:** Your company-wide rules never leak into a temporary bug-fix session because the memory is physically partitioned.
-
-Includes domain registry (1.11) and Pointer-Wiki / spatial anchoring.
 # Tri-Strata — Global, Domain, and Task Namespace Isolation
 
 > **Why you care:** Company-wide infrastructure rules should apply everywhere, project-specific architecture rules should stay inside their repository, and temporary debugging notes should never pollute long-term memory. Tri-Strata enforces this separation at the storage and query boundary.
