@@ -3211,7 +3211,10 @@ impl crate::traits::AsAny for RecordingStore {
         let base = format!("http://{addr}");
         let bare = reqwest::Client::new();
         let mut serving = false;
-        for _ in 0..500 {
+        // Keep the helper's readiness window consistent with the sibling
+        // spawn helpers above; native test binaries may take longer to
+        // fingerprint than the production executable.
+        for _ in 0..3000 {
             if bare
                 .get(format!("{base}/health"))
                 .send()
