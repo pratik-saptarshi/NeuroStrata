@@ -1,0 +1,243 @@
+name: lbug-arms (one-off repetition evidence — scratch branches only)
+
+# DESIGN DRAFT — Task 5 (local half), lbug 0.20.4 -> 0.22.3 upgrade.
+# This file is drafted in the run directory only. It is NEVER committed to the
+# PR branch (deps/lbug-0.22.3) or to any upstream/fork long-lived branch.
+# In Task 7 (after Pratik's Stage 5 authorization) it is added as
+#   .github/workflows/lbug-arms.yml
+# in a single extra commit on top of each scratch branch:
+#   control:   scratch/lbug-arms-control-51be592   (tree under test: 51be592, lbug 0.20.4)
+#   treatment: scratch/lbug-arms-treatment-<head>  (tree under test: PR head, lbug 0.22.3)
+# Scratch-branch tree delta vs the commit under test = this file only (disclosed
+# in the evidence record; the lbug-vendor.yml precedent from the fork's #1386
+# validation).
+#
+# Repetition set (plan Task 5, identical for both arms):
+#   - one full test (ubuntu) leg: job `full-test-leg`, a step-for-step mirror of
+#     upstream ci.yml's `test` job (same runner class: ubuntu-latest);
+#   - 10x the parser::ingest module: job `ingest-repetitions`
+#     (cargo test --locked --bin neurostrata-mcp parser::ingest:: -- --test-threads=1).
+#     The module filter includes the two upstream analogues named by the
+#     retarget ruling (a_failed_staging_leaves_the_previous_generation_active,
+#     a_mid_stage_failure_aborts_and_keeps_the_previous_generation_active);
+#     their per-test lines are extracted into the evidence record each iteration.
+#     The fork-only #1536 test (a_failed_relink_rolls_back_to_the_previous_generation)
+#     does not exist in this tree and is NOT part of these arms.
+# Pass condition per arm: zero SIGABRT / assertion-abort signatures and zero
+# failed iterations across the whole set.
+#
+# Provenance (plan section 2): LBUG_VERSION is pinned explicitly to the crate's
+# own version via the dispatch input, and the first step refuses to run if the
+# input does not match the lbug pin in the checked-out Cargo.toml — an unpinned
+# control could silently link a newer prebuilt engine and invalidate the
+# comparison. Each job also records the lbug build script's
+# LBUG_PRECOMPILED_SOURCE line from the FIRST build on the fresh runner
+# (cache-hit re-runs overwrite it; runners start cold, so the first build is
+# the capture point).
+
+on:
+  workflow_dispatch:
+    inputs:
+      lbug_version:
+        description: "Must exactly match the lbug pin in this tree's Cargo.toml (control: 0.20.4, treatment: 0.22.3)"
+        required: true
+        type: string
+      repetitions:
+        description: "parser::ingest module repetitions (plan standard: 10)"
+        required: true
+        type: number
+        default: 10
+
+permissions:
+  contents: read
+
+# Deliberately NO concurrency group: upstream ci.yml cancels superseded runs,
+# but an evidence set must never be cancelled mid-set.
+
+env:
+  LBUG_VERSION: ${{ inputs.lbug_version }}
+
+jobs:
+  full-test-leg:
+    name: full test leg (ubuntu) — mirror of ci.yml test job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provenance pin self-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^lbug = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "Cargo.toml lbug pin: $pin ; dispatch input LBUG_VERSION: $LBUG_VERSION"
+          if [ "$pin" != "$LBUG_VERSION" ]; then
+            echo "::error::LBUG_VERSION input ($LBUG_VERSION) does not match the tree's lbug pin ($pin). Refusing to produce unpinned-provenance evidence."
+            exit 1
+          fi
+          {
+            echo "## Arm provenance (full-test-leg)"
+            echo "- tree commit: $(git rev-parse HEAD) (scratch tip; commit under test is its parent)"
+            echo "- LBUG_VERSION: $LBUG_VERSION (pinned, matches Cargo.toml)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
+      # First build on a cold runner: capture the lbug build script's recorded
+      # prebuilt source before any cache-hit re-run can overwrite it.
+      - name: Build test binaries (first build — provenance capture)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-run 2>&1 | tee first-build.log
+          out="$(find target/debug/build -maxdepth 2 -path '*lbug*/output' | head -1)"
+          echo "lbug build output file: $out"
+          grep -E "LBUG_PRECOMPILED_SOURCE|Installed .* from release" "$out" | tee provenance.txt || true
+          {
+            echo "- LBUG_PRECOMPILED_SOURCE record:"
+            cat provenance.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test
+        shell: bash
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Test wasm crate
+        shell: bash
+        run: cargo test -p neurostrata-wasm --locked -- --test-threads=1
+
+      - name: Upload provenance record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provenance-full-test-leg-${{ github.run_id }}
+          path: |
+            provenance.txt
+            first-build.log
+          if-no-files-found: warn
+
+  ingest-repetitions:
+    name: parser::ingest repetitions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provenance pin self-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^lbug = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "Cargo.toml lbug pin: $pin ; dispatch input LBUG_VERSION: $LBUG_VERSION"
+          if [ "$pin" != "$LBUG_VERSION" ]; then
+            echo "::error::LBUG_VERSION input ($LBUG_VERSION) does not match the tree's lbug pin ($pin). Refusing to produce unpinned-provenance evidence."
+            exit 1
+          fi
+          {
+            echo "## Arm provenance (ingest-repetitions)"
+            echo "- tree commit: $(git rev-parse HEAD) (scratch tip; commit under test is its parent)"
+            echo "- LBUG_VERSION: $LBUG_VERSION (pinned, matches Cargo.toml)"
+            echo "- repetitions: ${{ inputs.repetitions }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
+      - name: Build ingest test binary (first build — provenance capture)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-run --bin neurostrata-mcp 2>&1 | tee first-build.log
+          out="$(find target/debug/build -maxdepth 2 -path '*lbug*/output' | head -1)"
+          echo "lbug build output file: $out"
+          grep -E "LBUG_PRECOMPILED_SOURCE|Installed .* from release" "$out" | tee provenance.txt || true
+          {
+            echo "- LBUG_PRECOMPILED_SOURCE record:"
+            cat provenance.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # All iterations run even after a failure (evidence completeness); the
+      # gate step at the end fails the job if any iteration failed or carried
+      # an abort signature. Abort signature = the #1536 shape: a C++ assertion
+      # / SIGABRT terminating the test process (nonzero exit with no normal
+      # test-result line, or explicit SIGABRT/assertion text in the log).
+      - name: Repetition loop (10x parser::ingest)
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p arm-results
+          : > arm-results/iterations.tsv
+          echo -e "iteration\texit_code\tresult_line\tabort_signature\tstaging_analogue\tmidstage_analogue" >> arm-results/iterations.tsv
+          for i in $(seq 1 "${{ inputs.repetitions }}"); do
+            log="arm-results/iter-$i.log"
+            cargo test --locked --bin neurostrata-mcp parser::ingest:: -- --test-threads=1 > "$log" 2>&1
+            rc=$?
+            result="$(grep -E '^test result:' "$log" | tail -1 || true)"
+            if grep -Eq 'SIGABRT|signal: 6|Assertion.*failed|parser::ingest.*abort' "$log"; then abort=1; else abort=0; fi
+            s1="$(grep -E 'a_failed_staging_leaves_the_previous_generation_active \.\.\. (ok|FAILED)' "$log" | awk '{print $NF}' || true)"
+            s2="$(grep -E 'a_mid_stage_failure_aborts_and_keeps_the_previous_generation_active \.\.\. (ok|FAILED)' "$log" | awk '{print $NF}' || true)"
+            echo -e "$i\t$rc\t$result\t$abort\t${s1:-missing}\t${s2:-missing}" >> arm-results/iterations.tsv
+            echo "iteration $i: exit=$rc abort_signature=$abort result=[$result]"
+          done
+          cat arm-results/iterations.tsv
+
+      - name: Arm gate (zero SIGABRT, zero failed iterations)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad="$(awk -F'\t' 'NR>1 && ($2 != 0 || $4 != 0 || $5 != "ok" || $6 != "ok") {c++} END {print c+0}' arm-results/iterations.tsv)"
+          total="$(($(wc -l < arm-results/iterations.tsv) - 1))"
+          {
+            echo "## Repetition results"
+            echo "- iterations: $total ; failed/aborted: $bad"
+            echo '```'
+            cat arm-results/iterations.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$bad" != "0" ]; then
+            echo "::error::$bad of $total iterations failed or carried an abort signature."
+            exit 1
+          fi
+          echo "Arm pass condition met: $total/$total iterations green, zero SIGABRT."
+
+      - name: Upload repetition evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-repetitions-${{ github.run_id }}
+          path: |
+            arm-results/
+            provenance.txt
+            first-build.log
+          if-no-files-found: warn
