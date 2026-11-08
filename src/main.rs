@@ -4714,7 +4714,6 @@ async fn run() -> anyhow::Result<()> {
                     DaemonStderr::Log(file) => std::process::Stdio::from(file),
                     DaemonStderr::Null => std::process::Stdio::null(),
                 })
-                .stderr(std::process::Stdio::null())
                 .spawn()?;
 
             eprintln!(
