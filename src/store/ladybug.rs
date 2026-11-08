@@ -3420,6 +3420,30 @@ impl LadybugStore {
         self.with_conn_inner(f, false).await
     }
 
+    /// Takes the write turn for a `with_conn` caller, waiting at most
+    /// `write_timeout()` — the same budget `write_with_deadline` gives its
+    /// own queue. The wait is a queue wait only: no statement has been
+    /// started, so giving up leaks nothing, and the caller is told the
+    /// store is busy (`StoreBusy`) instead of stalling without a timeout
+    /// behind a publication whose transaction may stay unresolved for a
+    /// long while (lock-panel verdict §5, owner-adopted 2026-11-07). The
+    /// bound changes how long a caller queues, never how the turn is
+    /// held: once acquired, the guard still lives inside the blocking
+    /// task for the whole engine call, as in `write_owning_turn`.
+    async fn acquire_write_turn(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        self.acquire_write_turn_within(write_timeout()).await
+    }
+
+    async fn acquire_write_turn_within(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        match tokio::time::timeout(wait, Arc::clone(&self.write_lock).lock_owned()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(StoreBusy { waited: wait }.into()),
+        }
+    }
+
     async fn with_conn_inner<T, F>(&self, f: F, take_turn: bool) -> Result<T>
     where
         T: Send + 'static,
@@ -3434,7 +3458,7 @@ impl LadybugStore {
         // inside the blocking task, so a dropped await cannot release it
         // while a statement is still running.
         let turn = if take_turn {
-            Some(Arc::clone(&self.write_lock).lock_owned().await)
+            Some(self.acquire_write_turn().await?)
         } else {
             None
         };
@@ -10798,6 +10822,41 @@ fn is_write_collision(err: &anyhow::Error) -> bool {
         .contains("Cannot start a new write transaction")
 }
 
+/// The store is busy: a `with_conn` caller waited the full turn budget
+/// and the write turn was still held — a publication (or another long
+/// writer) is in flight. This is the read-side counterpart of
+/// `write_with_deadline`'s "the database is busy" refusal, with one
+/// difference that matters: it is typed, so a caller can tell "retry in
+/// a moment" apart from an engine failure or its own cancellation.
+/// Carried inside `anyhow::Error` the way `EmbedApiStatus` is; classify
+/// with `is_store_busy` or `downcast_ref::<StoreBusy>()`. (Lock-panel
+/// verdict §5, owner-adopted 2026-11-07: the caller is told in terms
+/// that the store is busy, not left to stall until some outer layer's
+/// own timeout fires.)
+#[derive(Debug, Clone, Copy)]
+pub struct StoreBusy {
+    /// How long the caller waited before being told the store is busy.
+    pub waited: std::time::Duration,
+}
+
+impl std::fmt::Display for StoreBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the store is busy: the write turn was still held after waiting {}s (a publication or write is in flight); retry",
+            self.waited.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for StoreBusy {}
+
+/// Whether an error is the store refusing a turn wait as busy, as
+/// opposed to an engine failure or a caller-side cancellation.
+pub fn is_store_busy(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<StoreBusy>().is_some()
+}
+
 /// Whether a memory has been retired, meaning its `valid_to` has passed.
 ///
 /// A retired row has to stop surfacing wherever results come from: the vector
@@ -14052,6 +14111,100 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// §5 amendment (lock-panel verdict, owner-adopted 2026-11-07): a
+    /// caller queued behind a held turn is told the store is busy once
+    /// the wait budget is spent, instead of stalling without a timeout.
+    /// Deterministic form: the budget is passed explicitly, so no clock
+    /// or environment is involved.
+    #[tokio::test]
+    async fn a_turn_wait_past_its_budget_is_store_busy_not_a_stall() {
+        let root = std::env::temp_dir().join(format!("turn-wait-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("turn-wait-busy").await.unwrap();
+
+        let held_turn = store.write_lock.clone().lock_owned().await;
+        let started = std::time::Instant::now();
+        let err = match store
+            .acquire_write_turn_within(std::time::Duration::from_millis(250))
+            .await
+        {
+            Ok(_) => panic!("a held turn must refuse the wait as busy"),
+            Err(e) => e,
+        };
+        assert!(
+            is_store_busy(&err),
+            "the refusal must be the typed StoreBusy error: {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusal must arrive within a generous multiple of the budget, took {:?}",
+            started.elapsed()
+        );
+        drop(held_turn);
+
+        // With the turn free, the same acquisition succeeds at once.
+        let _turn = store
+            .acquire_write_turn_within(std::time::Duration::from_millis(250))
+            .await
+            .expect("a free turn is acquired");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// §5 amendment at the public surface: with the turn held — the
+    /// state a publication leaves readers in — a `get` fails with the
+    /// typed StoreBusy error inside the wait budget instead of hanging,
+    /// and answers as before once the turn is released. The budget is
+    /// the shared `write_timeout()`, shortened here through its own env
+    /// override, the same seam the write-deadline tests use.
+    #[tokio::test]
+    async fn a_get_behind_a_held_turn_fails_busy_and_recovers_on_release() {
+        let root = std::env::temp_dir().join(format!("get-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("get-busy").await.unwrap();
+        store
+            .upsert(
+                "get-busy",
+                "rule-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "seed".into(),
+                    user_id: "tester".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: "src/lib.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let held_turn = store.write_lock.clone().lock_owned().await;
+        let started = std::time::Instant::now();
+        let err = match store.get("get-busy", "rule-1").await {
+            Ok(_) => panic!("a get behind a held turn must fail busy, not answer or hang"),
+            Err(e) => e,
+        };
+        let elapsed = started.elapsed();
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+        assert!(
+            is_store_busy(&err),
+            "the failure must be the typed StoreBusy error: {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the busy failure must land within a generous multiple of the 1s budget, took {elapsed:?}"
+        );
+        drop(held_turn);
+
+        assert!(
+            store.get("get-busy", "rule-1").await.unwrap().is_some(),
+            "with the turn released the same get answers as before"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_dispatched_write_marks_dirty_after_its_caller_is_cancelled() {
         let root =
@@ -15822,7 +15975,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
-    #[ignore = "publication read-liveness deferred to B1 (owner-adopted lock-panel verdict 2026-11-07): reads, including a snapshot read of an in-flight record, proceed during a publication — to be delivered by the C3 snapshot tier; interim: reads take the write turn"]
+    #[ignore = "publication read-liveness deferred to B1 (owner-adopted lock-panel verdict 2026-11-07): reads, including a snapshot read of an in-flight record, proceed during a publication — to be delivered by the C3 snapshot tier; interim: reads take the write turn with a bounded wait (StoreBusy on expiry)"]
     async fn readers_keep_seeing_the_old_ingest_until_atomic_commit() {
         let dir = std::env::temp_dir().join(format!("atomic-reader-{}", uuid::Uuid::new_v4()));
         let store = std::sync::Arc::new(LadybugStore::for_testing(&dir, 4).expect("open DB"));
@@ -15895,7 +16048,7 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
-    #[ignore = "publication read-liveness deferred to B1 (owner-adopted lock-panel verdict 2026-11-07): reads, including a snapshot read of an in-flight record, proceed during a publication — to be delivered by the C3 snapshot tier; interim: reads take the write turn"]
+    #[ignore = "publication read-liveness deferred to B1 (owner-adopted lock-panel verdict 2026-11-07): reads, including a snapshot read of an in-flight record, proceed during a publication — to be delivered by the C3 snapshot tier; interim: reads take the write turn with a bounded wait (StoreBusy on expiry)"]
     async fn publication_deadline_waits_for_transaction_resolution() {
         let dir = std::env::temp_dir().join(format!("atomic-deadline-{}", uuid::Uuid::new_v4()));
         let store = std::sync::Arc::new(LadybugStore::for_testing(&dir, 4).expect("open DB"));
