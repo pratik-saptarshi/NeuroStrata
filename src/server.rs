@@ -13867,6 +13867,53 @@ async fn test_handle_search_memory_applies_search_filters() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+    // ── Task 8: the three server.rs namespace sites refuse illegal names ──
+    // Each test drives a namespace that is legal under the old hand-rolled
+    // checks (no '/', no '\\', non-empty) but illegal under DR-1 (it carries
+    // a space), so the refusal can only come from the shared validator.
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_add_memory() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let reply = handle_add_memory(
+            serde_json::json!({ "content": "a fact", "namespace": "bad ns" }),
+            Arc::new(StubEmbedder),
+            store,
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
+        assert!(reply.contains("bad ns"), "{}", reply);
+    }
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_guard() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let result = build_guard_validator(
+            &serde_json::json!({ "namespace": "bad ns" }),
+            store,
+            Arc::new(StubEmbedder),
+            "validate",
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("a namespace with a space must be refused"),
+            Err(e) => assert!(e.contains("ERROR [NAMESPACE]"), "{}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_get_memory() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let reply = handle_get_memory(
+            serde_json::json!({ "id": "x", "namespace": "bad ns" }),
+            store,
+        )
+        .await;
+        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
+    }
+
 }
 
 
@@ -14168,52 +14215,5 @@ mod context_plan_tests {
             parse_items(none).iter().any(|id| id == "plan-alias-seed"),
             "without prior usage the seed must be planned"
         );
-    }
-
-    // ── Task 8: the three server.rs namespace sites refuse illegal names ──
-    // Each test drives a namespace that is legal under the old hand-rolled
-    // checks (no '/', no '\\', non-empty) but illegal under DR-1 (it carries
-    // a space), so the refusal can only come from the shared validator.
-
-    #[tokio::test]
-    async fn site_refuses_illegal_namespace_add_memory() {
-        let (store, _) = store_with_one_rule("probe").await;
-        let reply = handle_add_memory(
-            serde_json::json!({ "content": "a fact", "namespace": "bad ns" }),
-            Arc::new(StubEmbedder),
-            store,
-            None,
-            quiet_bus(),
-        )
-        .await;
-        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
-        assert!(reply.contains("bad ns"), "{}", reply);
-    }
-
-    #[tokio::test]
-    async fn site_refuses_illegal_namespace_guard() {
-        let (store, _) = store_with_one_rule("probe").await;
-        let result = build_guard_validator(
-            &serde_json::json!({ "namespace": "bad ns" }),
-            store,
-            Arc::new(StubEmbedder),
-            "validate",
-        )
-        .await;
-        match result {
-            Ok(_) => panic!("a namespace with a space must be refused"),
-            Err(e) => assert!(e.contains("ERROR [NAMESPACE]"), "{}", e),
-        }
-    }
-
-    #[tokio::test]
-    async fn site_refuses_illegal_namespace_get_memory() {
-        let (store, _) = store_with_one_rule("probe").await;
-        let reply = handle_get_memory(
-            serde_json::json!({ "id": "x", "namespace": "bad ns" }),
-            store,
-        )
-        .await;
-        assert!(reply.contains("ERROR [NAMESPACE]"), "{}", reply);
     }
 }
