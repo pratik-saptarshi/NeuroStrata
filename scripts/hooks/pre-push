@@ -61,10 +61,10 @@ unset _ns_remote_name _ns_remote_url _ns_path
 # The hook IS the gate. It runs on every push on ANY git host, so it is
 # the required default; CI is vendor-specific and only a defense-in-depth
 # extra. (`neurostrata-mcp hooks install` writes a hook into the
-# directory git actually runs hooks from, core.hooksPath honored; if
-# that installer is used, re-check that the upstream-push guard above
-# is still present in the installed copy — the two install paths must
-# not drift apart on the guard.)
+# directory git actually runs hooks from, core.hooksPath honored; the
+# scaffolded hook text it writes — and that hook hygiene auto-installs
+# over a stale copy — carries the same Guard 1 executable guard above,
+# so either install path, and any hygiene pass, retains the guard.)
 
 command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
