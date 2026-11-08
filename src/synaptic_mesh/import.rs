@@ -6385,9 +6385,6 @@ mod tests {
             json!(["read spec", "act"])
         );
 
-        // Original tags survive; the references link lands in metadata.
-        assert_eq!(z.payload.metadata["tags"], json!(["mesh", "procedure"]));
-        assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
         // Original tags survive; the references metadata carries the ORIGINAL
         // id link first, then the edit's own carried reference (F5: the
         // preserved edit no longer discards its reference links).
