@@ -3831,6 +3831,128 @@ mod tests {
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
 
+    /// Serializes the tests in this module that create, rewrite, or
+    /// delete the real daemon token file: they share one path on disk,
+    /// so parallel test threads would race each other's token. CI runs
+    /// the suite with --test-threads=1, but the lock keeps local
+    /// parallel runs deterministic too.
+    static TOKEN_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn token_file_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock means an earlier token test panicked while
+        // holding it; its guard already restored the file on drop, so
+        // recovering the guard is safe and keeps one failure from
+        // cascading into the other token tests.
+        TOKEN_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The real daemon token path. `crate::daemon::token_config_dir` is
+    /// private, so this mirrors its construction -- the same way
+    /// daemon.rs's own tests locate the file.
+    fn daemon_token_path() -> std::path::PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        home.join(".config").join("neurostrata").join("daemon.token")
+    }
+
+    /// Save/restore guard for the real daemon token file: snapshots its
+    /// contents (or its absence) on creation and puts them back on
+    /// drop, panic included, so a token test never leaves the
+    /// operator's credential created, rewritten, or deleted behind it.
+    struct TokenFileGuard {
+        path: std::path::PathBuf,
+        saved: Option<String>,
+    }
+
+    impl TokenFileGuard {
+        fn new() -> Self {
+            let path = daemon_token_path();
+            let saved = std::fs::read_to_string(&path).ok();
+            Self { path, saved }
+        }
+
+        fn remove(&self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+
+        fn write(&self, token: &str) {
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            std::fs::write(&self.path, token).unwrap();
+        }
+    }
+
+    impl Drop for TokenFileGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(contents) => {
+                    let _ = std::fs::write(&self.path, contents);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// A recording stub that stands in for the daemon: accepts
+    /// `expected_requests` sequential connections and records each
+    /// request's Authorization header in arrival order (an empty string
+    /// when the request carried none). The canned reply sends
+    /// `connection: close`, so every forwarded request arrives on a
+    /// fresh connection.
+    fn spawn_recording_stub(
+        expected_requests: usize,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = std::thread::spawn(move || {
+            let mut auths = Vec::new();
+            for _ in 0..expected_requests {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut auth = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    let lower = trimmed.to_ascii_lowercase();
+                    if lower.starts_with("authorization:") {
+                        // The value is compared exactly, so take it from
+                        // the original line -- only the name match is
+                        // folded.
+                        auth = trimmed["authorization:".len()..].trim().to_string();
+                    }
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                }
+                let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+                auths.push(auth);
+            }
+            auths
+        });
+        (addr, stub)
+    }
+
     /// Task 1 (F1/FM-2 regression): the stdio proxy's client must carry
     /// the daemon bearer token, or every proxied MCP session is a 401
     /// against the token-enforcing daemon -- the proxy is the product's
@@ -3838,59 +3960,95 @@ mod tests {
     /// and captures the Authorization header of the forwarded request.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_forwards_the_daemon_bearer_token() {
-        use std::io::{BufRead, Read, Write};
+        let _lock = token_file_test_lock();
+        // load_or_create_daemon_token below may create the real token
+        // file; the guard puts back whatever was there before the test.
+        let _guard = TokenFileGuard::new();
 
         // The token the daemon would have created and the proxy must read.
         let expected = crate::daemon::load_or_create_daemon_token();
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stub = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut auth = String::new();
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let trimmed = line.trim_end();
-                if trimmed.is_empty() {
-                    break;
-                }
-                let lower = trimmed.to_ascii_lowercase();
-                if lower.starts_with("authorization:") {
-                    // The value is compared exactly, so take it from the
-                    // original line -- only the name match is folded.
-                    auth = trimmed["authorization:".len()..].trim().to_string();
-                }
-                if let Some(v) = lower.strip_prefix("content-length:") {
-                    content_length = v.trim().parse().unwrap_or(0);
-                }
-            }
-            if content_length > 0 {
-                let mut body = vec![0u8; content_length];
-                reader.read_exact(&mut body).unwrap();
-            }
-            let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            reader.get_mut().write_all(response.as_bytes()).unwrap();
-            auth
-        });
+        let (addr, stub) = spawn_recording_stub(1);
 
         let client = proxy_client();
         let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
         let url = format!("http://{addr}/mcp");
         let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
         assert!(resp.status().is_success());
-        let auth = stub.join().unwrap();
+        let auth = stub.join().unwrap().into_iter().next().unwrap();
         assert_eq!(
             auth,
             format!("Bearer {expected}"),
             "the proxy must forward the daemon bearer token"
+        );
+    }
+
+    /// The race behind the Codex P2 on AEP PR #66: the proxy can start
+    /// before the daemon has created its token file (model load can
+    /// outlast the readiness poll), so a client that snapshots the
+    /// token at construction forwards without credentials forever. The
+    /// token must be resolved when a request is forwarded: a token
+    /// that appears after the client is built is picked up by the next
+    /// request through the same client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_picks_up_a_token_that_appears_after_the_client_is_built() {
+        let _lock = token_file_test_lock();
+        let guard = TokenFileGuard::new();
+        guard.remove();
+
+        let (addr, stub) = spawn_recording_stub(2);
+        let client = proxy_client();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let url = format!("http://{addr}/mcp");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        guard.write("stage1-token-appears");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        let auths = stub.join().unwrap();
+        assert_eq!(
+            auths,
+            vec![String::new(), "Bearer stage1-token-appears".to_string()],
+            "the first request predates the token file and carries no header; \
+             the second must carry the token that appeared in between"
+        );
+    }
+
+    /// Token rotation -- the documented lockout recovery deletes and
+    /// regenerates daemon.token -- must reach a running proxy on the
+    /// next request, without a proxy restart, and no caching of the
+    /// token may stand in the way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_uses_the_rotated_token_on_the_next_request() {
+        let _lock = token_file_test_lock();
+        let guard = TokenFileGuard::new();
+        guard.write("stage1-token-a");
+
+        let (addr, stub) = spawn_recording_stub(2);
+        let client = proxy_client();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let url = format!("http://{addr}/mcp");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        guard.write("stage1-token-b");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        let auths = stub.join().unwrap();
+        assert_eq!(
+            auths,
+            vec![
+                "Bearer stage1-token-a".to_string(),
+                "Bearer stage1-token-b".to_string()
+            ],
+            "each request must carry the token the file held when it was forwarded"
         );
     }
 
