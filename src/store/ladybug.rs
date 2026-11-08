@@ -16957,7 +16957,8 @@ eurostrata\src\daemon.rs",
 
         let seed = |id: &str, metadata: &str| {
             format!(
-                "CREATE (m:Memory {{id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                "CREATE (m:Memory {{pk: '{}', id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                escape_ladybug_string(&format!("seed-pk:{id}")),
                 escape_ladybug_string(id),
                 escape_ladybug_string(metadata)
             )
