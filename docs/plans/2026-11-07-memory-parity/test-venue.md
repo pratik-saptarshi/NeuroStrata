@@ -232,7 +232,18 @@ Reading notes, all learned on the pilot:
 
 - In `pr checks` output an in-progress leg prints as `pending` with
   duration `0`. The `check-runs` API above is the authoritative source for
-  `in_progress` vs `queued` and for real start times.
+  `in_progress` vs `queued`. Qualification on start times: while a job is
+  `queued`, its `started_at` may be populated but is provisional and can
+  shift when the job actually starts (observed 10:29:17Z → 10:29:24Z);
+  the `status` field is authoritative for state, and start times are real
+  once the job is `in_progress`/`completed`.
+- A check-runs poll can transiently return an empty result before any row
+  exists (observed 4s before `started_at` on a GREEN cycle) — empty is
+  not an error or a failed query; keep polling.
+- `ghg run -- pr checks <n>` exits 1 whenever any leg has failed —
+  including the routine report-only baseline failures — while still
+  printing a fully usable snapshot; exit 1 there does not mean the
+  command failed.
 - Queue time (push → check `started_at`) was 9–25s in every pilot cycle.
   The wall-clock that matters for budgeting is **push → terminal result
   for `test (ubuntu-latest)`**, job duration + queue + push time.
@@ -305,7 +316,9 @@ early in the suite (see §2.1, consequence 2). `ATTEMPT_KEYS` is a
    line, RED is still confirmed (your line precedes the abort point). If
    the log shows the abort and **no** line for your test, RED is **not**
    confirmed — your test never ran; move it earlier and repeat.
-5. Change `999` to `4`. Commit:
+5. Change `999` to `4`, and remove the trailing
+   `// RED: deliberately wrong` comment — a correct assertion must not
+   keep a comment calling it deliberately wrong. Commit:
    `test(attempt): correct pilot venue test expectation (GREEN)`. Push.
 6. Wait for `test (ubuntu-latest)` again. Expect: your test's `... ok`
    line. The check conclusion is `success` on a healthy day; on a
@@ -532,9 +545,9 @@ Pilots are closed, never merged, and their branches are **left in place**
 ```bash
 export GHG_ACTOR=parity-m0
 ~/go/bin/ghg check pr comment <n> --repo pratik-saptarshi/NeuroStrata \
-  --body "Measurement pilot for Task 0.3 … evidence recorded in docs/plans/2026-11-07-memory-parity/test-venue.md … not for merge."
+  --body "Measurement pilot for Task 0.3 … evidence recorded in <where the run's evidence is recorded — the runbook for the original pilot, the run report for re-runs> … not for merge."
 ~/go/bin/ghg run -- pr comment <n> --repo pratik-saptarshi/NeuroStrata \
-  --body "Measurement pilot for Task 0.3 … evidence recorded in docs/plans/2026-11-07-memory-parity/test-venue.md … not for merge."
+  --body "Measurement pilot for Task 0.3 … evidence recorded in <where the run's evidence is recorded — the runbook for the original pilot, the run report for re-runs> … not for merge."
 ~/go/bin/ghg check pr close <n> --repo pratik-saptarshi/NeuroStrata
 ~/go/bin/ghg run -- pr close <n> --repo pratik-saptarshi/NeuroStrata
 ```
