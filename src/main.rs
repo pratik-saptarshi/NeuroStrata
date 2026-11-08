@@ -2592,6 +2592,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "F6 read-surface exactness deferred to B1 (owner ruling 2026-11-07): whether read-time-synthesized provenance is part of a record's default presentation at get — interim: get presents the synthesized edge_sources; this byte-exactness assertion reactivates when B1 rules on the F6 cluster"]
     async fn strict_restore_rejects_or_exactly_replays_unverified_wal_capture() {
         use crate::traits::MemoryPayload;
         use serde_json::json;
