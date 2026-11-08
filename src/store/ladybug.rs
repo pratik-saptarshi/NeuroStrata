@@ -4425,26 +4425,22 @@ impl LadybugStore {
         self.list(namespace, user_id, memory_type).await
     }
 
-    pub async fn active_generations_public(&self, namespace: &str) -> std::collections::HashSet<u64> {
-        let ns_label = namespace.to_string();
+    pub async fn active_generations_public(
+        &self,
+        namespace: &str,
+    ) -> Result<std::collections::HashSet<u64>> {
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| Ok(crate::store::ladybug::active_generations_of(conn, &namespace)))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("active generations query failed for '{ns_label}': {e}");
-                Default::default()
-            })
+        self.with_conn(move |conn| {
+            Ok(crate::store::ladybug::active_generations_of(
+                conn, &namespace,
+            ))
+        })
+        .await
     }
 
-    pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
-        let gens = self.active_generations_public(namespace).await;
-        let memories = self
-            .list(namespace, Some("auto-ingestor"), None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("symbol_ids memory list failed for '{namespace}': {e}");
-                Default::default()
-            });
+    pub async fn symbol_ids(&self, namespace: &str) -> Result<Vec<String>> {
+        let gens = self.active_generations_public(namespace).await?;
+        let memories = self.list(namespace, Some("auto-ingestor"), None).await?;
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
@@ -4465,23 +4461,23 @@ impl LadybugStore {
             }
             out.push(m.id);
         }
-        out
+        Ok(out)
     }
 
-    pub async fn mention_symbol_ids(&self, namespace: &str) -> std::sync::Arc<Vec<String>> {
-        let gens = self.active_generations_public(namespace).await;
+    pub async fn mention_symbol_ids(&self, namespace: &str) -> Result<std::sync::Arc<Vec<String>>> {
+        let gens = self.active_generations_public(namespace).await?;
         {
             let guard = self.mention_symbol_ids.read().await;
             if let Some((cached_gens, vec)) = guard.as_ref() {
                 if *cached_gens == gens {
-                    return vec.clone();
+                    return Ok(vec.clone());
                 }
             }
         }
-        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await);
+        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await?);
         let mut guard = self.mention_symbol_ids.write().await;
         *guard = Some((gens, vec.clone()));
-        vec
+        Ok(vec)
     }
 
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
@@ -4774,15 +4770,12 @@ impl LadybugStore {
         }).await
     }
 
-    /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
-    pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
-        let rows = match self.list(namespace, None, None).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!("shape_warnings list failed for '{namespace}': {e}");
-                Vec::new()
-            }
-        };
+    /// Advisory shape warnings for every row in the namespace (F18).
+    /// Propagates store errors (including StoreBusy) rather than
+    /// reporting a busy store as clean; advisory-ness is the caller's
+    /// choice — the caller may treat an error as warn-only.
+    pub async fn shape_warnings(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
+        let rows = self.list(namespace, None, None).await?;
         let mut out = Vec::new();
         for r in rows {
             // shacl validate
@@ -4830,7 +4823,7 @@ impl LadybugStore {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Advisory ontology warnings for a namespace (F21). Never blocks.
@@ -5870,7 +5863,7 @@ impl VectorStore for LadybugStore {
         }
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
         {
-            let ids = self.mention_symbol_ids(&namespace).await;
+            let ids = self.mention_symbol_ids(&namespace).await?;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             for key in ["related_to", "contained_by", "governs", "extracted_from", "depends_on"] {
                 if let Some(arr) = payload.metadata.get(key).and_then(|v| v.as_array()).cloned() {
@@ -6050,7 +6043,7 @@ impl VectorStore for LadybugStore {
         // Mention detection (OxiRS §1.8): only for agent/user-written rows.
         let mut mentions_for_write: Vec<String> = Vec::new();
         if payload.user_id != "auto-ingestor" {
-            let ids = self.mention_symbol_ids(&namespace).await;
+            let ids = self.mention_symbol_ids(&namespace).await?;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             let mut mentions = crate::mention::detect_mentions(&payload.content, &payload.location, &known);
             mentions.retain(|m| m != &id);
@@ -14326,6 +14319,181 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// FIX17 (panel R-2): `shape_warnings` mapped a failed `list` to
+    /// `Vec::new()`, so a busy store reported zero shape warnings —
+    /// indistinguishable from a clean namespace. The surface now
+    /// propagates the typed StoreBusy error, and answers as before
+    /// once the turn is released.
+    #[tokio::test]
+    async fn shape_warnings_behind_a_held_turn_reports_busy_not_clean() {
+        let root =
+            std::env::temp_dir().join(format!("shape-warnings-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("shape-warnings-busy").await.unwrap();
+        store
+            .upsert(
+                "shape-warnings-busy",
+                "rule-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "seed".into(),
+                    user_id: "tester".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: "src/lib.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let held_turn = store.write_lock.clone().lock_owned().await;
+        let started = std::time::Instant::now();
+        let err = match store.shape_warnings("shape-warnings-busy").await {
+            Ok(_) => panic!("shape_warnings behind a held turn must fail busy, not report clean"),
+            Err(e) => e,
+        };
+        let elapsed = started.elapsed();
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+        assert!(
+            is_store_busy(&err),
+            "the failure must be the typed StoreBusy error: {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the busy failure must land within a generous multiple of the 1s budget, took {elapsed:?}"
+        );
+        drop(held_turn);
+
+        assert!(
+            store.shape_warnings("shape-warnings-busy").await.is_ok(),
+            "with the turn released shape_warnings answers as before"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// FIX17 (panel R-2): `active_generations_public` swallowed every
+    /// `with_conn` error into an empty generation set, which
+    /// `symbol_ids` treats as "no generation filtering" — a busy store
+    /// silently returned symbols from inactive generations. The
+    /// surface now propagates the typed StoreBusy error.
+    #[tokio::test]
+    async fn active_generations_behind_a_held_turn_reports_busy_not_an_empty_set() {
+        let root =
+            std::env::temp_dir().join(format!("active-generations-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("active-generations-busy").await.unwrap();
+        store
+            .upsert(
+                "active-generations-busy",
+                "rule-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "seed".into(),
+                    user_id: "tester".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: "src/lib.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let held_turn = store.write_lock.clone().lock_owned().await;
+        let started = std::time::Instant::now();
+        let err = match store.active_generations_public("active-generations-busy").await {
+            Ok(_) => panic!(
+                "active_generations_public behind a held turn must fail busy, not report an empty set"
+            ),
+            Err(e) => e,
+        };
+        let elapsed = started.elapsed();
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+        assert!(
+            is_store_busy(&err),
+            "the failure must be the typed StoreBusy error: {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the busy failure must land within a generous multiple of the 1s budget, took {elapsed:?}"
+        );
+        drop(held_turn);
+
+        assert!(
+            store
+                .active_generations_public("active-generations-busy")
+                .await
+                .is_ok(),
+            "with the turn released active_generations_public answers as before"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// FIX17 (panel R-2): `mention_symbol_ids` could cache the
+    /// degraded empty-set answer produced behind a held turn. It now
+    /// propagates the typed StoreBusy error, and the cache is written
+    /// only on success — after release the same call answers `Ok`,
+    /// proving the busy call cached nothing.
+    #[tokio::test]
+    async fn mention_symbol_ids_behind_a_held_turn_reports_busy_not_a_cached_empty_set() {
+        let root =
+            std::env::temp_dir().join(format!("mention-symbol-ids-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        store.init("mention-symbol-ids-busy").await.unwrap();
+        store
+            .upsert(
+                "mention-symbol-ids-busy",
+                "rule-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "seed".into(),
+                    user_id: "tester".into(),
+                    memory_type: "rule".into(),
+                    agent_name: None,
+                    location: "src/lib.rs".into(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let held_turn = store.write_lock.clone().lock_owned().await;
+        let started = std::time::Instant::now();
+        let err = match store.mention_symbol_ids("mention-symbol-ids-busy").await {
+            Ok(_) => panic!(
+                "mention_symbol_ids behind a held turn must fail busy, not answer a cached empty set"
+            ),
+            Err(e) => e,
+        };
+        let elapsed = started.elapsed();
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+        assert!(
+            is_store_busy(&err),
+            "the failure must be the typed StoreBusy error: {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the busy failure must land within a generous multiple of the 1s budget, took {elapsed:?}"
+        );
+        drop(held_turn);
+
+        assert!(
+            store
+                .mention_symbol_ids("mention-symbol-ids-busy")
+                .await
+                .is_ok(),
+            "with the turn released mention_symbol_ids answers Ok, proving the busy call cached nothing"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn a_dispatched_write_marks_dirty_after_its_caller_is_cancelled() {
         let root =
@@ -21785,7 +21953,7 @@ eurostrata\src\daemon.rs",
             "resolved valid-target must not be in dangling_edges"
         );
 
-        let warnings = store.shape_warnings("probe").await;
+        let warnings = store.shape_warnings("probe").await.expect("shape warnings");
         assert!(
             warnings.iter().any(|w| w.get("why").and_then(|r| r.as_str()).map(|s| s.contains("endpoint role mismatch")).unwrap_or(false)),
             "expected endpoint role mismatch in shape_warnings: {:?}",
