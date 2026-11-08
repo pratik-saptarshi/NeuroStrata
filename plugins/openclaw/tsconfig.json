@@ -4,22 +4,6 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
-    "outDir": "./dist",
-    "rootDir": ".",
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFilesNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": false
-  },
-  "include": ["index.ts"],
-  "exclude": ["node_modules", "dist"]
-}
     "types": ["node"],
     "typeRoots": ["./node_modules/@types", "../opencode/node_modules/@types"],
     "rootDir": ".",
