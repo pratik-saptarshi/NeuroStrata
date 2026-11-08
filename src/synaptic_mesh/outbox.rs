@@ -253,8 +253,6 @@ impl Outbox {
             if line.is_empty() {
                 continue;
             }
-            let entry: OutboxEntry = serde_json::from_str(line)
-                .map_err(|e| format!("corrupt outbox WAL line ({}): {e}", self.dir.display()))?;
             // Fail-soft: one corrupt line must not permanently wedge the
             // drain loop (mark_committed re-reads pending(), so an Err here
             // would block every retry). Diagnostics are preserved, never
