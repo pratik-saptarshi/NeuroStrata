@@ -246,11 +246,6 @@ mod tests {
         let b_out = Outbox::open(&outbox_dir_for(b.root())).unwrap();
         let m1 = Uuid::new_v4();
         let m2 = Uuid::new_v4();
-        let (a, b) = joined_pair(&base, "disjoint").await;
-        let a_out = Outbox::open(&outbox_dir_for(a.root())).unwrap();
-        let b_out = Outbox::open(&outbox_dir_for(b.root())).unwrap();
-        let m1 = Uuid::now_v7();
-        let m2 = Uuid::now_v7();
 
         // A publishes first, and applies its own row to its local store
         // (the daemon's view lives in the sameLadybug store the real
@@ -566,11 +561,6 @@ mod tests {
         let rule_id = Uuid::new_v4();
         let proc_id = Uuid::new_v4();
         let private_id = Uuid::new_v4();
-        let (a, b) = joined_pair(&base, "recovery").await;
-        let a_out = Outbox::open(&outbox_dir_for(a.root())).unwrap();
-        let rule_id = Uuid::now_v7();
-        let proc_id = Uuid::now_v7();
-        let private_id = Uuid::now_v7();
 
         // A publishes a rule AND a procedure definition (no counters travel).
         let rule = entry(
@@ -595,11 +585,6 @@ mod tests {
             }),
             "procedure",
         );
-        publish(&a, &a_out, "node-a", proc.clone()).await;
-
-        // B accepts both, and holds one PRIVATE row (no provenance —
-        // someone's local note).
-        b.pull().await.unwrap();
         publish(&a, &a_out, "node-a", proc).await;
 
         // B accepts both, and holds one PRIVATE row (no provenance —
