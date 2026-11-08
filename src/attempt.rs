@@ -123,6 +123,11 @@ mod tests {
     }
 
     #[test]
+    fn pilot_venue_attempt_keys_count_is_stable() {
+        assert_eq!(ATTEMPT_KEYS.len(), 999); // RED: deliberately wrong
+    }
+
+    #[test]
     fn whitespace_string_is_a_defect() {
         let metadata = serde_json::json!({
             "attempt": {
