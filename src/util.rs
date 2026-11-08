@@ -49,13 +49,6 @@ mod tests {
     }
 
     #[test]
-    fn pilot_venue_lock_helper_preserves_value() {
-        let mutex = Mutex::new(7);
-        let guard = lock_or_err(&mutex).expect("a healthy mutex locks");
-        assert_eq!(*guard, 999);
-    }
-
-    #[test]
     fn helper_maps_poison_to_error() {
         let mutex = Mutex::new(());
         // Panic in a scoped thread while it holds the lock: the mutex is

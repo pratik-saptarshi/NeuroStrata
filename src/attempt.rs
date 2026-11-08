@@ -59,6 +59,11 @@ mod tests {
     }
 
     #[test]
+    fn pilot_venue_attempt_keys_count_is_stable() {
+        assert_eq!(ATTEMPT_KEYS.len(), 999);
+    }
+
+    #[test]
     fn a_malformed_attempt_is_neither_a_failed_attempt_nor_defect_free() {
         // missing key
         let missing = serde_json::json!({
