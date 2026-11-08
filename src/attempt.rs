@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn pilot_venue_attempt_keys_count_is_stable() {
-        assert_eq!(ATTEMPT_KEYS.len(), 999); // RED: deliberately wrong
+        assert_eq!(ATTEMPT_KEYS.len(), 4);
     }
 
     #[test]
