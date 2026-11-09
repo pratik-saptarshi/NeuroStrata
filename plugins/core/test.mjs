@@ -469,13 +469,58 @@ describe("resolveActiveTaskFromDaemon", () => {
         hooks: {},
       };
       await initialize(ctx);
-      const res = await resolveActiveTaskFromDaemon("ns");
+      const res = await resolveActiveTaskFromDaemon("ns", null, "sess-d1");
       assert.equal(res.taskId, "task-d1");
       assert.equal(res.sessionId, "sess-d1");
       assert.equal(res.promptInjection, "### Injected daemon context");
       assert.equal(cachedTaskInjection.get("task-d1"), "### Injected daemon context");
       // Second call re-queries (function always queries) but cache holds the injection.
       assert.equal(counters.taskList, 1);
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("does not adopt a task or its session without caller identity", async () => {
+    const { server, url } = await createMockDaemonServer({ returnTask: [{ id: "task-d1", session_id: "sess-d1", status: "in_progress", subagent_prompt_injection: "### Injected daemon context" }] });
+    try {
+      const ctx = {
+        config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      };
+      await initialize(ctx);
+      const res = await resolveActiveTaskFromDaemon("ns");
+      assert.equal(res.taskId, null);
+      assert.equal(res.sessionId, null);
+      assert.equal(res.promptInjection, null);
+      assert.deepEqual(getTrackingState(), { activeTaskId: null, activeSessionId: null, mutationsSinceNote: 0 });
+      // The per-task injection cache is still filled for other flows.
+      assert.equal(cachedTaskInjection.get("task-d1"), "### Injected daemon context");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("does not adopt a task claimed by a different session", async () => {
+    const { server, url } = await createMockDaemonServer({ returnTask: [{ id: "task-d1", session_id: "sess-d1", status: "in_progress", subagent_prompt_injection: "### Injected daemon context" }] });
+    try {
+      const ctx = {
+        config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      };
+      await initialize(ctx);
+      const res = await resolveActiveTaskFromDaemon("ns", null, "sess-other");
+      assert.equal(res.taskId, null);
+      // The caller's own identity is recorded; the foreign task's is never adopted.
+      assert.equal(res.sessionId, "sess-other");
+      assert.equal(res.promptInjection, null);
+      const state = getTrackingState();
+      assert.equal(state.activeTaskId, null);
+      assert.equal(state.activeSessionId, "sess-other");
     } finally {
       server.close();
       resetModuleState();

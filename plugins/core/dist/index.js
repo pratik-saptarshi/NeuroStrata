@@ -854,11 +854,24 @@ export function extractRepoFilePaths(promptText) {
 // Cached daemon subagent prompt injections keyed by active task id.
 export const cachedTaskInjection = new Map();
 export const cachedSubagentPromptByTask = cachedTaskInjection;
+/** Session id a daemon task record is claimed under, if any. */
+function taskSessionId(rec) {
+    return (asString(rec.session_id) ??
+        asString(rec.claim?.session_id) ??
+        null);
+}
 /**
- * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
- * activeSessionId and cachedTaskInjection.
+ * Resolve the active task from the daemon (fail-soft). Caches activeTaskId
+ * and cachedTaskInjection. A task is adopted only when it is the caller's
+ * preferred task or when its claim session matches the caller's own session
+ * identity: a foreign session's task (and its session id) is never adopted.
+ * activeSessionId is only ever set from the caller's own identity, never
+ * from a task record.
  */
-export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
+export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId, callerSessionId) {
+    if (callerSessionId) {
+        activeSessionId = callerSessionId;
+    }
     if (!mcpClient) {
         return { taskId: activeTaskId, sessionId: activeSessionId, promptInjection: null };
     }
@@ -872,6 +885,7 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
             body = {};
         }
         const tasks = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.items) ? body.items : [];
+        const effectiveSessionId = callerSessionId ?? activeSessionId;
         let target = null;
         for (const item of tasks) {
             if (typeof item !== "object" || item === null)
@@ -885,32 +899,26 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
                 target = rec;
                 break;
             }
-            if (!target && asString(rec.status) === "in_progress") {
+            if (!target &&
+                effectiveSessionId &&
+                taskSessionId(rec) === effectiveSessionId &&
+                asString(rec.status) === "in_progress") {
                 target = rec;
             }
         }
-        if (!target && tasks.length > 0 && typeof tasks[0] === "object" && tasks[0] !== null) {
-            target = tasks[0];
-        }
         if (target) {
             const taskId = asString(target.id);
-            const sessionId = asString(target.session_id) ??
-                asString(target.claim?.session_id) ??
-                null;
             const promptInjection = asString(target.subagent_prompt_injection) ?? null;
             if (taskId) {
-                if (!preferredTaskId || taskId === preferredTaskId) {
-                    activeTaskId = taskId;
-                    activeSessionId = sessionId;
-                }
+                activeTaskId = taskId;
                 cachedTaskInjection.set(taskId, promptInjection);
             }
             if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
                 cachedTaskInjection.set(preferredTaskId, promptInjection);
             }
             return {
-                taskId: preferredTaskId ?? taskId ?? null,
-                sessionId: sessionId ?? activeSessionId,
+                taskId: preferredTaskId ?? taskId ?? activeTaskId,
+                sessionId: activeSessionId,
                 promptInjection: preferredTaskId ? (cachedTaskInjection.get(preferredTaskId) ?? promptInjection) : promptInjection,
             };
         }
@@ -1214,7 +1222,7 @@ const executeBeforeHandler = async (input) => {
     // Enhancement 1: resolve active task from daemon before subagent injection & mutating guard.
     if (!activeTaskId && (isSubagentTool(toolName) || isMutatingTool(toolName))) {
         try {
-            await resolveActiveTaskFromDaemon(config.namespace);
+            await resolveActiveTaskFromDaemon(config.namespace, null, asString(input?.session_id) ?? asString(input?.sessionID) ?? null);
         }
         catch {
             // fail-soft
@@ -1502,7 +1510,7 @@ export async function handleHookEvent(event) {
         if (isMutatingTool(toolNameRaw)) {
             if (!activeTaskId) {
                 try {
-                    await resolveActiveTaskFromDaemon(config.namespace);
+                    await resolveActiveTaskFromDaemon(config.namespace, null, asString(event.session_id) ?? asString(event.sessionID) ?? null);
                 }
                 catch {
                     // fail-soft
