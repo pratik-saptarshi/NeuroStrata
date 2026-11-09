@@ -385,6 +385,30 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
     assert.ok(target.prompt.includes("### NeuroStrata Task & Graph Context"));
   });
 
+  it("PreToolUse spawn_agent enriches the message field (Codex reproduction)", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      const target = { message: "Touch src/foo.ts please" };
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "spawn_agent",
+        tool_input: target,
+      });
+      assert.equal(out.continue, true);
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+      assert.ok(
+        out.hookSpecificOutput.updatedInput.message.includes("### NeuroStrata Task & Graph Context"),
+        "spawn_agent message must carry the injected context marker",
+      );
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
   it("PreToolUse file-touch returns recall block when daemon healthy", async () => {
     const { server, url } = await createMockDaemonServer();
     try {
@@ -573,6 +597,18 @@ describe("injectSubagentPrompt", () => {
     const marked = { prompt: "### NeuroStrata Task & Graph Context x" };
     assert.equal(injectSubagentPrompt(marked, "ns", "t"), false);
   });
+
+  it("injects into message when prompt is absent (Codex spawn_agent); prompt wins when both present", () => {
+    const target = { message: "Do the thing" };
+    assert.equal(injectSubagentPrompt(target, "ns", "task-1"), true);
+    assert.ok(target.message.startsWith("### NeuroStrata Task & Graph Context"));
+    assert.ok(target.message.endsWith("Do the thing"));
+    assert.equal(injectSubagentPrompt(target, "ns", "task-1"), false, "idempotent per field");
+    const both = { prompt: "Prompt text", message: "Message text" };
+    assert.equal(injectSubagentPrompt(both, "ns", "task-1"), true);
+    assert.ok(both.prompt.startsWith("### NeuroStrata Task & Graph Context"));
+    assert.equal(both.message, "Message text", "message untouched when prompt present");
+  });
 });
 
 describe("extractRepoFilePaths", () => {
@@ -638,6 +674,30 @@ describe("enrichAndInjectSubagentPrompt", () => {
       server.close();
       resetModuleState();
     }
+  });
+
+  it("injects header + file recall into message-based inputs (Codex spawn_agent)", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      const target = { message: "Touch src/foo.ts please" };
+      const changed = await enrichAndInjectSubagentPrompt(target, "ns");
+      assert.equal(changed, true);
+      assert.ok(target.message.includes("### NeuroStrata Task & Graph Context"));
+      assert.ok(target.message.includes("[NeuroStrata rule mem-rule-1"));
+      assert.equal(target.prompt, undefined, "no prompt field is synthesized");
+      assert.equal(await enrichAndInjectSubagentPrompt(target, "ns"), false, "idempotent on the message field");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("returns false when neither prompt nor message is a string", async () => {
+    assert.equal(await enrichAndInjectSubagentPrompt({ other: "data" }, "ns"), false);
+    assert.equal(await enrichAndInjectSubagentPrompt({ message: 42 }, "ns"), false);
   });
 });
 

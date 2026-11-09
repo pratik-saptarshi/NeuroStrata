@@ -828,11 +828,25 @@ export function buildSubagentContextHeader(namespace, taskId, extraContext) {
         extra +
         `\n`);
 }
+/**
+ * The field a subagent tool input carries its instructions in: "prompt" for
+ * most hosts, "message" for Codex spawn_agent. Prompt wins when both exist.
+ */
+function subagentInstructionField(target) {
+    if (typeof target.prompt === "string")
+        return "prompt";
+    if (typeof target.message === "string")
+        return "message";
+    return null;
+}
 export function injectSubagentPrompt(target, namespace, taskId, extraContext) {
-    const raw = typeof target.prompt === "string" ? target.prompt : null;
-    if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER))
+    const field = subagentInstructionField(target);
+    if (field === null)
         return false;
-    target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
+    const raw = target[field];
+    if (raw.includes(SUBAGENT_CONTEXT_MARKER))
+        return false;
+    target[field] = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
     return true;
 }
 export function extractRepoFilePaths(promptText) {
@@ -937,7 +951,11 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId, ca
  * target prompt. Idempotent.
  */
 export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
-    if (typeof target.prompt !== "string" || target.prompt.includes(SUBAGENT_CONTEXT_MARKER)) {
+    const field = subagentInstructionField(target);
+    if (field === null)
+        return false;
+    const instructionText = target[field];
+    if (instructionText.includes(SUBAGENT_CONTEXT_MARKER)) {
         return false;
     }
     let effectiveTaskId = taskId ?? null;
@@ -957,7 +975,7 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     const extraLines = [];
     if (injection)
         extraLines.push(injection);
-    const files = extractRepoFilePaths(target.prompt).slice(0, 5);
+    const files = extractRepoFilePaths(instructionText).slice(0, 5);
     const seenInPrompt = new Set();
     for (const fp of files) {
         try {

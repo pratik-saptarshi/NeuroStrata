@@ -947,15 +947,27 @@ export function buildSubagentContextHeader(
   );
 }
 
+/**
+ * The field a subagent tool input carries its instructions in: "prompt" for
+ * most hosts, "message" for Codex spawn_agent. Prompt wins when both exist.
+ */
+function subagentInstructionField(target: Record<string, unknown>): "prompt" | "message" | null {
+  if (typeof target.prompt === "string") return "prompt";
+  if (typeof target.message === "string") return "message";
+  return null;
+}
+
 export function injectSubagentPrompt(
   target: Record<string, unknown>,
   namespace: string,
   taskId: string | null,
   extraContext?: string,
 ): boolean {
-  const raw = typeof target.prompt === "string" ? target.prompt : null;
-  if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER)) return false;
-  target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
+  const field = subagentInstructionField(target);
+  if (field === null) return false;
+  const raw = target[field] as string;
+  if (raw.includes(SUBAGENT_CONTEXT_MARKER)) return false;
+  target[field] = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
   return true;
 }
 
@@ -1073,7 +1085,10 @@ export async function enrichAndInjectSubagentPrompt(
   namespace: string,
   taskId?: string | null,
 ): Promise<boolean> {
-  if (typeof target.prompt !== "string" || target.prompt.includes(SUBAGENT_CONTEXT_MARKER)) {
+  const field = subagentInstructionField(target);
+  if (field === null) return false;
+  const instructionText = target[field] as string;
+  if (instructionText.includes(SUBAGENT_CONTEXT_MARKER)) {
     return false;
   }
   let effectiveTaskId: string | null = taskId ?? null;
@@ -1090,7 +1105,7 @@ export async function enrichAndInjectSubagentPrompt(
   }
   const extraLines: string[] = [];
   if (injection) extraLines.push(injection);
-  const files = extractRepoFilePaths(target.prompt).slice(0, 5);
+  const files = extractRepoFilePaths(instructionText).slice(0, 5);
   const seenInPrompt = new Set<string>();
   for (const fp of files) {
     try {
