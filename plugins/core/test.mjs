@@ -2267,4 +2267,74 @@ await beforeHook({ tool: "execute", input: { code: 'neurostrata_task_update({ id
       rmSync(projectDir, { recursive: true, force: true });
     }
   });
+
+  it("(f) racing stale-lock takeovers lose no increments (C-46-2)", { timeout: 120000 }, async () => {
+    const projectDir = makeProjectDir();
+    const session = "sess-race";
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const counterFile = join(hookStateDir, `mutations-${session}.json`);
+    const lockDir = `${counterFile}.lock`;
+    const goFile = join(projectDir, "go.txt");
+
+    // Each racer signals readiness, parks on the GO barrier, then performs
+    // exactly one bump — the barrier shape of the C-46-2 reproduction, so
+    // both racers judge the same pre-aged stale lock in the same instant.
+    const racerSource = `
+import { writeFileSync, existsSync } from "node:fs";
+const core = await import(${JSON.stringify(distUrl)});
+writeFileSync(process.env.NS_READY, "ready");
+const t0 = Date.now();
+while (!existsSync(process.env.NS_GO)) { if (Date.now() - t0 > 10000) process.exit(4); }
+console.log(core.bumpPersistedMutationCounter(${JSON.stringify(session)}));
+`;
+
+    async function runRaceRound(round) {
+      rmSync(counterFile, { force: true });
+      rmSync(lockDir, { recursive: true, force: true });
+      rmSync(goFile, { force: true });
+      // Pre-create the stale lock in its production shape: an empty
+      // directory whose mtime is well past the 10 s stale threshold.
+      mkdirSync(lockDir, { recursive: true });
+      const stale = new Date(Date.now() - 20000);
+      utimesSync(lockDir, stale, stale);
+
+      const racers = [0, 1].map((k) => {
+        const readyFile = join(projectDir, `ready-${round}-${k}`);
+        rmSync(readyFile, { force: true });
+        return {
+          readyFile,
+          promise: runChildAsync(projectDir, `racer-${round}-${k}.mjs`, racerSource, { NS_READY: readyFile, NS_GO: goFile }),
+        };
+      });
+      const waitStart = Date.now();
+      while (!racers.every((r) => existsSync(r.readyFile))) {
+        if (Date.now() - waitStart > 15000) throw new Error("racers did not reach the barrier");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      writeFileSync(goFile, "go");
+      const returns = (await Promise.all(racers.map((r) => r.promise))).map((out) => {
+        const v = out.trim();
+        return v === "null" ? null : Number(v);
+      });
+      const persisted = existsSync(counterFile)
+        ? JSON.parse(readFileSync(counterFile, "utf8")).mutations_since_note
+        : 0;
+      // The verification round's loss definition: every bump reported
+      // success, yet the persisted total is wrong or two bumps returned
+      // the same value (proof their critical sections overlapped).
+      const allSucceeded = returns.every((v) => v !== null);
+      const dup = new Set(returns).size !== returns.length;
+      return allSucceeded && (persisted !== 2 || dup);
+    }
+
+    try {
+      let losses = 0;
+      for (let round = 0; round < 40; round++) {
+        if (await runRaceRound(round)) losses++;
+      }
+      assert.equal(losses, 0, `40 barrier-synchronized stale-lock takeover rounds must lose zero increments (lost ${losses})`);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
 });

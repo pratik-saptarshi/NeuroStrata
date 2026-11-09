@@ -1257,6 +1257,64 @@ const MUTATION_COUNTER_LOCK_POLL_MS = 10;
 const MUTATION_COUNTER_LOCK_STALE_MS = 10_000;
 
 /**
+ * Steal a lock directory that was judged stale, ownership-safely.
+ *
+ * Path-based removal is NOT safe here: two processes can judge the same
+ * stale lock removable, and the second one's removal can land after the
+ * first has already created a FRESH lock at the same path — deleting the
+ * live lock and admitting both into the critical section (C-46-2). A
+ * rename, by contrast, atomically moves the directory OBJECT, and only
+ * one stealer can move a given generation. So: rename the lock to a
+ * unique sibling trash path, then re-stat the moved directory — its
+ * mtime must equal the exact mtime that was judged stale (a rename does
+ * not change a directory's mtime; a fresh lock always carries a current
+ * one). Only the judged generation may be deleted. If the moved
+ * directory is a live lock (mtime mismatch), it is renamed back
+ * untouched; if even that fails because the path was reoccupied, the
+ * live lock is left where it is — deleting a lock known to be live is
+ * the defect being fixed, never the recovery.
+ *
+ * Returns "stolen" (the judged stale generation was removed; retry the
+ * acquire promptly), or "blocked" (lost the steal race, moved a live
+ * lock and restored it, or the filesystem refused: caller polls within
+ * the same deadline as ordinary contention, so the wait stays bounded).
+ * Never throws.
+ */
+function stealStaleMutationCounterLock(lockDir: string, judgedMtimeMs: number): "stolen" | "blocked" {
+  const trashDir = `${lockDir}.steal-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    renameSync(lockDir, trashDir);
+  } catch {
+    return "blocked";
+  }
+  let movedMtimeMs: number | null = null;
+  try {
+    movedMtimeMs = statSync(trashDir).mtimeMs;
+  } catch {
+    // The directory we just moved is the only handle on it; if it cannot
+    // be stat'ed, treat it as the judged generation and remove it rather
+    // than strand a lock no one else can find.
+  }
+  if (movedMtimeMs !== null && movedMtimeMs !== judgedMtimeMs) {
+    try {
+      renameSync(trashDir, lockDir);
+    } catch {
+      // The lock path was reoccupied during the displacement. Leave the
+      // live lock at the trash path (its holder's release tolerates the
+      // path being gone) instead of deleting a live lock.
+    }
+    return "blocked";
+  }
+  try {
+    rmSync(trashDir, { recursive: true, force: true });
+  } catch {
+    // Best effort: an orphaned trash dir is inert — nothing stats or
+    // acquires it, unlike the lock path itself.
+  }
+  return "stolen";
+}
+
+/**
  * Acquire the exclusive lock directory for a counter file (mkdirSync is an
  * atomic create). Polls briefly; a lock older than the stale threshold is
  * presumed to belong to a crashed holder and is stolen. Returns the lock
@@ -1271,23 +1329,19 @@ function acquireMutationCounterLock(filePath: string): string | null {
       mkdirSync(lockDir);
       return lockDir;
     } catch {
-      let stale = false;
+      let staleMtimeMs: number | null = null;
       try {
-        stale = Date.now() - statSync(lockDir).mtimeMs > MUTATION_COUNTER_LOCK_STALE_MS;
+        const mtimeMs = statSync(lockDir).mtimeMs;
+        if (Date.now() - mtimeMs > MUTATION_COUNTER_LOCK_STALE_MS) staleMtimeMs = mtimeMs;
       } catch {
         // Lock vanished between attempts (or never existed): just retry.
       }
-      if (stale) {
-        try {
-          rmSync(lockDir, { recursive: true, force: true });
-        } catch {
-          // Another process may have stolen it first; the retry decides.
-        }
-        // A successful steal retries promptly; a failed steal (the lock
-        // is still there, e.g. removal is not permitted) must NOT spin:
-        // it falls through to the same deadline check + poll sleep as
-        // ordinary contention, so the wait stays bounded.
-        if (!existsSync(lockDir)) continue;
+      if (staleMtimeMs !== null) {
+        // A successful steal retries promptly; a blocked steal (lost the
+        // race, or the filesystem refuses, e.g. removal is not permitted)
+        // must NOT spin: it falls through to the same deadline check +
+        // poll sleep as ordinary contention, so the wait stays bounded.
+        if (stealStaleMutationCounterLock(lockDir, staleMtimeMs) === "stolen") continue;
       }
       if (Date.now() >= deadline) return null;
       sleepMsSync(MUTATION_COUNTER_LOCK_POLL_MS);
