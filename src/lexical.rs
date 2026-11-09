@@ -44,6 +44,32 @@ pub fn tokenize_code_for_tantivy(text: &str) -> String {
     tokens.join(" ")
 }
 
+/// Neutralize a tokenized query for Tantivy's `QueryParser`: quote-wrap
+/// every whitespace-separated term so user text is parsed as literal
+/// phrases, never as query syntax.
+///
+/// Tantivy 0.27's grammar (tantivy-query-grammar `simple_term`) parses a
+/// double-quoted string as one literal whose contents may contain any
+/// character except an unescaped `"`; a `\` escapes the next character.
+/// The parser then runs the field tokenizer over the literal exactly as
+/// it does for a bare term — a literal tokenizing to one term stays a
+/// term query, several terms become the same phrase query a bare
+/// multi-token literal produced — so per-field boosts and matching
+/// semantics are unchanged, while `:`, `(`, `)`, leading `+`/`-`,
+/// unbalanced quotes, `^`, `~`, `/` etc. inside the quotes can no
+/// longer be read as field references, grouping, occur operators,
+/// boosts, fuzzy markers, or regex delimiters. Without this, the raw
+/// full-text token appended by [`tokenize_code_for_tantivy`] (e.g.
+/// `std::sync::mutex`) reached `parse_query` as syntax and the search
+/// failed with a propagated parse error instead of returning matches.
+fn quote_tokenized_query(tokenized: &str) -> String {
+    tokenized
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, Clone)]
 pub struct TantivyHit {
     pub id: String,
@@ -391,7 +417,7 @@ impl TantivyLexicalIndex {
         parser.set_field_boost(self.symbol_f, 2.0);
         parser.set_field_boost(self.location_f, 1.5);
 
-        let tokenized_query = tokenize_code_for_tantivy(query_str);
+        let tokenized_query = quote_tokenized_query(&tokenize_code_for_tantivy(query_str));
         let parsed = parser.parse_query(&tokenized_query)?;
 
         // Apply the row filters inside the query, before TopDocs collects:
@@ -880,6 +906,116 @@ mod tests {
             "expected full memory id, got ids: {:?}",
             hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
         );
+    }
+
+    fn mutex_payload() -> MemoryPayload {
+        dummy_payload("guarded by a mutex lock", Some("std::sync::Mutex"))
+    }
+
+    #[test]
+    fn test_search_qualified_symbol_with_colons_returns_seeded_row() {
+        // Round-13 P2 regression: the exact qualified symbol must return Ok
+        // WITH the seeded row (an error-swallowing fix returning Ok(empty)
+        // fails this oracle).
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload()).unwrap();
+        let hits = idx
+            .search("ns", "std::sync::Mutex", 10, true, true, None)
+            .expect("qualified-symbol search must not error");
+        assert!(
+            hits.iter().any(|h| h.id == "mutex-row"),
+            "exact qualified symbol must return the seeded row, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_parser_hostile_path_token_with_colons() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("path token target row", Some("foo::bar::Baz"));
+        idx.upsert_memory("ns", "path-row", &p).unwrap();
+        let hits = idx
+            .search("ns", "foo::bar::Baz", 10, true, true, None)
+            .expect("path-like token search must not error");
+        assert!(hits.iter().any(|h| h.id == "path-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_trailing_colon() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload()).unwrap();
+        let hits = idx
+            .search("ns", "Mutex:", 10, true, true, None)
+            .expect("trailing-colon search must not error");
+        assert!(hits.iter().any(|h| h.id == "mutex-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_unbalanced_quote() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("say hello loudly", None);
+        idx.upsert_memory("ns", "quote-row", &p).unwrap();
+        let hits = idx
+            .search("ns", "say \"hello", 10, true, true, None)
+            .expect("unbalanced-quote search must not error");
+        assert!(hits.iter().any(|h| h.id == "quote-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_unbalanced_paren() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload()).unwrap();
+        let hits = idx
+            .search("ns", "(Mutex", 10, true, true, None)
+            .expect("unbalanced-paren search must not error");
+        assert!(hits.iter().any(|h| h.id == "mutex-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_leading_plus_minus_are_literal() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload()).unwrap();
+        for q in ["+Mutex", "-Mutex"] {
+            let hits = idx
+                .search("ns", q, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {q:?} must not error: {e}"));
+            assert!(
+                hits.iter().any(|h| h.id == "mutex-row"),
+                "query {q:?} must be literal text and return the seeded row, got: {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_parser_hostile_boolean_words_are_literal() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("fish and chips or peas supper", None);
+        idx.upsert_memory("ns", "bool-row", &p).unwrap();
+        for q in ["AND", "chips OR peas"] {
+            let hits = idx
+                .search("ns", q, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {q:?} must not error: {e}"));
+            assert!(
+                hits.iter().any(|h| h.id == "bool-row"),
+                "query {q:?} must return the seeded row, got: {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_plain_multiword_query_result_set_pin() {
+        // PIN: ordinary multi-word behaviour is unchanged by the fix
+        // (this leg is green on the unmodified tree and must stay green).
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "p1", &dummy_payload("alpha beta gamma", None)).unwrap();
+        idx.upsert_memory("ns", "p2", &dummy_payload("alpha beta delta", None)).unwrap();
+        idx.upsert_memory("ns", "p3", &dummy_payload("unrelated omega", None)).unwrap();
+        let hits = idx.search("ns", "alpha beta", 10, true, true, None).unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["p1", "p2"]);
     }
 
     #[test]
