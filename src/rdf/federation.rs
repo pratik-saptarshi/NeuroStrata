@@ -235,11 +235,12 @@ pub async fn project_federated_sparql_dataset_async(
             continue;
         }
 
-        // ReBAC restricted: visible_to is a non-empty array without "*"
-        if let Some(arr) = meta.get("visible_to").and_then(|v| v.as_array()) {
-            if !arr.is_empty() && !arr.iter().any(|v| v.as_str() == Some("*")) {
-                continue;
-            }
+        // ReBAC restricted: visible_to is a non-empty ACL without "*".
+        // Canonical extraction, so the object form {"principal":"*"}
+        // reads as "*" just like the string form.
+        let visible_to = crate::rebac::extract_visible_to(meta);
+        if !visible_to.is_empty() && !visible_to.iter().any(|entry| entry == "*") {
+            continue;
         }
 
         // Structural memory types
@@ -666,6 +667,65 @@ mod tests {
         ));
         assert!(contains_custom_neurostrata_function("SELECT * WHERE { ?s ns:salience ?v }"));
         assert!(!contains_custom_neurostrata_function("SELECT * WHERE { ?s ?p ?o }"));
+    }
+
+    // T1 oracle 7 — A2: a shareable row whose visible_to carries the
+    // object-form wildcard {"principal":"*"} IS projected into the
+    // federation dataset; a genuinely restricted shareable row still is not.
+    #[tokio::test]
+    async fn federation_dataset_projects_object_wildcard_shareable_row() {
+        use crate::traits::VectorStore;
+        let dir = std::env::temp_dir().join(format!(
+            "ns-federation-a2-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
+            .expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+        for (id, metadata) in [
+            (
+                "wildcard-shareable",
+                serde_json::json!({
+                    "eligibility": "shareable",
+                    "visible_to": [{"principal": "*", "role": "viewer"}]
+                }),
+            ),
+            (
+                "restricted-shareable",
+                serde_json::json!({
+                    "eligibility": "shareable",
+                    "visible_to": ["alice"]
+                }),
+            ),
+        ] {
+            let payload = crate::traits::MemoryPayload {
+                content: format!("federation row {id}"),
+                user_id: "owner".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata,
+            };
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        let (dataset, _truncated) =
+            project_federated_sparql_dataset_async("probe", &store, 250_000).await;
+        let subjects: Vec<String> = dataset
+            .iter()
+            .map(|q| q.subject.to_string())
+            .collect();
+        assert!(
+            subjects.iter().any(|s| s.contains("wildcard-shareable")),
+            "object-wildcard shareable row must be projected, subjects: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("restricted-shareable")),
+            "genuinely restricted shareable row must not be projected, subjects: {subjects:?}"
+        );
     }
 
     #[test]
