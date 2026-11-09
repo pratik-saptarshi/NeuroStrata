@@ -1,6 +1,7 @@
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { spawn } from "node:child_process";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,7 +52,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], guardMutations: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -128,6 +129,8 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_guard_validate") {
             counters.guardValidate++;
+            const guardArgs = params.arguments ?? {};
+            counters.guardMutations.push(guardArgs.mutations_since_note);
             // `guardReject` may be a boolean or a getter, so a test can flip the
             // verdict between two calls against the same mock daemon.
             const reject = typeof guardReject === "function" ? guardReject() : guardReject;
@@ -2004,6 +2007,128 @@ describe("round-9: CLI hook runners flush stdout before exiting", () => {
         src.includes("const writeStdout = (text) =>"),
         `${rel}: writeStdout helper missing`,
       );
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// N2: mutation counter persistence across stateless hook processes.
+// In the stateless CLI-hook deployment every tool invocation is a fresh
+// Node process, so the in-process `mutationsSinceNote` resets to 0 and
+// guard_validate always saw mutations_since_note: 0. The counter must be
+// persisted per session under <projectRoot>/.NeuroStrata/hook-state/.
+// ──────────────────────────────────────────────────────────────────────
+
+describe("N2: mutation counter persistence across stateless hook processes", () => {
+  const distUrl = new URL("./dist/index.js", import.meta.url).href;
+
+  const editChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "Edit", tool_input: { file_path: "src/x.rs" }, session_id: process.env.NS_SESSION });
+`;
+
+  const resetChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "neurostrata_task_update", tool_input: { id: "t1", note: "checkpoint" }, session_id: process.env.NS_SESSION });
+`;
+
+  function makeProjectDir() {
+    const dir = mkdtempSync(join(tmpdir(), "ns-n2-xproc-"));
+    mkdirSync(join(dir, ".NeuroStrata"), { recursive: true });
+    return dir;
+  }
+
+  // Children are spawned async (never spawnSync): the mock daemon lives in
+  // this same test process, so blocking its event loop would starve the
+  // very server the children call.
+  function runChildAsync(projectDir, scriptName, source, env = {}) {
+    const scriptPath = join(projectDir, scriptName);
+    writeFileSync(scriptPath, source);
+    return new Promise((resolveChild, rejectChild) => {
+      const child = spawn(process.execPath, [scriptPath], {
+        cwd: projectDir,
+        env: { ...process.env, ...env },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("error", rejectChild);
+      child.on("close", (code) => {
+        if (code === 0) resolveChild(stdout);
+        else rejectChild(new Error(`child ${scriptName} exited ${code}: ${stderr}`));
+      });
+    });
+  }
+
+  // In-process tests elsewhere in this suite run with cwd = repo root and,
+  // after the N2 fix, write hook-state files under the repo root's
+  // (git-ignored) .NeuroStrata/. Remove that directory's hook-state so the
+  // working tree is left exactly as found.
+  after(() => {
+    rmSync(join(process.cwd(), ".NeuroStrata", "hook-state"), { recursive: true, force: true });
+  });
+
+  it("(a) six sequential hook processes report mutations_since_note [0,1,2,3,4,5] to the guard", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    try {
+      for (let i = 0; i < 6; i++) {
+        await runChildAsync(projectDir, `edit-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-xproc" });
+      }
+      assert.deepEqual(counters.guardMutations, [0, 1, 2, 3, 4, 5]);
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) a note-carrying task_update in one process resets the persisted counter for the next", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    const stateFile = join(projectDir, ".NeuroStrata", "hook-state", "mutations-sess-reset.json");
+    const readPersisted = () => JSON.parse(readFileSync(stateFile, "utf8")).mutations_since_note;
+    try {
+      await runChildAsync(projectDir, "edit-b1.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      await runChildAsync(projectDir, "edit-b2.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      assert.equal(readPersisted(), 2, "two Edit processes persist a count of 2");
+
+      await runChildAsync(projectDir, "reset-b.mjs", resetChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      assert.equal(readPersisted(), 0, "task_update(note) process persists the reset to 0");
+
+      await runChildAsync(projectDir, "edit-b3.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      await runChildAsync(projectDir, "edit-b4.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      assert.deepEqual(counters.guardMutations, [0, 1, 0, 1]);
+      assert.equal(readPersisted(), 2, "counter accumulates again after the reset");
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) parallel bumpPersistedMutationCounter children lose no updates", async () => {
+    const projectDir = makeProjectDir();
+    try {
+      const bumpSource = `
+const core = await import(${JSON.stringify(distUrl)});
+for (let i = 0; i < 25; i++) {
+  const v = core.bumpPersistedMutationCounter("sess-conc");
+  if (v === null) { console.error("bump returned null"); process.exit(3); }
+}
+`;
+      await Promise.all(
+        [0, 1, 2, 3].map((n) => runChildAsync(projectDir, `bump-${n}.mjs`, bumpSource)),
+      );
+      const readerSource = `
+const core = await import(${JSON.stringify(distUrl)});
+console.log(core.readPersistedMutationCounter("sess-conc"));
+`;
+      const out = await runChildAsync(projectDir, "read-conc.mjs", readerSource);
+      assert.equal(out.trim(), "100", "4 children x 25 bumps persist exactly 100");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
     }
   });
 });

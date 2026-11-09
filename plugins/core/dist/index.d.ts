@@ -222,6 +222,15 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
+export declare function mutationCounterFilePath(sessionId?: string): string;
+export declare function readPersistedMutationCounter(sessionId?: string): number | null;
+/**
+ * Increment the persisted counter under its lock and return the new value,
+ * or null on any failure (callers fall back to the in-process increment).
+ */
+export declare function bumpPersistedMutationCounter(sessionId?: string): number | null;
+/** Persist a reset to 0 under the same lock. Best-effort; never throws. */
+export declare function resetPersistedMutationCounter(sessionId?: string): void;
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
 /**
