@@ -6751,6 +6751,15 @@ impl VectorStore for LadybugStore {
             let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
                 continue;
             };
+            // D1 backstop: the fts query verdict trusted the index doc; a
+            // stale/corrupt index doc must not surface a row the stored
+            // payload excludes. Re-derive the doc from the hydrated payload
+            // through the store's own conversion and apply the query path's
+            // own verdict function under the same options.
+            let derived = Self::lexical_doc(namespace, &hit.id, &payload);
+            if !crate::fts::doc_visible(&derived, &options) {
+                continue;
+            }
             results.push(SearchResult {
                 id: hit.id,
                 score: hit.score,
@@ -15262,6 +15271,170 @@ eurostrata\src\daemon.rs",
         assert!(
             !alice_ids.contains(&"malformed-acl".to_string()),
             "all-malformed visible_to must fail closed, got: {alice_ids:?}"
+        );
+    }
+
+    // T1 oracle 2 — limit-fill (kills backstop-only): the top hits by the
+    // deterministic score-then-id sort (fts finalize: equal scores sort by
+    // id) are object-ACL-restricted to alice; searching as the excluded
+    // principal bob must still return a full `limit` of visible results,
+    // which requires the ACL to be applied BEFORE the limit truncates.
+    #[tokio::test]
+    async fn lexical_search_limit_fills_with_visible_results_past_restricted_top_hits() {
+        let store = retired_test_store().await;
+        for id in ["a-restricted-1", "a-restricted-2"] {
+            let mut payload = retired_test_payload(
+                "fact",
+                "owner",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+            );
+            payload.content = "quixotic fillterm row".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+        for id in ["b-visible-1", "b-visible-2", "b-visible-3"] {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = "quixotic fillterm row".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+        let bob = store
+            .search_lexical("probe", "quixotic", 3, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            bob_ids,
+            vec![
+                "b-visible-1".to_string(),
+                "b-visible-2".to_string(),
+                "b-visible-3".to_string()
+            ],
+            "bob must get a full limit of visible results past the restricted top hits, got: {bob_ids:?}"
+        );
+    }
+
+    // T1 oracle 3 helper — index-corruption set (kills conversion-only):
+    // the STORED row carries the true restriction for `class`; the in-house
+    // index doc is then doctored directly to the permissive value for that
+    // one class, so the fts query verdict alone would serve the row. Only a
+    // hydration backstop that re-derives the doc from the stored payload
+    // can drop it. Returns the ids search_lexical serves to bob.
+    async fn corrupted_index_search_ids(class: &str) -> Vec<String> {
+        let store = retired_test_store().await;
+        let (id, mut payload) = match class {
+            "visible_to" => (
+                "corrupt-visible-to",
+                retired_test_payload("fact", "owner", json!({"visible_to": ["alice"]})),
+            ),
+            "registry" => (
+                "corrupt-registry",
+                retired_test_payload(
+                    "fact",
+                    "owner",
+                    crate::registry::registry_metadata(&["auth".to_string()]),
+                ),
+            ),
+            "archived" => (
+                "corrupt-archived",
+                retired_test_payload("fact", "owner", json!({"archived": true})),
+            ),
+            "valid_to" => (
+                "corrupt-valid-to",
+                retired_test_payload("fact", "owner", json!({"valid_to": 1})),
+            ),
+            "conflicting" => (
+                "corrupt-conflicting",
+                retired_test_payload("fact", "owner", json!({"mesh": {"conflict": true}})),
+            ),
+            "structural" => (
+                "corrupt-structural",
+                retired_test_payload("directory", "owner", json!({})),
+            ),
+            other => panic!("unknown corruption class {other}"),
+        };
+        payload.content = "corrupttoken corrupted row".to_string();
+        store
+            .upsert("probe", id, vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        // Force the namespace into the loaded set, then seed/replace the
+        // index doc directly (registry/conflicting/structural rows never
+        // enter via add/upsert, so the doctored doc is upserted here).
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let mut doctored = LadybugStore::lexical_doc("probe", id, &payload);
+        match class {
+            "visible_to" => doctored.visible_to = Vec::new(),
+            "registry" => doctored.registry = false,
+            "archived" => doctored.archived = false,
+            "valid_to" => {
+                doctored.valid_to = Some(chrono::Utc::now().timestamp() + 3600);
+            }
+            "conflicting" => doctored.conflicting = false,
+            "structural" => doctored.structural = false,
+            _ => unreachable!(),
+        }
+        store
+            .lexical
+            .write()
+            .expect("lexical index lock")
+            .upsert(doctored);
+        let outcome = store
+            .search_lexical("probe", "corrupttoken", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        outcome.results.iter().map(|r| r.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_visible_to_index_corruption() {
+        let ids = corrupted_index_search_ids("visible_to").await;
+        assert!(
+            ids.is_empty(),
+            "visible_to-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_registry_index_corruption() {
+        let ids = corrupted_index_search_ids("registry").await;
+        assert!(
+            ids.is_empty(),
+            "registry-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_archived_index_corruption() {
+        let ids = corrupted_index_search_ids("archived").await;
+        assert!(
+            ids.is_empty(),
+            "archived-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_valid_to_index_corruption() {
+        let ids = corrupted_index_search_ids("valid_to").await;
+        assert!(
+            ids.is_empty(),
+            "valid_to-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_conflicting_index_corruption() {
+        let ids = corrupted_index_search_ids("conflicting").await;
+        assert!(
+            ids.is_empty(),
+            "conflicting-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_structural_index_corruption() {
+        let ids = corrupted_index_search_ids("structural").await;
+        assert!(
+            ids.is_empty(),
+            "structural-corrupted row must not surface via search_lexical, got: {ids:?}"
         );
     }
 

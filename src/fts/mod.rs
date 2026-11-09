@@ -622,7 +622,7 @@ pub fn acl_allows(user: &str, resource_owner: &str, relation: &str, acl: &[Strin
     }
 }
 
-fn doc_visible(doc: &LexicalDoc, opts: &SearchOptions) -> bool {
+pub(crate) fn doc_visible(doc: &LexicalDoc, opts: &SearchOptions) -> bool {
     if doc.structural || doc.registry || doc.conflicting {
         return false;
     }
