@@ -87,6 +87,75 @@ pub fn decode_cursor(cursor: &str) -> Result<(String, String), String> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Shared typed resolver for GraphQL argument values.
+///
+/// Takes an argument's `graphql_parser` value plus the variables map and
+/// yields the typed value: a literal yields itself; a
+/// `Value::Variable(name)` yields the entry under that exact name in the
+/// variables map. Extraction is strict-and-silent, through the same
+/// `as_i64() -> as i32` / `as_str()` / `as_bool()` funnels the literal arms
+/// always used: no coercion (`"1"` and `1.5` yield `None`), no errors on
+/// mismatch, no `Value::Float` arm. An absent variable, or a provided JSON
+/// null (extraction fails on null), yields `None`, which callers treat as
+/// "argument not provided" so the current default stands. Only the
+/// variables map is read — variable-definition defaults are never read.
+pub(crate) fn resolve_arg_i32<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<i32> {
+    match value {
+        graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i as i32),
+        graphql_parser::query::Value::Variable(name) => {
+            variables.get(*name).and_then(|v| v.as_i64()).map(|i| i as i32)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_arg_string<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match value {
+        graphql_parser::query::Value::String(s) => Some(s.clone()),
+        graphql_parser::query::Value::Variable(name) => {
+            variables.get(*name).and_then(|v| v.as_str()).map(|s| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_arg_bool<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    match value {
+        graphql_parser::query::Value::Boolean(b) => Some(*b),
+        graphql_parser::query::Value::Variable(name) => {
+            variables.get(*name).and_then(|v| v.as_bool())
+        }
+        _ => None,
+    }
+}
+
+/// ID resolver (C2): the `ID` type has two literal forms, so accept string
+/// and integer forms alike — `Value::Int` literals via `as_i64()` to a
+/// decimal string, and variables holding either a JSON string or a JSON
+/// integer.
+pub(crate) fn resolve_arg_id<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match value {
+        graphql_parser::query::Value::String(s) => Some(s.clone()),
+        graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i.to_string()),
+        graphql_parser::query::Value::Variable(name) => variables.get(*name).and_then(|v| {
+            v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|i| i.to_string()))
+        }),
+        _ => None,
+    }
+}
+
 fn sanitize_metadata(metadata: &Value, principal: &str, user_id: &str) -> Value {
     let mut cleaned = metadata.clone();
     if let Some(obj) = cleaned.as_object_mut() {
@@ -368,6 +437,8 @@ pub fn execute_on_records(
 
     // Variables extraction
     let vars = variables.unwrap_or(&Value::Null);
+    let empty_var_map = serde_json::Map::new();
+    let var_map = vars.as_object().unwrap_or(&empty_var_map);
 
     // Build result from query type: determine operation
     let mut data = json!({});
@@ -388,44 +459,42 @@ pub fn execute_on_records(
                         // accumulated into `data` under its response key
                         // (the alias when one is given, else the field
                         // name). Per-field state therefore starts from the
-                        // variable-derived defaults and a fresh result, so
+                        // constant defaults and a fresh result, so
                         // an earlier field's arguments or result can never
                         // leak into a later field.
                         let response_key: &str = f.alias.unwrap_or(root_name);
-                        let mut var_first = vars.get("first").and_then(|v| v.as_i64()).map(|i| i as i32).unwrap_or(20);
-                        let mut var_after = vars.get("after").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let mut var_memory_type = vars.get("memoryType").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let mut var_include_archived = vars.get("includeArchived").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let mut var_include_retired = vars.get("includeRetired").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let mut var_text = vars.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let mut var_first: i32 = 20;
+                        let mut var_after = String::new();
+                        let mut var_memory_type = String::new();
+                        let mut var_include_archived = false;
+                        let mut var_include_retired = false;
+                        let mut var_text = String::new();
                         let mut root_result: Option<Value> = None;
                         for (k, v) in &f.arguments {
                             match *k {
                                 "first" => {
-                                    if let graphql_parser::query::Value::Int(num) = v {
-                                        if let Some(n) = num.as_i64() {
-                                            var_first = n as i32;
-                                        }
+                                    if let Some(n) = resolve_arg_i32(v, var_map) {
+                                        var_first = n;
                                     }
                                 }
                                 "after" => {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        var_after = s.clone();
+                                    if let Some(s) = resolve_arg_string(v, var_map) {
+                                        var_after = s;
                                     }
                                 }
                                 "memoryType" => {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        var_memory_type = s.clone();
+                                    if let Some(s) = resolve_arg_string(v, var_map) {
+                                        var_memory_type = s;
                                     }
                                 }
                                 "includeArchived" => {
-                                    if let graphql_parser::query::Value::Boolean(b) = v {
-                                        var_include_archived = *b;
+                                    if let Some(b) = resolve_arg_bool(v, var_map) {
+                                        var_include_archived = b;
                                     }
                                 }
                                 "includeRetired" => {
-                                    if let graphql_parser::query::Value::Boolean(b) = v {
-                                        var_include_retired = *b;
+                                    if let Some(b) = resolve_arg_bool(v, var_map) {
+                                        var_include_retired = b;
                                     }
                                 }
                                 "text" => {
@@ -446,14 +515,8 @@ pub fn execute_on_records(
                             let mut id_arg = "".to_string();
                             for (k, v) in &f.arguments {
                                 if *k == "id" {
-                                    match v {
-                                        graphql_parser::query::Value::String(s) => id_arg = s.clone(),
-                                        graphql_parser::query::Value::Variable(name) => {
-                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
-                                                id_arg = s.to_string();
-                                            }
-                                        }
-                                        _ => {}
+                                    if let Some(s) = resolve_arg_id(v, var_map) {
+                                        id_arg = s;
                                     }
                                 }
                             }
@@ -1228,6 +1291,241 @@ mod tests {
         assert!(rows.iter().all(|r| !r["node"].is_null()), "no edge may carry node: null: {rows:?}");
         let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
         assert_eq!(ids, vec![&serde_json::json!("real1"), &serde_json::json!("real2")], "page must contain exactly the real rows in order: {ids:?}");
+    }
+
+    // ---- T3 oracle helpers ----
+    fn t3_payload(content: &str, memory_type: &str, metadata: serde_json::Value) -> crate::traits::MemoryPayload {
+        crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: memory_type.into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata,
+        }
+    }
+
+    fn t3_numbered_records(n: usize) -> Vec<(String, crate::traits::MemoryPayload)> {
+        (1..=n)
+            .map(|i| {
+                (
+                    format!("m{i}"),
+                    t3_payload("c", "fact", serde_json::json!({"valid_from": 1000 - (i as i64) * 10})),
+                )
+            })
+            .collect()
+    }
+
+    fn t3_edge_ids(resp: &GraphQLResponse, key: &str) -> Vec<String> {
+        let data = resp.data.as_ref().expect("data must be present");
+        data[key]["edges"]
+            .as_array()
+            .expect("edges must be an array")
+            .iter()
+            .map(|e| e["node"]["id"].as_str().expect("node id must be a string").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_first() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": 1})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["m1".to_string()]);
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_after() {
+        let records = t3_numbered_records(3);
+        let cursor = encode_cursor("valid_from", "m1");
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($c: String) { memories(after: $c) { edges { node { id } } } }",
+            Some(&json!({"c": cursor})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["m2".to_string(), "m3".to_string()]);
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_memory_type() {
+        let records = vec![
+            ("f1".into(), t3_payload("fact row", "fact", serde_json::json!({"valid_from": 200}))),
+            ("n1".into(), t3_payload("note row", "note", serde_json::json!({"valid_from": 100}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($t: String) { memories(memoryType: $t) { edges { node { id } } } }",
+            Some(&json!({"t": "note"})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["n1".to_string()]);
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_include_archived() {
+        let records = vec![
+            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
+            ("arch".into(), t3_payload("archived", "fact", serde_json::json!({"valid_from": 100, "archived": true}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($a: Boolean) { memories(includeArchived: $a) { edges { node { id } } } }",
+            Some(&json!({"a": true})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let ids = t3_edge_ids(&resp, "memories");
+        assert_eq!(ids.len(), 2, "archived row must be included via renamed variable: {ids:?}");
+        assert!(ids.contains(&"arch".to_string()), "archived row id missing: {ids:?}");
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_include_retired() {
+        let now = chrono::Utc::now().timestamp();
+        let records = vec![
+            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
+            ("old".into(), t3_payload("retired", "fact", serde_json::json!({"valid_from": 100, "valid_to": now - 10}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($r: Boolean) { memories(includeRetired: $r) { edges { node { id } } } }",
+            Some(&json!({"r": true})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let ids = t3_edge_ids(&resp, "memories");
+        assert_eq!(ids.len(), 2, "retired row must be included via renamed variable: {ids:?}");
+        assert!(ids.contains(&"old".to_string()), "retired row id missing: {ids:?}");
+    }
+
+    #[test]
+    fn t3_o2_unreferenced_variable_first_does_not_paginate() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories { edges { node { id } } } }",
+            Some(&json!({"first": 1})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "unreferenced first=1 must not paginate: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o2_unreferenced_variable_include_archived_does_not_include() {
+        let records = vec![
+            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
+            ("arch".into(), t3_payload("archived", "fact", serde_json::json!({"valid_from": 100, "archived": true}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories { edges { node { id } } } }",
+            Some(&json!({"includeArchived": true})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["live".to_string()], "unreferenced includeArchived=true must not include archived rows: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o3_absent_referenced_variable_ignores_stray_seed() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"first": 1})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "absent $n must page by default 20, not stray first=1: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o3_referenced_variable_wins_over_stray_seed() {
+        let records = t3_numbered_records(8);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": 7, "first": 1})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories").len(), 7, "referenced $n=7 must win over stray first=1: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o4_definition_default_is_not_honoured() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($n: Int = 1) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "definition default must NOT be honoured; default-20 page expected: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o5_string_first_variable_yields_default() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": "1"})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "string \"1\" must not coerce; default 20 expected: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o5_float_first_variable_yields_default() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": 1.5})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "float 1.5 must not coerce; default 20 expected: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o5_string_bool_variable_yields_default() {
+        let records = vec![
+            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
+            ("arch".into(), t3_payload("archived", "fact", serde_json::json!({"valid_from": 100, "archived": true}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($b: Boolean) { memories(includeArchived: $b) { edges { node { id } } } }",
+            Some(&json!({"b": "true"})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["live".to_string()], "string \"true\" must not coerce; archived stays excluded: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o6_per_field_isolation_literal_arguments() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ a: memories(first: 1) { edges { node { id } } } b: memories(first: 2) { edges { node { id } } } }",
+            None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "a"), vec!["m1".to_string()]);
+        assert_eq!(t3_edge_ids(&resp, "b"), vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[test]
+    fn t3_o6_per_field_isolation_variable_arguments() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($x: Int, $y: Int) { a: memories(first: $x) { edges { node { id } } } b: memories(first: $y) { edges { node { id } } } }",
+            Some(&json!({"x": 1, "y": 2})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "a"), vec!["m1".to_string()]);
+        assert_eq!(t3_edge_ids(&resp, "b"), vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[test]
+    fn t3_o7_int_literal_id_returns_row_42() {
+        let records = vec![("42".into(), t3_payload("answer", "fact", serde_json::json!({})))];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memory(id: 42) { id } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42", "Int literal id must return row 42: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o7_int_variable_id_returns_row_42() {
+        let records = vec![("42".into(), t3_payload("answer", "fact", serde_json::json!({})))];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($id: ID) { memory(id: $id) { id } }",
+            Some(&json!({"id": 42})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42", "integer variable id must return row 42: {:?}", resp.data);
+    }
+
+    #[test]
+    fn t3_o7_string_literal_id_control() {
+        let records = vec![("42".into(), t3_payload("answer", "fact", serde_json::json!({})))];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memory(id: \"42\") { id } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42");
     }
 
     #[test]
