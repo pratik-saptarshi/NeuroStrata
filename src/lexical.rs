@@ -15,6 +15,25 @@ use crate::traits::{MemoryPayload};
 
 pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v1");
 
+/// Read the archive tombstone from payload metadata as an index flag.
+///
+/// The tombstone producer (`handlers::archive_memory`) writes a boolean
+/// `true`, while older rows may carry an integer flag; accept both shapes:
+/// 1 when `archived` is boolean `true` or an integer != 0, else 0.
+fn archived_flag(metadata: &serde_json::Value) -> i64 {
+    match metadata.get("archived") {
+        Some(v) if v.as_bool() == Some(true) => 1,
+        Some(v) => {
+            if v.as_i64().map(|n| n != 0).unwrap_or(false) {
+                1
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
 /// Code-aware pre-tokenization for Tantivy (whitespace-separated sub-tokens + full lowercased text).
 pub fn tokenize_code_for_tantivy(text: &str) -> String {
     let mut tokens = crate::fts::tokenize_code(text);
@@ -263,8 +282,7 @@ impl TantivyLexicalIndex {
         doc.add_i64(self.valid_from_f, valid_from);
         let valid_to: i64 = payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0);
         doc.add_i64(self.valid_to_f, valid_to);
-        let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
-        doc.add_i64(self.archived_f, archived);
+        doc.add_i64(self.archived_f, archived_flag(&payload.metadata));
 
         if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             w.add_document(doc)?;
@@ -313,8 +331,7 @@ impl TantivyLexicalIndex {
                 doc.add_i64(self.valid_from_f, valid_from);
                 let valid_to: i64 = payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0);
                 doc.add_i64(self.valid_to_f, valid_to);
-                let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
-                doc.add_i64(self.archived_f, archived);
+                doc.add_i64(self.archived_f, archived_flag(&payload.metadata));
                 w.add_document(doc)?;
                 indexed += 1;
             }
@@ -501,6 +518,79 @@ mod tests {
         ];
         let count = idx.rebuild(&rows).unwrap();
         assert_eq!(count, 2);
+    }
+
+    fn payload_with_archived(content: &str, archived: serde_json::Value) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "test-user".to_string(),
+            memory_type: "memory".to_string(),
+            agent_name: None,
+            location: "/src/lib.rs".to_string(),
+            location_lines: "1-10".to_string(),
+            metadata: json!({"valid_from": 100, "valid_to": 0, "archived": archived}),
+        }
+    }
+
+    #[test]
+    fn test_bool_archived_tombstone_excluded_via_upsert() {
+        // archive_memory writes a boolean `true` tombstone; it must index as
+        // archived=1 so include_archived=false excludes the row.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = payload_with_archived("bool tombstone upsert token", json!(true));
+        idx.upsert_memory("ns", "arch-bool", &p).unwrap();
+        let excluded = idx.search("ns", "tombstone upsert", 10, true, false, None).unwrap();
+        assert!(
+            !excluded.iter().any(|h| h.id == "arch-bool"),
+            "boolean-archived row must be excluded when include_archived=false, got: {:?}",
+            excluded.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let included = idx.search("ns", "tombstone upsert", 10, true, true, None).unwrap();
+        assert!(included.iter().any(|h| h.id == "arch-bool"));
+    }
+
+    #[test]
+    fn test_bool_archived_tombstone_excluded_via_rebuild() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let rows = vec![(
+            "ns".to_string(),
+            "arch-bool-rebuild".to_string(),
+            payload_with_archived("bool tombstone rebuild token", json!(true)),
+        )];
+        let count = idx.rebuild(&rows).unwrap();
+        assert_eq!(count, 1);
+        let excluded = idx.search("ns", "tombstone rebuild", 10, true, false, None).unwrap();
+        assert!(
+            !excluded.iter().any(|h| h.id == "arch-bool-rebuild"),
+            "boolean-archived row must be excluded when include_archived=false, got: {:?}",
+            excluded.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let included = idx.search("ns", "tombstone rebuild", 10, true, true, None).unwrap();
+        assert!(included.iter().any(|h| h.id == "arch-bool-rebuild"));
+    }
+
+    #[test]
+    fn test_int_archived_flag_still_excluded() {
+        // Integer tombstones (legacy rows) keep working on both write paths.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = payload_with_archived("int tombstone upsert token", json!(1));
+        idx.upsert_memory("ns", "arch-int", &p).unwrap();
+        let excluded = idx.search("ns", "tombstone upsert", 10, true, false, None).unwrap();
+        assert!(!excluded.iter().any(|h| h.id == "arch-int"));
+        let included = idx.search("ns", "tombstone upsert", 10, true, true, None).unwrap();
+        assert!(included.iter().any(|h| h.id == "arch-int"));
+
+        let idx2 = TantivyLexicalIndex::open_in_ram().unwrap();
+        let rows = vec![(
+            "ns".to_string(),
+            "arch-int-rebuild".to_string(),
+            payload_with_archived("int tombstone rebuild token", json!(1)),
+        )];
+        idx2.rebuild(&rows).unwrap();
+        let excluded2 = idx2.search("ns", "tombstone rebuild", 10, true, false, None).unwrap();
+        assert!(!excluded2.iter().any(|h| h.id == "arch-int-rebuild"));
+        let included2 = idx2.search("ns", "tombstone rebuild", 10, true, true, None).unwrap();
+        assert!(included2.iter().any(|h| h.id == "arch-int-rebuild"));
     }
 
     #[test]

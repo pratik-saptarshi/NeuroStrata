@@ -5143,6 +5143,20 @@ impl LadybugStore {
                 if !include_tasks && payload.memory_type == "task" {
                     continue;
                 }
+                // Defense in depth: never surface an archived row when the
+                // caller excluded archived rows, even if its index entry
+                // predates the tombstone fix. Bool/int-tolerant, matching
+                // lexical::archived_flag (duplicated inline per convention).
+                if !include_archived {
+                    let archived = match payload.metadata.get("archived") {
+                        Some(v) if v.as_bool() == Some(true) => true,
+                        Some(v) => v.as_i64().map(|n| n != 0).unwrap_or(false),
+                        None => false,
+                    };
+                    if archived {
+                        continue;
+                    }
+                }
                 let vis = crate::rebac::extract_visible_to(&payload.metadata);
                 if !crate::rebac::allowed(principal, &payload.user_id, "viewer", &vis) {
                     continue;
