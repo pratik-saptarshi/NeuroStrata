@@ -373,16 +373,9 @@ pub fn execute_on_records(
 
     // Variables extraction
     let vars = variables.unwrap_or(&Value::Null);
-    let mut var_first = vars.get("first").and_then(|v| v.as_i64()).map(|i| i as i32).unwrap_or(20);
-    let mut var_after = vars.get("after").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let mut var_memory_type = vars.get("memoryType").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let mut var_include_archived = vars.get("includeArchived").and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut var_include_retired = vars.get("includeRetired").and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut var_text = vars.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     // Build result from query type: determine operation
     let mut data = json!({});
-    let mut root_result: Option<Value> = None;
 
     // Try to locate the first selection (memory, memories, search)
     for def in &parsed.definitions {
@@ -396,6 +389,21 @@ pub fn execute_on_records(
                 for sel in &sel_set.items {
                     if let graphql_parser::query::Selection::Field(f) = sel {
                         let root_name: &str = f.name;
+                        // Each root selection is evaluated independently and
+                        // accumulated into `data` under its response key
+                        // (the alias when one is given, else the field
+                        // name). Per-field state therefore starts from the
+                        // variable-derived defaults and a fresh result, so
+                        // an earlier field's arguments or result can never
+                        // leak into a later field.
+                        let response_key: &str = f.alias.unwrap_or(root_name);
+                        let mut var_first = vars.get("first").and_then(|v| v.as_i64()).map(|i| i as i32).unwrap_or(20);
+                        let mut var_after = vars.get("after").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let mut var_memory_type = vars.get("memoryType").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let mut var_include_archived = vars.get("includeArchived").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mut var_include_retired = vars.get("includeRetired").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let mut var_text = vars.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let mut root_result: Option<Value> = None;
                         for (k, v) in &f.arguments {
                             match *k {
                                 "first" => {
@@ -497,7 +505,9 @@ pub fn execute_on_records(
                                 // Explicit null when queried by id but excluded (registry, mesh-conflict, privacy) or missing
                                 root_result = None;
                             }
-                            data = json!({ "memory": root_result });
+                            if let Some(obj) = data.as_object_mut() {
+                                obj.insert(response_key.to_string(), root_result.unwrap_or(Value::Null));
+                            }
                         } else if root_name == "memories" || root_name == "search" {
                             let mut ns_arg = namespace.to_string();
                             for (k, v) in &f.arguments {
@@ -650,18 +660,18 @@ pub fn execute_on_records(
                                 }
                             }).collect();
 
-                            let mut root_map = serde_json::Map::new();
-                            root_map.insert(
-                                root_name.to_string(),
-                                json!({
-                                    "edges": memory_edges_fixed,
-                                    "pageInfo": {
-                                        "hasNextPage": has_next,
-                                        "endCursor": end_cursor_opt
-                                    }
-                                }),
-                            );
-                            data = Value::Object(root_map);
+                            if let Some(obj) = data.as_object_mut() {
+                                obj.insert(
+                                    response_key.to_string(),
+                                    json!({
+                                        "edges": memory_edges_fixed,
+                                        "pageInfo": {
+                                            "hasNextPage": has_next,
+                                            "endCursor": end_cursor_opt
+                                        }
+                                    }),
+                                );
+                            }
                         }
                     }
                 }
@@ -975,6 +985,85 @@ mod tests {
         assert!(bad.data.is_none(), "cross-namespace variable must be rejected");
         assert!(bad.errors.iter().any(|e| e.message.contains("namespace isolation violation")
             && e.message.contains("'other'") && e.message.contains("'ns'")));
+    }
+
+    #[test]
+    fn multi_field_query_returns_every_root_field() {
+        let mk = |content: &str| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        };
+        let records = vec![("m1".into(), mk("one")), ("m2".into(), mk("two"))];
+        // memory first, memories second: neither may replace the other.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\") { id content } memories { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(data["memory"]["id"], "m1", "memory field must survive: {data}");
+        assert_eq!(data["memory"]["content"], "one");
+        let rows = data["memories"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "memories field must survive: {data}");
+
+        // Reverse order: memories first, memory second.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } memory(id: \"m2\") { id content } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        let rows = data["memories"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "memories field must survive: {data}");
+        assert_eq!(data["memory"]["id"], "m2", "memory field must survive: {data}");
+        assert_eq!(data["memory"]["content"], "two");
+    }
+
+    #[test]
+    fn aliased_root_fields_use_alias_as_response_key() {
+        let mk = |content: &str| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        };
+        let records = vec![("m1".into(), mk("one")), ("m2".into(), mk("two"))];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ one: memory(id: \"m1\") { id } two: memory(id: \"m2\") { id } missing: memory(id: \"nope\") { id } all: memories { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(data["one"]["id"], "m1", "first alias must key its result: {data}");
+        assert_eq!(data["two"]["id"], "m2", "second alias must key its own result: {data}");
+        assert!(
+            data["missing"].is_null(),
+            "a missing aliased memory must be null, not a stale earlier result: {data}"
+        );
+        let rows = data["all"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "aliased memories field must survive: {data}");
+        assert!(data.get("memory").is_none(), "unaliased key must not appear: {data}");
+        assert!(data.get("memories").is_none(), "unaliased key must not appear: {data}");
     }
 
     #[test]
