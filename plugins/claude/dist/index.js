@@ -1117,6 +1117,8 @@ function acquireMutationCounterLock(filePath) {
     const lockDir = `${filePath}.lock`;
     const deadline = Date.now() + MUTATION_COUNTER_LOCK_TIMEOUT_MS;
     while (true) {
+        if (Date.now() >= deadline)
+            return null;
         try {
             mkdirSync(lockDir);
             return lockDir;
@@ -1136,7 +1138,12 @@ function acquireMutationCounterLock(filePath) {
                 catch {
                     // Another process may have stolen it first; the retry decides.
                 }
-                continue;
+                // A successful steal retries promptly; a failed steal (the lock
+                // is still there, e.g. removal is not permitted) must NOT spin:
+                // it falls through to the same deadline check + poll sleep as
+                // ordinary contention, so the wait stays bounded.
+                if (!existsSync(lockDir))
+                    continue;
             }
             if (Date.now() >= deadline)
                 return null;

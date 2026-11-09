@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync, chmodSync, utimesSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -2130,5 +2130,80 @@ console.log(core.readPersistedMutationCounter("sess-conc"));
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
+  });
+
+  it("(d) unremovable stale lock bounds the wait: bump returns null instead of spinning", { timeout: 30000 }, async () => {
+    const projectDir = makeProjectDir();
+    const session = "sess-stale-unremovable";
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const killTimeoutMs = 12000;
+    let result;
+    try {
+      mkdirSync(hookStateDir, { recursive: true });
+      const lockDir = join(hookStateDir, `mutations-${session}.json.lock`);
+      mkdirSync(lockDir);
+      const staleTime = new Date(Date.now() - 20000);
+      utimesSync(lockDir, staleTime, staleTime);
+
+      // The core dist is imported by absolute path. In the root route the
+      // child runs as nobody, which cannot traverse the worktree under
+      // /home/hatch (verified: EACCES even on a 0644 file there), so the
+      // test imports a byte-identical copy of the dist placed inside the
+      // temp project instead of the worktree path.
+      const distCopyPath = join(projectDir, "core-dist.mjs");
+      copyFileSync(new URL("./dist/index.js", import.meta.url), distCopyPath);
+      chmodSync(distCopyPath, 0o644);
+
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      chmodSync(projectDir, 0o755);
+      chmodSync(join(projectDir, ".NeuroStrata"), 0o755);
+      // Root route: 0755 root-owned dir — nobody can unlink entries in it.
+      // Non-root route: 0555 dir — unlink is genuinely blocked for the
+      // current user. Both make rmSync(lockDir) throw EACCES on every
+      // stale-steal attempt.
+      chmodSync(hookStateDir, isRoot ? 0o755 : 0o555);
+
+      const bumpSource = `
+import { pathToFileURL } from "node:url";
+const core = await import(pathToFileURL(process.env.NS_DIST_COPY).href);
+console.log(core.bumpPersistedMutationCounter(${JSON.stringify(session)}));
+`;
+      const scriptPath = join(projectDir, "bump-stale.mjs");
+      writeFileSync(scriptPath, bumpSource);
+      chmodSync(scriptPath, 0o644);
+
+      result = await new Promise((resolveChild) => {
+        const started = Date.now();
+        const child = spawn(process.execPath, [scriptPath], {
+          cwd: projectDir,
+          env: { ...process.env, HOME: projectDir, NS_DIST_COPY: distCopyPath },
+          ...(isRoot ? { uid: 65534, gid: 65534 } : {}),
+        });
+        let stdout = "";
+        let stderr = "";
+        let killed = false;
+        const timer = setTimeout(() => {
+          killed = true;
+          child.kill("SIGKILL");
+        }, killTimeoutMs);
+        child.stdout.on("data", (d) => { stdout += d; });
+        child.stderr.on("data", (d) => { stderr += d; });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          resolveChild({ killed, code: null, signal: null, stdout, stderr: `${stderr}${err}`, elapsedMs: Date.now() - started });
+        });
+        child.on("close", (code, signal) => {
+          clearTimeout(timer);
+          resolveChild({ killed, code, signal, stdout, stderr, elapsedMs: Date.now() - started });
+        });
+      });
+    } finally {
+      try { chmodSync(hookStateDir, 0o755); } catch { /* best-effort restore for cleanup */ }
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+    assert.equal(result.killed, false, `child must exit on its own within ${killTimeoutMs}ms, not be killed while spinning on an unremovable stale lock (elapsed ${result.elapsedMs}ms, stderr: ${result.stderr})`);
+    assert.equal(result.code, 0, `child must exit 0 (got code ${result.code}, signal ${result.signal}, stderr: ${result.stderr})`);
+    assert.equal(result.stdout.trim(), "null", "bump must fail open (return null) when the lock cannot be acquired");
+    assert.ok(result.elapsedMs < 9000, `child wall time must be bounded (~2s deadline + generous slack, and < ${killTimeoutMs}ms kill timeout); got ${result.elapsedMs}ms`);
   });
 });
