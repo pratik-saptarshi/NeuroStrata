@@ -1649,8 +1649,43 @@ async fn search_inner(
             // hydrated to real content) joins the result set. Empty-stub rows
             // carry no content and are never merged, so reasoning cannot
             // invent a result.
+            //
+            // Admission applies the same predicates the preceding passes
+            // apply, because `ReasoningAdapter::execute` returns a hydrated
+            // row for the query itself whenever the query equals a memory
+            // id, even with no ontology expansion — an unfiltered merge
+            // would hand back rows every preceding pass excluded: retired
+            // and mesh-conflicting rows, registry rows, archived rows and
+            // task / structural row classes (gated by the same escape
+            // hatches), and rows outside the requested domains.
             for inferred in inferred_results {
                 if inferred.payload.content.is_empty() {
+                    continue;
+                }
+                let metadata_val = &inferred.payload.metadata;
+                if is_retired_at(metadata_val, now) {
+                    continue;
+                }
+                if !include_archived && is_archived(metadata_val) {
+                    continue;
+                }
+                if is_mesh_conflicting(metadata_val) {
+                    continue;
+                }
+                if crate::registry::is_registry_row(metadata_val) {
+                    continue;
+                }
+                if !include_tasks && inferred.payload.memory_type == "task" {
+                    continue;
+                }
+                if STRUCTURAL_MEMORY_TYPES.contains(&inferred.payload.memory_type.as_str()) {
+                    continue;
+                }
+                if !domain_keys.is_empty()
+                    && !crate::domain::domain_keys(metadata_val)
+                        .iter()
+                        .any(|k| domain_keys.contains(k))
+                {
                     continue;
                 }
                 if results.iter().any(|existing| existing.id == inferred.id) {
@@ -17853,6 +17888,108 @@ eurostrata\src\daemon.rs",
 
         assert!(ids.contains(&"live-rule".to_string()), "{:?}", ids);
         assert!(!ids.contains(&"retired-rule".to_string()), "{:?}", ids);
+    }
+
+    #[tokio::test]
+    async fn search_inferred_merge_excludes_rows_hidden_from_vector_passes() {
+        // ReasoningAdapter::execute returns a hydrated row for the query
+        // itself when the query equals a memory id, even with no ontology
+        // expansion. The exact/vector passes exclude archived, retired,
+        // task, registry, mesh-conflicting and structural rows (and, under
+        // a domain filter, other-domain rows); the inferred merge must
+        // apply the same predicates or those rows leak back in.
+        let store = retired_test_store().await;
+        let vec4 = vec![0.1; 4];
+        // Anchor primary: at equal distance it sorts first (id ASC), so
+        // with limit 1 it is the only primary and every row below can
+        // surface only through the inferred merge.
+        store
+            .upsert("probe", "a-anchor", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "auth"})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "archived-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"archived": true})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"valid_to": 1})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "task-row", vec4.clone(), retired_test_payload("task", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "registry-row", vec4.clone(), retired_test_payload("fact", "agent", crate::registry::registry_metadata(&["auth".to_string()])))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "conflicting-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"mesh": {"conflict": true}})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "structural-row", vec4.clone(), retired_test_payload("file", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "other-domain-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "database"})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "z-clean-row", vec4.clone(), retired_test_payload("fact", "agent", json!({})))
+            .await
+            .unwrap();
+
+        for excluded in ["archived-row", "retired-row", "task-row", "registry-row", "conflicting-row", "structural-row"] {
+            let outcome = store
+                .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some(excluded), false)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert!(ids.contains(&"a-anchor"), "anchor primary must surface for {excluded}, got: {ids:?}");
+            assert!(
+                !ids.contains(&excluded),
+                "inferred merge must not surface {excluded}, got: {ids:?}"
+            );
+        }
+
+        // Domain predicate: under an "auth" filter, a database-domain row
+        // queried by id must not re-enter through the inferred merge.
+        let outcome = store
+            .search_with_domain("probe", vec4.clone(), 1, false, false, &["auth".to_string()], Some("other-domain-row"), false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"other-domain-row"),
+            "inferred merge must not surface a domain-mismatched row, got: {ids:?}"
+        );
+
+        // Positive control: a clean row surfaces through the inferred
+        // merge (limit 1 kept it out of the primaries).
+        let outcome = store
+            .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some("z-clean-row"), false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"z-clean-row"),
+            "clean row must surface via the inferred merge, got: {ids:?}"
+        );
+
+        // The escape hatches still govern the inferred merge: with
+        // include_tasks / include_archived set, those rows are admitted.
+        for (id, include_tasks, include_archived) in [("task-row", true, false), ("archived-row", false, true)] {
+            let outcome = store
+                .search_with_domain("probe", vec4.clone(), 1, include_tasks, include_archived, &[], Some(id), false)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert!(
+                ids.contains(&id),
+                "{id} must surface via the inferred merge when its escape hatch is set, got: {ids:?}"
+            );
+        }
     }
 
     #[tokio::test]
