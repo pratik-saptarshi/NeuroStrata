@@ -5,7 +5,7 @@ Status: implemented (ship-now scope, task neurostrata-majk). Answers the guinea 
 > **Recipes:** [`docs/architecture/prescribed-wire-recipes.md`](architecture/prescribed-wire-recipes.md)
 > documents each `project-pipeline` wire a project implements itself — A2, A3,
 > A4, A5-residual, A7, plus the A8 `gate-self-test` harness — with rationale,
-> shape, keywest.health reference impls, and acceptance criteria. Start there
+> shape, dogfood-app reference impls, and acceptance criteria. Start there
 > when wiring a project up; this document stays the design of record.
 
 ---
@@ -32,7 +32,7 @@ One block added to the `bootstrap` / `task_setup` result, beside `instructions`:
         "blocks": true,
         "gate_point": null,
         "reason": "paths in memories rot silently as files move",
-        "reference": "keywest.health: scripts/ci/memory-repo-drift (reference impl available)"
+        "reference": "dogfood-app: scripts/ci/memory-repo-drift (reference impl available)"
       }
     ],
     "reminders": [
@@ -137,7 +137,7 @@ The 1.7.0 template got this exactly backwards. It said "Git detected — the
 default and recommended instance" and then, in the same breath, told the agent
 to "wire the project-pipeline gates above into your CI". The principle was
 right; the application pointed at the narrower solution. The guinea pig
-(keywest.health, 2026-10-09) landed 7 architecture gates in
+(dogfood-app, 2026-10-09) landed 7 architecture gates in
 `.github/workflows/` and 0 in pre-push, having followed the instruction
 perfectly: where every existing guard already lives is the loudest signal, and
 "add a GitHub Actions workflow" is always the path of least resistance.

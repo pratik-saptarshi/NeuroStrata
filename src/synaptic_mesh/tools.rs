@@ -23,9 +23,9 @@ pub fn synaptic_mesh_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "Human-readable mesh name, e.g. 'platform-team'." },
                     "namespace": {
-                        "type": "array",
+                        "type": [ "string", "array" ],
                         "items": { "type": "string" },
-                        "description": "Namespaces to share, repeatable. Omitted = the current project namespace only; the mesh is opt-in per namespace."
+                        "description": "Namespaces to share — one string or an array of strings, repeatable via array. Omitted = the current project namespace only; the mesh is opt-in per namespace."
                     },
                     "remote": { "type": "string", "description": "Git remote URL the mesh pushes to. Omitted = local-only mesh; add it later before inviting teammates." },
                     "project_root": { "type": "string", "description": "Project root that holds the pointer file. Defaults to the working directory." },
@@ -63,7 +63,12 @@ pub fn synaptic_mesh_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project_root": { "type": "string", "description": "Project root whose pointer file names the mesh. Defaults to the working directory." }
+                    "project_root": { "type": "string", "description": "Project root whose pointer file names the mesh. Defaults to the working directory." },
+                    "namespace": {
+                        "type": [ "string", "array" ],
+                        "items": { "type": "string" },
+                        "description": "Optional namespaces to scope store replay after git pull — one string or an array of strings, repeatable via array. Omitted = replay every pending record."
+                    }
                 },
                 "required": []
             }

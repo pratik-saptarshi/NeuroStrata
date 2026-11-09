@@ -50,6 +50,46 @@ fn plan_with_graph_read_is_supported() {
 }
 
 #[test]
+fn plan_with_items_dedups_budgets_and_truncates() {
+    let service = ContextService::new();
+    let request = ContextRequest {
+        session_id: "s".into(),
+        context_epoch: 1,
+        event_id: "evt".into(),
+        trigger: "file_touch".into(),
+        source: SourceIdentity::default(),
+        policy: EgressPolicy::default(),
+    };
+    let mk = |id: &str, content: &str| model::ContextItem {
+        id: id.into(),
+        memory_type: "rule".into(),
+        content: content.into(),
+        freshness: None,
+    };
+    let candidates = vec![
+        mk("i1", "content-1"),
+        mk("i1", "dup-id"),
+        mk("i2", "content-1"), // dup content for i1
+        mk("i3", "content-3"),
+        mk("i4", "content-4"),
+    ];
+    // Dedup by id/content leaves 3 items; max_items=2 truncates further.
+    let plan = service.plan_with_items(&request, candidates, plan::Budget::from(10_000usize), 2);
+    assert_eq!(plan.items.len(), 2);
+    assert_eq!(plan.items[0].id, "i1");
+    assert_eq!(plan.items[1].id, "i3");
+    assert!(plan.truncation);
+    assert_eq!(plan.degradation, Degradation::Supported);
+
+    // A tight budget starves expensive items instead of half-delivering them.
+    let candidates = vec![mk("big", &"x".repeat(1000)), mk("small", "tiny")];
+    let plan = service.plan_with_items(&request, candidates, plan::Budget::from(30usize), 10);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].id, "small");
+    assert!(plan.truncation); // the out-of-budget item counts as dropped
+}
+
+#[test]
 fn source_resolve_sets_relative_path() {
     let id = source::resolve("src/lib.rs", std::env::temp_dir().to_string_lossy().as_ref());
     assert_eq!(id.relative_path, "src/lib.rs");

@@ -1,0 +1,753 @@
+//! Federation (SERVICE) layer — transient read-only SPARQL federation across
+//! NeuroStrata daemon instances using `spargebra`, `spareval`, `sparesults`,
+//! `oxrdf` and `reqwest`.
+
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fmt;
+use std::time::Duration;
+
+use spargebra::algebra::GraphPattern;
+use spargebra::{Query, SparqlParser};
+
+/// Peer definition for outbound SERVICE endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparqlServicePeer {
+    pub endpoint_url: String,
+    pub remote_namespace: String,
+    pub bearer_token_env: String,
+}
+
+/// Federation service configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederationConfig {
+    pub served_namespaces: Vec<String>,
+    pub served_hosts: Vec<String>,
+    pub service_peers: Vec<SparqlServicePeer>,
+    pub timeout_ms: u64,
+    pub max_solutions: usize,
+    pub max_dataset_quads: usize,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            served_namespaces: Vec::new(),
+            served_hosts: Vec::new(),
+            service_peers: Vec::new(),
+            timeout_ms: 250,
+            max_solutions: 1000,
+            max_dataset_quads: 250_000,
+        }
+    }
+}
+
+/// Federation-level errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederationError {
+    Denied(String),
+    NestedServiceDenied,
+    CustomFunctionDenied(String),
+    Network(String),
+    Timeout(String),
+    Parse(String),
+    Evaluation(String),
+}
+
+impl fmt::Display for FederationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Denied(s) => write!(f, "Denied: {}", s),
+            Self::NestedServiceDenied => write!(f, "Nested SERVICE clauses are not permitted"),
+            Self::CustomFunctionDenied(s) => write!(f, "Custom function denied: {}", s),
+            Self::Network(s) => write!(f, "Network error: {}", s),
+            Self::Timeout(s) => write!(f, "Timeout: {}", s),
+            Self::Parse(s) => write!(f, "Parse error: {}", s),
+            Self::Evaluation(s) => write!(f, "Evaluation error: {}", s),
+        }
+    }
+}
+
+impl Error for FederationError {}
+
+/// Execution report returned by the remote `/sparql` endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct FederationExecutionReport {
+    pub body: String,
+    pub solution_count: usize,
+    pub truncated: bool,
+    pub timed_out: bool,
+    pub warnings: Vec<String>,
+}
+
+// ------------------------------------------------------------------
+// AST inspection helpers
+// ------------------------------------------------------------------
+
+fn contains_service(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Service { inner: _, .. } => {
+            // The inner itself may contain a nested service — handled by
+            // the caller that checks inner specifically.
+            true
+        }
+        GraphPattern::Join { left, right } => contains_service(left) || contains_service(right),
+        GraphPattern::LeftJoin { left, right, .. } => {
+            contains_service(left) || contains_service(right)
+        }
+        GraphPattern::Filter { inner, .. } => contains_service(inner),
+        GraphPattern::Graph { inner, .. } => contains_service(inner),
+        GraphPattern::Union { left, right } => contains_service(left) || contains_service(right),
+        GraphPattern::Extend { inner, .. } => contains_service(inner),
+        GraphPattern::OrderBy { inner, .. } => contains_service(inner),
+        GraphPattern::Project { inner, .. } => contains_service(inner),
+        GraphPattern::Group { inner, .. } => contains_service(inner),
+        GraphPattern::Minus { left, right } => contains_service(left) || contains_service(right),
+        GraphPattern::Distinct { inner } => contains_service(inner),
+        GraphPattern::Reduced { inner } => contains_service(inner),
+        GraphPattern::Slice { inner, .. } => contains_service(inner),
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => false,
+        _ => false,
+    }
+}
+
+fn collect_service_endpoints(
+    pattern: &GraphPattern,
+    out: &mut Vec<(String, bool)>,
+) -> Result<(), FederationError> {
+    match pattern {
+        GraphPattern::Service { name, inner, silent } => {
+            // Check nested SERVICE inside inner.
+            if contains_service(inner) {
+                return Err(FederationError::NestedServiceDenied);
+            }
+            match name {
+                spargebra::term::NamedNodePattern::Variable(_) => {
+                    return Err(FederationError::Denied(
+                        "variable SERVICE endpoints are not permitted".into(),
+                    ));
+                }
+                spargebra::term::NamedNodePattern::NamedNode(nn) => {
+                    out.push((nn.as_str().to_string(), *silent));
+                }
+            }
+        }
+        GraphPattern::Join { left, right } => {
+            collect_service_endpoints(left, out)?;
+            collect_service_endpoints(right, out)?;
+        }
+        GraphPattern::LeftJoin { left, right, .. } => {
+            collect_service_endpoints(left, out)?;
+            collect_service_endpoints(right, out)?;
+        }
+        GraphPattern::Filter { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Graph { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Union { left, right } => {
+            collect_service_endpoints(left, out)?;
+            collect_service_endpoints(right, out)?;
+        }
+        GraphPattern::Extend { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::OrderBy { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Project { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Group { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Minus { left, right } => {
+            collect_service_endpoints(left, out)?;
+            collect_service_endpoints(right, out)?;
+        }
+        GraphPattern::Distinct { inner } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Reduced { inner } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Slice { inner, .. } => collect_service_endpoints(inner, out)?,
+        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Inspect a parsed `spargebra::Query` for SERVICE clauses.
+/// Returns endpoint IRI strings paired with `silent` flag.
+pub fn inspect_service_clauses(query: &Query) -> Result<Vec<(String, bool)>, FederationError> {
+    let mut endpoints = Vec::new();
+    let pattern = match query {
+        Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => pattern,
+    };
+    collect_service_endpoints(pattern, &mut endpoints)?;
+    Ok(endpoints)
+}
+
+/// Checks whether the raw SPARQL string references the NeuroStrata custom
+/// salience function (rejected remotely per §5.2).
+pub fn contains_custom_neurostrata_function(query_str: &str) -> bool {
+    let s = query_str;
+    s.contains("urn:neurostrata:ns#salience") || s.contains("ns:salience")
+}
+
+// ------------------------------------------------------------------
+// Projection
+// ------------------------------------------------------------------
+
+/// Projects a federated dataset for `namespace`, excluding private,
+/// structural, task, retired, archived, mesh-conflicting and registry rows,
+/// and filtering out raw `ns:metadata` quads.
+pub async fn project_federated_sparql_dataset_async(
+    namespace: &str,
+    store: &crate::store::ladybug::LadybugStore,
+    max_quads: usize,
+) -> (oxrdf::Dataset, bool) {
+    use crate::rdf::projection::memory_to_quads;
+    use crate::rdf::types::Tier;
+
+    let mut dataset = oxrdf::Dataset::new();
+    let search_results = match store.list_memories(namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("federation dataset load failed for namespace '{}': {e}", namespace);
+            return (dataset, false);
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let structural_types: [&str; 8] = [
+        "directory",
+        "file",
+        "markdown",
+        "freshness_flag",
+        "guard_event",
+        "community_summary",
+        "digital_twin",
+        "digital_twin_schema",
+    ];
+
+    let meta_predicate = crate::rdf::namespace::field_predicate("metadata");
+
+    for m in search_results {
+        let payload = &m.payload;
+        let meta = &payload.metadata;
+
+        // Private: eligibility must be "shareable"
+        if meta.get("eligibility").and_then(|v| v.as_str()) != Some("shareable") {
+            continue;
+        }
+
+        // ReBAC restricted: visible_to is a non-empty ACL without "*".
+        // Canonical extraction, so the object form {"principal":"*"}
+        // reads as "*" just like the string form.
+        let visible_to = crate::rebac::extract_visible_to(meta);
+        if !visible_to.is_empty() && !visible_to.iter().any(|entry| entry == "*") {
+            continue;
+        }
+
+        // Structural memory types
+        if structural_types.contains(&payload.memory_type.as_str()) {
+            continue;
+        }
+
+        // Task rows
+        if payload.memory_type == "task" {
+            continue;
+        }
+
+        // Retired: valid_to > 0 and <= now
+        if let Some(v) = meta.get("valid_to").and_then(|v| v.as_i64()) {
+            if v > 0 && v <= now {
+                continue;
+            }
+        }
+
+        // Archived
+        if meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+
+        // Mesh-conflicting
+        if crate::synaptic_mesh::conflict::is_conflicting_metadata(meta) {
+            continue;
+        }
+
+        // Registry rows
+        if crate::registry::is_registry_row(meta) {
+            continue;
+        }
+
+        // Project surviving row
+        let quads = memory_to_quads(&m.id, payload, namespace, Tier::Domain, 0);
+        for q in quads {
+            // Exclude raw metadata quads so private metadata never leaks
+            if q.predicate.as_str() == meta_predicate {
+                continue;
+            }
+            if dataset.len() >= max_quads {
+                return (dataset, true);
+            }
+            dataset.insert(&q);
+        }
+    }
+
+    (dataset, false)
+}
+
+// ------------------------------------------------------------------
+// Remote /sparql handler
+// ------------------------------------------------------------------
+
+/// Serialize an `oxrdf::Term` as a W3C SPARQL-results JSON term object.
+fn term_to_json(term: &oxrdf::Term) -> serde_json::Value {
+    use oxrdf::Term;
+    match term {
+        Term::NamedNode(nn) => serde_json::json!({ "type": "uri", "value": nn.as_str() }),
+        Term::BlankNode(bn) => serde_json::json!({ "type": "bnode", "value": bn.as_str() }),
+        Term::Literal(lit) => {
+            let mut obj = serde_json::json!({ "type": "literal", "value": lit.value() });
+            if let Some(lang) = lit.language() {
+                obj["xml:lang"] = serde_json::json!(lang);
+            } else if lit.datatype().as_str() != "http://www.w3.org/2001/XMLSchema#string" {
+                obj["datatype"] = serde_json::json!(lit.datatype().as_str());
+            }
+            obj
+        }
+        Term::Triple(_) => serde_json::json!({ "type": "literal", "value": "<RDF-star triple>" }),
+    }
+}
+
+/// Handles an inbound remote `/sparql` SPARQL request.
+pub async fn handle_remote_sparql_request(
+    query_str: &str,
+    namespace: &str,
+    host_header: Option<&str>,
+    auth_header: Option<&str>,
+    config: &FederationConfig,
+    store: &crate::store::ladybug::LadybugStore,
+) -> Result<FederationExecutionReport, FederationError> {
+    // Host-header allowlist (security is enforced via served_hosts/served_namespaces
+    // allowlists and bearer-token peers, not a boolean toggle).
+    if !config.served_hosts.is_empty() {
+        match host_header {
+            Some(h) if config.served_hosts.iter().any(|s| s == h) => {}
+            _ => {
+                return Err(FederationError::Denied(
+                    "host not in served_hosts allowlist".into(),
+                ));
+            }
+        }
+    }
+
+    // Namespace filter
+    if !config.served_namespaces.iter().any(|ns| ns == namespace) {
+        return Err(FederationError::Denied(format!(
+            "namespace {} not served",
+            namespace
+        )));
+    }
+
+    // Bearer auth (inbound peer credential): a peer row shipping a
+    // bearer_token_env marks this endpoint as bearer-gated, and any supplied
+    // Authorization header must be a well-formed non-empty Bearer token.
+    let requires_bearer = config
+        .service_peers
+        .iter()
+        .any(|p| !p.bearer_token_env.is_empty());
+    match auth_header {
+        Some(hdr) => {
+            let token = hdr
+                .strip_prefix("Bearer ")
+                .or_else(|| hdr.strip_prefix("bearer "))
+                .map(|rest| rest.trim())
+                .unwrap_or("");
+            if token.is_empty() {
+                return Err(FederationError::Denied(
+                    "malformed or empty Bearer Authorization header".into(),
+                ));
+            }
+            if let Ok(expected) = std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN") {
+                let expected = expected.trim();
+                if !expected.is_empty() && token != expected {
+                    return Err(FederationError::Denied(
+                        "invalid Bearer token".into(),
+                    ));
+                }
+            }
+        }
+        None if requires_bearer => {
+            return Err(FederationError::Denied(
+                "peer federation requires bearer auth".into(),
+            ));
+        }
+        None => {}
+    }
+
+    // Custom NeuroStrata functions rejected remotely
+    if contains_custom_neurostrata_function(query_str) {
+        return Err(FederationError::CustomFunctionDenied(
+            "ns:salience is local-only".into(),
+        ));
+    }
+
+    // Parse
+    let query = SparqlParser::new()
+        .parse_query(query_str)
+        .map_err(|e| FederationError::Parse(format!("{}", e)))?;
+
+    // Project federated dataset
+    let (dataset, mut truncated) =
+        project_federated_sparql_dataset_async(namespace, store, config.max_dataset_quads).await;
+
+    // Evaluate (no custom functions registered)
+    let evaluator = spareval::QueryEvaluator::new();
+    let results = evaluator
+        .prepare(&query)
+        .execute(&dataset)
+        .map_err(|e| FederationError::Evaluation(format!("{}", e)))?;
+
+    // Build JSON report body, respecting max_solutions
+    let body: String;
+    let mut count = 0usize;
+    let warnings = Vec::new();
+
+    match results {
+        spareval::QueryResults::Solutions(mut sol_iter) => {
+            let mut collected = Vec::new();
+            while let Some(item) = sol_iter.next() {
+                if collected.len() >= config.max_solutions {
+                    break;
+                }
+                collected.push(item);
+            }
+            count = collected.len();
+            if count >= config.max_solutions && sol_iter.next().is_some() {
+                truncated = true;
+            }
+
+            // Serialize in standard W3C application/sparql-results+json form:
+            // {"head":{"vars":[...]},"results":{"bindings":[{"<var>":{"type":"uri"|"literal","value":"..."}}]}}
+            let mut var_names: Vec<String> = Vec::new();
+            for item in &collected {
+                if let Ok(sol) = item {
+                    for v in sol.variables() {
+                        let name = v.as_str().to_string();
+                        if !var_names.contains(&name) {
+                            var_names.push(name);
+                        }
+                    }
+                }
+            }
+            let mut bindings: Vec<serde_json::Value> = Vec::new();
+            for item in &collected {
+                if let Ok(sol) = item {
+                    let mut binding = serde_json::Map::new();
+                    for v in sol.variables() {
+                        if let Some(term) = sol.get(v.as_str()) {
+                            binding.insert(v.as_str().to_string(), term_to_json(term));
+                        }
+                    }
+                    bindings.push(serde_json::Value::Object(binding));
+                }
+            }
+            body = serde_json::json!({
+                "head": { "vars": var_names },
+                "results": { "bindings": bindings }
+            }).to_string();
+        }
+        spareval::QueryResults::Boolean(b) => {
+            body = format!(r#"{{"head":{{"vars":[]}},"boolean":{}}}"#, b);
+        }
+        spareval::QueryResults::Graph(mut triples) => {
+            let mut bindings: Vec<serde_json::Value> = Vec::new();
+            while let Some(item) = triples.next() {
+                if bindings.len() >= config.max_solutions {
+                    truncated = true;
+                    break;
+                }
+                if let Ok(triple) = item {
+                    let mut binding = serde_json::Map::new();
+                    binding.insert(
+                        "s".to_string(),
+                        term_to_json(&oxrdf::Term::from(triple.subject)),
+                    );
+                    binding.insert(
+                        "p".to_string(),
+                        term_to_json(&oxrdf::Term::from(triple.predicate)),
+                    );
+                    binding.insert("o".to_string(), term_to_json(&triple.object));
+                    bindings.push(serde_json::Value::Object(binding));
+                }
+            }
+            count = bindings.len();
+            body = serde_json::json!({
+                "head": { "vars": ["s", "p", "o"] },
+                "results": { "bindings": bindings }
+            })
+            .to_string();
+        }
+    }
+
+    // SELECT queries above are serialized in the standard W3C
+    // application/sparql-results+json format; Boolean and Graph bodies are
+    // handled by the same contract (head/boolean, empty bindings).
+    let mut report = FederationExecutionReport {
+        body,
+        solution_count: count,
+        truncated,
+        timed_out: false,
+        warnings,
+    };
+
+    // Apply max_solutions cap on count (already capped by dataset projection,
+    // but we enforce here symbolically).
+    if count > config.max_solutions {
+        report.truncated = true;
+        report.solution_count = config.max_solutions;
+        report.warnings.push(format!(
+            "solutions truncated at max_solutions={}",
+            config.max_solutions
+        ));
+    }
+
+    Ok(report)
+}
+
+// ------------------------------------------------------------------
+// Outbound SERVICE handler (spareval DefaultServiceHandler)
+// ------------------------------------------------------------------
+
+/// HTTP-backed `spareval::DefaultServiceHandler` for federated SERVICE queries.
+pub struct HttpServiceHandler {
+    pub config: FederationConfig,
+}
+
+impl spareval::DefaultServiceHandler for HttpServiceHandler {
+    type Error = FederationError;
+
+    fn handle(
+        &self,
+        service_name: &oxrdf::NamedNode,
+        pattern: &GraphPattern,
+        base_iri: Option<&oxiri::Iri<String>>,
+    ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
+        self.execute(service_name, pattern, base_iri)
+    }
+}
+
+impl HttpServiceHandler {
+    /// Resolve the peer for a SERVICE endpoint IRI, fetch its result over HTTP
+    /// and convert the SPARQL-results JSON into an owned solution iterator.
+    pub fn execute(
+        &self,
+        service_name: &oxrdf::NamedNode,
+        pattern: &GraphPattern,
+        base_iri: Option<&oxiri::Iri<String>>,
+    ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
+        let endpoint_str = service_name.as_str();
+        let peer = self
+            .config
+            .service_peers
+            .iter()
+            .find(|p| p.endpoint_url.trim_end_matches('/') == endpoint_str.trim_end_matches('/'));
+        let peer = match peer {
+            Some(p) => p,
+            None => {
+                return Err(FederationError::Denied(format!(
+                    "no peer configured for service {}",
+                    endpoint_str
+                )));
+            }
+        };
+        let token = std::env::var(&peer.bearer_token_env)
+            .map_err(|_| FederationError::Denied("bearer token env missing".into()))?;
+        let inner_str = match base_iri {
+            Some(iri) => format!("BASE <{}> SELECT * WHERE {{ {} }}", iri.as_str(), pattern),
+            None => format!("SELECT * WHERE {{ {} }}", pattern),
+        };
+        let url = format!(
+            "{}?namespace={}",
+            peer.endpoint_url.trim_end_matches('/'),
+            peer.remote_namespace
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(self.config.timeout_ms))
+            .build()
+            .map_err(|e| FederationError::Network(format!("{}", e)))?;
+        let send_result = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/sparql-query")
+            .header("Accept", "application/sparql-results+json")
+            .body(inner_str)
+            .send();
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) if e.is_timeout() => {
+                return Err(FederationError::Timeout(format!(
+                    "peer {} did not answer within {}ms",
+                    endpoint_str, self.config.timeout_ms
+                )));
+            }
+            Err(e) => return Err(FederationError::Network(format!("{}", e))),
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(FederationError::Network(format!(
+                "remote returned status {}",
+                status
+            )));
+        }
+        let body_bytes = resp
+            .bytes()
+            .map_err(|e| FederationError::Network(format!("{}", e)))?;
+        let parser = sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+        let output = parser
+            .for_slice(&body_bytes)
+            .map_err(|e| FederationError::Parse(format!("{}", e)))?;
+        match output {
+            sparesults::SliceQueryResultsParserOutput::Solutions(sol_parser) => {
+                let variables: std::sync::Arc<[oxrdf::Variable]> =
+                    sol_parser.variables().to_vec().into();
+                let mut collected: Vec<Result<sparesults::QuerySolution, spareval::QueryEvaluationError>> =
+                    Vec::new();
+                for item in sol_parser {
+                    match item {
+                        Ok(sol) => collected.push(Ok(sol)),
+                        Err(e) => collected.push(Err(spareval::QueryEvaluationError::Service(
+                            Box::new(FederationError::Parse(e.to_string())),
+                        ))),
+                    }
+                }
+                Ok(spareval::QuerySolutionIter::new(
+                    variables,
+                    collected.into_iter(),
+                ))
+            }
+            sparesults::SliceQueryResultsParserOutput::Boolean(_) => {
+                let variables: std::sync::Arc<[oxrdf::Variable]> = std::sync::Arc::new([]);
+                Ok(spareval::QuerySolutionIter::new(variables, std::iter::empty()))
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspect_service_clauses_top_level() {
+        let query = SparqlParser::new()
+            .parse_query("SELECT * WHERE { SERVICE <http://example.org/s> { ?s ?p ?o } }")
+            .unwrap();
+        let endpoints = inspect_service_clauses(&query).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].0, "http://example.org/s");
+        assert!(!endpoints[0].1);
+    }
+
+    #[test]
+    fn inspect_service_clauses_nested_rejected() {
+        let query = SparqlParser::new()
+            .parse_query(
+                "SELECT * WHERE { SERVICE <http://a/> { SERVICE <http://b/> {} } }",
+            )
+            .unwrap();
+        let res = inspect_service_clauses(&query);
+        assert!(matches!(res, Err(FederationError::NestedServiceDenied)));
+    }
+
+    #[test]
+    fn contains_custom_neurostrata_function_detects() {
+        assert!(contains_custom_neurostrata_function(
+            "SELECT * WHERE { ?s <urn:neurostrata:ns#salience> ?v }"
+        ));
+        assert!(contains_custom_neurostrata_function("SELECT * WHERE { ?s ns:salience ?v }"));
+        assert!(!contains_custom_neurostrata_function("SELECT * WHERE { ?s ?p ?o }"));
+    }
+
+    // T1 oracle 7 — A2: a shareable row whose visible_to carries the
+    // object-form wildcard {"principal":"*"} IS projected into the
+    // federation dataset; a genuinely restricted shareable row still is not.
+    #[tokio::test]
+    async fn federation_dataset_projects_object_wildcard_shareable_row() {
+        use crate::traits::VectorStore;
+        let dir = std::env::temp_dir().join(format!(
+            "ns-federation-a2-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
+            .expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+        for (id, metadata) in [
+            (
+                "wildcard-shareable",
+                serde_json::json!({
+                    "eligibility": "shareable",
+                    "visible_to": [{"principal": "*", "role": "viewer"}]
+                }),
+            ),
+            (
+                "restricted-shareable",
+                serde_json::json!({
+                    "eligibility": "shareable",
+                    "visible_to": ["alice"]
+                }),
+            ),
+        ] {
+            let payload = crate::traits::MemoryPayload {
+                content: format!("federation row {id}"),
+                user_id: "owner".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata,
+            };
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        let (dataset, _truncated) =
+            project_federated_sparql_dataset_async("probe", &store, 250_000).await;
+        let subjects: Vec<String> = dataset
+            .iter()
+            .map(|q| q.subject.to_string())
+            .collect();
+        assert!(
+            subjects.iter().any(|s| s.contains("wildcard-shareable")),
+            "object-wildcard shareable row must be projected, subjects: {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("restricted-shareable")),
+            "genuinely restricted shareable row must not be projected, subjects: {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn federation_config_default() {
+        let c = FederationConfig::default();
+        assert_eq!(c.timeout_ms, 250);
+        assert_eq!(c.max_solutions, 1000);
+        assert_eq!(c.max_dataset_quads, 250_000);
+        assert!(c.served_hosts.is_empty());
+        assert!(c.served_namespaces.is_empty());
+    }
+
+    #[test]
+    fn federation_config_allowlists() {
+        // Unserved namespace/host allowlists remain the security surface.
+        let cfg = FederationConfig {
+            served_namespaces: vec!["served".into()],
+            served_hosts: vec!["peer".into()],
+            ..FederationConfig::default()
+        };
+        assert!(cfg.served_namespaces.contains(&"served".to_string()));
+        assert!(!cfg.served_namespaces.contains(&"other".to_string()));
+        assert!(cfg.served_hosts.contains(&"peer".to_string()));
+    }
+}

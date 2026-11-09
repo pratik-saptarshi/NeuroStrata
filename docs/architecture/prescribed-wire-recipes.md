@@ -13,8 +13,8 @@ NeuroStrata ships the **query surface** (the export carries `absolute_path`,
 `location`, `metadata.governs`, `metadata.related_to`, `superseded`,
 `superseded_by`); the project ships the **predicate**.
 
-Reference implementations are the `keywest.health` guinea pig
-(`~/Documents/keywest.health`, sessions 2026-09-27 →). Every file path in this
+Reference implementations are the `dogfood-app` guinea pig
+(`~/Documents/dogfood-app`, sessions 2026-09-27 →). Every file path in this
 document is relative to that repo root unless it starts with `docs/` inside
 NeuroStrata.
 
@@ -31,11 +31,11 @@ the **contract and its own self-test**, never the file-mutating runner.
 | Exit codes | `0` clean · `1` violation found · `2` could-not-check (infra) | Q4.2; already the `task gate` convention (`neurostrata-mcp task gate --help`) |
 | Teeth | `blocks: true` → exit 1 fails the pipeline. `blocks: false` → warn only, exit 0 | Q1 field contract; `src/task/wiring.rs` |
 | Self-test | accept `--self-test`: exit 0 **iff** a planted violation makes the gate exit 1 AND the tree is byte-identical afterward | Q4.2, Q4.3 |
-| Language | do not enforce with a tool the project has banned (keywest: Go-only products, no Python in tracked trees) | `scripts/neurostrata-sync-gate.sh:33-34` |
+| Language | do not enforce with a tool the project has banned (dogfood: Go-only products, no Python in tracked trees) | `scripts/neurostrata-sync-gate.sh:33-34` |
 | Registry honesty | if a gate is `PARTIAL`, say so in the file header and print the known gap | `scripts/owner-directive-gate.sh:24-26,126-131` |
 
 The `--self-test` convention exists because **a gate that passes its own test is
-not a gate**. keywest learned this the expensive way: `phi-guard` was green for
+not a gate**. dogfood learned this the expensive way: `phi-guard` was green for
 its first build while being blind, because `grep -E` against a `(?i)` pattern
 matches nothing and still exits 0
 (`scripts/tests/gate-negative-controls.sh:8-11`). The same trap killed two
@@ -60,7 +60,7 @@ structural claim, not prose: it says "this rule governs that file". The moment
 the file moves, the claim silently becomes false and the rule stops being
 applied to the code it was written for — while still surfacing in
 `get_snapshot` with full authority. Two such rot events were found by accident
-in keywest on day one, not by any gate (`scripts/neurostrata-sync-gate.sh:9-15`).
+in dogfood on day one, not by any gate (`scripts/neurostrata-sync-gate.sh:9-15`).
 `neurostrata-mcp doctor` reports the same class as "declared targets that match
 nothing ingested".
 
@@ -71,10 +71,10 @@ anything under another project's prefix, then assert every remaining path
 exists. Exit 1 naming each stale path; exit 2 if `jq` is missing or the export
 is absent — never exit 0 on an unreadable input.
 
-Three non-obvious requirements, all of which bit keywest:
+Three non-obvious requirements, all of which bit dogfood:
 
 1. **Scope by namespace, and skip superseded.** The export carries every
-   project on the machine (8 namespaces, 1275 nodes in keywest's copy).
+   project on the machine (8 namespaces, 1275 nodes in dogfood's copy).
    Filtering is not cosmetic: NeuroStrata's own rows carry `./src/daemon.rs`
    paths that would flood the check. And a retired memory pointing at a
    retired path is *history, not a defect* — it is marked
@@ -112,7 +112,7 @@ mapfile -t allpaths < <(jq -r --arg ns "$NS" '
 
 **Rationale.** The inverse direction, and the more dangerous one: a dated owner
 ruling written into a tracked doc but never added to memory is **invisible to
-the layer agents query first**. keywest's arrangement is explicit — the memory
+the layer agents query first**. dogfood's arrangement is explicit — the memory
 layer is *first line*, files are *backup*
 (`docs/neurostrata/README.md:18-24`) — so an unrecorded ruling is a ruling the
 agent never sees. It was measured, not guessed: 21 of 22 owner phrases were
@@ -149,7 +149,7 @@ non-rulings (`:174-181`).
 file. Fail only if the count *rises above* it; when it falls, print the
 instruction to lower the baseline **in the same commit** so the gain locks in.
 A gate red from day one gets disabled; a gate that only ratchets keeps the
-improvement (`:202-232`). keywest's baseline is `docs/neurostrata/sync-baseline.txt`,
+improvement (`:202-232`). dogfood's baseline is `docs/neurostrata/sync-baseline.txt`,
 currently `0`.
 
 **Reference impl.** `scripts/neurostrata-sync-gate.sh`, check B (lines 119-232),
@@ -162,7 +162,7 @@ baseline at `docs/neurostrata/sync-baseline.txt`.
 - [ ] Unquoted dated lines are counted as `skipped_noquote`, not as violations.
 - [ ] The four excluded paths above are excluded by an explicit, commented filter — not by accident.
 - [ ] Both exclusion directions hold under `--self-test`: plant a real ruling in a scanned doc → exit 1; plant the same line in `docs/operating-state/` → exit 0.
-- [ ] Normalization is exercised: a quote differing only by trailing punctuation matches (keywest lost two rulings here).
+- [ ] Normalization is exercised: a quote differing only by trailing punctuation matches (dogfood lost two rulings here).
 
 ---
 
@@ -177,10 +177,10 @@ per commit. A stale backup is still a backup. So this is the one wire in the
 backup; warn, never block"*).
 
 **The shape.** `age_days = (now - mtime(export)) / 86400`; warn when
-`> MAX_AGE_DAYS` (keywest: 14, overridable by env). **Exit 0 either way.** The
+`> MAX_AGE_DAYS` (dogfood: 14, overridable by env). **Exit 0 either way.** The
 warning names the refresh command.
 
-Do not let the freshness check absorb a fidelity check. keywest's export gate
+Do not let the freshness check absorb a fidelity check. dogfood's export gate
 originally did both and collapsed into a re-check of a bug already fixed
 upstream; the shipped version does only the fidelity job
 ([`docs/design-wiring-panel.md`](../design-wiring-panel.md) Q3, "A1 shrinks… A5
@@ -242,7 +242,7 @@ config". That was true while projects hand-maintained a
 `docs/neurostrata/superseded.txt` driving a `jq` delete. It stopped being true
 upstream: `export-graph` now writes the markers and offers
 `--exclude-superseded` (confirmed in `neurostrata-mcp export-graph --help`),
-so keywest deleted the sidecar
+so dogfood deleted the sidecar
 (`scripts/neurostrata-export.sh:102-111`). The sidecar "was the second copy
 that disagreed with the first" — a hand-maintained duplicate of an export is
 worse than no backup, because it is trusted.
@@ -276,11 +276,11 @@ So the residual a project now implements is:
 
 ## A7 · `directive-preservation` — a recorded ruling must survive verbatim
 
-**Rationale.** The owner's rule (keywest `AGENTS.md`, 2026-10-03): recorded
+**Rationale.** The owner's rule (dogfood `AGENTS.md`, 2026-10-03): recorded
 owner words are spellchecked and otherwise kept — *"verbatim means his words,
 not his typos."* Moving a directive is not permission to reword it. The worst
 failure mode of a refactor that reorganizes docs is **silent loss of a ruling**,
-and silent loss is invisible by construction. keywest shrank `AGENTS.md` and
+and silent loss is invisible by construction. dogfood shrank `AGENTS.md` and
 `bosun.md` on 2026-10-08 and needed a machine to prove nothing was lost
 (`scripts/directive-preservation-gate.sh:8-13`).
 
@@ -325,7 +325,7 @@ non-zero, then asserts green after restore. Gate point:
 Not one of the five, but it is the `project-pipeline` wire that makes their
 acceptance criteria enforceable, and the recipe is the sharpest thing in the
 guinea pig: **a gate that cannot fail its own negative control is not a gate,
-it is a script that exits 0.** Every gate in keywest was tested, but the tests
+it is a script that exits 0.** Every gate in dogfood was tested, but the tests
 were ad-hoc and never committed, so nothing prevented silent gate rot.
 
 The shape (`scripts/tests/gate-negative-controls.sh`, 356 lines):
@@ -384,13 +384,13 @@ compiles" is not "it works".
   contract, Q5 verification, Q6 "file as tasks".
 - `src/task/wiring.rs` — the shipped registry: ids, `runs_in`, `blocks`,
   `reason` strings quoted above.
-- `docs/architecture/legacy/keywest.health_legacy.md` — guinea-pig context.
+- `docs/architecture/legacy/dogfood-app_legacy.md` — guinea-pig context.
 - Memories: `7134dc9d-d080-42ce-9bfb-9d33f8a59b7e` (wiring panel),
   `eed92855-8ea0-43c8-a095-47f04af72b15` (core/project self-test split),
   `a2be86b7-ca23-411f-b4b7-ca0cc40849e1` (self-test drill),
   `bcecac84-54d1-4ad7-9ec5-f42e2aa326fb` (gate contract / exit codes),
   `8c85f445-8904-4239-8f08-7f4de4f241d8` (lbug 8 TiB sharp edge).
-- Reference impl (external repo `~/Documents/keywest.health`):
+- Reference impl (external repo `~/Documents/dogfood-app`):
   `scripts/neurostrata-sync-gate.sh`, `scripts/neurostrata-export-gate.sh`,
   `scripts/neurostrata-export.sh`, `scripts/directive-preservation-gate.sh`,
   `scripts/tests/gate-negative-controls.sh`,

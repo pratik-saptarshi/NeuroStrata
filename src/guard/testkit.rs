@@ -192,6 +192,7 @@ impl VectorStore for MockStore {
                     kind: crate::traits::EvidenceKind::DirectMatch,
                     path: vec![],
                     explanation: "This memory matched the query vector.".to_string(),
+                    derivation: vec![],
                 }]),
             })
             .collect())
@@ -205,6 +206,8 @@ impl VectorStore for MockStore {
         _include_tasks: bool,
         _include_archived: bool,
         domains: &[String],
+        _query_text: Option<&str>,
+        _exact: bool,
     ) -> Result<DomainSearchOutcome> {
         if *self.search_fails.lock().expect("mock store lock") {
             return Err(anyhow::anyhow!(
@@ -241,6 +244,7 @@ impl VectorStore for MockStore {
                     kind: crate::traits::EvidenceKind::DirectMatch,
                     path: vec![],
                     explanation: "This memory matched the query vector.".to_string(),
+                    derivation: vec![],
                 }]),
             };
 
@@ -385,6 +389,7 @@ impl VectorStore for MockStore {
         rows.extend(promoted);
         Ok(0)
     }
+
 
     async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> Result<usize> {
         Ok(0)

@@ -66,11 +66,20 @@ impl MeshStorage {
             namespaces: namespaces.to_vec(),
             policy: MeshPolicy::default(),
             remote: remote.map(str::to_string),
+            signers: Vec::new(),
         };
         write_manifest(&root, &manifest)?;
 
-        Ok(MeshStorage { root, manifest })
+        // AK-H1: the ignore rule goes in before the first `git add -A` so the
+        // private signing key can never enter history through the first
+        // commit.
+        let mesh = MeshStorage { root, manifest };
+        mesh.ensure_signing_key_ignored()?;
+        mesh.ensure_bundles_ignored()?;
+
+        Ok(mesh)
     }
+
 
     /// Open an EXISTING mesh checkout. Refuses any manifest whose
     /// `schema_version` is not `synaptic-mesh/v1`, naming the offending
@@ -110,7 +119,7 @@ impl MeshStorage {
         mesh_dir: &Path,
         remote: Option<&str>,
     ) -> Result<()> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("pointer dir could not be created at {}", parent.display())
@@ -129,7 +138,7 @@ impl MeshStorage {
 
     /// Read the project pointer. `Ok(None)` when the project has no mesh.
     pub fn read_pointer(project: &Path) -> Result<Option<(Uuid, PathBuf, Option<String>)>> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -168,7 +177,7 @@ impl MeshStorage {
     /// `leave()`: drop the project's link to the mesh. Idempotent — a project
     /// with no pointer is already left.
     pub fn remove_pointer(project: &Path) -> Result<()> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -190,6 +199,8 @@ impl MeshStorage {
     /// `Ok(false)` on a no-op (nothing changed) — an empty commit is a bug
     /// in the caller, never a fallback.
     pub async fn commit_all(&self, message: &str, node_id: &str) -> Result<bool> {
+        self.ensure_signing_key_ignored()?;
+        self.ensure_bundles_ignored()?;
         run_ok(&self.root, &["add", "-A"]).await?;
         let staged = run(&self.root, &["status", "--porcelain"]).await?;
         if String::from_utf8_lossy(&staged.stdout).trim().is_empty() {
@@ -238,6 +249,7 @@ impl MeshStorage {
         Ok(())
     }
 
+
     fn require_remote(&self) -> Result<()> {
         match &self.manifest.remote {
             Some(url) if !url.trim().is_empty() => Ok(()),
@@ -247,10 +259,116 @@ impl MeshStorage {
             ),
         }
     }
-}
 
-fn pointer_path(project: &Path) -> PathBuf {
-    project.join(POINTER_DIR_NAME).join(POINTER_FILE_NAME)
+
+    /// Keep the local Ed25519 signing key out of the published history.
+    ///
+    /// The default key path is `<mesh_root>/.neurostrata-mesh/signing.key`
+    /// (see `worker.rs`) and [`commit_all`] stages with `git add -A`, so
+    /// without an explicit ignore rule `git add -A` would publish the
+    /// private key into the team-shared history on the very next commit.
+    /// Both patterns are enforced because a mesh may hand its key a
+    /// different physical name through `NEUROSTRATA_MESH_SIGNING_KEY`.
+    /// Idempotent: existing lines are never duplicated or rewritten.
+    fn ensure_signing_key_ignored(&self) -> Result<()> {
+        self.ensure_ignored_lines(&[".neurostrata-mesh/signing.key", "*.key"])
+    }
+
+    /// Keep drain bundles out of the published history.
+    ///
+    /// A drain's opt-in compressed bundle lands in `<mesh_root>/bundles/`
+    /// (see `worker.rs`) and is a local-only artifact: it is a lagging
+    /// duplicate replay source, never the drain's publication channel.
+    /// [`commit_all`] stages with `git add -A`, so without an explicit
+    /// ignore rule a written bundle would be staged by a later drain —
+    /// and, until then, it would trip the import dirty gate as an
+    /// untracked path. A tracked bundle would also be re-scanned on
+    /// every import pass. The rule is artifact-scoped
+    /// (`/bundles/*.bundle.zst`): `write_compressed_bundle` writes
+    /// exactly `<name>.bundle.zst` directly into `bundles/` — the
+    /// drain passes `drain-<millis>` as the name — via a plain
+    /// `std::fs::write`, with no staging file and no rename, so that
+    /// suffix is the whole artifact set in-flight and at rest (a
+    /// partial write still carries it). Only those files are ignored.
+    /// Namespaces are root-level directories
+    /// (`<root>/<namespace>/{memories,procedures}/<id>.json`; see
+    /// `record_path` in `worker.rs`), so a namespace literally named
+    /// `bundles` keeps its `memories/`/`procedures/` records stageable
+    /// and publishing normally — the previous directory-level rule
+    /// (`/bundles`) silently swallowed them: the drain marked them
+    /// committed while `commit_all`'s `git add -A` never staged them. The
+    /// trade: a stray non-artifact file placed directly in `bundles/`
+    /// — or at the `bundles` path itself, as a regular file or a
+    /// symlink — is no longer ignore-covered. It shows in
+    /// `git status --porcelain` and pauses the import dirty gate, but
+    /// only until the next committing drain: [`commit_all`] stages
+    /// with an unconditional `git add -A` and no drain-side gate
+    /// check, so that drain sweeps the stray into tracked,
+    /// peer-published mesh history (a file or symlink at `bundles`
+    /// is committed as `bundles`), after which porcelain is clean
+    /// again. Under the superseded directory-level rule the whole
+    /// `bundles` path was ignore-covered, so a stray stayed hidden
+    /// indefinitely. Idempotent: existing lines are never duplicated
+    /// or rewritten.
+    fn ensure_bundles_ignored(&self) -> Result<()> {
+        self.ensure_ignored_lines(&["/bundles/*.bundle.zst"])
+    }
+
+    /// Append any of `wanted` missing from the checkout's `.gitignore`.
+    ///
+    /// Shared body of the ignore-rule wrappers above: reads the file,
+    /// appends only the missing lines under a header naming the artifact
+    /// class being kept local, and never rewrites existing lines.
+    /// Idempotent.
+    fn ensure_ignored_lines(&self, wanted: &[&str]) -> Result<()> {
+        let path = self.root.join(".gitignore");
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("failed to read {}: {e}", path.display());
+                }
+                String::new()
+            }
+        };
+        let have: Vec<&str> = existing.lines().map(|l| l.trim()).collect();
+        let missing: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|w| !have.contains(w))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut text = existing;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        // The header names the artifact class this call is keeping local;
+        // both rule sets share the "never publish" rationale.
+        if wanted.contains(&"/bundles/*.bundle.zst") {
+            text.push_str(
+                "# Drain bundles are local-only artifacts — never publish to the mesh history.\n",
+            );
+        } else {
+            text.push_str(
+                "# Private Ed25519 signing material — never publish to the mesh history.\n",
+            );
+        }
+        for entry in &missing {
+            text.push_str(entry);
+            text.push('\n');
+        }
+        std::fs::write(&path, text).with_context(|| {
+            format!(".gitignore could not be written to {}", path.display())
+        })?;
+        Ok(())
+    }
+
+    /// The project-side pointer path: `<project>/.NeuroStrata/synaptic-mesh-ref`.
+    pub(crate) fn pointer_path(project: &Path) -> PathBuf {
+        project.join(POINTER_DIR_NAME).join(POINTER_FILE_NAME)
+    }
 }
 
 fn write_manifest(root: &Path, manifest: &MeshManifest) -> Result<()> {
@@ -424,6 +542,7 @@ mod tests {
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     }
 
+
     #[tokio::test]
     async fn manifest_round_trips_to_disk() {
         let base = scratch("roundtrip");
@@ -434,6 +553,7 @@ mod tests {
         assert_eq!(reopened.manifest(), &original);
         assert_eq!(reopened.root(), mesh.root());
     }
+
 
     #[tokio::test]
     async fn open_refuses_unknown_schema_version() {
@@ -454,6 +574,7 @@ mod tests {
             "error must name the offending version, got: {err}"
         );
     }
+
 
     #[test]
     fn pointer_round_trips() {
@@ -516,6 +637,7 @@ mod tests {
             "a clean tree is Ok(false), never an empty commit"
         );
     }
+
 
     #[tokio::test]
     async fn push_and_pull_between_two_checkouts() {
@@ -598,6 +720,7 @@ mod tests {
         );
     }
 
+
     #[tokio::test]
     async fn push_without_remote_errors() {
         let base = scratch("no-remote");
@@ -615,6 +738,7 @@ mod tests {
             "got: {push_err}"
         );
     }
+
 
     // --- Task 13 (J12, DR-4): the git funnel is timed ---------------------
 
@@ -830,6 +954,149 @@ mod tests {
         assert!(
             msg.contains("Needed a single revision"),
             "error must carry git's stderr verbatim, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_all_never_stages_or_commits_the_signing_key() {
+        let base = scratch("signing-key");
+        let mesh = init_under(&base).await;
+
+        // The key material exists before the first commit (a feasible local
+        // state: auto-sign has run or the operator pre-created the key).
+        let key_dir = mesh.root().join(".neurostrata-mesh");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join("signing.key"), "ed25519 private bytes").unwrap();
+
+        let memories = mesh.root().join("stripe-api").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
+        assert!(mesh.commit_all("first record with a local key", "node-key").await.unwrap());
+
+        let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
+        assert!(
+            gitignore.contains(".neurostrata-mesh/signing.key") && gitignore.contains("*.key"),
+            ".gitignore must carry the signing-key patterns, got: {gitignore:?}"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["ls-files", ".neurostrata-mesh/signing.key"]),
+            "",
+            "the signing key must never be staged or committed"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["check-ignore", "--quiet", ".neurostrata-mesh/signing.key"]),
+            "",
+            "check-ignore must flag the signing key"
+        );
+
+        // Idempotent: a second pass never duplicates or rewrites the rules.
+        let before = gitignore.clone();
+        mesh.ensure_signing_key_ignored().unwrap();
+        assert_eq!(std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn init_ignores_drain_bundles_and_never_duplicates_the_rule() {
+        let base = scratch("bundles-ignored");
+        let mesh = init_under(&base).await;
+
+        // Whether `git check-ignore` does NOT accept `path`: the raw
+        // command, because `git_out` asserts success (exit 0 = ignored).
+        let not_ignored = |path: &str| {
+            !Command::new("git")
+                .args(["check-ignore", "--quiet", path])
+                .current_dir(mesh.root())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+
+        let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l.trim() == "/bundles/*.bundle.zst"),
+            ".gitignore must carry the /bundles/*.bundle.zst pattern, got: {gitignore:?}"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]),
+            "",
+            "check-ignore must flag a drain bundle artifact"
+        );
+        // Deliberately REVERSED from the directory-level rule: the bare
+        // `bundles` path is no longer ignore-covered. Under `/bundles`
+        // this assertion demanded the opposite (see the P2 fix commit).
+        assert!(
+            not_ignored("bundles"),
+            "check-ignore must NOT flag the bare bundles path"
+        );
+        assert!(
+            not_ignored("probe/bundles/inner.txt"),
+            "check-ignore must NOT flag a nested same-named path"
+        );
+
+        // Idempotent: a second pass never duplicates or rewrites the rule.
+        mesh.ensure_bundles_ignored().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(),
+            gitignore
+        );
+    }
+
+    /// Discriminating oracle for the artifact-scoped rule: a root-level
+    /// namespace literally named `bundles` publishes its records
+    /// normally, while a drain bundle artifact beside them stays
+    /// local-only. Under the old directory-level rule (`/bundles`) the
+    /// `git add -A` inside `commit_all` never staged the records, so
+    /// the `ls-files` assertions below fail there (verified against a
+    /// scratch repo carrying the old pattern).
+    #[tokio::test]
+    async fn a_namespace_named_bundles_still_publishes_its_records() {
+        let base = scratch("bundles-namespace");
+        let mesh = init_under(&base).await;
+
+        let memories = mesh.root().join("bundles").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
+        let procedures = mesh.root().join("bundles").join("procedures");
+        std::fs::create_dir_all(&procedures).unwrap();
+        std::fs::write(procedures.join("p1.json"), r#"{"id":"p1"}"#).unwrap();
+        // The artifact the rule exists for, in the same directory.
+        std::fs::write(
+            mesh.root().join("bundles").join("drain-1.bundle.zst"),
+            b"bundle bytes",
+        )
+        .unwrap();
+
+        for rel in ["bundles/memories/m1.json", "bundles/procedures/p1.json"] {
+            let out = Command::new("git")
+                .args(["check-ignore", "--quiet", rel])
+                .current_dir(mesh.root())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                !out.status.success(),
+                "check-ignore must NOT flag the bundles-namespace record {rel}"
+            );
+        }
+
+        assert!(
+            mesh.commit_all("bundles namespace records", "node-abc123")
+                .await
+                .unwrap(),
+            "commit_all must report a commit for the namespace records"
+        );
+        let tracked = git_out(mesh.root(), &["ls-files"]);
+        for rel in ["bundles/memories/m1.json", "bundles/procedures/p1.json"] {
+            assert!(
+                tracked.lines().any(|l| l == rel),
+                "{rel} must be tracked, ls-files: {tracked}"
+            );
+        }
+        assert!(
+            !tracked.lines().any(|l| l.ends_with(".bundle.zst")),
+            "no bundle artifact may be tracked, ls-files: {tracked}"
         );
     }
 }

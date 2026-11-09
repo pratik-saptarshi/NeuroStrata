@@ -62,8 +62,8 @@ const fn t(from: Status, to: Status, guard: Guard) -> Transition {
     Transition { from, to, guard }
 }
 
-/// The whole machine: 4 states, 8 legal edges, one terminal state.
-/// `done` has exactly two entrances and both are ExtractionRequired.
+/// The whole machine: 4 states, 8 legal edges. `done` has two entrances
+/// (both ExtractionRequired) and can reopen to open with RequireReason.
 pub const TABLE: &[Transition] = &[
     t(Status::Open, Status::InProgress, Guard::None), // claim
     t(Status::Open, Status::Blocked, Guard::RequireReason),
@@ -202,6 +202,15 @@ pub fn apply(task: &Task, to: Status, ctx: &Ctx) -> Result<Task, TransitionError
     let at = timestamp();
     task_obj.insert("status".into(), serde_json::json!(to.as_str()));
     task_obj.insert("updated_at".into(), serde_json::json!(at));
+
+    // Unclaim is the machine's job, not a handler courtesy: an Open task
+    // carries no live claim, so the InProgress -> Open edge itself clears the
+    // holder's marks. (Only unclaim: reopening a Done row is not a claim, and
+    // Done rows may still say who finished them.)
+    if from == Status::InProgress && to == Status::Open {
+        task_obj.remove("assignee");
+        task_obj.remove("session_id");
+    }
 
     let mut history = match task_obj.get("history").and_then(|h| h.as_array()) {
         Some(entries) => entries.clone(),

@@ -559,7 +559,7 @@ fn resolve_embedding_model(model_name: &str) -> Result<EmbeddingModel> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// The DR-7 artifact pin over one model's snapshot directory: every file
@@ -604,7 +604,7 @@ fn sha256_hex_of_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn collect_artifact_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
@@ -895,39 +895,202 @@ impl<T> IdleSession<T> {
 
 /// Verify a model file's SHA-256 checksum against a pinned value.
 /// Returns `Err` on mismatch (fail-closed supply-chain protection).
-fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
-    // Try common model file paths within the cache
-    let possible_paths = vec![
-        cache_dir.join(format!("models--{}", model_name.replace("/", "--"))),
-        cache_dir.join(model_name.replace("/", "--")),
+
+/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
+use std::fmt;
+
+fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
+    // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
+    // reading the variable directly sends this to a relative path under whatever
+    // directory happened to launch the process. config.rs already resolves it this way.
+    let config_dir = dirs::home_dir()
+        .map(|home| home.join(".config").join("neurostrata"))
+        .unwrap_or_else(|| PathBuf::from(".neurostrata"));
+
+    if !config_dir.exists() {
+        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
+    }
+
+    let config_path = config_dir.join("embedders.json");
+
+    // Default list if file doesn't exist or is empty
+    let default_models = vec![
+        AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15".to_string(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+            // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
+            model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
+            generated_by: None,
+            artifact_pin: None,
+        },
     ];
 
-    for path in &possible_paths {
-        if path.is_file() {
-            let data = std::fs::read(path)
-                .context("Failed to read model file for checksum verification")?;
-            let actual = format!("{:x}", Sha256::digest(&data));
-            if actual != pinned_sha {
-                return Err(anyhow!(
-                    "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
-                    model_name, path.display(), pinned_sha, actual
-                ));
+    if config_path.exists() {
+        let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
+        match serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
+            Ok(mut models) => {
+                if !models.is_empty() {
+                    // Backfill known pins for configs written before supply-chain
+                    // verification existed; unknown models remain unpinned and fail
+                    // closed at load time.
+                    for model in &mut models {
+                        if model.model_sha256.is_none()
+                            && model.model_name.eq_ignore_ascii_case("NomicEmbedTextV15")
+                        {
+                            model.model_sha256 = Some(
+                                "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    return Ok(models);
+                }
+            }
+            Err(e) => {
+                // A corrupt user file must never be silently overwritten: the
+                // user's edits stay on disk while we run on the in-memory default.
+                tracing::warn!(
+                    "Failed to parse {}: {e}; using default embedder list in memory without overwriting existing file",
+                    config_path.display()
+                );
+                return Ok(default_models);
             }
         }
     }
 
-    // If we found no file to verify, log a warning (cannot verify without model file).
-    // The model may be downloaded lazily; if a pinned checksum is set, the user
-    // expects it to be enforced on the actual model data.
-    eprintln!(
-        "[WARNING] Pinned SHA-256 set for embedder '{}' but model file not found in cache for verification.",
-        model_name
-    );
-    Ok(())
+    // Write default to file so user can edit it (only when the file is absent
+    // or was an empty, valid list)
+    if let Ok(json_content) = serde_json::to_string_pretty(&default_models) {
+        if let Err(e) = fs::write(&config_path, json_content) {
+            tracing::warn!(
+                "Failed to write default embedder config to {}: {e}",
+                config_path.display()
+            );
+        }
+    }
+
+    Ok(default_models)
 }
+
+
+/// The model this process is configured to use: the one NEUROSTRATA_MODEL names
+/// when it is acceptable, otherwise the first acceptable entry.
+
+/// The embedding width of the configured model, without loading the model.
+///
+/// Backup and restore need only this number to open the store. Loading the model
+/// can mean a 523 MB download, which is the wrong thing to require on the fresh
+/// or offline machine a restore is usually run on.
 
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 
+
+/// Verify a model file's SHA-256 checksum against a pinned value.
+/// Returns `Err` on mismatch or when no model file can be found (fail-closed).
+pub fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
+    // Collect candidate model files. Check the flat cache layout first, then
+    // walk the fastembed/HuggingFace snapshot layout (models--X/snapshots/*/onnx/model.onnx).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Flat fallback: cache_dir/model.onnx
+    let flat = cache_dir.join("model.onnx");
+    if flat.is_file() {
+        candidates.push(flat);
+    }
+
+    // fastembed layout: cache_dir/models--{name}/snapshots/*/onnx/model.onnx (and model.onnx)
+    let model_dir_name = format!("models--{}", model_name.replace("/", "--"));
+    let model_dir = cache_dir.join(&model_dir_name);
+    if model_dir.is_dir() {
+        collect_onnx_files(&model_dir, &mut candidates, 0, 6);
+    }
+
+    // Generic walk of cache_dir for any model.onnx (covers alternate cache roots)
+    if candidates.is_empty() {
+        collect_onnx_files(cache_dir, &mut candidates, 0, 4);
+    }
+
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
+            model_name, pinned_sha
+        ));
+    }
+
+    // Verify candidates: at least one must match the pinned SHA, and the
+    // newest candidate (sorted order ⇒ last entry) must match too. Stale
+    // non-matching candidates only warn, so a fresh valid download beside an
+    // old one still verifies.
+    candidates.sort();
+    let oldest_sha = |path: &PathBuf| -> Result<String> {
+        let data = std::fs::read(path).with_context(|| {
+            format!(
+                "Failed to read model file {} for checksum verification",
+                path.display()
+            )
+        })?;
+        Ok(hex::encode(Sha256::digest(&data)))
+    };
+
+    let mut matched: Option<&PathBuf> = None;
+    let mut stale: Vec<(&PathBuf, String)> = Vec::new();
+    for path in &candidates {
+        let actual = oldest_sha(path)?;
+        if actual == pinned_sha {
+            matched = Some(path);
+        } else {
+            stale.push((path, actual));
+        }
+    }
+
+    let newest = candidates.last().expect("candidates checked non-empty");
+    if matched.is_none() || stale.iter().any(|(p, _)| *p == newest) {
+        let path = newest;
+        let actual = oldest_sha(path)?;
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
+            model_name, path.display(), pinned_sha, actual
+        ));
+    }
+
+    for (path, actual) in stale {
+        tracing::warn!(
+            "Embedder '{}': stale model file {} does not match pin (expected {}, actual {}); using verified candidate {}",
+            model_name, path.display(), pinned_sha, actual,
+            matched.map_or("", |m| m.to_str().unwrap_or(""))
+        );
+    }
+    Ok(())
+}
+
+fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_depth: usize) {
+    if depth > max_depth {
+        return;
+    }
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name == "model.onnx" {
+                        out.push(path);
+                    }
+                } else if path.is_dir() {
+                    collect_onnx_files(&path, out, depth + 1, max_depth);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("collect_onnx_files: read_dir({}) failed: {e}", dir.display());
+        }
+    }
+}
+
+/// Local fastembed-backed embedding provider.
 pub struct FastEmbedder {
     session: Arc<IdleSession<TextEmbedding>>,
     model_name: String,
@@ -1098,6 +1261,17 @@ impl Embedder for FastEmbedder {
     fn session_loaded_snapshot(&self) -> Option<bool> {
         Some(self.session.snapshot_loaded())
     }
+    fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".into(),
+            model: self.model_name.clone(),
+            revision: "onnx".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
 }
 
 pub struct RemoteEmbedder {
@@ -1145,6 +1319,20 @@ fn validate_remote_base_url(base_url: &str) -> Result<()> {
         ),
     }
 }
+
+/// A typed carrier for the response status so the retry loop can downcast to
+/// it from the anyhow chain (reqwest::StatusCode does not implement
+/// std::error::Error itself).
+#[derive(Debug)]
+struct StatusError(reqwest::StatusCode);
+
+impl fmt::Display for StatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for StatusError {}
 
 impl RemoteEmbedder {
     pub fn new(
@@ -1197,6 +1385,14 @@ impl RemoteEmbedder {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
+                    if let Some(s) = e.downcast_ref::<StatusError>() {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || s.0.is_server_error()
+                        {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
                     return Err(e);
                 }
             }
@@ -1243,14 +1439,46 @@ impl RemoteEmbedder {
             }));
         }
 
-        let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
-        let embedding = json["data"][0]["embedding"]
-            .as_array()
-            .context("Missing embedding in response")?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
 
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            // The status travels in the error chain so the retry loop in
+            // `embed_with_retry` can downcast and tell retryable server
+            // errors from fatal client ones.
+            return Err(anyhow::Error::new(StatusError(status))
+                .context(format!("API error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
+        // Embedding-space identity persistence: a malformed remote vector must
+        // be rejected outright. Substituting 0.0 for non-numeric or non-finite
+        // elements would silently poison cosine distances, and a length that
+        // disagrees with self.dimensions would be unmixable with every stored
+        // vector in the space. Fail-closed (Composite Recommendation #11).
+        let arr = json["data"][0]["embedding"]
+            .as_array()
+            .context("Missing embedding in response")?;
+        if arr.is_empty() {
+            anyhow::bail!("remote embedding was empty");
+        }
+        let mut embedding = Vec::with_capacity(arr.len());
+        for v in arr {
+            let val = v
+                .as_f64()
+                .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+            if !val.is_finite() {
+                anyhow::bail!("remote embedding contained non-finite or non-numeric value");
+            }
+            embedding.push(val as f32);
+        }
+        if self.dimensions > 0 && embedding.len() != self.dimensions {
+            anyhow::bail!(
+                "remote embedding dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                embedding.len()
+            );
+        }
         Ok(embedding)
     }
 }
@@ -1268,10 +1496,38 @@ impl Embedder for RemoteEmbedder {
     fn embedder_id(&self) -> &str {
         &self.model_name
     }
+
+    fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "openai-compatible".into(),
+            model: self.api_model.clone(),
+            revision: "unknown".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
 }
 
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
-    build_embedder_for(&configured_model()?)
+    let emb = build_embedder_for(&configured_model()?)?;
+
+    // Embedding-space identity must resolve at startup: descriptors get
+    // persisted on namespace metadata and compared with `compatible`, so an
+    // embedder that reports the "unknown" descriptor would defeat that check.
+    let descriptor = emb.embedding_descriptor();
+    if descriptor.compatible(&crate::traits::EmbeddingDescriptor::unknown()) {
+        anyhow::bail!(
+            "embedder '{}' reports the unknown embedding descriptor",
+            emb.embedder_id()
+        );
+    }
+    eprintln!(
+        "Embedding space: provider={} model={} dims={}",
+        descriptor.provider, descriptor.model, descriptor.dims
+    );
+    Ok(emb)
 }
 
 /// Build the embedder for an already-resolved model. Resolution is not
@@ -1364,6 +1620,34 @@ mod tests {
         server.abort();
     }
 
+    /// Read one full HTTP request (headers + declared body) off the socket,
+    /// so responding cannot race the client still writing.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            acc.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&acc).to_string();
+            if let Some(idx) = text.find("\r\n\r\n") {
+                let mut content_length = 0usize;
+                for line in text[..idx].lines() {
+                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = rest.trim().parse().unwrap_or(0);
+                    }
+                }
+                if acc.len() >= idx + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&acc).to_string()
+    }
+
     #[test]
     fn the_configured_width_is_known_without_loading_a_model() {
         assert!(configured_dimensions().expect("embedders resolve") > 0);
@@ -1380,6 +1664,131 @@ mod tests {
             768,
         );
         assert!(embedder.is_ok());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let req = read_http_request(&mut sock).await;
+            assert!(
+                req.contains("POST /embeddings"),
+                "request: {}",
+                req
+            );
+            assert!(
+                req.to_ascii_lowercase()
+                    .contains("authorization: bearer test-key"),
+                "request: {}",
+                req
+            );
+            let body = r#"{"data":[{"embedding":[0.25,0.5,0.75,1.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder.embed("hello").await.unwrap();
+        assert_eq!(v, vec![0.25f32, 0.5, 0.75, 1.0]);
+        server.await.unwrap();
+    }
+
+    /// Composite Recommendation #11: a remote response whose embedding is
+    /// non-numeric, non-finite, empty, or dimension-mismatched must fail the
+    /// embed call instead of silently surviving as 0.0 fills.
+    #[tokio::test]
+    async fn remote_embedder_rejects_non_numeric_and_mismatched_embeddings() {
+        let bad_embeddings: Vec<(&str, &str)> = vec![
+            ("non-numeric element", r#"[1.0, "not-a-number", 3.0, 4.0]"#),
+            ("dimension mismatch (expected 4)", r#"[1.0, 2.0, 3.0]"#),
+            ("empty", r#"[]"#),
+        ];
+        for (case, body_vec) in bad_embeddings {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let _ = read_http_request(&mut sock).await;
+                let body =
+                    format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                use tokio::io::AsyncWriteExt;
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            });
+            let embedder = RemoteEmbedder::new(
+                format!("http://{}", addr),
+                "test-key".to_string(),
+                "test-model".to_string(),
+                4,
+            )
+            .unwrap();
+            let err = embedder.embed("hello").await.expect_err(case);
+            assert!(
+                err.to_string().contains("remote embedding"),
+                "case '{}' produced an unexpected error: {}",
+                case,
+                err
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_retries_on_500() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut handled = 0usize;
+            for attempt in 0..2 {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let req = read_http_request(&mut sock).await;
+                assert!(req.contains("POST /embeddings"), "request: {}", req);
+                let (status_line, body) = if attempt == 0 {
+                    ("HTTP/1.1 500 Internal Server Error", "server fail")
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]}]}"#,
+                    )
+                };
+                let resp = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                use tokio::io::AsyncWriteExt;
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                handled += 1;
+            }
+            handled
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder.embed("retry me").await.unwrap();
+        assert_eq!(v, vec![1.0f32, 2.0, 3.0, 4.0]);
+        let handled = server.await.unwrap();
+        assert_eq!(handled, 2, "server must see both the failed and the retried attempt");
     }
 
     #[test]
@@ -2334,11 +2743,11 @@ mod tests {
             let bytes = std::fs::read(dir.join(name)).unwrap();
             listing.push_str(&format!(
                 "{}  {}\n",
-                format!("{:x}", Sha256::digest(&bytes)),
+                hex::encode(Sha256::digest(&bytes)),
                 name
             ));
         }
-        format!("{:x}", Sha256::digest(listing.as_bytes()))
+        hex::encode(Sha256::digest(listing.as_bytes()))
     }
 
     fn collect_spec_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -2514,6 +2923,30 @@ mod tests {
     }
 
     #[test]
+    fn remote_embedder_descriptor_is_resolved_not_unknown() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            768,
+        )
+        .unwrap();
+        let d = embedder.embedding_descriptor();
+        assert_eq!(d.provider, "openai-compatible");
+        assert_eq!(d.model, "test-model");
+        assert_eq!(d.dims, 768);
+        assert!(!d.compatible(&crate::traits::EmbeddingDescriptor::unknown()));
+    }
+
+    #[test]
+    fn build_embedder_falls_back_to_local() {
+        // When no remote config, should use local
+        // This tests the factory logic
+        let embedder = build_embedder();
+        assert!(embedder.is_ok());
+    }
+
+    #[test]
     fn remote_http_to_loopback_loads() {
         for url in ["http://127.0.0.1:8080", "http://[::1]:8080"] {
             let embedder = RemoteEmbedder::new(
@@ -2583,5 +3016,27 @@ mod tests {
             !err.contains("MARKER-SECRET-BODY"),
             "never carries the response body: {err}"
         );
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_on_mismatch() {
+        let dir = std::env::temp_dir().join("ns-checksum-mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("model.onnx");
+        std::fs::write(&model_path, b"not-the-model").unwrap();
+        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_when_no_file() {
+        let dir = std::env::temp_dir().join("ns-checksum-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
+        assert!(err.to_string().contains("model file not found"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

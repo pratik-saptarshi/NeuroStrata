@@ -37,8 +37,7 @@
 //! The overlay file remains the durable source of truth for [`status_lines`]
 //! and for [`Overlay`]-driven re-presentation; the metadata marker is its
 //! live reflection in the store.
-
-use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -109,9 +108,9 @@ impl Overlay {
     /// The live suppression signal reads the row's `metadata.mesh.conflict`
     /// marker (via [`is_conflicting_metadata`]) rather than this set, because
     /// the store read paths carry no `mesh_dir`. This remains the overlay's
-    /// own query for `status_lines`/future read sites that do resolve the dir.
-    #[allow(dead_code)]
-    pub fn unresolved_ids(&self, namespace: &str) -> HashSet<String> {
+    /// own query, exercised by the overlay round-trip tests.
+    #[cfg(test)]
+    pub fn unresolved_ids(&self, namespace: &str) -> std::collections::HashSet<String> {
         self.conflicts
             .iter()
             .filter(|e| e.namespace == namespace && e.kind == ConflictKind::Unresolved)
@@ -135,13 +134,34 @@ pub fn load_overlay(mesh_dir: &Path) -> Overlay {
     let file = conflicts_dir_for(mesh_dir).join(OVERLAY_FILE_NAME);
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
-        Err(_) => return Overlay::empty(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Overlay::empty(),
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or incompatible mesh conflict overlay at {}: read failed ({e}) — treating as empty",
+                file.display()
+            );
+            return Overlay::empty();
+        }
     };
     let overlay: Overlay = match serde_json::from_str(&text) {
         Ok(o) => o,
-        Err(_) => return Overlay::empty(),
+        Err(e) => {
+            tracing::warn!("corrupt mesh conflict overlay at {}: {e}", file.display());
+            // Preserve the corrupt bytes for diagnostics (never deleted);
+            // the overlay itself reads as empty (fail-soft).
+            if let Err(e) = std::fs::copy(&file, file.with_extension("json.corrupt")) {
+                tracing::warn!("failed to copy corrupt overlay {}: {e}", file.display());
+            }
+            return Overlay::empty();
+        }
     };
     if overlay.schema_version != OVERLAY_SCHEMA_VERSION {
+        tracing::warn!(
+            "corrupt or incompatible mesh conflict overlay at {}: schema_version {:?} (expected {:?}) — treating as empty",
+            file.display(),
+            overlay.schema_version,
+            OVERLAY_SCHEMA_VERSION
+        );
         return Overlay::empty();
     }
     overlay
@@ -155,14 +175,20 @@ pub fn save_overlay(mesh_dir: &Path, overlay: &Overlay) -> anyhow::Result<()> {
         .with_context(|| format!("conflicts dir could not be created at {}", dir.display()))?;
     let file = dir.join(OVERLAY_FILE_NAME);
     let tmp = file.with_extension("json.tmp");
-    std::fs::write(
-        &tmp,
-        format!(
-            "{}\n",
-            serde_json::to_string(overlay).context("overlay serialization")?
-        ),
-    )
-    .with_context(|| format!("overlay tmp could not be written at {}", tmp.display()))?;
+    let json = format!(
+        "{}\n",
+        serde_json::to_string(overlay).context("overlay serialization")?
+    );
+    // Write → flush to disk → rename, so the rename can never publish a
+    // truncated or not-yet-durable buffer (the module doc's durability
+    // guarantee for the overlay).
+    let mut out = std::fs::File::create(&tmp)
+        .with_context(|| format!("overlay tmp could not be created at {}", tmp.display()))?;
+    out.write_all(json.as_bytes())
+        .with_context(|| format!("overlay tmp could not be written at {}", tmp.display()))?;
+    out.sync_all()
+        .with_context(|| format!("overlay tmp could not be flushed at {}", tmp.display()))?;
+    drop(out);
     std::fs::rename(&tmp, &file).with_context(|| {
         format!(
             "overlay could not be moved into place at {}",
@@ -256,10 +282,9 @@ pub fn is_conflicting(payload: &MemoryPayload) -> bool {
     is_conflicting_metadata(&payload.metadata)
 }
 
-/// Status lines for the `mesh status` surface (wired by the orchestrator at
-/// merge — slice 6 exports it, slice 7 owns `mesh_service::status_report`).
-/// Never fails: a missing/corrupt overlay yields an empty report.
-#[allow(dead_code)] // slice-7 seam: mesh_service::status_report wires it
+/// Status lines for the `mesh status` surface (called by
+/// `mesh_service::status_report`). Never fails: a missing/corrupt overlay
+/// yields an empty report.
 pub fn status_lines(mesh_dir: &Path) -> Vec<String> {
     let overlay = load_overlay(mesh_dir);
     let unresolved: Vec<&ConflictEntry> = overlay
@@ -474,6 +499,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_overlay(&mesh_dir).unresolved_count(), 0);
+        // AK-M6: corrupt bytes are preserved for diagnostics before the
+        // fail-soft empty read — never silently overwritten or deleted.
+        let backup = conflicts_dir_for(&mesh_dir)
+            .join(OVERLAY_FILE_NAME)
+            .with_extension("json.corrupt");
+        assert!(
+            backup.is_file(),
+            "a parse-safe backup of the corrupt overlay must exist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{ not json",
+            "the backup carries the corrupt bytes byte-for-byte"
+        );
     }
 
     /// is_conflicting is true only for the typed `metadata.mesh.conflict:

@@ -15,9 +15,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
-/// The four relations the traversal may follow (vocabulary v7).
-pub const DEFAULT_RELATIONS: [&str; 4] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM"];
+/// The five relations the traversal may follow (vocabulary v7).
+pub const DEFAULT_RELATIONS: [&str; 5] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
 
 /// The default and maximum hop counts (spec §4.2: default 1, max 2).
 pub const DEFAULT_MAX_HOPS: usize = 1;
@@ -60,6 +61,8 @@ pub enum EdgeRole {
     Supporting,
     /// `EXTRACTED_FROM`: provenance (memory ← task), evidence not authority.
     Extraction,
+    /// `DEPENDS_ON`: dependency traversal.
+    Dependency,
 }
 
 /// The role a relation plays in the traversal.
@@ -68,6 +71,7 @@ pub fn edge_role(relation: &str) -> EdgeRole {
         "GOVERNS" => EdgeRole::Governance,
         "CONTAINS" => EdgeRole::Structure,
         "EXTRACTED_FROM" => EdgeRole::Extraction,
+        "DEPENDS_ON" => EdgeRole::Dependency,
         _ => EdgeRole::Supporting,
     }
 }
@@ -84,12 +88,19 @@ pub fn is_allowed_relation(relation: &str) -> bool {
     DEFAULT_RELATIONS.contains(&relation)
 }
 
-/// Parse a caller-supplied direction, defaulting to `Both`.
+/// Parse a caller-supplied direction, defaulting to `Both`. An unrecognized
+/// non-empty value is warned about (warn-first, never fail the query) and read
+/// as `Both`.
 pub fn parse_direction(raw: Option<&str>) -> Direction {
     match raw {
         Some("outgoing") => Direction::Outgoing,
         Some("incoming") => Direction::Incoming,
         _ => Direction::Both,
+        Some("both" | "") | None => Direction::Both,
+        Some(other) => {
+            tracing::warn!("unknown graph_read direction '{}'; defaulting to Both", other);
+            Direction::Both
+        }
     }
 }
 
@@ -159,15 +170,32 @@ pub struct TraversalEdge {
     pub target: String,
     pub role: EdgeRole,
     pub depth: usize,
+    /// INT64 validity columns of the stored edge (`0` = unbounded).
+    #[serde(default)]
+    pub valid_from: i64,
+    #[serde(default)]
+    pub valid_to: i64,
 }
 
+
 /// The chain of edges that led the traversal to one node. `kind` is `"direct"`
-/// for the seed and `"path"` otherwise.
+/// for the seed and `"path"` otherwise; the seed's entry is built by
+/// [`direct_evidence_for_seed`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidencePath {
     pub kind: String,
     pub path: Vec<TraversalEdge>,
     pub explanation: String,
+}
+
+/// Build the seed's own evidence entry: `kind == "direct"` with no edges,
+/// because the seed is the explicit query target and was never "reached".
+pub fn direct_evidence_for_seed() -> EvidencePath {
+    EvidencePath {
+        kind: "direct".to_string(),
+        path: Vec::new(),
+        explanation: "seed node (direct match)".to_string(),
+    }
 }
 
 /// A pagination cursor: the query fingerprint plus the generation the query ran
@@ -210,11 +238,16 @@ pub struct NodeSpec {
 }
 
 /// One in-memory edge the store hands to the traversal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeSpec {
     pub source: String,
     pub relation: String,
     pub target: String,
+    /// INT64 validity columns of the stored edge (`0` = unbounded).
+    #[serde(default)]
+    pub valid_from: i64,
+    #[serde(default)]
+    pub valid_to: i64,
 }
 
 /// The bounded BFS core. It takes an in-memory subgraph (already row-filtered
@@ -254,7 +287,7 @@ pub fn graph_read_related(
         return empty();
     }
 
-    // Relation allowlist: empty means the four defaults.
+    // Relation allowlist: empty means the five defaults.
     let allowed: HashSet<&str> = if relations.is_empty() {
         DEFAULT_RELATIONS.iter().copied().collect()
     } else {
@@ -364,6 +397,8 @@ pub fn graph_read_related(
                         target: es.target.clone(),
                         role: edge_role(&es.relation),
                         depth,
+                        valid_from: es.valid_from,
+                        valid_to: es.valid_to,
                     });
                 }
             }
@@ -380,6 +415,7 @@ pub fn graph_read_related(
     let mut evidence: Vec<EvidencePath> = Vec::new();
     for node in &all_nodes {
         if node.id == seed {
+            evidence.push(direct_evidence_for_seed());
             continue;
         }
         let mut path: Vec<TraversalEdge> = Vec::new();
@@ -392,6 +428,8 @@ pub fn graph_read_related(
                 target: es.target.clone(),
                 role: edge_role(&es.relation),
                 depth: es_depth,
+                valid_from: es.valid_from,
+                valid_to: es.valid_to,
             });
             hops += 1;
             cur = prev;
@@ -505,3 +543,197 @@ mod tests {
         assert_eq!(snippet_of("hello world", 5), "hello…");
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueryBudget {
+    pub max_hops: usize,
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub deadline: Instant,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self {
+            max_hops: 10,
+            max_nodes: 5000,
+            max_edges: 50000,
+            deadline: Instant::now() + Duration::from_millis(250),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetExceeded {
+    pub stage: String,
+    pub visited: usize,
+    pub truncated: bool,
+    pub deadline_remaining_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureResult<T> {
+    pub items: Vec<T>,
+    pub truncated: bool,
+    pub budget_exceeded: Option<BudgetExceeded>,
+}
+
+pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> ClosureResult<String> {
+    let mut items: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+    // Include root in the closure result.
+    if !items.contains(&root.to_string()) {
+        items.push(root.to_string());
+    }
+    visited.insert(root.to_string());
+    queue.push_back((root.to_string(), 0));
+
+    let mut truncated = false;
+    let mut edge_crossed = 0usize;
+
+    while let Some((current, depth)) = queue.pop_front() {
+        // Enforce the wall-clock deadline inside the loop: an expired
+        // deadline halts traversal immediately instead of only being
+        // reported after the whole graph has been walked.
+        if Instant::now() >= budget.deadline {
+            truncated = true;
+            let len = items.len();
+            return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+        }
+        // Gather outgoing GOVERNS neighbors sorted lexicographically. Every
+        // matched edge counts against the edge budget here -- in the edge loop
+        // itself -- so edges to already-visited neighbours are counted too.
+        let mut neighbors: Vec<String> = Vec::new();
+        for edge in edges {
+            if edge.relation == "GOVERNS" && edge.source == current {
+                edge_crossed += 1;
+                if edge_crossed > budget.max_edges {
+                    truncated = true;
+                    let len = items.len();
+                    return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+                }
+                neighbors.push(edge.target.clone());
+            }
+        }
+        neighbors.sort();
+        neighbors.dedup();
+        if depth >= budget.max_hops {
+            if neighbors.iter().any(|n| !visited.contains(n)) {
+                truncated = true;
+            }
+            continue;
+        }
+        for neighbor in neighbors {
+            if visited.contains(&neighbor) {
+                continue;
+            }
+            // Hard cap on nodes.
+            if visited.len() >= budget.max_nodes {
+                truncated = true;
+                // Stop expanding further.
+                let len = items.len();
+                return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+            }
+            visited.insert(neighbor.clone());
+            items.push(neighbor.clone());
+            queue.push_back((neighbor, depth + 1));
+        }
+    }
+
+    let len = items.len();
+    build_result(items, truncated, budget, false, "closure_governs".to_string(), len)
+}
+
+fn build_result(
+    items: Vec<String>,
+    truncated: bool,
+    budget: &QueryBudget,
+    hard_truncated: bool,
+    stage: String,
+    visited: usize,
+) -> ClosureResult<String> {
+    let truncated_final = truncated || hard_truncated;
+    let mut budget_exceeded: Option<BudgetExceeded> = None;
+    if truncated_final {
+        budget_exceeded = Some(BudgetExceeded {
+            stage: stage.clone(),
+            visited,
+            truncated: true,
+            deadline_remaining_ms: budget.deadline.saturating_duration_since(Instant::now()).as_millis() as u64,
+        });
+    }
+    // Deadline advisory: if past deadline and no budget exceeded yet, set advisory.
+    if !truncated_final && Instant::now() > budget.deadline {
+        budget_exceeded = Some(BudgetExceeded {
+            stage: stage.clone(),
+            visited,
+            truncated: false,
+            deadline_remaining_ms: 0,
+        });
+    }
+    ClosureResult {
+        items,
+        truncated: truncated_final,
+        budget_exceeded,
+    }
+}
+
+#[cfg(test)]
+mod closure_tests {
+    use super::*;
+
+    #[test]
+    fn chain_closure() {
+        let edges = vec![
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string(), valid_from: 0, valid_to: 0 },
+        ];
+        let budget = QueryBudget::default();
+        let result = closure_governs("A", &edges, &budget);
+        assert!(!result.truncated);
+        assert_eq!(result.items, vec!["A", "B", "C"]);
+        assert!(result.budget_exceeded.is_none());
+    }
+
+    #[test]
+    fn cycle_guard_self_loop() {
+        let edges = vec![
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "A".to_string(), valid_from: 0, valid_to: 0 },
+        ];
+        let budget = QueryBudget::default();
+        let result = closure_governs("A", &edges, &budget);
+        assert!(!result.truncated);
+        assert_eq!(result.items, vec!["A"]);
+    }
+
+    #[test]
+    fn max_hops_truncation_and_budget_exceeded() {
+        let edges = vec![
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec { source: "C".to_string(), relation: "GOVERNS".to_string(), target: "D".to_string(), valid_from: 0, valid_to: 0 },
+        ];
+        let mut budget = QueryBudget::default();
+        budget.max_hops = 1;
+        let result = closure_governs("A", &edges, &budget);
+        assert!(result.truncated);
+        assert_eq!(result.items, vec!["A", "B"]);
+        assert!(result.budget_exceeded.is_some());
+        let exceeded = result.budget_exceeded.unwrap();
+        assert_eq!(exceeded.stage, "closure_governs");
+        assert!(exceeded.truncated);
+    }
+
+    #[test]
+    fn disconnected_root() {
+        let edges: Vec<EdgeSpec> = vec![];
+        let budget = QueryBudget::default();
+        let result = closure_governs("X", &edges, &budget);
+        assert!(!result.truncated);
+        assert_eq!(result.items, vec!["X"]);
+        assert!(result.budget_exceeded.is_none());
+    }
+}
+
