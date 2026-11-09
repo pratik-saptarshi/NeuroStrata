@@ -111,11 +111,6 @@ fn is_structural(memory_type: &str) -> bool {
     STRUCTURAL.contains(&memory_type)
 }
 
-fn is_registry_row(metadata: &Value) -> bool {
-    metadata.get("registry").and_then(|v| v.as_bool()).unwrap_or(false)
-        || metadata.get("is_registry").and_then(|v| v.as_bool()).unwrap_or(false)
-}
-
 fn is_mesh_conflicting(metadata: &Value) -> bool {
     crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
 }
@@ -142,7 +137,7 @@ fn build_memory_node(
     include_archived: bool,
     include_retired: bool,
 ) -> Option<Value> {
-    if is_registry_row(&payload.metadata) {
+    if crate::registry::is_registry_row(&payload.metadata) {
         return None; // hard exclude registry even by id -> null
     }
     if is_mesh_conflicting(&payload.metadata) {
@@ -551,7 +546,7 @@ pub fn execute_on_records(
                                 if !var_include_retired && is_retired_at(&payload.metadata, now) {
                                     continue;
                                 }
-                                if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                                if crate::registry::is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
                                     continue;
                                 }
                                 if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
@@ -1159,5 +1154,110 @@ mod tests {
     fn unknown_field_rejected() {
         let resp = execute_on_records(&[], &std::collections::HashMap::new(), "ns", "admin", "{ memories(namespace: \"ns\") { badField } }", None);
         assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
+    }
+
+    #[test]
+    fn f2_domain_registry_row_absent_from_memories_search_and_memory_by_id() {
+        let mk = |content: &str, meta: serde_json::Value| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: meta,
+        };
+        let records = vec![
+            ("reg1".into(), mk("alpha registry row", serde_json::json!({"domain_registry": {"domains": ["auth"]}}))),
+            ("real1".into(), mk("alpha real row", serde_json::json!({}))),
+        ];
+        // memories surface
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories { edges { node { id } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(ids.contains(&&serde_json::json!("real1")), "real row must be served in memories: {ids:?}");
+        assert!(!ids.contains(&&serde_json::json!("reg1")), "domain_registry row must be absent from memories: {ids:?}");
+        // search surface
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ search(text: \"alpha\") { edges { node { id } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["search"]["edges"].as_array().unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(ids.contains(&&serde_json::json!("real1")), "real row must be served in search: {ids:?}");
+        assert!(!ids.contains(&&serde_json::json!("reg1")), "domain_registry row must be absent from search: {ids:?}");
+        // memory(id:) surface
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memory(id: \"reg1\") { id } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert!(resp.data.as_ref().unwrap()["memory"].is_null(), "domain_registry row must be null from memory(id:): {}", resp.data.as_ref().unwrap());
+        // by-id control: the real row is served by id
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memory(id: \"real1\") { id } }", None);
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "real1");
+    }
+
+    #[test]
+    fn f2_domain_registry_row_consumes_no_page_slot_and_no_null_edge() {
+        let mk = |content: &str, valid_from: i64, meta: serde_json::Value| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: {
+                let mut m = meta;
+                m["valid_from"] = serde_json::json!(valid_from);
+                m
+            },
+        };
+        // Registry row sorts first in memories (highest valid_from), so if it
+        // is not filtered before pagination it consumes the first page slot.
+        let records = vec![
+            ("reg1".into(), mk("registry row", 300, serde_json::json!({"domain_registry": {"domains": ["auth"]}}))),
+            ("real1".into(), mk("real one", 200, serde_json::json!({}))),
+            ("real2".into(), mk("real two", 100, serde_json::json!({}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories(first: 2) { edges { node { id } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "both real rows must fill the page: {rows:?}");
+        assert!(rows.iter().all(|r| !r["node"].is_null()), "no edge may carry node: null: {rows:?}");
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert_eq!(ids, vec![&serde_json::json!("real1"), &serde_json::json!("real2")], "page must contain exactly the real rows in order: {ids:?}");
+    }
+
+    #[test]
+    fn f2_registry_true_only_row_is_served() {
+        let mk = |content: &str, meta: serde_json::Value| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: meta,
+        };
+        let records = vec![
+            ("boolreg".into(), mk("boolean registry row", serde_json::json!({"registry": true}))),
+            ("real1".into(), mk("real row", serde_json::json!({}))),
+        ];
+        // memories surface: a registry:true-only row carries no
+        // domain_registry mark, so the canonical predicate serves it.
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories { edges { node { id } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(ids.contains(&&serde_json::json!("boolreg")), "registry:true-only row must be served in memories: {ids:?}");
+        assert!(ids.contains(&&serde_json::json!("real1")), "real row must be served in memories: {ids:?}");
+        // memory(id:) surface
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memory(id: \"boolreg\") { id } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "boolreg", "registry:true-only row must be served by id: {}", resp.data.as_ref().unwrap());
     }
 }
