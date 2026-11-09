@@ -20,6 +20,8 @@ import {
   extractRepoFilePaths,
   enrichAndInjectSubagentPrompt,
   resolveActiveTaskFromDaemon,
+  extractPatchPaths,
+  extractFilePaths,
   createHarnessPlugin,
   initialize,
   TOOL_CLASSIFICATION,
@@ -1594,6 +1596,59 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
   });
 });
 
+describe("extractPatchPaths / extractFilePaths", () => {
+  it("returns every file in a multi-file Codex patch, deduped, order-preserving", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: src/first.rs",
+      "@@",
+      "-a",
+      "+b",
+      "*** Add File: src/second.rs",
+      "+hello",
+      "*** Update File: src/first.rs",
+      "@@",
+      "-c",
+      "+d",
+      "*** End Patch",
+    ].join("\n");
+    assert.deepEqual(extractPatchPaths(patch), ["src/first.rs", "src/second.rs"]);
+  });
+
+  it("includes the Move to destination", () => {
+    const patch = "*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n-a\n+b\n";
+    assert.deepEqual(extractPatchPaths(patch), ["src/old.rs", "src/new.rs"]);
+  });
+
+  it("parses unified-diff --- a/ and +++ b/ headers, deduped across both", () => {
+    const diff =
+      "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1 +1 @@\n-a\n+b\n" +
+      "--- a/src/y.rs\n+++ b/src/y.rs\n@@ -1 +1 @@\n-c\n+d\n";
+    assert.deepEqual(extractPatchPaths(diff), ["src/x.rs", "src/y.rs"]);
+  });
+
+  it("captures Delete File headers and returns [] for pathless input", () => {
+    assert.deepEqual(extractPatchPaths("*** Delete File: src/gone.rs\n"), ["src/gone.rs"]);
+    assert.deepEqual(extractPatchPaths(undefined), []);
+    assert.deepEqual(extractPatchPaths(null), []);
+    assert.deepEqual(extractPatchPaths("no paths here"), []);
+  });
+
+  it("extractFilePaths: explicit path wins as a single-element list; patch sources keep precedence", () => {
+    assert.deepEqual(
+      extractFilePaths({ file_path: "src/one.rs", patch: "*** Update File: src/two.rs\n" }),
+      ["src/one.rs"],
+    );
+    assert.deepEqual(
+      extractFilePaths({ patch: "*** Update File: src/two.rs\n*** Add File: src/three.rs\n" }),
+      ["src/two.rs", "src/three.rs"],
+    );
+    assert.deepEqual(extractFilePaths({}, undefined, "*** Delete File: src/gone.rs\n"), ["src/gone.rs"]);
+    assert.deepEqual(extractFilePaths({}, { path: "src/alt.rs" }), ["src/alt.rs"]);
+    assert.deepEqual(extractFilePaths({}), []);
+  });
+});
+
 describe("round-8: Codex apply_patch extraction, decoded ledger matching, and batched writes", () => {
   it("executeBeforeHandler extracts *** Update File path from string input", async () => {
     const { server, url, counters } = await createMockDaemonServer();
@@ -1616,6 +1671,65 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       );
       const blob = JSON.stringify(result ?? {});
       assert.ok(blob.includes("src/codex.rs"), "recall block must mention the patched file");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("executeBeforeHandler recalls governing memories for BOTH files in a two-file apply_patch", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      let beforeExecFn = null;
+      await initialize({
+        config: { namespace: "r8-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 500 },
+        hooks: {
+          beforeToolExec: async (fn) => {
+            beforeExecFn = fn;
+          },
+        },
+      });
+      const patch = "*** Update File: src/first.rs\n@@\n-a\n+b\n*** Add File: src/second.rs\n+new\n";
+      const result = await beforeExecFn({ tool: "apply_patch", input: patch });
+      assert.ok(
+        counters.memoriesForFilePaths.includes("src/first.rs"),
+        `first patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+      );
+      assert.ok(
+        counters.memoriesForFilePaths.includes("src/second.rs"),
+        `second patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+      );
+      const blob = JSON.stringify(result ?? {});
+      assert.ok(blob.includes("src/first.rs"), "recall block must mention the first patched file");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("handleHookEvent recalls governing memories for BOTH files in a two-file apply_patch (Codex reproduction)", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      await initialize({
+        config: { namespace: "r8-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      const result = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "apply_patch",
+        input: "*** Update File: src/first.rs\n@@\n-a\n+b\n*** Update File: src/second.rs\n@@\n-c\n+d\n",
+      });
+      assert.ok(
+        counters.memoriesForFilePaths.includes("src/first.rs"),
+        `first patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+      );
+      assert.ok(
+        counters.memoriesForFilePaths.includes("src/second.rs"),
+        `second patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+      );
+      const blob = JSON.stringify(result ?? {});
+      assert.ok(blob.includes("src/first.rs"), "hook recall must mention the first patched file");
     } finally {
       server.close();
       resetModuleState();

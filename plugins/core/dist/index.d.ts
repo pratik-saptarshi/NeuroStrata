@@ -224,6 +224,19 @@ export declare function getTrackingState(): {
 };
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
+/**
+ * Every file path a patch touches, deduped and order-preserving: Codex
+ * `*** Update/Add/Delete File:` headers, `*** Move to:` destinations, and
+ * unified-diff `--- a/` / `+++ b/` headers.
+ */
+export declare function extractPatchPaths(raw: unknown): string[];
+/**
+ * Multi-path counterpart of extractFilePath, with the same precedence: an
+ * explicit file_path/filePath/path wins as a single-element list; otherwise
+ * every path from the first patch-bearing source (args patch fields, then
+ * the raw patch, then altArgs).
+ */
+export declare function extractFilePaths(args: Record<string, unknown>, altArgs?: Record<string, unknown>, rawPatch?: unknown): string[];
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;

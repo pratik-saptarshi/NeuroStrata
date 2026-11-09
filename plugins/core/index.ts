@@ -1313,10 +1313,30 @@ function consumePendingRecall(
   return shifted;
 }
 
+/**
+ * Every file path a patch touches, deduped and order-preserving: Codex
+ * `*** Update/Add/Delete File:` headers, `*** Move to:` destinations, and
+ * unified-diff `--- a/` / `+++ b/` headers.
+ */
+export function extractPatchPaths(raw: unknown): string[] {
+  if (typeof raw !== "string") return [];
+  const regex =
+    /^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*([^\r\n]+)|^\*\*\*\s+Move to:\s*([^\r\n]+)|^---\s+a\/([^\r\n]+)|^\+\+\+\s+b\/([^\r\n]+)/gm;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(raw))) {
+    const p = (m[1] ?? m[2] ?? m[3] ?? m[4])?.trim();
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
 function extractPatchPath(raw: unknown): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const m = raw.match(/(?:^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*|^---\s+a\/|^\+\+\+\s+b\/)([^\r\n]+)/m);
-  return m?.[1]?.trim();
+  return extractPatchPaths(raw)[0];
 }
 
 function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string, unknown>, rawPatch?: unknown): string | undefined {
@@ -1333,6 +1353,27 @@ function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string,
          extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input))
       : undefined)
   );
+}
+
+/**
+ * Multi-path counterpart of extractFilePath, with the same precedence: an
+ * explicit file_path/filePath/path wins as a single-element list; otherwise
+ * every path from the first patch-bearing source (args patch fields, then
+ * the raw patch, then altArgs).
+ */
+export function extractFilePaths(args: Record<string, unknown>, altArgs?: Record<string, unknown>, rawPatch?: unknown): string[] {
+  const explicit = asString(args.file_path) ?? asString(args.filePath) ?? asString(args.path);
+  if (explicit) return [explicit];
+  const fromArgs = extractPatchPaths(args.patchText ?? args.patch ?? args.diff ?? args.input);
+  if (fromArgs.length > 0) return fromArgs;
+  const fromRaw = extractPatchPaths(rawPatch);
+  if (fromRaw.length > 0) return fromRaw;
+  if (altArgs) {
+    const altExplicit = asString(altArgs.file_path) ?? asString(altArgs.filePath) ?? asString(altArgs.path);
+    if (altExplicit) return [altExplicit];
+    return extractPatchPaths(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input);
+  }
+  return [];
 }
 
 const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> => {
@@ -1440,22 +1481,27 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     }
   }
 
-  // Bug 5: file-touch recall.
+  // Bug 5: file-touch recall. A patch can touch several files: prefetch
+  // governing memories for every extracted path and combine the per-file
+  // recall blocks.
   let snippets: string[] = [];
-  let filePath: string | undefined;
+  let filePaths: string[] = [];
+  let block: string | undefined;
   if (isFileTouchTool(toolName)) {
-    filePath = extractFilePath(args, altArgs, input?.input);
-    if (filePath) {
+    filePaths = extractFilePaths(args, altArgs, input?.input);
+    const blocks: string[] = [];
+    for (const fp of filePaths) {
       try {
-        snippets = await prefetchMemoriesForFile(config.namespace, filePath);
+        const fileSnippets = await prefetchMemoriesForFile(config.namespace, fp);
+        snippets.push(...fileSnippets);
+        if (fileSnippets.length > 0) blocks.push(formatFileTouchRecallBlock(fp, fileSnippets));
       } catch {
-        snippets = [];
+        // prefetch failures are fail-soft, per file
       }
     }
+    if (blocks.length > 0) block = blocks.join("\n");
   }
-  let block: string | undefined;
-  if (snippets.length > 0 && filePath) {
-    block = formatFileTouchRecallBlock(filePath, snippets);
+  if (block) {
     input.additionalContext = block;
     input.neurostrataContext = block;
   }
@@ -1463,7 +1509,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   // Non-mutating file-touch with recalled snippets -> return the recall block.
   if (snippets.length > 0 && !isMutatingTool(toolName)) {
     if (block) enqueuePendingRecall(block, asRecord(input), args);
-    if (filePath) confirmPrefetchDelivery(config.namespace, filePath);
+    for (const fp of filePaths) confirmPrefetchDelivery(config.namespace, fp);
     return { additionalContext: block, neurostrataContext: block, snippets };
   }
 
@@ -1506,7 +1552,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
         // The recall block never reaches the caller on a rejection, so the
         // prefetch dedup state is rolled back: an allowed retry must still
         // see the governing rules.
-        if (filePath) restorePrefetchDelivery(config.namespace, filePath);
+        for (const fp of filePaths) restorePrefetchDelivery(config.namespace, fp);
         if (message.includes("Zero-Action Start violation:") || message.includes("Guard rejected")) throw err;
         throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
       }
@@ -1514,7 +1560,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     mutationsSinceNote++;
   }
 
-  if (filePath) confirmPrefetchDelivery(config.namespace, filePath);
+  for (const fp of filePaths) confirmPrefetchDelivery(config.namespace, fp);
   if (block) {
     enqueuePendingRecall(block, asRecord(input), args);
     return { additionalContext: block, neurostrataContext: block, snippets };
@@ -1670,20 +1716,22 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
       };
     }
 
-    // File-touch tools: prefetch governing memories, build recall block.
+    // File-touch tools: prefetch governing memories for every extracted
+    // path (a patch can touch several files), build the combined recall block.
     let recallBlock: string | undefined;
-    let recalledFilePath: string | undefined;
+    let recalledFilePaths: string[] = [];
     if (isFileTouchTool(toolNameRaw)) {
-      const filePath = extractFilePath(toolInput, undefined, toolInputRaw);
-      if (filePath) {
-        recalledFilePath = filePath;
+      recalledFilePaths = extractFilePaths(toolInput, undefined, toolInputRaw);
+      const blocks: string[] = [];
+      for (const fp of recalledFilePaths) {
         try {
-          const snippets = await prefetchMemoriesForFile(config.namespace, filePath);
-          if (snippets.length > 0) recallBlock = formatFileTouchRecallBlock(filePath, snippets);
+          const snippets = await prefetchMemoriesForFile(config.namespace, fp);
+          if (snippets.length > 0) blocks.push(formatFileTouchRecallBlock(fp, snippets));
         } catch {
-          // prefetch failures are fail-soft
+          // prefetch failures are fail-soft, per file
         }
       }
+      if (blocks.length > 0) recallBlock = blocks.join("\n");
     }
 
     // A denial never delivers the recall block, so the prefetch dedup state
@@ -1691,7 +1739,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
     // rules. The block is attached to the denial as well, so the agent reads
     // the rules that blocked it.
     const denyWithRecall = (reason: string) => {
-      if (recalledFilePath) restorePrefetchDelivery(config.namespace, recalledFilePath);
+      for (const fp of recalledFilePaths) restorePrefetchDelivery(config.namespace, fp);
       return {
         ...(recallBlock ? { systemMessage: recallBlock } : {}),
         hookSpecificOutput: {
@@ -1756,7 +1804,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
       }
       mutationsSinceNote++;
     }
-    if (recalledFilePath) confirmPrefetchDelivery(config.namespace, recalledFilePath);
+    for (const fp of recalledFilePaths) confirmPrefetchDelivery(config.namespace, fp);
     return {
       continue: true,
       ...(recallBlock ? { systemMessage: recallBlock } : {}),
