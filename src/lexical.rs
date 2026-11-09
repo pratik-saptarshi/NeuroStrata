@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field as TantivyField, Schema, STORED, STRING, TEXT, FAST, INDEXED, Value as TantivyValue};
+use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, QueryParser, RangeQuery, TermQuery};
+use tantivy::schema::{Field as TantivyField, IndexRecordOption, Schema, STORED, STRING, TEXT, FAST, INDEXED, Value as TantivyValue};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::traits::{MemoryPayload};
@@ -394,10 +394,73 @@ impl TantivyLexicalIndex {
         let tokenized_query = tokenize_code_for_tantivy(query_str);
         let parsed = parser.parse_query(&tokenized_query)?;
 
+        // Apply the row filters inside the query, before TopDocs collects:
+        // filtering afterwards lets higher-scoring rows from other
+        // namespaces (or excluded tasks / archived / retired rows) exhaust
+        // fetch_limit and starve matches that would have survived the
+        // filters. The per-hit checks below stay as defense in depth.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let visible_at = as_of.unwrap_or(now);
+        // tantivy 0.27 has no Occur::Filter; a Must clause wrapped in a
+        // zero-score ConstScoreQuery filters without touching BM25 ranking.
+        fn filter(query: Box<dyn tantivy::query::Query>) -> (Occur, Box<dyn tantivy::query::Query>) {
+            (Occur::Must, Box::new(ConstScoreQuery::new(query, 0.0)))
+        }
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
+            (Occur::Must, parsed),
+            filter(Box::new(TermQuery::new(
+                Term::from_field_text(self.namespace_f, namespace),
+                IndexRecordOption::Basic,
+            ))),
+            // Not yet retired at the visible moment: valid_to unset (0) or
+            // strictly after it. Mirrors the per-hit validity check below.
+            filter(Box::new(BooleanQuery::new(vec![
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_i64(self.valid_to_f, 0),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn tantivy::query::Query>,
+                ),
+                (
+                    Occur::Should,
+                    Box::new(RangeQuery::new(
+                        std::ops::Bound::Excluded(Term::from_field_i64(self.valid_to_f, visible_at)),
+                        std::ops::Bound::Unbounded,
+                    )) as Box<dyn tantivy::query::Query>,
+                ),
+            ]))),
+        ];
+        if let Some(ts) = as_of {
+            clauses.push(filter(Box::new(RangeQuery::new(
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Included(Term::from_field_i64(self.valid_from_f, ts)),
+            ))));
+        }
+        if !include_tasks {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.memory_type_f, "task"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if !include_archived {
+            clauses.push(filter(Box::new(RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_i64(self.archived_f, 0)),
+                std::ops::Bound::Included(Term::from_field_i64(self.archived_f, 0)),
+            ))));
+        }
+        let filtered_query = BooleanQuery::new(clauses);
+
         let fetch_limit = (limit.max(1) * 8) as usize;
         let searcher = self.reader.searcher();
         let top_docs = TopDocs::with_limit(fetch_limit).order_by_score();
-        let hits: Vec<(f32, tantivy::DocAddress)> = searcher.search(&parsed, &top_docs)?;
+        let hits: Vec<(f32, tantivy::DocAddress)> = searcher.search(&filtered_query, &top_docs)?;
 
         let mut candidates: Vec<TantivyHit> = Vec::with_capacity(hits.len());
         for (score, doc_address) in hits {
@@ -666,6 +729,66 @@ mod tests {
         assert!(
             !hits.iter().any(|h| h.id == "already-expired"),
             "past valid_to must be hidden in an ordinary search, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    fn payload_typed(content: &str, memory_type: &str) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "test-user".to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: "/src/lib.rs".to_string(),
+            location_lines: "1-10".to_string(),
+            metadata: json!({"valid_from": 100, "valid_to": 0, "archived": 0}),
+        }
+    }
+
+    #[test]
+    fn test_search_namespace_filter_applies_before_top_docs() {
+        // fetch_limit is limit*8: with limit=2 the collector takes the top 16
+        // hits globally. If namespace filtering happened only afterwards,
+        // 24 higher-scoring namespace-A rows would exhaust that window and
+        // namespace B's match would never be collected.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..24 {
+            let p = payload_typed("sharedtoken sharedtoken sharedtoken", "memory");
+            idx.upsert_memory("A", &format!("a{i}"), &p).unwrap();
+        }
+        let b = payload_typed(
+            "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
+            "memory",
+        );
+        idx.upsert_memory("B", "b1", &b).unwrap();
+
+        let hits = idx.search("B", "sharedtoken", 2, true, true, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "b1"),
+            "namespace B match must be collected even when A outscores it, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_task_filter_applies_before_top_docs() {
+        // Same starvation shape for the task filter: higher-scoring task
+        // rows must not consume the TopDocs window when tasks are excluded.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..24 {
+            let p = payload_typed("sharedtoken sharedtoken sharedtoken", "task");
+            idx.upsert_memory("ns", &format!("t{i}"), &p).unwrap();
+        }
+        let m = payload_typed(
+            "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
+            "memory",
+        );
+        idx.upsert_memory("ns", "m1", &m).unwrap();
+
+        let hits = idx.search("ns", "sharedtoken", 2, false, true, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "m1"),
+            "non-task match must be collected even when excluded tasks outscore it, got: {:?}",
             hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
         );
     }
