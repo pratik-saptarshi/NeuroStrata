@@ -18,7 +18,7 @@
 // ──────────────────────────────────────────────────────────────────────
 // Node built-ins only (ESM). Zero require(), zero external runtime deps.
 // ──────────────────────────────────────────────────────────────────────
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 // ──────────────────────────────────────────────────────────────────────
@@ -1018,6 +1018,7 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
         toolName === "neurostrata_task_complete" ||
         payloadArgs.note !== undefined) {
         mutationsSinceNote = 0;
+        resetPersistedMutationCounter(sessionId);
     }
     if (MEMORY_MUTATION_TOOLS.has(toolName)) {
         cachedTaskInjection.clear();
@@ -1059,6 +1060,146 @@ export function resetClientForTesting() {
 }
 export function getTrackingState() {
     return { activeTaskId, activeSessionId, mutationsSinceNote };
+}
+// ──────────────────────────────────────────────────────────────────────
+// N2: mutation-counter persistence for stateless hook processes.
+//
+// Stateless CLI hooks run one Node process per tool invocation, so the
+// in-process `mutationsSinceNote` above resets to 0 every time and the
+// daemon's BreathRequired threshold can never trigger in that shape.
+// The counter is therefore also persisted per session in
+// <projectRoot>/.NeuroStrata/hook-state/mutations-<session-key>.json
+// (the plugin's existing local-state convention; see session_queries.json).
+// Every helper fails OPEN: bookkeeping must never block a tool call, so
+// any error falls back to today's in-process behaviour.
+// ──────────────────────────────────────────────────────────────────────
+function sanitizeMutationCounterKey(raw) {
+    const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+    return cleaned.length > 0 ? cleaned : "shared";
+}
+export function mutationCounterFilePath(sessionId) {
+    const key = sanitizeMutationCounterKey(sessionId ?? activeSessionId ?? "shared");
+    return join(findProjectRoot(), ".NeuroStrata", "hook-state", `mutations-${key}.json`);
+}
+export function readPersistedMutationCounter(sessionId) {
+    try {
+        const parsed = JSON.parse(readFileSync(mutationCounterFilePath(sessionId), "utf8"));
+        const value = parsed !== null && typeof parsed === "object"
+            ? parsed.mutations_since_note
+            : undefined;
+        return typeof value === "number" && Number.isFinite(value) && value >= 0
+            ? Math.floor(value)
+            : null;
+    }
+    catch {
+        return null;
+    }
+}
+function sleepMsSync(ms) {
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    }
+    catch {
+        // No SharedArrayBuffer/Atomics.wait: proceed without the pause; the
+        // bounded deadline below still caps the total wait.
+    }
+}
+const MUTATION_COUNTER_LOCK_TIMEOUT_MS = 2000;
+const MUTATION_COUNTER_LOCK_POLL_MS = 10;
+const MUTATION_COUNTER_LOCK_STALE_MS = 10_000;
+/**
+ * Acquire the exclusive lock directory for a counter file (mkdirSync is an
+ * atomic create). Polls briefly; a lock older than the stale threshold is
+ * presumed to belong to a crashed holder and is stolen. Returns the lock
+ * dir path, or null on timeout/failure (callers fail open).
+ */
+function acquireMutationCounterLock(filePath) {
+    const lockDir = `${filePath}.lock`;
+    const deadline = Date.now() + MUTATION_COUNTER_LOCK_TIMEOUT_MS;
+    while (true) {
+        try {
+            mkdirSync(lockDir);
+            return lockDir;
+        }
+        catch {
+            let stale = false;
+            try {
+                stale = Date.now() - statSync(lockDir).mtimeMs > MUTATION_COUNTER_LOCK_STALE_MS;
+            }
+            catch {
+                // Lock vanished between attempts (or never existed): just retry.
+            }
+            if (stale) {
+                try {
+                    rmSync(lockDir, { recursive: true, force: true });
+                }
+                catch {
+                    // Another process may have stolen it first; the retry decides.
+                }
+                continue;
+            }
+            if (Date.now() >= deadline)
+                return null;
+            sleepMsSync(MUTATION_COUNTER_LOCK_POLL_MS);
+        }
+    }
+}
+function releaseMutationCounterLock(lockDir) {
+    try {
+        rmSync(lockDir, { recursive: true, force: true });
+    }
+    catch {
+        // best-effort; a stranded lock goes stale and is stolen later
+    }
+}
+/** Write under the caller's lock: tmp file + atomic rename, never torn. */
+function writePersistedMutationCounter(filePath, value) {
+    const tmpPath = `${filePath}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, JSON.stringify({ mutations_since_note: value, updated_at: Math.floor(Date.now() / 1000) }));
+    renameSync(tmpPath, filePath);
+}
+/**
+ * Increment the persisted counter under its lock and return the new value,
+ * or null on any failure (callers fall back to the in-process increment).
+ */
+export function bumpPersistedMutationCounter(sessionId) {
+    const filePath = mutationCounterFilePath(sessionId);
+    let lockDir = null;
+    try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        lockDir = acquireMutationCounterLock(filePath);
+        if (lockDir === null)
+            return null;
+        const next = (readPersistedMutationCounter(sessionId) ?? 0) + 1;
+        writePersistedMutationCounter(filePath, next);
+        return next;
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (lockDir !== null)
+            releaseMutationCounterLock(lockDir);
+    }
+}
+/** Persist a reset to 0 under the same lock. Best-effort; never throws. */
+export function resetPersistedMutationCounter(sessionId) {
+    const filePath = mutationCounterFilePath(sessionId);
+    let lockDir = null;
+    try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        lockDir = acquireMutationCounterLock(filePath);
+        if (lockDir === null)
+            return;
+        writePersistedMutationCounter(filePath, 0);
+    }
+    catch {
+        // fail open: the in-process reset already happened
+    }
+    finally {
+        if (lockDir !== null)
+            releaseMutationCounterLock(lockDir);
+    }
 }
 // ──────────────────────────────────────────────────────────────────────
 // Bug 5: execute.before / execute.after recall delivery
@@ -1249,6 +1390,7 @@ const executeBeforeHandler = async (input) => {
             activeSessionId = inspection.sessionId;
         if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
             mutationsSinceNote = 0;
+            resetPersistedMutationCounter(inspection.sessionId ?? undefined);
         }
         if (inspection.taskCompleted) {
             if (activeTaskId)
@@ -1360,6 +1502,9 @@ const executeBeforeHandler = async (input) => {
             if (!mcpClient) {
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): no MCP client`);
             }
+            const persistedMutations = readPersistedMutationCounter(session_id);
+            if (persistedMutations !== null)
+                mutationsSinceNote = persistedMutations;
             try {
                 const text = await mcpClient.callTool("neurostrata_guard_validate", {
                     namespace: config.namespace,
@@ -1391,7 +1536,8 @@ const executeBeforeHandler = async (input) => {
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
             }
         }
-        mutationsSinceNote++;
+        const bumpedMutations = bumpPersistedMutationCounter(asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined);
+        mutationsSinceNote = bumpedMutations ?? mutationsSinceNote + 1;
     }
     for (const fp of filePaths)
         confirmPrefetchDelivery(config.namespace, fp);
@@ -1505,6 +1651,7 @@ export async function handleHookEvent(event) {
                 activeSessionId = inspection.sessionId;
             if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
                 mutationsSinceNote = 0;
+                resetPersistedMutationCounter(inspection.sessionId ?? undefined);
             }
             if (inspection.taskCompleted) {
                 if (activeTaskId)
@@ -1596,6 +1743,9 @@ export async function handleHookEvent(event) {
                 try {
                     if (!mcpClient)
                         throw new Error("no MCP client");
+                    const persistedMutations = readPersistedMutationCounter(session_id);
+                    if (persistedMutations !== null)
+                        mutationsSinceNote = persistedMutations;
                     const text = await mcpClient.callTool("neurostrata_guard_validate", {
                         namespace: config.namespace,
                         session_id,
@@ -1623,7 +1773,8 @@ export async function handleHookEvent(event) {
                     return denyWithRecall(`Guard unavailable: ${message}`);
                 }
             }
-            mutationsSinceNote++;
+            const bumpedMutations = bumpPersistedMutationCounter(asString(event.session_id) ?? asString(event.sessionID) ?? activeSessionId ?? undefined);
+            mutationsSinceNote = bumpedMutations ?? mutationsSinceNote + 1;
         }
         for (const fp of recalledFilePaths)
             confirmPrefetchDelivery(config.namespace, fp);
