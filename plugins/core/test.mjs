@@ -411,6 +411,55 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
     }
   });
 
+  it("PreToolUse Task with hook session id resolves the hook session's task and injects its daemon context", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      const target = { prompt: "Do the work" };
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        session_id: "sess-d1",
+        tool_input: target,
+      });
+      assert.equal(out.continue, true);
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+      const prompt = out.hookSpecificOutput.updatedInput.prompt;
+      assert.ok(prompt.includes("### NeuroStrata Task & Graph Context"), "prompt must carry the injected context marker");
+      assert.ok(prompt.includes("### Injected daemon context"), "prompt must carry the resolved task's daemon injection");
+      assert.ok(!prompt.includes("unclaimed"), "prompt must not carry the bare unclaimed header");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("PreToolUse Task without hook session id stays unclaimed and gets no daemon injection", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      const target = { prompt: "Do the work" };
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_input: target,
+      });
+      assert.equal(out.continue, true);
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+      const prompt = out.hookSpecificOutput.updatedInput.prompt;
+      assert.ok(prompt.includes("### NeuroStrata Task & Graph Context"), "prompt must carry the injected context marker");
+      assert.ok(prompt.includes("unclaimed"), "header must show unclaimed without a matching session identity");
+      assert.ok(!prompt.includes("### Injected daemon context"), "daemon injection must be absent without a matching session identity");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
   it("PreToolUse file-touch returns recall block when daemon healthy", async () => {
     const { server, url } = await createMockDaemonServer();
     try {

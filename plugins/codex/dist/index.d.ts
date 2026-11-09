@@ -211,7 +211,7 @@ export declare function resolveActiveTaskFromDaemon(namespace: string, preferred
  * inject the daemon's subagent_prompt_injection plus any recalled snippets into the
  * target prompt. Idempotent.
  */
-export declare function enrichAndInjectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId?: string | null): Promise<boolean>;
+export declare function enrichAndInjectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId?: string | null, callerSessionId?: string | null): Promise<boolean>;
 export declare let activeSessionId: string | null;
 export declare let activeTaskId: string | null;
 export declare let mutationsSinceNote: number;

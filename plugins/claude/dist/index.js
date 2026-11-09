@@ -950,7 +950,7 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId, ca
  * inject the daemon's subagent_prompt_injection plus any recalled snippets into the
  * target prompt. Idempotent.
  */
-export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
+export async function enrichAndInjectSubagentPrompt(target, namespace, taskId, callerSessionId) {
     const field = subagentInstructionField(target);
     if (field === null)
         return false;
@@ -961,12 +961,12 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     let effectiveTaskId = taskId ?? null;
     let injection = null;
     if (!effectiveTaskId) {
-        const resolved = await resolveActiveTaskFromDaemon(namespace);
+        const resolved = await resolveActiveTaskFromDaemon(namespace, null, callerSessionId);
         effectiveTaskId = resolved.taskId;
         injection = resolved.promptInjection;
     }
     else if (!cachedTaskInjection.has(effectiveTaskId)) {
-        const resolved = await resolveActiveTaskFromDaemon(namespace, effectiveTaskId);
+        const resolved = await resolveActiveTaskFromDaemon(namespace, effectiveTaskId, callerSessionId);
         injection = cachedTaskInjection.get(effectiveTaskId) ?? resolved.promptInjection ?? null;
     }
     else {
@@ -1302,7 +1302,7 @@ const executeBeforeHandler = async (input) => {
         }
         for (const target of targets) {
             try {
-                await enrichAndInjectSubagentPrompt(target, config.namespace, activeTaskId);
+                await enrichAndInjectSubagentPrompt(target, config.namespace, activeTaskId, asString(input?.session_id) ?? asString(input?.sessionID) ?? undefined);
             }
             catch {
                 injectSubagentPrompt(target, config.namespace, activeTaskId);
@@ -1528,7 +1528,7 @@ export async function handleHookEvent(event) {
         }
         // Subagent tools: enrich & inject subagent prompt, return allow + updatedInput.
         if (isSubagentTool(toolNameRaw)) {
-            await enrichAndInjectSubagentPrompt(toolInput, config.namespace, activeTaskId);
+            await enrichAndInjectSubagentPrompt(toolInput, config.namespace, activeTaskId, asString(event.session_id) ?? asString(event.sessionID) ?? undefined);
             return {
                 continue: true,
                 hookSpecificOutput: {
