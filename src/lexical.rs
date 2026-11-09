@@ -433,8 +433,16 @@ impl TantivyLexicalIndex {
                     continue;
                 }
             } else {
-                if valid_to != 0 {
-                    continue; // active only at current time when no as_of
+                // No as_of: visible at the current time, mirroring the
+                // in-house engine's retirement_visible — a row retires only
+                // once its valid_to has actually passed, not merely because
+                // an expiration exists.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if valid_to != 0 && valid_to <= now {
+                    continue;
                 }
             }
 
@@ -616,6 +624,50 @@ mod tests {
         assert!(!excluded2.iter().any(|h| h.id == "arch-int-rebuild"));
         let included2 = idx2.search("ns", "tombstone rebuild", 10, true, true, None).unwrap();
         assert!(included2.iter().any(|h| h.id == "arch-int-rebuild"));
+    }
+
+    fn payload_with_valid_to(content: &str, valid_to: i64) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "test-user".to_string(),
+            memory_type: "memory".to_string(),
+            agent_name: None,
+            location: "/src/lib.rs".to_string(),
+            location_lines: "1-10".to_string(),
+            metadata: json!({"valid_from": 100, "valid_to": valid_to, "archived": 0}),
+        }
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn test_future_valid_to_stays_visible_until_it_expires() {
+        // A memory whose valid_to lies in the future has not retired yet: an
+        // ordinary search (as_of: None, as search_tantivy_lexical always
+        // passes) must return it, while an already-expired one must not.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let now = now_unix();
+        let live = payload_with_valid_to("expiring token future row", now + 86_400);
+        idx.upsert_memory("ns", "expires-later", &live).unwrap();
+        let dead = payload_with_valid_to("expiring token past row", now - 86_400);
+        idx.upsert_memory("ns", "already-expired", &dead).unwrap();
+
+        let hits = idx.search("ns", "expiring token", 10, true, true, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "expires-later"),
+            "future valid_to must stay visible in an ordinary search, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !hits.iter().any(|h| h.id == "already-expired"),
+            "past valid_to must be hidden in an ordinary search, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
