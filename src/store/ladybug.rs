@@ -4890,6 +4890,19 @@ impl LadybugStore {
             if doc.archived {
                 meta.insert("archived".to_string(), Value::Number(1.into()));
             }
+            // Preserve the exclusion flags lexical_doc decided: upsert_memory
+            // re-derives them from payload metadata via is_registry_row /
+            // is_conflicting_metadata, so dropping them here would index
+            // rows the rebuild path (full payloads) correctly excludes.
+            if doc.registry {
+                meta.insert(
+                    "domain_registry".to_string(),
+                    serde_json::json!({"domains": []}),
+                );
+            }
+            if doc.conflicting {
+                meta.insert("mesh".to_string(), serde_json::json!({"conflict": true}));
+            }
             let payload = MemoryPayload {
                 content: doc.content.clone(),
                 user_id: doc.user_id.clone(),
@@ -5156,6 +5169,13 @@ impl LadybugStore {
                     if archived {
                         continue;
                     }
+                }
+                // Defense in depth: registry and mesh-conflicting rows are
+                // excluded at index time, but a stale index entry must not
+                // surface them either (the in-house engine's doc_visible
+                // rejects both classes on every read).
+                if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                    continue;
                 }
                 let vis = crate::rebac::extract_visible_to(&payload.metadata);
                 if !crate::rebac::allowed(principal, &payload.user_id, "viewer", &vis) {
@@ -14946,6 +14966,107 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata,
         }
+    }
+
+    fn tantivy_exclusion_payload(content: &str, metadata: Value) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn tantivy_upsert_path_excludes_registry_and_conflicting_rows() {
+        // lexical_apply_doc rebuilds a payload from the LexicalDoc before
+        // calling upsert_memory; the registry/conflicting flags decided in
+        // lexical_doc must survive that reconstruction, or excluded rows
+        // are indexed and surface in Tantivy search until the next rebuild.
+        let store = retired_test_store().await;
+        *store.tantivy_lexical.write().unwrap() =
+            Some(crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap());
+
+        let registry_payload = tantivy_exclusion_payload(
+            "zebratoken registry row",
+            crate::registry::registry_metadata(&["auth".to_string()]),
+        );
+        let conflicting_payload = tantivy_exclusion_payload(
+            "zebratoken conflicting row",
+            json!({"mesh": {"conflict": true}}),
+        );
+        let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
+
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "registry-row", &registry_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "conflicting-row", &conflicting_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "clean-row", &clean_payload));
+
+        let guard = store.tantivy_lexical.read().unwrap();
+        let idx = guard.as_ref().expect("tantivy open");
+        let hits = idx.search("probe", "zebratoken", 10, true, true, None).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must be indexed, got: {ids:?}");
+        assert!(
+            !ids.contains(&"registry-row"),
+            "registry row must not be indexed via the upsert path, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conflicting-row"),
+            "mesh-conflicting row must not be indexed via the upsert path, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tantivy_search_hydration_excludes_registry_and_conflicting_rows() {
+        // Defense in depth at hydration: a stale index entry whose stored
+        // row is a registry or mesh-conflicting row must not surface from
+        // search_tantivy_lexical even when the entry itself carries no
+        // exclusion metadata.
+        let store = retired_test_store().await;
+        let registry_payload = tantivy_exclusion_payload(
+            "zebratoken registry row",
+            crate::registry::registry_metadata(&["auth".to_string()]),
+        );
+        let conflicting_payload = tantivy_exclusion_payload(
+            "zebratoken conflicting row",
+            json!({"mesh": {"conflict": true}}),
+        );
+        let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
+        // Store rows first (Tantivy not yet open, so nothing indexes live).
+        store.upsert("probe", "registry-row", vec![0.0; 4], registry_payload.clone()).await.unwrap();
+        store.upsert("probe", "conflicting-row", vec![0.0; 4], conflicting_payload.clone()).await.unwrap();
+        store.upsert("probe", "clean-row", vec![0.0; 4], clean_payload.clone()).await.unwrap();
+
+        // Seed a stale index: same ids/content, exclusion metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("registry-row", &registry_payload),
+            ("conflicting-row", &conflicting_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let outcome = store
+            .search_tantivy_lexical("probe", "zebratoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
+        assert!(
+            !ids.contains(&"registry-row"),
+            "registry row must not surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conflicting-row"),
+            "mesh-conflicting row must not surface from tantivy search, got: {ids:?}"
+        );
     }
 
     #[tokio::test]
