@@ -2337,4 +2337,64 @@ console.log(core.bumpPersistedMutationCounter(${JSON.stringify(session)}));
       rmSync(projectDir, { recursive: true, force: true });
     }
   });
+
+  it("(g) a checkpoint naming a different session also clears the outer event session's persisted counter (C2-1)", { timeout: 90000 }, async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const readPersisted = (key) => JSON.parse(readFileSync(join(hookStateDir, `mutations-${key}.json`), "utf8")).mutations_since_note;
+
+    // Case A reset shape (Code Mode): the executed code names session
+    // "current" while the outer event carries the session whose counter
+    // the bump paths credit and the guard actually checks.
+    const codeModeExplicitChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "execute", tool_input: { code: 'neurostrata_task_update({ id: "t1", session_id: "current", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    // Case B reset shape (native): tool_input names session "current",
+    // the outer event carries the gating session.
+    const nativeExplicitChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "neurostrata_task_update", tool_input: { id: "t1", session_id: "current", note: "checkpoint" }, session_id: process.env.NS_SESSION });
+`;
+
+    // Case A through the execute.before handler, captured from
+    // initialize() with a fake host ctx (the capture pattern used by
+    // test (e) shape 2), in a fresh process.
+    const codeModeExplicitBeforeChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+let beforeHook = null;
+await core.initialize({
+  config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" },
+  tool: { hook: async (name, fn) => { if (name === "execute.before") beforeHook = fn; } },
+});
+if (typeof beforeHook !== "function") { console.error("execute.before hook was not registered"); process.exit(3); }
+await beforeHook({ tool: "execute", input: { code: 'neurostrata_task_update({ id: "t1", session_id: "current", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    async function runShape(label, outerSession, resetScript, resetSource) {
+      for (let i = 0; i < 5; i++) {
+        await runChildAsync(projectDir, `edit-g-${label}-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: outerSession });
+      }
+      assert.equal(readPersisted(outerSession), 5, `${label}: five Edit processes persist a count of 5`);
+      await runChildAsync(projectDir, resetScript, resetSource, { NS_ENDPOINT: url, NS_SESSION: outerSession });
+      assert.equal(readPersisted(outerSession), 0, `${label}: the checkpoint clears the outer event session's persisted counter`);
+      assert.equal(readPersisted("current"), 0, `${label}: the checkpoint also clears the named session's persisted counter`);
+      const guardBefore = counters.guardMutations.length;
+      await runChildAsync(projectDir, `edit-g-${label}-next.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: outerSession });
+      assert.equal(counters.guardMutations[guardBefore], 0, `${label}: the next Edit after the checkpoint forwards 0 to the guard`);
+    }
+
+    try {
+      await runShape("codemode", "sess-c2-codemode", "reset-g-codemode.mjs", codeModeExplicitChildSource);
+      await runShape("native", "sess-c2-native", "reset-g-native.mjs", nativeExplicitChildSource);
+      await runShape("before", "sess-c2-before", "reset-g-before.mjs", codeModeExplicitBeforeChildSource);
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
 });

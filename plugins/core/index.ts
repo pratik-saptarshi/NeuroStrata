@@ -1146,6 +1146,16 @@ function trackNativeTaskToolCall(
   outerInput?: Record<string, unknown>,
 ): void {
   if (!TASK_MUTATION_TOOLS.has(toolName) && !MEMORY_MUTATION_TOOLS.has(toolName)) return;
+  // The chain identity is what the bump/guard paths resolve to without
+  // the call-named slot; capture the active session before this call's
+  // own adoption below overwrites it (C2-1).
+  const priorActiveSessionId = activeSessionId;
+  const callNamedSessionId = asString(payloadArgs.session_id) ?? undefined;
+  const chainSessionId =
+    asString(outerInput?.session_id) ??
+    asString(outerInput?.sessionID) ??
+    priorActiveSessionId ??
+    undefined;
   const sessionId =
     asString(payloadArgs.session_id) ??
     asString(outerInput?.session_id) ??
@@ -1158,7 +1168,7 @@ function trackNativeTaskToolCall(
     payloadArgs.note !== undefined
   ) {
     mutationsSinceNote = 0;
-    resetPersistedMutationCounter(sessionId);
+    resetPersistedMutationCounterForCheckpoint(callNamedSessionId, chainSessionId);
   }
   if (MEMORY_MUTATION_TOOLS.has(toolName)) {
     cachedTaskInjection.clear();
@@ -1404,6 +1414,42 @@ export function resetPersistedMutationCounter(sessionId?: string): void {
   }
 }
 
+/**
+ * Checkpoint reset (C2-1): clear the counter of the session the task
+ * call named AND the counter the fallback chain resolves to without
+ * the call-named slot, when the two differ.
+ *
+ * The bump paths have no call-named slot: they credit the counter of
+ * the identity the hook event itself carries (or the process's active
+ * session when the event is silent), and the guard reads and forwards
+ * that same counter — it is the one that gates BreathRequired. A
+ * checkpoint whose task call names a different session would otherwise
+ * clear only the named session's counter and leave the gating counter
+ * hot, so the checkpoint never restores progress. The named counter is
+ * still cleared, exactly as before: the note was recorded under that
+ * session, so its count is zero by definition. When the two identities
+ * coincide, or either is absent, this is exactly the single reset the
+ * call sites performed before — including the internal active/shared
+ * fallback when both are absent. Each reset keeps the same lock
+ * discipline and fail-open behavior; the two resets run sequentially,
+ * never nested.
+ */
+export function resetPersistedMutationCounterForCheckpoint(
+  callNamedSessionId?: string,
+  chainSessionId?: string,
+): void {
+  if (
+    callNamedSessionId !== undefined &&
+    chainSessionId !== undefined &&
+    callNamedSessionId !== chainSessionId
+  ) {
+    resetPersistedMutationCounter(callNamedSessionId);
+    resetPersistedMutationCounter(chainSessionId);
+    return;
+  }
+  resetPersistedMutationCounter(callNamedSessionId ?? chainSessionId);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Bug 5: execute.before / execute.after recall delivery
 // ──────────────────────────────────────────────────────────────────────
@@ -1614,6 +1660,11 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
       cachedTaskInjection.delete(inspection.id);
       activeTaskId = inspection.id;
     }
+    // The chain identity is what the bump/guard paths resolve to
+    // without the in-code slot; capture it before the adoption on the
+    // next line overwrites the active session (C2-1).
+    const chainSessionId =
+      asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined;
     if (inspection.sessionId) activeSessionId = inspection.sessionId;
     if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
       mutationsSinceNote = 0;
@@ -1621,14 +1672,12 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
       // session first, then the outer event's, then the active session —
       // a fresh stateless process has no active session, so without the
       // outer event the reset would fall back to the `shared` counter and
-      // never clear the real session's persisted count (C-46-1).
-      resetPersistedMutationCounter(
-        inspection.sessionId ??
-          asString(input?.session_id) ??
-          asString(input?.sessionID) ??
-          activeSessionId ??
-          undefined,
-      );
+      // never clear the real session's persisted count (C-46-1). When the
+      // in-code session differs from the chain identity, the checkpoint
+      // clears both: the bump paths credit the chain identity's counter,
+      // so clearing only the named one leaves the gating counter hot
+      // (C2-1).
+      resetPersistedMutationCounterForCheckpoint(inspection.sessionId ?? undefined, chainSessionId);
     }
     if (inspection.taskCompleted) {
       if (activeTaskId) cachedTaskInjection.delete(activeTaskId);
@@ -1903,20 +1952,23 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
         cachedTaskInjection.delete(inspection.id);
         activeTaskId = inspection.id;
       }
+      // The chain identity is what the bump/guard paths resolve to
+      // without the in-code slot; capture it before the adoption on the
+      // next line overwrites the active session (C2-1).
+      const chainSessionId =
+        asString(event.session_id) ?? asString(event.sessionID) ?? activeSessionId ?? undefined;
       if (inspection.sessionId) activeSessionId = inspection.sessionId;
       if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
         mutationsSinceNote = 0;
         // Same resolution as the bump/guard paths: in-code session, then
         // the outer event's, then the active session — otherwise a fresh
         // stateless process resets `shared` and the real session's
-        // persisted count survives the checkpoint (C-46-1).
-        resetPersistedMutationCounter(
-          inspection.sessionId ??
-            asString(event.session_id) ??
-            asString(event.sessionID) ??
-            activeSessionId ??
-            undefined,
-        );
+        // persisted count survives the checkpoint (C-46-1). When the
+        // in-code session differs from the chain identity, the checkpoint
+        // clears both: the bump paths credit the chain identity's
+        // counter, so clearing only the named one leaves the gating
+        // counter hot (C2-1).
+        resetPersistedMutationCounterForCheckpoint(inspection.sessionId ?? undefined, chainSessionId);
       }
       if (inspection.taskCompleted) {
         if (activeTaskId) cachedTaskInjection.delete(activeTaskId);
