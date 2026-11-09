@@ -443,8 +443,14 @@ pub fn execute_on_records(
                             let mut id_arg = "".to_string();
                             for (k, v) in &f.arguments {
                                 if *k == "id" {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        id_arg = s.clone();
+                                    match v {
+                                        graphql_parser::query::Value::String(s) => id_arg = s.clone(),
+                                        graphql_parser::query::Value::Variable(name) => {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                                id_arg = s.to_string();
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -452,8 +458,14 @@ pub fn execute_on_records(
                             let mut ns_arg = namespace.to_string();
                             for (k, v) in &f.arguments {
                                 if *k == "namespace" {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        ns_arg = s.clone();
+                                    match v {
+                                        graphql_parser::query::Value::String(s) => ns_arg = s.clone(),
+                                        graphql_parser::query::Value::Variable(name) => {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                                ns_arg = s.to_string();
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -884,6 +896,85 @@ mod tests {
         let ok = execute_on_records(&records, &Default::default(), "ns", "admin",
             "{ memories(namespace: \"ns\") { edges { node { id } } } }", None);
         assert!(ok.errors.is_empty());
+    }
+
+    #[test]
+    fn memory_id_via_variable_returns_record() {
+        let records = vec![("m1".into(), crate::traits::MemoryPayload {
+            content: "variable target".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        })];
+        // Variable-backed id must resolve, not fall through to null.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($id: ID!) { memory(id: $id) { id content } }",
+            Some(&json!({"id": "m1"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert!(!data["memory"].is_null(), "variable-backed id must return the record, got: {}", data);
+        assert_eq!(data["memory"]["id"], "m1");
+        assert_eq!(data["memory"]["content"], "variable target");
+
+        // Literal-id control: same record via a string literal.
+        let control = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\") { id content } }",
+            None,
+        );
+        assert!(control.errors.is_empty(), "errors: {:?}", control.errors);
+        let cdata = control.data.as_ref().unwrap();
+        assert_eq!(cdata["memory"]["id"], "m1");
+        assert_eq!(cdata["memory"]["content"], "variable target");
+    }
+
+    #[test]
+    fn memory_namespace_via_variable_is_resolved() {
+        let records = vec![("m1".into(), crate::traits::MemoryPayload {
+            content: "x".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        })];
+        // Same-namespace variable is allowed and returns the record.
+        let ok = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($ns: String) { memory(id: \"m1\", namespace: $ns) { id } }",
+            Some(&json!({"ns": "ns"})),
+        );
+        assert!(ok.errors.is_empty(), "errors: {:?}", ok.errors);
+        assert_eq!(ok.data.as_ref().unwrap()["memory"]["id"], "m1");
+
+        // Cross-namespace variable must hit the isolation check (i.e. the
+        // variable was actually resolved, not silently ignored).
+        let bad = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($ns: String) { memory(id: \"m1\", namespace: $ns) { id } }",
+            Some(&json!({"ns": "other"})),
+        );
+        assert!(bad.data.is_none(), "cross-namespace variable must be rejected");
+        assert!(bad.errors.iter().any(|e| e.message.contains("namespace isolation violation")
+            && e.message.contains("'other'") && e.message.contains("'ns'")));
     }
 
     #[test]
