@@ -456,6 +456,49 @@ fn sync_skills_and_agent_rules(
     (skills_installed, patched_agents)
 }
 
+/// Merge the NeuroStrata hook `entry` into one claude `hooks` event array
+/// (`PreToolUse` / `Stop`) of a pre-existing settings document.
+///
+/// - Event key absent: insert `[entry]` (the historical fresh-file shape).
+/// - Event key present and an array: append `entry` unless an entry already
+///   carries the NeuroStrata command `cmd` (dedup keeps wiring idempotent);
+///   existing user entries are preserved verbatim.
+/// - Event key present but NOT an array: return `false` without touching the
+///   value. The caller treats this as "not wired" (fail-honest) rather than
+///   destroying user data to force the registration in.
+fn merge_claude_hook_event(
+    h_obj: &mut serde_json::Map<String, Value>,
+    event: &str,
+    entry: Value,
+    cmd: &str,
+) -> bool {
+    match h_obj.get_mut(event) {
+        None => {
+            h_obj.insert(event.to_string(), json!([entry]));
+            true
+        }
+        Some(value) => match value.as_array_mut() {
+            Some(arr) => {
+                let already_registered = arr.iter().any(|e| {
+                    e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|hs| {
+                            hs.iter().any(|h| {
+                                h.get("command").and_then(|c| c.as_str()) == Some(cmd)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                if !already_registered {
+                    arr.push(entry);
+                }
+                true
+            }
+            None => false,
+        },
+    }
+}
+
 fn wire_harness_config(
     project_root: &Path,
     namespace: &str,
@@ -623,23 +666,56 @@ fn wire_harness_config(
                     write_doc = true;
                 }
                 if write_doc {
+                    // Merge into any pre-existing event arrays instead of the
+                    // old insert-only-if-absent behaviour, which silently
+                    // skipped registration whenever the user already had a
+                    // `PreToolUse`/`Stop` array (even an empty one) while
+                    // still reporting the config as wired.
+                    //
+                    // Fail-honest on malformed shapes: a `hooks` value that is
+                    // not an object, or an event value that is not an array,
+                    // cannot be merged without destroying user data, so the
+                    // wiring reports `None` (not wired) and leaves the file
+                    // untouched instead of claiming a registration that did
+                    // not happen.
+                    let mut wired = false;
                     if let Some(obj) = doc.as_object_mut() {
-                        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-                        if let Some(h_obj) = hooks.as_object_mut() {
-                            h_obj.entry("PreToolUse").or_insert_with(|| {
-                                json!([{
+                        let hooks_shape_ok = match obj.get_mut("hooks") {
+                            None => {
+                                obj.insert("hooks".to_string(), json!({}));
+                                true
+                            }
+                            Some(h) => h.is_object(),
+                        };
+                        if hooks_shape_ok {
+                            let h_obj = obj
+                                .get_mut("hooks")
+                                .and_then(|h| h.as_object_mut())
+                                .expect("hooks checked to be an object");
+                            let pre_tool_use = merge_claude_hook_event(
+                                h_obj,
+                                "PreToolUse",
+                                json!({
                                     "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
                                     "hooks": [{ "type": "command", "command": cmd }]
-                                }])
-                            });
-                            h_obj.entry("Stop").or_insert_with(|| {
-                                json!([{
+                                }),
+                                &cmd,
+                            );
+                            let stop = merge_claude_hook_event(
+                                h_obj,
+                                "Stop",
+                                json!({
                                     "hooks": [{ "type": "command", "command": cmd }]
-                                }])
-                            });
+                                }),
+                                &cmd,
+                            );
+                            wired = pre_tool_use && stop;
                         }
                     }
-                    return write_json_if_changed(&cfg_path, &doc);
+                    if wired {
+                        return write_json_if_changed(&cfg_path, &doc);
+                    }
+                    return None;
                 }
             }
             None
@@ -788,6 +864,248 @@ mod tests {
             "root opencode.json preserves existing plugins entries"
         );
         assert_eq!(root_doc.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
+    }
+
+    // --- Round-13 P1 regression tests: claude hook merge into pre-existing
+    // settings.local.json event arrays (PR #35 thread PRRT_kwDOVS6VQM61K3fO).
+
+    fn seed_claude_settings(tmp: &tempfile::TempDir, doc: &Value) -> String {
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).expect("create .claude");
+        let raw = serde_json::to_string_pretty(doc).unwrap();
+        std::fs::write(dir.join("settings.local.json"), &raw).expect("seed settings");
+        raw
+    }
+
+    fn read_claude_settings(tmp: &tempfile::TempDir) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+                .expect("read settings"),
+        )
+        .expect("parse settings")
+    }
+
+    fn expected_ns_command(tmp: &tempfile::TempDir) -> String {
+        let runner = tmp.path().join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let abs = runner
+            .canonicalize()
+            .unwrap_or(runner)
+            .to_string_lossy()
+            .to_string();
+        format!("NEUROSTRATA_NAMESPACE=TestProj node \"{}\"", abs)
+    }
+
+    fn event_entries<'a>(doc: &'a Value, event: &str) -> &'a Vec<Value> {
+        doc.get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|v| v.as_array())
+            .expect("event array")
+    }
+
+    fn count_ns_entries(entries: &[Value], cmd: &str) -> usize {
+        entries
+            .iter()
+            .filter(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("command").and_then(|c| c.as_str()) == Some(cmd)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    fn claude_config_wired(report: &Value) -> &Value {
+        report["installed_plugins"]
+            .as_array()
+            .expect("installed array")
+            .iter()
+            .find(|p| p["harness"] == json!("claude"))
+            .map(|p| &p["config_wired"])
+            .expect("claude entry")
+    }
+
+    #[test]
+    fn claude_wiring_merges_into_empty_existing_pretooluse_array() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_claude_settings(&tmp, &json!({ "hooks": { "PreToolUse": [] } }));
+
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        assert!(claude_config_wired(&report).is_string(), "claude config reported wired");
+
+        let doc = read_claude_settings(&tmp);
+        let cmd = expected_ns_command(&tmp);
+        let pre = event_entries(&doc, "PreToolUse");
+        assert_eq!(pre.len(), 1, "NS entry merged into the empty PreToolUse array: {pre:?}");
+        assert_eq!(count_ns_entries(pre, &cmd), 1);
+        assert_eq!(
+            pre[0].get("matcher").and_then(|m| m.as_str()),
+            Some("Read|Write|Edit|MultiEdit|Bash|Task")
+        );
+        assert_eq!(count_ns_entries(event_entries(&doc, "Stop"), &cmd), 1);
+    }
+
+    #[test]
+    fn claude_wiring_appends_to_existing_pretooluse_preserving_unrelated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unrelated = json!({
+            "matcher": "Glob",
+            "hooks": [{ "type": "command", "command": "echo user-hook" }]
+        });
+        seed_claude_settings(&tmp, &json!({ "hooks": { "PreToolUse": [unrelated] } }));
+
+        auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        let doc = read_claude_settings(&tmp);
+        let cmd = expected_ns_command(&tmp);
+        let pre = event_entries(&doc, "PreToolUse");
+        assert_eq!(pre.len(), 2, "NS entry appended, unrelated entry kept: {pre:?}");
+        assert_eq!(
+            pre[0],
+            json!({
+                "matcher": "Glob",
+                "hooks": [{ "type": "command", "command": "echo user-hook" }]
+            }),
+            "unrelated entry survives verbatim"
+        );
+        assert_eq!(count_ns_entries(pre, &cmd), 1);
+    }
+
+    #[test]
+    fn claude_wiring_merges_into_empty_existing_stop_array() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_claude_settings(&tmp, &json!({ "hooks": { "Stop": [] } }));
+
+        auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        let doc = read_claude_settings(&tmp);
+        let cmd = expected_ns_command(&tmp);
+        let stop = event_entries(&doc, "Stop");
+        assert_eq!(stop.len(), 1, "NS entry merged into the empty Stop array: {stop:?}");
+        assert_eq!(count_ns_entries(stop, &cmd), 1);
+        assert_eq!(count_ns_entries(event_entries(&doc, "PreToolUse"), &cmd), 1);
+    }
+
+    #[test]
+    fn claude_wiring_merges_into_nonempty_existing_stop_array() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unrelated = json!({
+            "hooks": [{ "type": "command", "command": "echo user-stop" }]
+        });
+        seed_claude_settings(&tmp, &json!({ "hooks": { "Stop": [unrelated] } }));
+
+        auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        let doc = read_claude_settings(&tmp);
+        let cmd = expected_ns_command(&tmp);
+        let stop = event_entries(&doc, "Stop");
+        assert_eq!(stop.len(), 2, "NS entry appended, unrelated entry kept: {stop:?}");
+        assert_eq!(
+            stop[0],
+            json!({ "hooks": [{ "type": "command", "command": "echo user-stop" }] }),
+            "unrelated entry survives verbatim"
+        );
+        assert_eq!(count_ns_entries(stop, &cmd), 1);
+    }
+
+    #[test]
+    fn claude_wiring_is_idempotent_across_repeated_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unrelated = json!({
+            "matcher": "Glob",
+            "hooks": [{ "type": "command", "command": "echo user-hook" }]
+        });
+        seed_claude_settings(&tmp, &json!({ "hooks": { "PreToolUse": [unrelated] } }));
+
+        auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        let doc = read_claude_settings(&tmp);
+        let cmd = expected_ns_command(&tmp);
+        let pre = event_entries(&doc, "PreToolUse");
+        assert_eq!(count_ns_entries(pre, &cmd), 1, "exactly one NS PreToolUse entry after two runs: {pre:?}");
+        assert_eq!(pre.len(), 2, "unrelated entry preserved exactly once: {pre:?}");
+        let stop = event_entries(&doc, "Stop");
+        assert_eq!(count_ns_entries(stop, &cmd), 1, "exactly one NS Stop entry after two runs: {stop:?}");
+        assert_eq!(stop.len(), 1);
+    }
+
+    #[test]
+    fn claude_wiring_fresh_file_pin() {
+        // PIN: no pre-existing settings file -> today's exact result.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+
+        auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        let doc = read_claude_settings(&tmp);
+        let cmd = expected_ns_command(&tmp);
+        assert_eq!(
+            event_entries(&doc, "PreToolUse"),
+            &vec![json!({
+                "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                "hooks": [{ "type": "command", "command": cmd }]
+            })]
+        );
+        assert_eq!(
+            event_entries(&doc, "Stop"),
+            &vec![json!({
+                "hooks": [{ "type": "command", "command": cmd }]
+            })]
+        );
+
+        // PIN: settings file exists but has no "hooks" key -> hooks added,
+        // unrelated top-level keys preserved.
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        seed_claude_settings(&tmp2, &json!({ "otherKey": "preserve" }));
+
+        auto_install_detected_plugins(tmp2.path(), "TestProj", Some("claude"));
+
+        let doc2 = read_claude_settings(&tmp2);
+        let cmd2 = expected_ns_command(&tmp2);
+        assert_eq!(doc2.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
+        assert_eq!(count_ns_entries(event_entries(&doc2, "PreToolUse"), &cmd2), 1);
+        assert_eq!(count_ns_entries(event_entries(&doc2, "Stop"), &cmd2), 1);
+    }
+
+    #[test]
+    fn claude_wiring_fails_honest_on_non_array_event_value() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seeded = seed_claude_settings(
+            &tmp,
+            &json!({ "hooks": { "PreToolUse": "not-an-array" } }),
+        );
+
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        assert!(
+            claude_config_wired(&report).is_null(),
+            "non-array event value must not be reported as wired: {}",
+            claude_config_wired(&report)
+        );
+        let after = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+            .expect("read settings after");
+        assert_eq!(after, seeded, "malformed settings file left untouched");
+    }
+
+    #[test]
+    fn claude_wiring_fails_honest_on_non_object_hooks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seeded = seed_claude_settings(&tmp, &json!({ "hooks": ["not", "an", "object"] }));
+
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+
+        assert!(
+            claude_config_wired(&report).is_null(),
+            "non-object hooks must not be reported as wired: {}",
+            claude_config_wired(&report)
+        );
+        let after = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+            .expect("read settings after");
+        assert_eq!(after, seeded, "malformed settings file left untouched");
     }
 
     #[test]
