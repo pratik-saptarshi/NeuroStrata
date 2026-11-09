@@ -156,6 +156,69 @@ pub(crate) fn resolve_arg_id<'a>(
     }
 }
 
+/// Path-aware extraction of a node's nested `edges` field arguments (F3).
+///
+/// A node's edge pagination state comes from that node's own nested
+/// `edges` selection, resolved through the shared T3 resolver (literal +
+/// variable forms) — never from the root field's pagination state. The
+/// walk follows the actual path per root field kind: for `memory` the
+/// nested field is a direct child of the root field's selection set; for
+/// `memories`/`search` the path is `edges { node { edges(…) } }`, where
+/// the connection-level `edges` takes no arguments in the schema and its
+/// arguments (if a query puts any there) are a decoy that must not be
+/// read. Fragment-nested `edges` fields are not read (the executor is
+/// fragment-blind everywhere; unchanged). Within one node's selection
+/// set, repeated or aliased `edges` fields collapse to a single page —
+/// the first one wins, because build_memory_node emits one fixed
+/// "edges" key and the executor merges no aliased subfields.
+///
+/// Returns `(first, after)`: each is `None` when the nested field or the
+/// argument is absent, so build_memory_node applies its own defaults
+/// (first 20; no resume) — the root's `first`/`after` are never a
+/// fallback.
+fn nested_edges_args<'a>(
+    root_field: &graphql_parser::query::Field<'a, &'a str>,
+    root_name: &str,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> (Option<i32>, Option<String>) {
+    fn first_field<'a, 'b>(
+        items: &'b [graphql_parser::query::Selection<'a, &'a str>],
+        name: &str,
+    ) -> Option<&'b graphql_parser::query::Field<'a, &'a str>> {
+        items.iter().find_map(|sel| match sel {
+            graphql_parser::query::Selection::Field(f) if f.name == name => Some(f),
+            _ => None,
+        })
+    }
+    let nested = if root_name == "memory" {
+        first_field(&root_field.selection_set.items, "edges")
+    } else {
+        first_field(&root_field.selection_set.items, "edges")
+            .and_then(|conn| first_field(&conn.selection_set.items, "node"))
+            .and_then(|node| first_field(&node.selection_set.items, "edges"))
+    };
+    let mut first = None;
+    let mut after = None;
+    if let Some(field) = nested {
+        for (k, v) in &field.arguments {
+            match *k {
+                "first" => {
+                    if let Some(n) = resolve_arg_i32(v, variables) {
+                        first = Some(n);
+                    }
+                }
+                "after" => {
+                    if let Some(s) = resolve_arg_string(v, variables) {
+                        after = Some(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (first, after)
+}
+
 fn sanitize_metadata(metadata: &Value, principal: &str, user_id: &str) -> Value {
     let mut cleaned = metadata.clone();
     if let Some(obj) = cleaned.as_object_mut() {
@@ -542,6 +605,12 @@ pub fn execute_on_records(
                                 ) });
                                 return GraphQLResponse { data: None, errors };
                             }
+                            // F3: the node's edges paginate from its own
+                            // nested `edges` arguments (direct child of
+                            // this root field), never from the root field's
+                            // pagination state — schema-invalid pagination
+                            // arguments on the memory root itself are inert.
+                            let (nested_first, nested_after) = nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && payload.memory_type != "" {
                                     root_result = build_memory_node(
@@ -550,8 +619,8 @@ pub fn execute_on_records(
                                         payload,
                                         edges_by_source,
                                         principal,
-                                        Some(var_first),
-                                        Some(&var_after),
+                                        nested_first,
+                                        nested_after.as_deref(),
                                         var_include_archived,
                                         var_include_retired,
                                     );
@@ -699,6 +768,12 @@ pub fn execute_on_records(
                                 Some(encode_cursor(sort_key, &last_id))
                             } else { None };
 
+                            // F3: each node's edges paginate from the
+                            // node's own nested `edges` arguments, walked
+                            // path-aware via edges { node { edges(…) } } —
+                            // never from this root field's pagination state
+                            // (which governs the connection page above only).
+                            let (nested_first, nested_after) = nested_edges_args(f, root_name, var_map);
                             let memory_edges_fixed: Vec<Value> = page.iter().map(|(id_str, payload)| {
                                 let sort_key = if root_name == "memories" { "valid_from" } else { "score" };
                                 if let Some(node) = build_memory_node(
@@ -707,8 +782,8 @@ pub fn execute_on_records(
                                     payload,
                                     edges_by_source,
                                     principal,
-                                    Some(var_first),
-                                    Some(&var_after),
+                                    nested_first,
+                                    nested_after.as_deref(),
                                     var_include_archived,
                                     var_include_retired,
                                 ) {
@@ -1557,5 +1632,185 @@ mod tests {
             "{ memory(id: \"boolreg\") { id } }", None);
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "boolreg", "registry:true-only row must be served by id: {}", resp.data.as_ref().unwrap());
+    }
+
+    // ---- T4 (F3) nested edges oracles ----
+    // A node's edges live in `edges_by_source`; the node's JSON carries one
+    // fixed "edges" connection object ({ edges, pageInfo }) built by
+    // build_memory_node. Nested pagination state must come from the node's
+    // own nested `edges` field arguments, never from the root field's.
+
+    fn t4_payload(valid_from: i64) -> crate::traits::MemoryPayload {
+        t3_payload("c", "fact", serde_json::json!({"valid_from": valid_from}))
+    }
+
+    fn t4_edges_map(n: usize) -> std::collections::HashMap<String, Vec<(String, String, Option<String>)>> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "m1".to_string(),
+            (0..n)
+                .map(|i| (format!("t{i}"), "rel".to_string(), None))
+                .collect::<Vec<_>>(),
+        );
+        m
+    }
+
+    fn t4_targets(node: &serde_json::Value) -> Vec<String> {
+        node["edges"]["edges"]
+            .as_array()
+            .expect("node edges must be an array")
+            .iter()
+            .map(|e| e["targetId"].as_str().expect("targetId must be a string").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn t4_o1_memory_nested_first_and_after_resume() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memory(id: \"m1\") { edges(first: 1) { edges { targetId } pageInfo { hasNextPage endCursor } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memory"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string()]);
+        assert_eq!(node["edges"]["pageInfo"]["hasNextPage"], json!(true));
+        let end_cursor = node["edges"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("endCursor must be present when hasNextPage")
+            .to_string();
+        assert_eq!(end_cursor, encode_cursor("edge", "m1:0"));
+        let q2 = format!("{{ memory(id: \"m1\") {{ edges(first: 1, after: \"{end_cursor}\") {{ edges {{ targetId }} }} }} }}");
+        let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
+        assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
+        assert_eq!(t4_targets(&resp2.data.as_ref().unwrap()["memory"]), vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn t4_o2_connection_depth_nested_first() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories { edges { node { id edges(first: 1) { edges { targetId } } } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string()]);
+    }
+
+    #[test]
+    fn t4_o3_connection_level_edges_args_are_a_decoy() {
+        // edges(first: 99) sits on the CONNECTION-level field, which takes no
+        // arguments in the schema; the node's own edges(first: 2) governs.
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories { edges(first: 99) { node { id edges(first: 2) { edges { targetId } } } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string(), "t1".to_string()]);
+    }
+
+    #[test]
+    fn t4_o4_aliased_memory_roots_extract_independently() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ a: memory(id: \"m1\") { edges(first: 1) { edges { targetId } } } b: memory(id: \"m1\") { edges(first: 3) { edges { targetId } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(t4_targets(&data["a"]), vec!["t0".to_string()]);
+        assert_eq!(t4_targets(&data["b"]), vec!["t0".to_string(), "t1".to_string(), "t2".to_string()]);
+    }
+
+    #[test]
+    fn t4_o5_root_state_isolation_and_memory_root_args_inert() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        // Root first: 1 must not cap the node's nested edges(first: 2).
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories(first: 1) { edges { node { id edges(first: 2) { edges { targetId } pageInfo { hasNextPage endCursor } } } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string(), "t1".to_string()]);
+        let end_cursor = node["edges"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("endCursor must be present when hasNextPage")
+            .to_string();
+        // Nested after carrying that genuine edge cursor resumes at t2.
+        let q2 = format!("{{ memories(first: 1) {{ edges {{ node {{ id edges(first: 2, after: \"{end_cursor}\") {{ edges {{ targetId }} }} }} }} }} }}");
+        let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
+        assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
+        let node2 = &resp2.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node2), vec!["t2".to_string(), "t3".to_string()]);
+        // Inertness leg: schema-invalid first: 2 ON the memory root itself no
+        // longer caps the node's edges — with no nested arguments the node
+        // serves its edges under the default 20 (all 5 here).
+        let edges5 = t4_edges_map(5);
+        let resp3 = execute_on_records(&records, &edges5, "ns", "admin",
+            "{ memory(id: \"m1\", first: 2) { edges { edges { targetId } } } }", None);
+        assert!(resp3.errors.is_empty(), "errors: {:?}", resp3.errors);
+        assert_eq!(
+            t4_targets(&resp3.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string(), "t1".to_string(), "t2".to_string(), "t3".to_string(), "t4".to_string()]
+        );
+    }
+
+    #[test]
+    fn t4_o6_cursor_provenance_edge_resumes_root_restarts() {
+        let records = vec![("m1".into(), t4_payload(100)), ("m2".into(), t4_payload(50))];
+        let edges = t4_edges_map(25);
+        // Page 1 via the nested selection.
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memory(id: \"m1\") { edges(first: 2) { edges { targetId } pageInfo { endCursor } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memory"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string(), "t1".to_string()]);
+        let edge_cursor = node["edges"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("endCursor must be present when hasNextPage")
+            .to_string();
+        assert_eq!(edge_cursor, encode_cursor("edge", "m1:1"));
+        // Page 2 via page 1's EDGE endCursor resumes correctly.
+        let q2 = format!("{{ memory(id: \"m1\") {{ edges(first: 2, after: \"{edge_cursor}\") {{ edges {{ targetId }} }} }} }}");
+        let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
+        assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
+        assert_eq!(t4_targets(&resp2.data.as_ref().unwrap()["memory"]), vec!["t2".to_string(), "t3".to_string()]);
+        // The ROOT connection's endCursor lives in a different cursor domain.
+        let resp_root = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories(first: 1) { pageInfo { hasNextPage endCursor } } }", None);
+        assert!(resp_root.errors.is_empty(), "errors: {:?}", resp_root.errors);
+        let root_cursor = resp_root.data.as_ref().unwrap()["memories"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("root endCursor must be present when hasNextPage")
+            .to_string();
+        assert_ne!(root_cursor, edge_cursor);
+        // Feeding it as nested after restarts silently at the first edge.
+        let q3 = format!("{{ memory(id: \"m1\") {{ edges(first: 2, after: \"{root_cursor}\") {{ edges {{ targetId }} }} }} }}");
+        let resp3 = execute_on_records(&records, &edges, "ns", "admin", &q3, None);
+        assert!(resp3.errors.is_empty(), "errors: {:?}", resp3.errors);
+        assert_eq!(t4_targets(&resp3.data.as_ref().unwrap()["memory"]), vec!["t0".to_string(), "t1".to_string()]);
+    }
+
+    #[test]
+    fn t4_o7_variable_form_nested_first() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "query($n: Int) { memory(id: \"m1\") { edges(first: $n) { edges { targetId } } } }",
+            Some(&json!({"n": 1})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t4_targets(&resp.data.as_ref().unwrap()["memory"]), vec!["t0".to_string()]);
+    }
+
+    #[test]
+    fn t4_o8_within_node_aliased_edges_collapse_first_wins() {
+        // One node selection carrying edges(first: 1) and an aliased
+        // edges(first: 3): build_memory_node emits a single "edges" page, so
+        // the two fields collapse to one page — first wins.
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memory(id: \"m1\") { edges(first: 1) { edges { targetId } } e2: edges(first: 3) { edges { targetId } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t4_targets(&resp.data.as_ref().unwrap()["memory"]), vec!["t0".to_string()]);
     }
 }
