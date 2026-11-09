@@ -1710,6 +1710,26 @@ mod tests {
     }
 
     #[test]
+    fn t4_o3b_connection_decoy_without_nested_args_keeps_default_page() {
+        // PIN: the plan's literal oracle-3 configuration — connection-level
+        // edges(first: 99) present with nested edges arguments ABSENT.
+        // Green pre- and post-fix by construction; guards against a future
+        // "nested-else-connection-fallback" regression, which would read
+        // the connection-level first: 99 and return 25 instead of the
+        // schema-default page of 20.
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories { edges(first: 99) { node { id edges { edges { targetId } } } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        let targets = t4_targets(node);
+        assert_eq!(targets.len(), 20, "expected the default page of 20, got {}: {targets:?}", targets.len());
+        assert_eq!(targets.first().map(String::as_str), Some("t0"));
+        assert_eq!(targets.last().map(String::as_str), Some("t19"));
+    }
+
+    #[test]
     fn t4_o4_aliased_memory_roots_extract_independently() {
         let records = vec![("m1".into(), t4_payload(100))];
         let edges = t4_edges_map(25);
