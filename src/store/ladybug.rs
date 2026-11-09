@@ -2236,8 +2236,10 @@ pub struct LadybugStore {
     /// Compiled ontology index per namespace (domain DAG, aliases, sub-properties).
     /// Swapped on `refresh_ontology`; read lock-free via ArcSwap.
     ontology: Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::rdf::OntologyIndex>>>,
-    /// Cached active-generation symbol ids for mention detection.
-    mention_symbol_ids: Arc<tokio::sync::RwLock<Option<(std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
+    /// Cached active-generation symbol ids for mention detection, keyed
+    /// by namespace: generation counters are namespace-local, so a
+    /// generation set alone does not identify whose ids are cached.
+    mention_symbol_ids: Arc<tokio::sync::RwLock<std::collections::HashMap<String, (std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
     /// Lazily built in-house lexical index, partitioned by namespace.
     lexical: Arc<std::sync::RwLock<crate::fts::LexicalIndex>>,
     /// Namespaces whose lexical partition is loaded. A namespace absent here is
@@ -3163,7 +3165,7 @@ impl LadybugStore {
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             pk_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(std::collections::BTreeMap::new())),
-            mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
+            mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
             metrics: Arc::new(
@@ -4503,7 +4505,7 @@ impl LadybugStore {
         let gens = self.active_generations_public(namespace).await?;
         {
             let guard = self.mention_symbol_ids.read().await;
-            if let Some((cached_gens, vec)) = guard.as_ref() {
+            if let Some((cached_gens, vec)) = guard.get(namespace) {
                 if *cached_gens == gens {
                     return Ok(vec.clone());
                 }
@@ -4511,7 +4513,7 @@ impl LadybugStore {
         }
         let vec = std::sync::Arc::new(self.symbol_ids(namespace).await?);
         let mut guard = self.mention_symbol_ids.write().await;
-        *guard = Some((gens, vec.clone()));
+        guard.insert(namespace.to_string(), (gens, vec.clone()));
         Ok(vec)
     }
 
@@ -14567,6 +14569,132 @@ eurostrata\src\daemon.rs",
                 .await
                 .is_ok(),
             "with the turn released mention_symbol_ids answers Ok, proving the busy call cached nothing"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Seed one published generation-1 `file` row (user `auto-ingestor`,
+    /// so `symbol_ids` counts it) for `namespace`; returns its scoped id.
+    /// The namespace's active-generation set afterwards is exactly `{1}`.
+    async fn seed_mention_symbol_project(
+        store: &LadybugStore,
+        namespace: &str,
+        logical_path: &str,
+    ) -> String {
+        store.init(namespace).await.unwrap();
+        assert_eq!(store.begin_generation(namespace, "source-a").await.unwrap(), 1);
+        let scoped_id = crate::parser::ingest::generation_scoped_id(namespace, 1, logical_path);
+        store
+            .upsert(
+                namespace,
+                &scoped_id,
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store.publish_generation(namespace, "source-a", 1).await.unwrap();
+        scoped_id
+    }
+
+    /// Round-13 P1 (PR #35, thread PRRT_kwDOVS6VQM61K3fK): the
+    /// mention-symbol cache was keyed only by the active-generation set.
+    /// Generation counters are namespace-local, so two projects whose
+    /// active sets are equal (`{1}` after each one's first publish)
+    /// collided: the second project was served the first project's
+    /// symbol ids. Each namespace must get its OWN ids, in both orders.
+    #[tokio::test]
+    async fn mention_symbol_ids_are_keyed_by_namespace_not_only_generation_set() {
+        // Order 1: alpha queried first, then beta.
+        let root =
+            std::env::temp_dir().join(format!("mention-cache-ns-a-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        let alpha_id =
+            seed_mention_symbol_project(&store, "mention-cache-alpha", "src/alpha.rs").await;
+        let beta_id =
+            seed_mention_symbol_project(&store, "mention-cache-beta", "src/beta.rs").await;
+        assert_eq!(
+            store.active_generations_public("mention-cache-alpha").await.unwrap(),
+            store.active_generations_public("mention-cache-beta").await.unwrap(),
+            "precondition: both namespaces share the same active-generation set"
+        );
+        let alpha = store.mention_symbol_ids("mention-cache-alpha").await.unwrap();
+        assert_eq!(*alpha, vec![alpha_id.clone()], "alpha gets its own symbol ids");
+        let beta = store.mention_symbol_ids("mention-cache-beta").await.unwrap();
+        assert_eq!(*beta, vec![beta_id.clone()], "beta must get its OWN symbol ids, not alpha's cached set");
+        let _ = std::fs::remove_dir_all(root);
+
+        // Order 2 (fresh store): beta queried first, then alpha.
+        let root =
+            std::env::temp_dir().join(format!("mention-cache-ns-b-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        let alpha_id =
+            seed_mention_symbol_project(&store, "mention-cache-alpha", "src/alpha.rs").await;
+        let beta_id =
+            seed_mention_symbol_project(&store, "mention-cache-beta", "src/beta.rs").await;
+        let beta = store.mention_symbol_ids("mention-cache-beta").await.unwrap();
+        assert_eq!(*beta, vec![beta_id], "beta gets its own symbol ids");
+        let alpha = store.mention_symbol_ids("mention-cache-alpha").await.unwrap();
+        assert_eq!(*alpha, vec![alpha_id], "alpha must get its OWN symbol ids, not beta's cached set");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Discrimination leg: a cache keyed by namespace ALONE (dropping
+    /// the generation set) must fail here — when the namespace's active
+    /// generation moves from 1 to 2, the answer must refresh to the new
+    /// generation's ids instead of serving the stale generation-1 set.
+    #[tokio::test]
+    async fn mention_symbol_ids_refresh_when_the_generation_set_changes() {
+        let root =
+            std::env::temp_dir().join(format!("mention-cache-gen-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        let gen1_id =
+            seed_mention_symbol_project(&store, "mention-cache-gen", "src/gen1.rs").await;
+        let first = store.mention_symbol_ids("mention-cache-gen").await.unwrap();
+        assert_eq!(*first, vec![gen1_id]);
+
+        assert_eq!(store.begin_generation("mention-cache-gen", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id(
+            "mention-cache-gen",
+            2,
+            "src/gen2.rs",
+        );
+        store
+            .upsert(
+                "mention-cache-gen",
+                &gen2_id,
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("mention-cache-gen", "source-a", 2).await.unwrap();
+
+        let refreshed = store.mention_symbol_ids("mention-cache-gen").await.unwrap();
+        assert_eq!(
+            *refreshed,
+            vec![gen2_id],
+            "a changed generation set must refresh the cached symbol ids"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Discrimination leg: removing the cache entirely must fail here —
+    /// a repeat call for the same namespace and generation set must be
+    /// served from the cache, observable as the very same `Arc`.
+    #[tokio::test]
+    async fn mention_symbol_ids_repeat_call_is_served_from_the_cache() {
+        let root =
+            std::env::temp_dir().join(format!("mention-cache-hit-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&root, 4).expect("open DB");
+        let only_id =
+            seed_mention_symbol_project(&store, "mention-cache-hit", "src/only.rs").await;
+        let first = store.mention_symbol_ids("mention-cache-hit").await.unwrap();
+        assert_eq!(*first, vec![only_id]);
+        let second = store.mention_symbol_ids("mention-cache-hit").await.unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "a repeat call for the same namespace+generation must reuse the cached Arc"
         );
         let _ = std::fs::remove_dir_all(root);
     }
