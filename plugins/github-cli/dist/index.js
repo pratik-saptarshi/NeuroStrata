@@ -828,11 +828,25 @@ export function buildSubagentContextHeader(namespace, taskId, extraContext) {
         extra +
         `\n`);
 }
+/**
+ * The field a subagent tool input carries its instructions in: "prompt" for
+ * most hosts, "message" for Codex spawn_agent. Prompt wins when both exist.
+ */
+function subagentInstructionField(target) {
+    if (typeof target.prompt === "string")
+        return "prompt";
+    if (typeof target.message === "string")
+        return "message";
+    return null;
+}
 export function injectSubagentPrompt(target, namespace, taskId, extraContext) {
-    const raw = typeof target.prompt === "string" ? target.prompt : null;
-    if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER))
+    const field = subagentInstructionField(target);
+    if (field === null)
         return false;
-    target.prompt = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
+    const raw = target[field];
+    if (raw.includes(SUBAGENT_CONTEXT_MARKER))
+        return false;
+    target[field] = buildSubagentContextHeader(namespace, taskId, extraContext) + raw;
     return true;
 }
 export function extractRepoFilePaths(promptText) {
@@ -854,11 +868,24 @@ export function extractRepoFilePaths(promptText) {
 // Cached daemon subagent prompt injections keyed by active task id.
 export const cachedTaskInjection = new Map();
 export const cachedSubagentPromptByTask = cachedTaskInjection;
+/** Session id a daemon task record is claimed under, if any. */
+function taskSessionId(rec) {
+    return (asString(rec.session_id) ??
+        asString(rec.claim?.session_id) ??
+        null);
+}
 /**
- * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
- * activeSessionId and cachedTaskInjection.
+ * Resolve the active task from the daemon (fail-soft). Caches activeTaskId
+ * and cachedTaskInjection. A task is adopted only when it is the caller's
+ * preferred task or when its claim session matches the caller's own session
+ * identity: a foreign session's task (and its session id) is never adopted.
+ * activeSessionId is only ever set from the caller's own identity, never
+ * from a task record.
  */
-export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
+export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId, callerSessionId) {
+    if (callerSessionId) {
+        activeSessionId = callerSessionId;
+    }
     if (!mcpClient) {
         return { taskId: activeTaskId, sessionId: activeSessionId, promptInjection: null };
     }
@@ -872,6 +899,7 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
             body = {};
         }
         const tasks = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.items) ? body.items : [];
+        const effectiveSessionId = callerSessionId ?? activeSessionId;
         let target = null;
         for (const item of tasks) {
             if (typeof item !== "object" || item === null)
@@ -885,32 +913,26 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
                 target = rec;
                 break;
             }
-            if (!target && asString(rec.status) === "in_progress") {
+            if (!target &&
+                effectiveSessionId &&
+                taskSessionId(rec) === effectiveSessionId &&
+                asString(rec.status) === "in_progress") {
                 target = rec;
             }
         }
-        if (!target && tasks.length > 0 && typeof tasks[0] === "object" && tasks[0] !== null) {
-            target = tasks[0];
-        }
         if (target) {
             const taskId = asString(target.id);
-            const sessionId = asString(target.session_id) ??
-                asString(target.claim?.session_id) ??
-                null;
             const promptInjection = asString(target.subagent_prompt_injection) ?? null;
             if (taskId) {
-                if (!preferredTaskId || taskId === preferredTaskId) {
-                    activeTaskId = taskId;
-                    activeSessionId = sessionId;
-                }
+                activeTaskId = taskId;
                 cachedTaskInjection.set(taskId, promptInjection);
             }
             if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
                 cachedTaskInjection.set(preferredTaskId, promptInjection);
             }
             return {
-                taskId: preferredTaskId ?? taskId ?? null,
-                sessionId: sessionId ?? activeSessionId,
+                taskId: preferredTaskId ?? taskId ?? activeTaskId,
+                sessionId: activeSessionId,
                 promptInjection: preferredTaskId ? (cachedTaskInjection.get(preferredTaskId) ?? promptInjection) : promptInjection,
             };
         }
@@ -929,7 +951,11 @@ export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
  * target prompt. Idempotent.
  */
 export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
-    if (typeof target.prompt !== "string" || target.prompt.includes(SUBAGENT_CONTEXT_MARKER)) {
+    const field = subagentInstructionField(target);
+    if (field === null)
+        return false;
+    const instructionText = target[field];
+    if (instructionText.includes(SUBAGENT_CONTEXT_MARKER)) {
         return false;
     }
     let effectiveTaskId = taskId ?? null;
@@ -949,7 +975,7 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     const extraLines = [];
     if (injection)
         extraLines.push(injection);
-    const files = extractRepoFilePaths(target.prompt).slice(0, 5);
+    const files = extractRepoFilePaths(instructionText).slice(0, 5);
     const seenInPrompt = new Set();
     for (const fp of files) {
         try {
@@ -1123,11 +1149,29 @@ function consumePendingRecall(meta, target) {
     }
     return shifted;
 }
-function extractPatchPath(raw) {
+/**
+ * Every file path a patch touches, deduped and order-preserving: Codex
+ * `*** Update/Add/Delete File:` headers, `*** Move to:` destinations, and
+ * unified-diff `--- a/` / `+++ b/` headers.
+ */
+export function extractPatchPaths(raw) {
     if (typeof raw !== "string")
-        return undefined;
-    const m = raw.match(/(?:^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*|^---\s+a\/|^\+\+\+\s+b\/)([^\r\n]+)/m);
-    return m?.[1]?.trim();
+        return [];
+    const regex = /^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*([^\r\n]+)|^\*\*\*\s+Move to:\s*([^\r\n]+)|^---\s+a\/([^\r\n]+)|^\+\+\+\s+b\/([^\r\n]+)/gm;
+    const out = [];
+    const seen = new Set();
+    let m;
+    while ((m = regex.exec(raw))) {
+        const p = (m[1] ?? m[2] ?? m[3] ?? m[4])?.trim();
+        if (p && !seen.has(p)) {
+            seen.add(p);
+            out.push(p);
+        }
+    }
+    return out;
+}
+function extractPatchPath(raw) {
+    return extractPatchPaths(raw)[0];
 }
 function extractFilePath(args, altArgs, rawPatch) {
     return (asString(args.file_path) ??
@@ -1141,6 +1185,30 @@ function extractFilePath(args, altArgs, rawPatch) {
                 asString(altArgs.path) ??
                 extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input))
             : undefined));
+}
+/**
+ * Multi-path counterpart of extractFilePath, with the same precedence: an
+ * explicit file_path/filePath/path wins as a single-element list; otherwise
+ * every path from the first patch-bearing source (args patch fields, then
+ * the raw patch, then altArgs).
+ */
+export function extractFilePaths(args, altArgs, rawPatch) {
+    const explicit = asString(args.file_path) ?? asString(args.filePath) ?? asString(args.path);
+    if (explicit)
+        return [explicit];
+    const fromArgs = extractPatchPaths(args.patchText ?? args.patch ?? args.diff ?? args.input);
+    if (fromArgs.length > 0)
+        return fromArgs;
+    const fromRaw = extractPatchPaths(rawPatch);
+    if (fromRaw.length > 0)
+        return fromRaw;
+    if (altArgs) {
+        const altExplicit = asString(altArgs.file_path) ?? asString(altArgs.filePath) ?? asString(altArgs.path);
+        if (altExplicit)
+            return [altExplicit];
+        return extractPatchPaths(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input);
+    }
+    return [];
 }
 const executeAfterHandler = async (output, secondArg) => {
     // The host may pass (input, output) or a single `output`/`event` argument
@@ -1214,7 +1282,7 @@ const executeBeforeHandler = async (input) => {
     // Enhancement 1: resolve active task from daemon before subagent injection & mutating guard.
     if (!activeTaskId && (isSubagentTool(toolName) || isMutatingTool(toolName))) {
         try {
-            await resolveActiveTaskFromDaemon(config.namespace);
+            await resolveActiveTaskFromDaemon(config.namespace, null, asString(input?.session_id) ?? asString(input?.sessionID) ?? null);
         }
         catch {
             // fail-soft
@@ -1241,23 +1309,30 @@ const executeBeforeHandler = async (input) => {
             }
         }
     }
-    // Bug 5: file-touch recall.
+    // Bug 5: file-touch recall. A patch can touch several files: prefetch
+    // governing memories for every extracted path and combine the per-file
+    // recall blocks.
     let snippets = [];
-    let filePath;
+    let filePaths = [];
+    let block;
     if (isFileTouchTool(toolName)) {
-        filePath = extractFilePath(args, altArgs, input?.input);
-        if (filePath) {
+        filePaths = extractFilePaths(args, altArgs, input?.input);
+        const blocks = [];
+        for (const fp of filePaths) {
             try {
-                snippets = await prefetchMemoriesForFile(config.namespace, filePath);
+                const fileSnippets = await prefetchMemoriesForFile(config.namespace, fp);
+                snippets.push(...fileSnippets);
+                if (fileSnippets.length > 0)
+                    blocks.push(formatFileTouchRecallBlock(fp, fileSnippets));
             }
             catch {
-                snippets = [];
+                // prefetch failures are fail-soft, per file
             }
         }
+        if (blocks.length > 0)
+            block = blocks.join("\n");
     }
-    let block;
-    if (snippets.length > 0 && filePath) {
-        block = formatFileTouchRecallBlock(filePath, snippets);
+    if (block) {
         input.additionalContext = block;
         input.neurostrataContext = block;
     }
@@ -1265,8 +1340,8 @@ const executeBeforeHandler = async (input) => {
     if (snippets.length > 0 && !isMutatingTool(toolName)) {
         if (block)
             enqueuePendingRecall(block, asRecord(input), args);
-        if (filePath)
-            confirmPrefetchDelivery(config.namespace, filePath);
+        for (const fp of filePaths)
+            confirmPrefetchDelivery(config.namespace, fp);
         return { additionalContext: block, neurostrataContext: block, snippets };
     }
     // Mutating tool guard (fail closed).
@@ -1309,8 +1384,8 @@ const executeBeforeHandler = async (input) => {
                 // The recall block never reaches the caller on a rejection, so the
                 // prefetch dedup state is rolled back: an allowed retry must still
                 // see the governing rules.
-                if (filePath)
-                    restorePrefetchDelivery(config.namespace, filePath);
+                for (const fp of filePaths)
+                    restorePrefetchDelivery(config.namespace, fp);
                 if (message.includes("Zero-Action Start violation:") || message.includes("Guard rejected"))
                     throw err;
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
@@ -1318,8 +1393,8 @@ const executeBeforeHandler = async (input) => {
         }
         mutationsSinceNote++;
     }
-    if (filePath)
-        confirmPrefetchDelivery(config.namespace, filePath);
+    for (const fp of filePaths)
+        confirmPrefetchDelivery(config.namespace, fp);
     if (block) {
         enqueuePendingRecall(block, asRecord(input), args);
         return { additionalContext: block, neurostrataContext: block, snippets };
@@ -1463,30 +1538,33 @@ export async function handleHookEvent(event) {
                 },
             };
         }
-        // File-touch tools: prefetch governing memories, build recall block.
+        // File-touch tools: prefetch governing memories for every extracted
+        // path (a patch can touch several files), build the combined recall block.
         let recallBlock;
-        let recalledFilePath;
+        let recalledFilePaths = [];
         if (isFileTouchTool(toolNameRaw)) {
-            const filePath = extractFilePath(toolInput, undefined, toolInputRaw);
-            if (filePath) {
-                recalledFilePath = filePath;
+            recalledFilePaths = extractFilePaths(toolInput, undefined, toolInputRaw);
+            const blocks = [];
+            for (const fp of recalledFilePaths) {
                 try {
-                    const snippets = await prefetchMemoriesForFile(config.namespace, filePath);
+                    const snippets = await prefetchMemoriesForFile(config.namespace, fp);
                     if (snippets.length > 0)
-                        recallBlock = formatFileTouchRecallBlock(filePath, snippets);
+                        blocks.push(formatFileTouchRecallBlock(fp, snippets));
                 }
                 catch {
-                    // prefetch failures are fail-soft
+                    // prefetch failures are fail-soft, per file
                 }
             }
+            if (blocks.length > 0)
+                recallBlock = blocks.join("\n");
         }
         // A denial never delivers the recall block, so the prefetch dedup state
         // has to be rolled back: an allowed retry must still see the governing
         // rules. The block is attached to the denial as well, so the agent reads
         // the rules that blocked it.
         const denyWithRecall = (reason) => {
-            if (recalledFilePath)
-                restorePrefetchDelivery(config.namespace, recalledFilePath);
+            for (const fp of recalledFilePaths)
+                restorePrefetchDelivery(config.namespace, fp);
             return {
                 ...(recallBlock ? { systemMessage: recallBlock } : {}),
                 hookSpecificOutput: {
@@ -1502,7 +1580,7 @@ export async function handleHookEvent(event) {
         if (isMutatingTool(toolNameRaw)) {
             if (!activeTaskId) {
                 try {
-                    await resolveActiveTaskFromDaemon(config.namespace);
+                    await resolveActiveTaskFromDaemon(config.namespace, null, asString(event.session_id) ?? asString(event.sessionID) ?? null);
                 }
                 catch {
                     // fail-soft
@@ -1547,8 +1625,8 @@ export async function handleHookEvent(event) {
             }
             mutationsSinceNote++;
         }
-        if (recalledFilePath)
-            confirmPrefetchDelivery(config.namespace, recalledFilePath);
+        for (const fp of recalledFilePaths)
+            confirmPrefetchDelivery(config.namespace, fp);
         return {
             continue: true,
             ...(recallBlock ? { systemMessage: recallBlock } : {}),

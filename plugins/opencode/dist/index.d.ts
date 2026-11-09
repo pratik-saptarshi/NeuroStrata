@@ -194,10 +194,14 @@ export declare function extractRepoFilePaths(promptText: string): string[];
 export declare const cachedTaskInjection: Map<string, string | null>;
 export declare const cachedSubagentPromptByTask: Map<string, string | null>;
 /**
- * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
- * activeSessionId and cachedTaskInjection.
+ * Resolve the active task from the daemon (fail-soft). Caches activeTaskId
+ * and cachedTaskInjection. A task is adopted only when it is the caller's
+ * preferred task or when its claim session matches the caller's own session
+ * identity: a foreign session's task (and its session id) is never adopted.
+ * activeSessionId is only ever set from the caller's own identity, never
+ * from a task record.
  */
-export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null): Promise<{
+export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null, callerSessionId?: string | null): Promise<{
     taskId: string | null;
     sessionId: string | null;
     promptInjection: string | null;
@@ -220,6 +224,19 @@ export declare function getTrackingState(): {
 };
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
+/**
+ * Every file path a patch touches, deduped and order-preserving: Codex
+ * `*** Update/Add/Delete File:` headers, `*** Move to:` destinations, and
+ * unified-diff `--- a/` / `+++ b/` headers.
+ */
+export declare function extractPatchPaths(raw: unknown): string[];
+/**
+ * Multi-path counterpart of extractFilePath, with the same precedence: an
+ * explicit file_path/filePath/path wins as a single-element list; otherwise
+ * every path from the first patch-bearing source (args patch fields, then
+ * the raw patch, then altArgs).
+ */
+export declare function extractFilePaths(args: Record<string, unknown>, altArgs?: Record<string, unknown>, rawPatch?: unknown): string[];
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;
