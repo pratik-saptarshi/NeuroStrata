@@ -5203,8 +5203,16 @@ impl LadybugStore {
                 if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
                     continue;
                 }
-                let vis = crate::rebac::extract_visible_to(&payload.metadata);
-                if !crate::rebac::allowed(principal, &payload.user_id, "viewer", &vis) {
+                // Defense in depth: never surface a retired row, even if
+                // its index entry predates the valid_to handling. Uses the
+                // is_retired_at predicate defined in this module (the
+                // timestamp-aware variant at ladybug.rs:11054 in the
+                // pre-remediation tree): a non-null valid_to that does not
+                // parse as an integer reads as 0, i.e. retired.
+                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                    continue;
+                }
+                if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
                     continue;
                 }
                 candidates.push(crate::traits::SearchResult {
@@ -15480,6 +15488,127 @@ eurostrata\src\daemon.rs",
         assert!(
             carol_ids.contains(&"mixed-acl".to_string()),
             "mixed string+object row must admit object-named carol, got: {carol_ids:?}"
+        );
+    }
+
+    // T1 oracle 5 — D2 pair: rows with valid_to 0 and valid_to "soon" are
+    // retired under is_retired_at semantics (unparseable non-null reads as
+    // 0). A stale Tantivy entry (exclusion metadata stripped) must not
+    // surface them from search_tantivy_lexical; search_with_domain is the
+    // in-test control and must exclude them both pre- and post-fix.
+    #[tokio::test]
+    async fn tantivy_lexical_hydration_excludes_retired_valid_to_rows() {
+        let store = retired_test_store().await;
+        let zero_payload = tantivy_exclusion_payload(
+            "retiretoken zero row",
+            json!({"valid_to": 0}),
+        );
+        let soon_payload = tantivy_exclusion_payload(
+            "retiretoken soon row",
+            json!({"valid_to": "soon"}),
+        );
+        let clean_payload = tantivy_exclusion_payload("retiretoken clean row", json!({}));
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            store
+                .upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], payload.clone())
+                .await
+                .unwrap();
+        }
+        // Control: the vector/domain path already excludes both retired rows.
+        let control = store
+            .search_with_domain(
+                "probe",
+                vec![1.0, 0.0, 0.0, 0.0],
+                10,
+                false,
+                false,
+                &[],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            control_ids.contains(&"clean-row"),
+            "control must surface the clean row, got: {control_ids:?}"
+        );
+        assert!(
+            !control_ids.contains(&"retired-zero") && !control_ids.contains(&"retired-soon"),
+            "control (search_with_domain) must exclude both retired rows, got: {control_ids:?}"
+        );
+        // Seed a stale Tantivy index: same ids/content, metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        let outcome = store
+            .search_tantivy_lexical("probe", "retiretoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"clean-row"),
+            "clean row must surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"retired-zero"),
+            "valid_to:0 row must not surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"retired-soon"),
+            "valid_to:\"soon\" row must not surface from tantivy search, got: {ids:?}"
+        );
+    }
+
+    // T1 oracle 6 — PANEL-A-1 (tantivy half): the hydration ACL check must
+    // derive the owner canonically (can_read_memory): a row whose payload
+    // user_id is empty but whose metadata names user_id alice is alice's
+    // row — admitted for alice, denied for bob, even though its ACL names
+    // only carol.
+    #[tokio::test]
+    async fn tantivy_lexical_hydration_uses_metadata_owner_for_acl() {
+        let store = retired_test_store().await;
+        let mut payload = tantivy_exclusion_payload(
+            "a1token metadata owner row",
+            json!({"user_id": "alice", "visible_to": ["carol"]}),
+        );
+        payload.user_id = String::new();
+        store
+            .upsert("probe", "metadata-owner-row", vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("probe", "metadata-owner-row", &payload).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        let alice = store
+            .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], "alice")
+            .await
+            .unwrap();
+        let alice_ids: Vec<&str> = alice.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            alice_ids.contains(&"metadata-owner-row"),
+            "metadata-derived owner alice must be admitted via tantivy search, got: {alice_ids:?}"
+        );
+        let bob = store
+            .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], "bob")
+            .await
+            .unwrap();
+        let bob_ids: Vec<&str> = bob.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !bob_ids.contains(&"metadata-owner-row"),
+            "bob must be denied the metadata-owner row via tantivy search, got: {bob_ids:?}"
         );
     }
 
