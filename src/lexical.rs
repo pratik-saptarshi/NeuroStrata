@@ -310,8 +310,33 @@ impl TantivyLexicalIndex {
 
     /// Rebuild from slice (namespace, id, payload) — commit once (§4).
     pub fn rebuild(&self, rows: &[(String, String, MemoryPayload)]) -> Result<usize> {
+        self.rebuild_scoped(rows, None)
+    }
+
+    /// Rebuild, optionally scoped to a single namespace — commit once (§4).
+    ///
+    /// When `namespace` is `Some(ns)`, only that namespace's documents are
+    /// deleted before inserting `rows` (partition replace); every other
+    /// namespace's documents survive. When `None`, the whole index is
+    /// replaced, exactly as [`Self::rebuild`] has always done. A scoped
+    /// rebuild must never wipe other namespaces: `search_tantivy_lexical`
+    /// lazily initializes with a single-namespace rebuild, and namespaces
+    /// whose documents were wiped would never re-trigger initialization.
+    pub fn rebuild_scoped(
+        &self,
+        rows: &[(String, String, MemoryPayload)],
+        namespace: Option<&str>,
+    ) -> Result<usize> {
         if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            w.delete_all_documents()?;
+            match namespace {
+                Some(ns) => {
+                    let term = Term::from_field_text(self.namespace_f, ns);
+                    w.delete_term(term);
+                }
+                None => {
+                    w.delete_all_documents()?;
+                }
+            }
             let mut indexed = 0usize;
             for (ns, id, payload) in rows {
                 if Self::is_excluded(payload) {
@@ -591,6 +616,62 @@ mod tests {
         assert!(!excluded2.iter().any(|h| h.id == "arch-int-rebuild"));
         let included2 = idx2.search("ns", "tombstone rebuild", 10, true, true, None).unwrap();
         assert!(included2.iter().any(|h| h.id == "arch-int-rebuild"));
+    }
+
+    #[test]
+    fn test_rebuild_scoped_preserves_other_namespaces() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let seed = vec![
+            ("A".to_string(), "a1".to_string(), dummy_payload("alpha oldtoken", None)),
+            ("B".to_string(), "b1".to_string(), dummy_payload("bravo uniquetoken", None)),
+        ];
+        assert_eq!(idx.rebuild(&seed).unwrap(), 2);
+
+        // Scoped rebuild of A with a changed row set must not wipe B.
+        let new_a = vec![(
+            "A".to_string(),
+            "a2".to_string(),
+            dummy_payload("alpha newtoken", None),
+        )];
+        assert_eq!(idx.rebuild_scoped(&new_a, Some("A")).unwrap(), 1);
+
+        let b_hits = idx.search("B", "uniquetoken", 10, true, true, None).unwrap();
+        assert!(
+            b_hits.iter().any(|h| h.id == "b1"),
+            "namespace B rows must survive a scoped rebuild of A, got: {:?}",
+            b_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let a_old = idx.search("A", "oldtoken", 10, true, true, None).unwrap();
+        assert!(
+            !a_old.iter().any(|h| h.id == "a1"),
+            "scoped rebuild must replace A's old rows"
+        );
+        let a_new = idx.search("A", "newtoken", 10, true, true, None).unwrap();
+        assert!(a_new.iter().any(|h| h.id == "a2"));
+    }
+
+    #[test]
+    fn test_rebuild_scoped_none_replaces_everything() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let seed = vec![
+            ("A".to_string(), "a1".to_string(), dummy_payload("alpha oldtoken", None)),
+            ("B".to_string(), "b1".to_string(), dummy_payload("bravo uniquetoken", None)),
+        ];
+        idx.rebuild(&seed).unwrap();
+
+        let only_c = vec![(
+            "C".to_string(),
+            "c1".to_string(),
+            dummy_payload("charlie fresh token", None),
+        )];
+        assert_eq!(idx.rebuild_scoped(&only_c, None).unwrap(), 1);
+
+        let b_hits = idx.search("B", "uniquetoken", 10, true, true, None).unwrap();
+        assert!(b_hits.is_empty(), "unscoped rebuild must replace every namespace");
+        let a_hits = idx.search("A", "oldtoken", 10, true, true, None).unwrap();
+        assert!(a_hits.is_empty(), "unscoped rebuild must replace every namespace");
+        let c_hits = idx.search("C", "charlie fresh", 10, true, true, None).unwrap();
+        assert!(c_hits.iter().any(|h| h.id == "c1"));
     }
 
     #[test]
