@@ -1563,7 +1563,18 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     if (inspection.sessionId) activeSessionId = inspection.sessionId;
     if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
       mutationsSinceNote = 0;
-      resetPersistedMutationCounter(inspection.sessionId ?? undefined);
+      // Resolve the reset target like the bump/guard paths do: in-code
+      // session first, then the outer event's, then the active session —
+      // a fresh stateless process has no active session, so without the
+      // outer event the reset would fall back to the `shared` counter and
+      // never clear the real session's persisted count (C-46-1).
+      resetPersistedMutationCounter(
+        inspection.sessionId ??
+          asString(input?.session_id) ??
+          asString(input?.sessionID) ??
+          activeSessionId ??
+          undefined,
+      );
     }
     if (inspection.taskCompleted) {
       if (activeTaskId) cachedTaskInjection.delete(activeTaskId);
@@ -1841,7 +1852,17 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
       if (inspection.sessionId) activeSessionId = inspection.sessionId;
       if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
         mutationsSinceNote = 0;
-        resetPersistedMutationCounter(inspection.sessionId ?? undefined);
+        // Same resolution as the bump/guard paths: in-code session, then
+        // the outer event's, then the active session — otherwise a fresh
+        // stateless process resets `shared` and the real session's
+        // persisted count survives the checkpoint (C-46-1).
+        resetPersistedMutationCounter(
+          inspection.sessionId ??
+            asString(event.session_id) ??
+            asString(event.sessionID) ??
+            activeSessionId ??
+            undefined,
+        );
       }
       if (inspection.taskCompleted) {
         if (activeTaskId) cachedTaskInjection.delete(activeTaskId);

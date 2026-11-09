@@ -2206,4 +2206,65 @@ console.log(core.bumpPersistedMutationCounter(${JSON.stringify(session)}));
     assert.equal(result.stdout.trim(), "null", "bump must fail open (return null) when the lock cannot be acquired");
     assert.ok(result.elapsedMs < 9000, `child wall time must be bounded (~2s deadline + generous slack, and < ${killTimeoutMs}ms kill timeout); got ${result.elapsedMs}ms`);
   });
+
+  it("(e) a Code Mode task_update(note) with the session only on the outer event resets that session's persisted counter (C-46-1)", { timeout: 60000 }, async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const readPersisted = (key) => JSON.parse(readFileSync(join(hookStateDir, `mutations-${key}.json`), "utf8")).mutations_since_note;
+    const sharedFile = join(hookStateDir, "mutations-shared.json");
+
+    // Code Mode event via handleHookEvent: the executed code carries a
+    // note but NO session_id; the session identity lives only on the
+    // outer event (the shape the increment and guard-read paths resolve).
+    const codeModeResetChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "execute", tool_input: { code: 'neurostrata_task_update({ id: "t1", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    // Same Code Mode event via the execute.before handler, captured from
+    // initialize() with a fake host ctx (the hook-capture pattern used by
+    // the execute.before recall tests) in a fresh process.
+    const codeModeResetBeforeChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+let beforeHook = null;
+await core.initialize({
+  config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" },
+  tool: { hook: async (name, fn) => { if (name === "execute.before") beforeHook = fn; } },
+});
+if (typeof beforeHook !== "function") { console.error("execute.before hook was not registered"); process.exit(3); }
+await beforeHook({ tool: "execute", input: { code: 'neurostrata_task_update({ id: "t1", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    try {
+      // Shape 1: handleHookEvent reset site.
+      for (let i = 0; i < 5; i++) {
+        await runChildAsync(projectDir, `edit-e1-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode" });
+      }
+      assert.equal(readPersisted("sess-codemode"), 5, "five Edit processes persist a count of 5");
+      assert.deepEqual(counters.guardMutations.slice(0, 5), [0, 1, 2, 3, 4]);
+
+      await runChildAsync(projectDir, "reset-e1.mjs", codeModeResetChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode" });
+      assert.equal(readPersisted("sess-codemode"), 0, "Code Mode task_update(note) resets the outer event session's persisted counter");
+      assert.equal(existsSync(sharedFile), false, "the reset must not touch the shared counter");
+
+      const guardBefore = counters.guardMutations.length;
+      await runChildAsync(projectDir, "edit-e1-next.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode" });
+      assert.equal(counters.guardMutations[guardBefore], 0, "the next Edit after the checkpoint forwards 0 to the guard");
+
+      // Shape 2: execute.before reset site.
+      for (let i = 0; i < 3; i++) {
+        await runChildAsync(projectDir, `edit-e2-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode-before" });
+      }
+      assert.equal(readPersisted("sess-codemode-before"), 3, "three Edit processes persist a count of 3");
+
+      await runChildAsync(projectDir, "reset-e2.mjs", codeModeResetBeforeChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode-before" });
+      assert.equal(readPersisted("sess-codemode-before"), 0, "execute.before Code Mode task_update(note) resets the outer event session's persisted counter");
+      assert.equal(existsSync(sharedFile), false, "the execute.before reset must not touch the shared counter");
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
 });
