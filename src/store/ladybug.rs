@@ -4893,16 +4893,7 @@ impl LadybugStore {
         });
         doc.archived = is_archived(metadata);
         doc.user_id = payload.user_id.clone();
-        doc.visible_to = metadata
-            .get("visible_to")
-            .and_then(|v| v.as_array())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        doc.visible_to = crate::rebac::extract_visible_to(metadata);
         doc.domains = crate::domain::domain_keys(metadata);
         doc.structural = STRUCTURAL_MEMORY_TYPES.contains(&payload.memory_type.as_str());
         doc.registry = crate::registry::is_registry_row(metadata);
@@ -15203,6 +15194,170 @@ eurostrata\src\daemon.rs",
             .unwrap()
             .results
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn lexical_search_enforces_object_form_visible_to_acl() {
+        // Regression (Codex P1 on PR #35): lexical_doc parsed visible_to
+        // with as_str() only, so object-form entries
+        // ({"principal":"alice","role":"viewer"}) were dropped, leaving an
+        // empty ACL — which acl_allows treats as unrestricted for viewers.
+        // A memory restricted via the object form was therefore retrievable
+        // by ANY principal through the in-house lexical search path.
+        let store = retired_test_store().await;
+
+        for (id, metadata) in [
+            (
+                "object-acl",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+            ),
+            ("string-acl", json!({"visible_to": ["alice"]})),
+            (
+                "malformed-acl",
+                json!({"visible_to": [{"unexpected": "x"}]}),
+            ),
+        ] {
+            let mut payload = retired_test_payload("fact", "owner", metadata);
+            payload.content = "quixotic restricted row".to_string();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+
+        let ids_for = |outcome: &crate::traits::LexicalSearchOutcome| {
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A different principal must see none of the restricted rows.
+        let bob = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        let bob_ids = ids_for(&bob);
+        assert!(
+            bob_ids.is_empty(),
+            "bob must not retrieve ACL-restricted rows, got: {bob_ids:?}"
+        );
+
+        // The named principal sees the object- and string-form rows, but
+        // not the all-malformed row (fail-closed, not unrestricted).
+        let alice = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "alice", 2)
+            .await
+            .expect("lexical search as alice");
+        let alice_ids = ids_for(&alice);
+        assert!(
+            alice_ids.contains(&"object-acl".to_string()),
+            "alice must retrieve the object-form ACL row, got: {alice_ids:?}"
+        );
+        assert!(
+            alice_ids.contains(&"string-acl".to_string()),
+            "alice must retrieve the string-form ACL row, got: {alice_ids:?}"
+        );
+        assert!(
+            !alice_ids.contains(&"malformed-acl".to_string()),
+            "all-malformed visible_to must fail closed, got: {alice_ids:?}"
+        );
+    }
+
+    // T1 oracle 4 — wildcard/mixed guards for the canonical extraction:
+    // an object-wildcard {"principal":"*"} row stays viewer-visible to an
+    // arbitrary principal, and a mixed string+object visible_to row admits
+    // the object-named principal.
+    #[tokio::test]
+    async fn lexical_search_wildcard_and_mixed_visible_to_guards() {
+        let store = retired_test_store().await;
+        for (id, metadata) in [
+            (
+                "object-wildcard",
+                json!({"visible_to": [{"principal": "*", "role": "viewer"}]}),
+            ),
+            (
+                "mixed-acl",
+                json!({"visible_to": ["alice", {"principal": "carol", "role": "viewer"}]}),
+            ),
+        ] {
+            let mut payload = retired_test_payload("fact", "owner", metadata);
+            payload.content = "quixotic guard row".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+        let bob = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            bob_ids.contains(&"object-wildcard".to_string()),
+            "object-wildcard row must stay viewer-visible to bob, got: {bob_ids:?}"
+        );
+        assert!(
+            !bob_ids.contains(&"mixed-acl".to_string()),
+            "mixed-acl row must not be visible to bob, got: {bob_ids:?}"
+        );
+        let carol = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "carol", 2)
+            .await
+            .expect("lexical search as carol");
+        let carol_ids: Vec<String> = carol.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            carol_ids.contains(&"mixed-acl".to_string()),
+            "mixed string+object row must admit object-named carol, got: {carol_ids:?}"
+        );
+    }
+
+    // T1 oracle 8 — fresh-load: the F1 bob assertion must hold against a
+    // fresh load from stored rows (rebuild_lexical_index clears the loaded
+    // set and re-derives every lexical doc via ensure_lexical_loaded), not
+    // only in the long-lived index built by the upserts above.
+    #[tokio::test]
+    async fn lexical_search_enforces_acl_after_fresh_index_load() {
+        let store = retired_test_store().await;
+        for (id, metadata) in [
+            (
+                "object-acl",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+            ),
+            (
+                "malformed-acl",
+                json!({"visible_to": [{"unexpected": "x"}]}),
+            ),
+        ] {
+            let mut payload = retired_test_payload("fact", "owner", metadata);
+            payload.content = "quixotic freshload row".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+        let rebuilt = store
+            .rebuild_lexical_index(Some("probe"))
+            .await
+            .expect("rebuild the lexical index from stored rows");
+        assert_eq!(rebuilt, 2);
+        let bob = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob after fresh load");
+        let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            bob_ids.is_empty(),
+            "bob must not retrieve ACL-restricted rows after fresh load, got: {bob_ids:?}"
+        );
+        let alice = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "alice", 2)
+            .await
+            .expect("lexical search as alice after fresh load");
+        let alice_ids: Vec<String> = alice.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            alice_ids.contains(&"object-acl".to_string()),
+            "alice must retrieve the object-form ACL row after fresh load, got: {alice_ids:?}"
+        );
+        assert!(
+            !alice_ids.contains(&"malformed-acl".to_string()),
+            "all-malformed visible_to must fail closed after fresh load, got: {alice_ids:?}"
+        );
     }
 
     #[tokio::test]
