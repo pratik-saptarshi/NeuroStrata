@@ -2064,6 +2064,46 @@ mod tests {
         );
     }
 
+    /// PR #140 remediation (F2): the Restore arm reports the validated
+    /// install `restore_snapshot_bundle` already made. The legacy inline
+    /// copy that followed the helper call overwrote the installed DB
+    /// with the raw snapshot bytes (and the installed WAL with the raw
+    /// snapshot WAL, or -- for a WAL-less snapshot -- left the
+    /// post-validation WAL paired with the pre-validation DB), then
+    /// re-opened the target with the plain constructor to re-list the
+    /// namespaces the helper had already returned. The pin is
+    /// structural: the arm lives inline in `run()` and exits the
+    /// process on its error paths. The helper's install behaviour is
+    /// covered behaviourally by the `restore_snapshot_bundle` tests.
+    #[test]
+    fn restore_arm_uses_the_helpers_install_without_recopying() {
+        let source = include_str!("main.rs");
+        let arm_start = source
+            .find("\n            Commands::Restore { dir, into } => {")
+            .expect("the Restore arm exists");
+        let arm_end = source[arm_start..]
+            .find("Commands::Task")
+            .map(|offset| arm_start + offset)
+            .expect("the Restore arm is followed by the Task arm");
+        let arm = &source[arm_start..arm_end];
+        assert!(
+            arm.contains("restore_snapshot_bundle("),
+            "the Restore arm must restore through the validating helper"
+        );
+        assert!(
+            !arm.contains("std::fs::copy("),
+            "the Restore arm must not copy snapshot files over the helper's install"
+        );
+        assert!(
+            !arm.contains("LadybugStore::new("),
+            "the Restore arm must not re-open the restored target with the legacy constructor"
+        );
+        assert!(
+            !arm.contains("list_namespaces"),
+            "the Restore arm must report the helper's namespaces, not re-list them"
+        );
+    }
+
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
@@ -5241,42 +5281,6 @@ async fn run() -> anyhow::Result<()> {
                 }
                 let namespaces =
                     restore_snapshot_bundle(std::path::Path::new(&dir), &target, &config).await?;
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                let snapshot = std::path::Path::new(&dir).join("ladybug.store");
-                if !snapshot.exists() {
-                    eprintln!(
-                        "{:?} does not look like a snapshot: no ladybug.store inside it.",
-                        dir
-                    );
-                    std::process::exit(1);
-                }
-                std::fs::copy(&snapshot, &target)?;
-                let mut wal = snapshot.clone().into_os_string();
-                wal.push(".wal");
-                let wal = std::path::PathBuf::from(wal);
-                if wal.exists() {
-                    let mut target_wal = target.clone().into_os_string();
-                    target_wal.push(".wal");
-                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
-                }
-
-                // Opened only after the copy, to verify the restored store
-                // reads back and to report what it holds.
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    target.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                )?);
-
-                let namespaces = match vector_store.list_namespaces().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!("restore list_namespaces check failed: {e}");
-                        Vec::new()
-                    }
-                };
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
                     println!(
