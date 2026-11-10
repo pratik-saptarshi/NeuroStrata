@@ -1,6 +1,11 @@
 name: Release
 
 # Publishes the neurostrata-mcp binary for each supported platform, on v* tags.
+# Fork governance alignment: tag-push only (no workflow_dispatch/inputs --
+# provenance derives from the run ref), top-level permissions read-only with
+# the publish job re-granting write for itself, all actions SHA-pinned. This
+# mirrors the fork's develop-branch release.yml so the release governance CI
+# gate passes on main as well.
 # The rolling build lives in nightly.yml and targets its own tag, so the two
 # never write to the same release.
 #
@@ -12,15 +17,9 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Existing tag to build and attach assets to (e.g. v1.3.1)'
-        required: true
-        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -71,9 +70,9 @@ jobs:
       # workflow_dispatch run builds whatever branch it was launched from and
       # then attaches those binaries to the requested tag.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ github.ref_name }}
 
       - name: Toolchain versions
         shell: bash
@@ -136,7 +135,7 @@ jobs:
         run: Compress-Archive -Path 'dist' -DestinationPath '${{ matrix.archive }}'
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
@@ -147,9 +146,12 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    # Only this job publishes; it alone re-grants contents: write.
+    permissions:
+      contents: write
     steps:
       - name: Collect artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -166,7 +168,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
