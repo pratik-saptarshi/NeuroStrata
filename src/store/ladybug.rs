@@ -4645,6 +4645,11 @@ impl LadybugStore {
         .await
     }
 
+    /// Hygiene repair for one namespace. Returns `(shape_fixes,
+    /// dangling_reports)`: rows whose stored shape/content this run
+    /// actually repaired, and rows in which at least one edge
+    /// declaration's target does not currently resolve. Declarations are
+    /// reported, never removed (R5 — see block (b) below).
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         let namespace = namespace.to_string();
         self.write_with_deadline("repairing namespace hygiene", move |conn| {
@@ -4665,12 +4670,13 @@ impl LadybugStore {
                 rows.push((id, mtype, loc, content_str, meta_str));
             }
             let mut shape_updates = 0usize;
-            let mut dangling_updates = 0usize;
+            let mut dangling_reports = 0usize;
             for (id, mtype, loc, content_str, meta_str) in &rows {
                 let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
                 if !meta.is_object() { meta = serde_json::json!({}); }
                 let mut shape_changed = false;
-                let mut dangling_changed = false;
+                let mut arrays_changed = false;
+                let mut row_dangling = false;
                 // (a) rule source
                 if mtype == "rule" {
                     // A source is usable provenance when it is a non-empty string
@@ -4748,18 +4754,32 @@ impl LadybugStore {
                         .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
                         .unwrap_or_else(|| "legacy".to_string()));
                 }
-                // (b) dangling refs in edge arrays
+                // (b) edge-declaration arrays: residue cleanup + report.
+                //
+                // R5 (half1-readjudication.md, fork issue #85): repair
+                // never existence-prunes a declaration. A declaration is
+                // authorial data, and every other consumer preserves an
+                // unresolved one verbatim — relink and the publication
+                // replay keep it as declared, upsert materializes stub
+                // targets rather than dropping it. The old prune moved
+                // declarations to `archived_refs`, which has no reader,
+                // so the loss was permanent — including declarations
+                // whose targets were merely outside the active
+                // generation at repair time, which a later relink would
+                // have healed (the F7 loss shape). Repair therefore only
+                // COUNTS rows with unresolvable declarations (the second
+                // return value: rows reported, not rows "fixed") and
+                // still removes the `samples`/`total` literals, which
+                // are test residue, not declarations. `archived_refs`
+                // is left as stored; this prune was its only writer.
                 let keys = ["governs","related_to","relates_to","contained_by","extracted_from","depends_on"];
-                let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-                let mut unresolvable = Vec::new();
                 for k in &keys {
                     if let Some(arr) = meta.get(k).and_then(|v| v.as_array()).cloned() {
                         let mut kept = Vec::new();
                         for item in &arr {
                             if let Some(t) = item.as_str() {
-                                // Remove residual unresolved string targets (samples/total) and check existence
+                                // Remove the residual test-data literals (samples/total)
                                 if t == "samples" || t == "total" {
-                                    unresolvable.push(t.to_string());
                                     continue;
                                 }
                                 // Check existence against known_ids, resolved targets, and prefix-unqualified resolution
@@ -4774,7 +4794,8 @@ impl LadybugStore {
                                         false
                                     }
                                     || (t.len() >= 7 && known_ids.iter().filter(|k| k.starts_with(t)).count() == 1);
-                                if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
+                                if !exists { row_dangling = true; }
+                                kept.push(item.clone());
                             } else { kept.push(item.clone()); }
                         }
                         // Materialize missing graph edges for kept targets (borrow; move happens below)
@@ -4806,17 +4827,11 @@ impl LadybugStore {
                                 }
                             }
                         } // end for item in &kept
-                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; } }
+                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); arrays_changed = true; } }
                     }
                 }
-                if !unresolvable.is_empty() {
-                    archived_refs.extend(unresolvable);
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-                    }
-                    dangling_changed = true;
-                }
-                if shape_changed || dangling_changed || content_backfill.is_some() {
+                if row_dangling { dangling_reports += 1; }
+                if shape_changed || arrays_changed || content_backfill.is_some() {
                     let has_backfill = content_backfill.is_some();
                     let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
                     if let Err(e) = conn.query(&q_meta) {
@@ -4830,11 +4845,10 @@ impl LadybugStore {
                             }
                         }
                         if shape_changed || has_backfill { shape_updates += 1; }
-                        if dangling_changed { dangling_updates += 1; }
                     }
                 }
             }
-            Ok((shape_updates, dangling_updates))
+            Ok((shape_updates, dangling_reports))
         }).await
     }
 
@@ -23509,6 +23523,168 @@ eurostrata\src\daemon.rs",
         assert!(
             kinds_2.iter().any(|k| k == "ExactFile"),
             "F7: pre-existing rule must still surface after gen 2; got {kinds_2:?}"
+        );
+    }
+
+    /// T3 (half1-readjudication §Q4, the Q5-A/Q5-B pair as assertions):
+    /// a frozen declaration whose named generation row has been
+    /// hard-deleted must survive a hygiene-repair run so the replay
+    /// remap can still heal it. Before R5 (repair report-only for
+    /// declarations) repair pruned the declaration into `archived_refs`
+    /// at the repair step and the rule was gone for good, although its
+    /// file was live in generation 2.
+    #[tokio::test]
+    async fn f7_repair_report_only_keeps_frozen_declaration_after_row_deletion() {
+        let store = retired_test_store().await;
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        let gen1_id = f7_seed_file(&store, 1).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-r5-t3",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [gen1_id.clone()] })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f7_stored_values(&store, "rule-r5-t3", "governs").await,
+            vec![gen1_id.clone()],
+            "precondition: frozen declaration stored verbatim"
+        );
+
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            2
+        );
+        let gen2_id = f7_seed_file(&store, 2).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 2)
+            .await
+            .unwrap();
+        // Hard-delete the superseded generation-1 row (clear-ingested /
+        // explicit delete / history-dropping rebuild all reach this state).
+        store.delete("probe", &gen1_id).await.unwrap();
+
+        let (_shape, reported) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert!(
+            reported >= 1,
+            "the unresolvable declaration must still be counted in repair's report; got {reported}"
+        );
+        assert_eq!(
+            f7_stored_values(&store, "rule-r5-t3", "governs").await,
+            vec![gen1_id.clone()],
+            "R5: repair must not prune the frozen declaration"
+        );
+        assert!(
+            f7_stored_values(&store, "rule-r5-t3", "archived_refs")
+                .await
+                .is_empty(),
+            "R5: repair must not archive the declaration either"
+        );
+
+        store.relink_edges("probe", PROBE_SOURCE).await.unwrap();
+        assert_eq!(
+            f7_outgoing_targets(&store, "GOVERNS", "rule-r5-t3").await,
+            vec![gen2_id],
+            "the remap must heal the declaration repair preserved"
+        );
+        assert_eq!(
+            f7_hit_kinds(&store, "rule-r5-t3").await,
+            vec!["ExactFile".to_string()]
+        );
+    }
+
+    /// T4 (half1-readjudication §Q4): R5 keeps repair's other functions.
+    /// The `samples`/`total` residue literals are still removed,
+    /// resolvable and unresolvable declarations are both kept (the
+    /// unresolvable one is counted in repair's report, not archived),
+    /// and the shape repairs still apply.
+    #[tokio::test]
+    async fn repair_hygiene_report_only_declarations_residue_and_shape() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "real-target",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "row-mixed",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "governs": ["samples", "total", "real-target", "gone/file.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-needs-source",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        let source_before = store
+            .get("probe", "rule-needs-source")
+            .await
+            .unwrap()
+            .expect("rule row")
+            .1
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let (shape_fixes, reported) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert!(
+            reported >= 1,
+            "rows with unresolvable declarations must be counted in repair's report; got {reported}"
+        );
+        assert_eq!(
+            f7_stored_values(&store, "row-mixed", "governs").await,
+            vec!["real-target".to_string(), "gone/file.rs".to_string()],
+            "residue removed; resolvable and unresolvable declarations both kept"
+        );
+        assert!(
+            f7_stored_values(&store, "row-mixed", "archived_refs")
+                .await
+                .is_empty(),
+            "R5: repair archives nothing from the declaration keys"
+        );
+        // The rule-source shape repair still fires: a rule that had no
+        // usable source before the run has one after it.
+        let source_after = store
+            .get("probe", "rule-needs-source")
+            .await
+            .unwrap()
+            .expect("rule row")
+            .1
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            source_before.is_empty() && !source_after.is_empty(),
+            "shape repair must still backfill a rule source (before={source_before:?}, after={source_after:?}, shape_fixes={shape_fixes})"
         );
     }
 }
