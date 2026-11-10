@@ -1970,6 +1970,47 @@ mod tests {
         );
     }
 
+    /// PR #140 remediation (F1): the Daemon arm acquires the daemon lock
+    /// exactly once. The sync merge welded a second acquisition -- through
+    /// an independently opened handle, which flock refuses even
+    /// in-process, so the arm exited with "Another NeuroStrata daemon is
+    /// already running" against itself -- plus a legacy embedder/store
+    /// shadow pair onto the startup-resolved sequence. The pin is
+    /// structural, as with the pins above: driving the arm would start a
+    /// real server. The lock semantics it relies on are covered
+    /// behaviourally by `a_held_daemon_lock_is_seen_and_goes_with_its_holder`.
+    #[test]
+    fn daemon_arm_takes_the_daemon_lock_once_and_keeps_the_resolved_store() {
+        let source = include_str!("main.rs");
+        // Assembled from fragments so this test's own text is not counted.
+        let lock_set = ["DAEMON_LOCK", ".set("].concat();
+        assert_eq!(
+            source.matches(&lock_set).count(),
+            1,
+            "exactly one daemon-lock acquisition site may exist"
+        );
+        let arm_start = source
+            .find("\n            Commands::Daemon => {")
+            .expect("the Daemon arm exists");
+        let arm_end = source[arm_start..]
+            .find("Commands::Laya")
+            .map(|offset| arm_start + offset)
+            .expect("the Daemon arm is followed by the Laya arm");
+        let arm = &source[arm_start..arm_end];
+        assert!(
+            arm.contains("new_with_identity_limits"),
+            "the Daemon arm must open the identity-limits store"
+        );
+        assert!(
+            !arm.contains("LadybugStore::new("),
+            "the Daemon arm must not shadow the resolved store with the legacy constructor"
+        );
+        assert!(
+            !arm.contains("build_embedder()?"),
+            "the Daemon arm must not shadow the resolved embedder with the legacy builder"
+        );
+    }
+
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
@@ -4776,14 +4817,6 @@ async fn run() -> anyhow::Result<()> {
                         embedder.embedder_id().to_string(),
                         startup.limits,
                     )?);
-                if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
-                    tracing::debug!("DAEMON_LOCK was already initialized");
-                }
-                let embedder = build_embedder()?;
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
-                )?);
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
                     embedder,
