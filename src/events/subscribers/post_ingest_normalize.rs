@@ -56,12 +56,18 @@ fn normalize_payload_metadata(
             }
             if let Some(resolved) = known.resolve(s.as_str()) {
                 // F7 (fork issue #85): never rewrite a declaration to a
-                // generation-scoped physical id. The pre-generation
-                // two-segment form this pass produces stays reachable
-                // (relink resolves it by logical path); a
-                // `<ns>::<gen>::<path>` form would freeze the declaration
-                // to one generation and strand the edge when the next
-                // generation publishes.
+                // generation-scoped physical id — that form freezes the
+                // declaration to one generation and strands the edge when
+                // the next generation publishes; the guard keeps this
+                // site from producing that frozen form. The
+                // pre-generation two-segment form this pass produces is
+                // this pass's documented purpose; it stays reachable
+                // only while the legacy non-scoped row it targets stays
+                // present and permanently active as a read candidate —
+                // not because relink resolves it by logical path
+                // (resolve never logical-path-normalizes the declared
+                // string, and the replay remap cannot heal two-segment
+                // ids).
                 if resolved != *s && crate::parser::ingest::split_scoped_id(&resolved).is_none() {
                     *item = Value::String(resolved);
                     changed = true;

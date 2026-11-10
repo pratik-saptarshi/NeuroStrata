@@ -6348,11 +6348,23 @@ async fn run() -> anyhow::Result<()> {
                                                 // F7 (fork issue #85): never
                                                 // rewrite a declaration to a
                                                 // generation-scoped physical
-                                                // id — it would freeze the
+                                                // id — that form freezes the
                                                 // declaration to one
-                                                // generation (see the AC4
-                                                // guard in
+                                                // generation; this guard
+                                                // keeps the CLI from
+                                                // producing that frozen form
+                                                // (see the AC4 guard in
                                                 // events/subscribers/post_ingest_normalize.rs).
+                                                // Two-segment rewrites stay
+                                                // reachable only while the
+                                                // legacy non-scoped row they
+                                                // target stays present and
+                                                // permanently active as a
+                                                // read candidate — relink
+                                                // does not resolve them by
+                                                // logical path, and the
+                                                // replay remap cannot heal
+                                                // two-segment ids.
                                                 if resolved != s
                                                     && crate::parser::ingest::split_scoped_id(
                                                         &resolved,
