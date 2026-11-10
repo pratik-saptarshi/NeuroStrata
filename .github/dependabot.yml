@@ -1,0 +1,122 @@
+# Dependabot version updates for NeuroStrata.
+#
+# Design notes
+# - Security updates are separate from this file: they are controlled by the
+#   "Dependabot security updates" repo setting and ignore `cooldown` and
+#   `open-pull-requests-limit`, so a CVE fix is never delayed by this config.
+# - `cooldown` delays brand-new releases (supply-chain hygiene: most
+#   compromised/yanked releases are caught within days).
+# - Cargo/npm are grouped by risk tier so one noisy crate cannot block the
+#   rest, and majors always arrive as individual PRs.
+# - Schedules are staggered across the week: every PR runs the 3-OS CI matrix
+#   (heavy: lbug C++ build), so we avoid queueing them all at once.
+# - Workflow actions are SHA-pinned (enforced in ci.yml); Dependabot rewrites
+#   the pin and its `# vN` comment together, so keep the comment on each pin.
+version: 2
+
+updates:
+  # --- Rust: root crate + workspace member (crates/neurostrata-wasm) ---------
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      cargo-patch:
+        update-types: ["patch"]
+      cargo-minor:
+        update-types: ["minor"]
+
+  # --- Rust: src-tauri is excluded from the root workspace (own Cargo.lock) --
+  - package-ecosystem: "cargo"
+    directory: "/src-tauri"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      tauri-cargo-patch:
+        update-types: ["patch"]
+      tauri-cargo-minor:
+        update-types: ["minor"]
+
+  # --- npm: web-ui + every plugin package (glob keeps new plugins covered) ---
+  - package-ecosystem: "npm"
+    directories:
+      - "/web-ui"
+      - "/plugins/*"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    labels: ["dependencies", "javascript"]
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      npm-dev:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+      npm-prod:
+        dependency-type: "production"
+        update-types: ["minor", "patch"]
+
+  # --- GitHub Actions (SHA-pinned) --------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    labels: ["dependencies", "github_actions"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # --- Docker base images (Dockerfile.base / Dockerfile.build) ----------------
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 2
+    cooldown:
+      default-days: 7
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    ignore:
+      # ubuntu:24.04 is a deliberate LTS pin; do not auto-propose 25.x/26.x.
+      - dependency-name: "ubuntu"
+        update-types: ["version-update:semver-major"]

@@ -1970,6 +1970,189 @@ mod tests {
         );
     }
 
+    /// PR #140 remediation (F1): the Daemon arm acquires the daemon lock
+    /// exactly once. The sync merge welded a second acquisition -- through
+    /// an independently opened handle, which flock refuses even
+    /// in-process, so the arm exited with "Another NeuroStrata daemon is
+    /// already running" against itself -- plus a legacy embedder/store
+    /// shadow pair onto the startup-resolved sequence. The pin is
+    /// structural, as with the pins above: driving the arm would start a
+    /// real server. The lock semantics it relies on are covered
+    /// behaviourally by `a_held_daemon_lock_is_seen_and_goes_with_its_holder`.
+    #[test]
+    fn daemon_arm_takes_the_daemon_lock_once_and_keeps_the_resolved_store() {
+        let source = include_str!("main.rs");
+        // Assembled from fragments so this test's own text is not counted.
+        let lock_set = ["DAEMON_LOCK", ".set("].concat();
+        assert_eq!(
+            source.matches(&lock_set).count(),
+            1,
+            "exactly one daemon-lock acquisition site may exist"
+        );
+        let arm_start = source
+            .find("\n            Commands::Daemon => {")
+            .expect("the Daemon arm exists");
+        let arm_end = source[arm_start..]
+            .find("Commands::Laya")
+            .map(|offset| arm_start + offset)
+            .expect("the Daemon arm is followed by the Laya arm");
+        let arm = &source[arm_start..arm_end];
+        assert!(
+            arm.contains("new_with_identity_limits"),
+            "the Daemon arm must open the identity-limits store"
+        );
+        assert!(
+            !arm.contains("LadybugStore::new("),
+            "the Daemon arm must not shadow the resolved store with the legacy constructor"
+        );
+        assert!(
+            !arm.contains("build_embedder()?"),
+            "the Daemon arm must not shadow the resolved embedder with the legacy builder"
+        );
+    }
+
+    /// PR #140 remediation (F3): the standalone fallback dispatch and the
+    /// Backup arm each open the store exactly once -- the identity-aware
+    /// construction. The sync merge reintroduced the legacy plain opens
+    /// directly beneath the fork's identity opens; shadowing left the
+    /// first store alive-but-unused for the whole command while every
+    /// arm ran on the identity-less store with default limits, so the
+    /// embedding-identity guard and the profiled limits never fired.
+    /// The pin is structural: the dispatch lives inline in `run()` and
+    /// the tree has no CLI test harness.
+    #[test]
+    fn standalone_and_backup_arms_open_only_the_identity_store() {
+        let source = include_str!("main.rs");
+        let backup_start = source
+            .find("\n            Commands::Backup { dir } => {")
+            .expect("the Backup arm exists");
+        let backup_end = source[backup_start..]
+            .find("Commands::Restore")
+            .map(|offset| backup_start + offset)
+            .expect("the Backup arm is followed by the Restore arm");
+        let backup = &source[backup_start..backup_end];
+        assert!(
+            backup.contains("new_with_identity_limits"),
+            "the Backup arm must open the identity-limits store"
+        );
+        assert!(
+            !backup.contains("LadybugStore::new("),
+            "the Backup arm must not shadow the identity store with the legacy constructor"
+        );
+
+        // The fallback dispatch opens its store between the startup
+        // resolution (the second one in the file; the Daemon arm's is
+        // the first) and the `match other` dispatch.
+        let match_other = source
+            .find("\n                match other {")
+            .expect("the fallback dispatch exists");
+        let opens_start = source[..match_other]
+            .rfind("let startup = resolve_startup(&config)?;")
+            .expect("the fallback resolves startup before opening the store");
+        let opens = &source[opens_start..match_other];
+        assert!(
+            opens.contains("new_with_identity_limits"),
+            "the fallback dispatch must open the identity-limits store"
+        );
+        assert!(
+            !opens.contains("LadybugStore::new("),
+            "the fallback dispatch must not shadow the identity store with the legacy constructor"
+        );
+        assert!(
+            opens.contains("ReadSource::Direct"),
+            "the fallback dispatch reads through the opened store"
+        );
+    }
+
+    /// PR #140 remediation (F2): the Restore arm reports the validated
+    /// install `restore_snapshot_bundle` already made. The legacy inline
+    /// copy that followed the helper call overwrote the installed DB
+    /// with the raw snapshot bytes (and the installed WAL with the raw
+    /// snapshot WAL, or -- for a WAL-less snapshot -- left the
+    /// post-validation WAL paired with the pre-validation DB), then
+    /// re-opened the target with the plain constructor to re-list the
+    /// namespaces the helper had already returned. The pin is
+    /// structural: the arm lives inline in `run()` and exits the
+    /// process on its error paths. The helper's install behaviour is
+    /// covered behaviourally by the `restore_snapshot_bundle` tests.
+    #[test]
+    fn restore_arm_uses_the_helpers_install_without_recopying() {
+        let source = include_str!("main.rs");
+        let arm_start = source
+            .find("\n            Commands::Restore { dir, into } => {")
+            .expect("the Restore arm exists");
+        let arm_end = source[arm_start..]
+            .find("Commands::Task")
+            .map(|offset| arm_start + offset)
+            .expect("the Restore arm is followed by the Task arm");
+        let arm = &source[arm_start..arm_end];
+        assert!(
+            arm.contains("restore_snapshot_bundle("),
+            "the Restore arm must restore through the validating helper"
+        );
+        assert!(
+            !arm.contains("std::fs::copy("),
+            "the Restore arm must not copy snapshot files over the helper's install"
+        );
+        assert!(
+            !arm.contains("LadybugStore::new("),
+            "the Restore arm must not re-open the restored target with the legacy constructor"
+        );
+        assert!(
+            !arm.contains("list_namespaces"),
+            "the Restore arm must report the helper's namespaces, not re-list them"
+        );
+    }
+
+    /// PR #140 remediation (F5): the fallback Ingest arm ingests exactly
+    /// once, after the optional clear. The sync merge kept both evolved
+    /// forms of the arm sequentially, so one CLI ingest ran two full
+    /// staging/publication cycles and retained an unnecessary extra
+    /// generation -- and with NEUROSTRATA_CLEAR_BEFORE_INGEST set it
+    /// cleared the first cycle's result before rebuilding it. The same
+    /// union left a dead duplicate `Commands::Status` arm (with a
+    /// dangling comment fragment) behind the live one. The pin is
+    /// structural: the arm lives inline in `run()`; the
+    /// generation-count oracle would need a black-box binary run.
+    #[test]
+    fn ingest_arm_ingests_once_after_the_optional_clear() {
+        let source = include_str!("main.rs");
+        let arm_start = source
+            .find("\n                    Commands::Ingest {")
+            .expect("the fallback Ingest arm exists");
+        let arm_end = source[arm_start..]
+            .find("Commands::ExportGraph")
+            .map(|offset| arm_start + offset)
+            .expect("the Ingest arm is followed by the ExportGraph arm");
+        let arm = &source[arm_start..arm_end];
+        assert_eq!(
+            arm.matches("ingest_directory(").count(),
+            1,
+            "one CLI ingest must run exactly one ingest_directory cycle"
+        );
+        let clear_at = arm
+            .find("NEUROSTRATA_CLEAR_BEFORE_INGEST")
+            .expect("the opt-in pre-ingest clear stays");
+        let ingest_at = arm
+            .find("ingest_directory(")
+            .expect("the single ingest exists");
+        assert!(
+            clear_at < ingest_at,
+            "the optional clear must precede the single ingest"
+        );
+        assert!(
+            arm.contains("Failed to load schema"),
+            "the schema error path stays"
+        );
+        // Assembled from fragments so this test's own text is not counted.
+        let dead_arm = ["Commands::Status => ", "unreachable!"].concat();
+        assert_eq!(
+            source.matches(&dead_arm).count(),
+            0,
+            "the dead duplicate Status arm left by the union merge must be gone"
+        );
+    }
+
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
@@ -4776,14 +4959,6 @@ async fn run() -> anyhow::Result<()> {
                         embedder.embedder_id().to_string(),
                         startup.limits,
                     )?);
-                if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
-                    tracing::debug!("DAEMON_LOCK was already initialized");
-                }
-                let embedder = build_embedder()?;
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
-                )?);
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
                     embedder,
@@ -5133,10 +5308,6 @@ async fn run() -> anyhow::Result<()> {
                         embed::configured_embedder_id()?,
                         profiled_store_limits(&config)?,
                     )?);
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                )?);
                 vector_store.export_database(&dir).await?;
                 println!("Backed up to {}", dir);
                 return Ok(());
@@ -5159,42 +5330,6 @@ async fn run() -> anyhow::Result<()> {
                 }
                 let namespaces =
                     restore_snapshot_bundle(std::path::Path::new(&dir), &target, &config).await?;
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                let snapshot = std::path::Path::new(&dir).join("ladybug.store");
-                if !snapshot.exists() {
-                    eprintln!(
-                        "{:?} does not look like a snapshot: no ladybug.store inside it.",
-                        dir
-                    );
-                    std::process::exit(1);
-                }
-                std::fs::copy(&snapshot, &target)?;
-                let mut wal = snapshot.clone().into_os_string();
-                wal.push(".wal");
-                let wal = std::path::PathBuf::from(wal);
-                if wal.exists() {
-                    let mut target_wal = target.clone().into_os_string();
-                    target_wal.push(".wal");
-                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
-                }
-
-                // Opened only after the copy, to verify the restored store
-                // reads back and to report what it holds.
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    target.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                )?);
-
-                let namespaces = match vector_store.list_namespaces().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!("restore list_namespaces check failed: {e}");
-                        Vec::new()
-                    }
-                };
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
                     println!(
@@ -5917,10 +6052,6 @@ async fn run() -> anyhow::Result<()> {
                         embedder.embedder_id().to_string(),
                         startup.limits,
                     )?);
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                )?);
                 let read = ReadSource::Direct(vector_store.clone());
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).
@@ -6056,8 +6187,6 @@ async fn run() -> anyhow::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    // arm exits before the store opens.
-                    Commands::Status => unreachable!("handled before store open"),
                     Commands::Ingest {
                         dir,
                         namespace,
@@ -6077,25 +6206,6 @@ async fn run() -> anyhow::Result<()> {
                             include_str!("schema.json").to_string()
                         };
 
-                        if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                            println!(
-                                "Ingesting AST from {:?} into namespace '{}'",
-                                dir_path, namespace
-                            );
-                            crate::parser::ingest::ingest_directory(
-                                dir_path,
-                                &schema,
-                                embedder.clone(),
-                                vector_store.clone(),
-                                &namespace,
-                                // The CLI has nowhere to report progress to: it
-                                // is already printing each file as it goes.
-                                None,
-                                &[],
-                            )
-                            .await?;
-                            println!("Ingestion complete.");
-                        }
                         let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
                             Ok(s) => s,
                             Err(e) => {
