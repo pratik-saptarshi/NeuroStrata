@@ -2104,6 +2104,55 @@ mod tests {
         );
     }
 
+    /// PR #140 remediation (F5): the fallback Ingest arm ingests exactly
+    /// once, after the optional clear. The sync merge kept both evolved
+    /// forms of the arm sequentially, so one CLI ingest ran two full
+    /// staging/publication cycles and retained an unnecessary extra
+    /// generation -- and with NEUROSTRATA_CLEAR_BEFORE_INGEST set it
+    /// cleared the first cycle's result before rebuilding it. The same
+    /// union left a dead duplicate `Commands::Status` arm (with a
+    /// dangling comment fragment) behind the live one. The pin is
+    /// structural: the arm lives inline in `run()`; the
+    /// generation-count oracle would need a black-box binary run.
+    #[test]
+    fn ingest_arm_ingests_once_after_the_optional_clear() {
+        let source = include_str!("main.rs");
+        let arm_start = source
+            .find("\n                    Commands::Ingest {")
+            .expect("the fallback Ingest arm exists");
+        let arm_end = source[arm_start..]
+            .find("Commands::ExportGraph")
+            .map(|offset| arm_start + offset)
+            .expect("the Ingest arm is followed by the ExportGraph arm");
+        let arm = &source[arm_start..arm_end];
+        assert_eq!(
+            arm.matches("ingest_directory(").count(),
+            1,
+            "one CLI ingest must run exactly one ingest_directory cycle"
+        );
+        let clear_at = arm
+            .find("NEUROSTRATA_CLEAR_BEFORE_INGEST")
+            .expect("the opt-in pre-ingest clear stays");
+        let ingest_at = arm
+            .find("ingest_directory(")
+            .expect("the single ingest exists");
+        assert!(
+            clear_at < ingest_at,
+            "the optional clear must precede the single ingest"
+        );
+        assert!(
+            arm.contains("Failed to load schema"),
+            "the schema error path stays"
+        );
+        // Assembled from fragments so this test's own text is not counted.
+        let dead_arm = ["Commands::Status => ", "unreachable!"].concat();
+        assert_eq!(
+            source.matches(&dead_arm).count(),
+            0,
+            "the dead duplicate Status arm left by the union merge must be gone"
+        );
+    }
+
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
@@ -6138,8 +6187,6 @@ async fn run() -> anyhow::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    // arm exits before the store opens.
-                    Commands::Status => unreachable!("handled before store open"),
                     Commands::Ingest {
                         dir,
                         namespace,
@@ -6159,25 +6206,6 @@ async fn run() -> anyhow::Result<()> {
                             include_str!("schema.json").to_string()
                         };
 
-                        if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                            println!(
-                                "Ingesting AST from {:?} into namespace '{}'",
-                                dir_path, namespace
-                            );
-                            crate::parser::ingest::ingest_directory(
-                                dir_path,
-                                &schema,
-                                embedder.clone(),
-                                vector_store.clone(),
-                                &namespace,
-                                // The CLI has nowhere to report progress to: it
-                                // is already printing each file as it goes.
-                                None,
-                                &[],
-                            )
-                            .await?;
-                            println!("Ingestion complete.");
-                        }
                         let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
                             Ok(s) => s,
                             Err(e) => {
