@@ -1,7 +1,8 @@
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync, chmodSync, utimesSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -51,7 +52,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], guardMutations: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -128,6 +129,8 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_guard_validate") {
             counters.guardValidate++;
+            const guardArgs = params.arguments ?? {};
+            counters.guardMutations.push(guardArgs.mutations_since_note);
             // `guardReject` may be a boolean or a getter, so a test can flip the
             // verdict between two calls against the same mock daemon.
             const reject = typeof guardReject === "function" ? guardReject() : guardReject;
@@ -2004,6 +2007,394 @@ describe("round-9: CLI hook runners flush stdout before exiting", () => {
         src.includes("const writeStdout = (text) =>"),
         `${rel}: writeStdout helper missing`,
       );
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// N2: mutation counter persistence across stateless hook processes.
+// In the stateless CLI-hook deployment every tool invocation is a fresh
+// Node process, so the in-process `mutationsSinceNote` resets to 0 and
+// guard_validate always saw mutations_since_note: 0. The counter must be
+// persisted per session under <projectRoot>/.NeuroStrata/hook-state/.
+// ──────────────────────────────────────────────────────────────────────
+
+describe("N2: mutation counter persistence across stateless hook processes", () => {
+  const distUrl = new URL("./dist/index.js", import.meta.url).href;
+
+  const editChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "Edit", tool_input: { file_path: "src/x.rs" }, session_id: process.env.NS_SESSION });
+`;
+
+  const resetChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "neurostrata_task_update", tool_input: { id: "t1", note: "checkpoint" }, session_id: process.env.NS_SESSION });
+`;
+
+  function makeProjectDir() {
+    const dir = mkdtempSync(join(tmpdir(), "ns-n2-xproc-"));
+    mkdirSync(join(dir, ".NeuroStrata"), { recursive: true });
+    return dir;
+  }
+
+  // Children are spawned async (never spawnSync): the mock daemon lives in
+  // this same test process, so blocking its event loop would starve the
+  // very server the children call.
+  function runChildAsync(projectDir, scriptName, source, env = {}) {
+    const scriptPath = join(projectDir, scriptName);
+    writeFileSync(scriptPath, source);
+    return new Promise((resolveChild, rejectChild) => {
+      const child = spawn(process.execPath, [scriptPath], {
+        cwd: projectDir,
+        env: { ...process.env, ...env },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("error", rejectChild);
+      child.on("close", (code) => {
+        if (code === 0) resolveChild(stdout);
+        else rejectChild(new Error(`child ${scriptName} exited ${code}: ${stderr}`));
+      });
+    });
+  }
+
+  // In-process tests elsewhere in this suite run with cwd = repo root and,
+  // after the N2 fix, write hook-state files under the repo root's
+  // (git-ignored) .NeuroStrata/. Remove that directory's hook-state so the
+  // working tree is left exactly as found.
+  after(() => {
+    rmSync(join(process.cwd(), ".NeuroStrata", "hook-state"), { recursive: true, force: true });
+  });
+
+  it("(a) six sequential hook processes report mutations_since_note [0,1,2,3,4,5] to the guard", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    try {
+      for (let i = 0; i < 6; i++) {
+        await runChildAsync(projectDir, `edit-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-xproc" });
+      }
+      assert.deepEqual(counters.guardMutations, [0, 1, 2, 3, 4, 5]);
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(b) a note-carrying task_update in one process resets the persisted counter for the next", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    const stateFile = join(projectDir, ".NeuroStrata", "hook-state", "mutations-sess-reset.json");
+    const readPersisted = () => JSON.parse(readFileSync(stateFile, "utf8")).mutations_since_note;
+    try {
+      await runChildAsync(projectDir, "edit-b1.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      await runChildAsync(projectDir, "edit-b2.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      assert.equal(readPersisted(), 2, "two Edit processes persist a count of 2");
+
+      await runChildAsync(projectDir, "reset-b.mjs", resetChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      assert.equal(readPersisted(), 0, "task_update(note) process persists the reset to 0");
+
+      await runChildAsync(projectDir, "edit-b3.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      await runChildAsync(projectDir, "edit-b4.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-reset" });
+      assert.deepEqual(counters.guardMutations, [0, 1, 0, 1]);
+      assert.equal(readPersisted(), 2, "counter accumulates again after the reset");
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(c) parallel bumpPersistedMutationCounter children lose no updates", async () => {
+    const projectDir = makeProjectDir();
+    try {
+      const bumpSource = `
+const core = await import(${JSON.stringify(distUrl)});
+for (let i = 0; i < 25; i++) {
+  const v = core.bumpPersistedMutationCounter("sess-conc");
+  if (v === null) { console.error("bump returned null"); process.exit(3); }
+}
+`;
+      await Promise.all(
+        [0, 1, 2, 3].map((n) => runChildAsync(projectDir, `bump-${n}.mjs`, bumpSource)),
+      );
+      const readerSource = `
+const core = await import(${JSON.stringify(distUrl)});
+console.log(core.readPersistedMutationCounter("sess-conc"));
+`;
+      const out = await runChildAsync(projectDir, "read-conc.mjs", readerSource);
+      assert.equal(out.trim(), "100", "4 children x 25 bumps persist exactly 100");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(d) unremovable stale lock bounds the wait: bump returns null instead of spinning", { timeout: 30000 }, async () => {
+    const projectDir = makeProjectDir();
+    const session = "sess-stale-unremovable";
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const killTimeoutMs = 12000;
+    let result;
+    try {
+      mkdirSync(hookStateDir, { recursive: true });
+      const lockDir = join(hookStateDir, `mutations-${session}.json.lock`);
+      mkdirSync(lockDir);
+      const staleTime = new Date(Date.now() - 20000);
+      utimesSync(lockDir, staleTime, staleTime);
+
+      // The core dist is imported by absolute path. In the root route the
+      // child runs as nobody, which cannot traverse the worktree under
+      // /home/hatch (verified: EACCES even on a 0644 file there), so the
+      // test imports a byte-identical copy of the dist placed inside the
+      // temp project instead of the worktree path.
+      const distCopyPath = join(projectDir, "core-dist.mjs");
+      copyFileSync(new URL("./dist/index.js", import.meta.url), distCopyPath);
+      chmodSync(distCopyPath, 0o644);
+
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      chmodSync(projectDir, 0o755);
+      chmodSync(join(projectDir, ".NeuroStrata"), 0o755);
+      // Root route: 0755 root-owned dir — nobody can unlink entries in it.
+      // Non-root route: 0555 dir — unlink is genuinely blocked for the
+      // current user. Both make rmSync(lockDir) throw EACCES on every
+      // stale-steal attempt.
+      chmodSync(hookStateDir, isRoot ? 0o755 : 0o555);
+
+      const bumpSource = `
+import { pathToFileURL } from "node:url";
+const core = await import(pathToFileURL(process.env.NS_DIST_COPY).href);
+console.log(core.bumpPersistedMutationCounter(${JSON.stringify(session)}));
+`;
+      const scriptPath = join(projectDir, "bump-stale.mjs");
+      writeFileSync(scriptPath, bumpSource);
+      chmodSync(scriptPath, 0o644);
+
+      result = await new Promise((resolveChild) => {
+        const started = Date.now();
+        const child = spawn(process.execPath, [scriptPath], {
+          cwd: projectDir,
+          env: { ...process.env, HOME: projectDir, NS_DIST_COPY: distCopyPath },
+          ...(isRoot ? { uid: 65534, gid: 65534 } : {}),
+        });
+        let stdout = "";
+        let stderr = "";
+        let killed = false;
+        const timer = setTimeout(() => {
+          killed = true;
+          child.kill("SIGKILL");
+        }, killTimeoutMs);
+        child.stdout.on("data", (d) => { stdout += d; });
+        child.stderr.on("data", (d) => { stderr += d; });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          resolveChild({ killed, code: null, signal: null, stdout, stderr: `${stderr}${err}`, elapsedMs: Date.now() - started });
+        });
+        child.on("close", (code, signal) => {
+          clearTimeout(timer);
+          resolveChild({ killed, code, signal, stdout, stderr, elapsedMs: Date.now() - started });
+        });
+      });
+    } finally {
+      try { chmodSync(hookStateDir, 0o755); } catch { /* best-effort restore for cleanup */ }
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+    assert.equal(result.killed, false, `child must exit on its own within ${killTimeoutMs}ms, not be killed while spinning on an unremovable stale lock (elapsed ${result.elapsedMs}ms, stderr: ${result.stderr})`);
+    assert.equal(result.code, 0, `child must exit 0 (got code ${result.code}, signal ${result.signal}, stderr: ${result.stderr})`);
+    assert.equal(result.stdout.trim(), "null", "bump must fail open (return null) when the lock cannot be acquired");
+    assert.ok(result.elapsedMs < 9000, `child wall time must be bounded (~2s deadline + generous slack, and < ${killTimeoutMs}ms kill timeout); got ${result.elapsedMs}ms`);
+  });
+
+  it("(e) a Code Mode task_update(note) with the session only on the outer event resets that session's persisted counter (C-46-1)", { timeout: 60000 }, async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const readPersisted = (key) => JSON.parse(readFileSync(join(hookStateDir, `mutations-${key}.json`), "utf8")).mutations_since_note;
+    const sharedFile = join(hookStateDir, "mutations-shared.json");
+
+    // Code Mode event via handleHookEvent: the executed code carries a
+    // note but NO session_id; the session identity lives only on the
+    // outer event (the shape the increment and guard-read paths resolve).
+    const codeModeResetChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "execute", tool_input: { code: 'neurostrata_task_update({ id: "t1", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    // Same Code Mode event via the execute.before handler, captured from
+    // initialize() with a fake host ctx (the hook-capture pattern used by
+    // the execute.before recall tests) in a fresh process.
+    const codeModeResetBeforeChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+let beforeHook = null;
+await core.initialize({
+  config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" },
+  tool: { hook: async (name, fn) => { if (name === "execute.before") beforeHook = fn; } },
+});
+if (typeof beforeHook !== "function") { console.error("execute.before hook was not registered"); process.exit(3); }
+await beforeHook({ tool: "execute", input: { code: 'neurostrata_task_update({ id: "t1", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    try {
+      // Shape 1: handleHookEvent reset site.
+      for (let i = 0; i < 5; i++) {
+        await runChildAsync(projectDir, `edit-e1-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode" });
+      }
+      assert.equal(readPersisted("sess-codemode"), 5, "five Edit processes persist a count of 5");
+      assert.deepEqual(counters.guardMutations.slice(0, 5), [0, 1, 2, 3, 4]);
+
+      await runChildAsync(projectDir, "reset-e1.mjs", codeModeResetChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode" });
+      assert.equal(readPersisted("sess-codemode"), 0, "Code Mode task_update(note) resets the outer event session's persisted counter");
+      assert.equal(existsSync(sharedFile), false, "the reset must not touch the shared counter");
+
+      const guardBefore = counters.guardMutations.length;
+      await runChildAsync(projectDir, "edit-e1-next.mjs", editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode" });
+      assert.equal(counters.guardMutations[guardBefore], 0, "the next Edit after the checkpoint forwards 0 to the guard");
+
+      // Shape 2: execute.before reset site.
+      for (let i = 0; i < 3; i++) {
+        await runChildAsync(projectDir, `edit-e2-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode-before" });
+      }
+      assert.equal(readPersisted("sess-codemode-before"), 3, "three Edit processes persist a count of 3");
+
+      await runChildAsync(projectDir, "reset-e2.mjs", codeModeResetBeforeChildSource, { NS_ENDPOINT: url, NS_SESSION: "sess-codemode-before" });
+      assert.equal(readPersisted("sess-codemode-before"), 0, "execute.before Code Mode task_update(note) resets the outer event session's persisted counter");
+      assert.equal(existsSync(sharedFile), false, "the execute.before reset must not touch the shared counter");
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(f) racing stale-lock takeovers lose no increments (C-46-2)", { timeout: 120000 }, async () => {
+    const projectDir = makeProjectDir();
+    const session = "sess-race";
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const counterFile = join(hookStateDir, `mutations-${session}.json`);
+    const lockDir = `${counterFile}.lock`;
+    const goFile = join(projectDir, "go.txt");
+
+    // Each racer signals readiness, parks on the GO barrier, then performs
+    // exactly one bump — the barrier shape of the C-46-2 reproduction, so
+    // both racers judge the same pre-aged stale lock in the same instant.
+    const racerSource = `
+import { writeFileSync, existsSync } from "node:fs";
+const core = await import(${JSON.stringify(distUrl)});
+writeFileSync(process.env.NS_READY, "ready");
+const t0 = Date.now();
+while (!existsSync(process.env.NS_GO)) { if (Date.now() - t0 > 10000) process.exit(4); }
+console.log(core.bumpPersistedMutationCounter(${JSON.stringify(session)}));
+`;
+
+    async function runRaceRound(round) {
+      rmSync(counterFile, { force: true });
+      rmSync(lockDir, { recursive: true, force: true });
+      rmSync(goFile, { force: true });
+      // Pre-create the stale lock in its production shape: an empty
+      // directory whose mtime is well past the 10 s stale threshold.
+      mkdirSync(lockDir, { recursive: true });
+      const stale = new Date(Date.now() - 20000);
+      utimesSync(lockDir, stale, stale);
+
+      const racers = [0, 1].map((k) => {
+        const readyFile = join(projectDir, `ready-${round}-${k}`);
+        rmSync(readyFile, { force: true });
+        return {
+          readyFile,
+          promise: runChildAsync(projectDir, `racer-${round}-${k}.mjs`, racerSource, { NS_READY: readyFile, NS_GO: goFile }),
+        };
+      });
+      const waitStart = Date.now();
+      while (!racers.every((r) => existsSync(r.readyFile))) {
+        if (Date.now() - waitStart > 15000) throw new Error("racers did not reach the barrier");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      writeFileSync(goFile, "go");
+      const returns = (await Promise.all(racers.map((r) => r.promise))).map((out) => {
+        const v = out.trim();
+        return v === "null" ? null : Number(v);
+      });
+      const persisted = existsSync(counterFile)
+        ? JSON.parse(readFileSync(counterFile, "utf8")).mutations_since_note
+        : 0;
+      // The verification round's loss definition: every bump reported
+      // success, yet the persisted total is wrong or two bumps returned
+      // the same value (proof their critical sections overlapped).
+      const allSucceeded = returns.every((v) => v !== null);
+      const dup = new Set(returns).size !== returns.length;
+      return allSucceeded && (persisted !== 2 || dup);
+    }
+
+    try {
+      let losses = 0;
+      for (let round = 0; round < 40; round++) {
+        if (await runRaceRound(round)) losses++;
+      }
+      assert.equal(losses, 0, `40 barrier-synchronized stale-lock takeover rounds must lose zero increments (lost ${losses})`);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(g) a checkpoint naming a different session also clears the outer event session's persisted counter (C2-1)", { timeout: 90000 }, async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    const projectDir = makeProjectDir();
+    const hookStateDir = join(projectDir, ".NeuroStrata", "hook-state");
+    const readPersisted = (key) => JSON.parse(readFileSync(join(hookStateDir, `mutations-${key}.json`), "utf8")).mutations_since_note;
+
+    // Case A reset shape (Code Mode): the executed code names session
+    // "current" while the outer event carries the session whose counter
+    // the bump paths credit and the guard actually checks.
+    const codeModeExplicitChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "execute", tool_input: { code: 'neurostrata_task_update({ id: "t1", session_id: "current", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    // Case B reset shape (native): tool_input names session "current",
+    // the outer event carries the gating session.
+    const nativeExplicitChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+await core.initialize({ config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" } });
+await core.handleHookEvent({ hook_event_name: "PreToolUse", tool_name: "neurostrata_task_update", tool_input: { id: "t1", session_id: "current", note: "checkpoint" }, session_id: process.env.NS_SESSION });
+`;
+
+    // Case A through the execute.before handler, captured from
+    // initialize() with a fake host ctx (the capture pattern used by
+    // test (e) shape 2), in a fresh process.
+    const codeModeExplicitBeforeChildSource = `
+const core = await import(${JSON.stringify(distUrl)});
+let beforeHook = null;
+await core.initialize({
+  config: { namespace: "xproc-ns", endpoint: process.env.NS_ENDPOINT, strictMode: true, requestTimeoutMs: 2000, bearerToken: "tok" },
+  tool: { hook: async (name, fn) => { if (name === "execute.before") beforeHook = fn; } },
+});
+if (typeof beforeHook !== "function") { console.error("execute.before hook was not registered"); process.exit(3); }
+await beforeHook({ tool: "execute", input: { code: 'neurostrata_task_update({ id: "t1", session_id: "current", note: "checkpoint" });' }, session_id: process.env.NS_SESSION });
+`;
+
+    async function runShape(label, outerSession, resetScript, resetSource) {
+      for (let i = 0; i < 5; i++) {
+        await runChildAsync(projectDir, `edit-g-${label}-${i}.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: outerSession });
+      }
+      assert.equal(readPersisted(outerSession), 5, `${label}: five Edit processes persist a count of 5`);
+      await runChildAsync(projectDir, resetScript, resetSource, { NS_ENDPOINT: url, NS_SESSION: outerSession });
+      assert.equal(readPersisted(outerSession), 0, `${label}: the checkpoint clears the outer event session's persisted counter`);
+      assert.equal(readPersisted("current"), 0, `${label}: the checkpoint also clears the named session's persisted counter`);
+      const guardBefore = counters.guardMutations.length;
+      await runChildAsync(projectDir, `edit-g-${label}-next.mjs`, editChildSource, { NS_ENDPOINT: url, NS_SESSION: outerSession });
+      assert.equal(counters.guardMutations[guardBefore], 0, `${label}: the next Edit after the checkpoint forwards 0 to the guard`);
+    }
+
+    try {
+      await runShape("codemode", "sess-c2-codemode", "reset-g-codemode.mjs", codeModeExplicitChildSource);
+      await runShape("native", "sess-c2-native", "reset-g-native.mjs", nativeExplicitChildSource);
+      await runShape("before", "sess-c2-before", "reset-g-before.mjs", codeModeExplicitBeforeChildSource);
+    } finally {
+      server.close();
+      rmSync(projectDir, { recursive: true, force: true });
     }
   });
 });
