@@ -2011,6 +2011,59 @@ mod tests {
         );
     }
 
+    /// PR #140 remediation (F3): the standalone fallback dispatch and the
+    /// Backup arm each open the store exactly once -- the identity-aware
+    /// construction. The sync merge reintroduced the legacy plain opens
+    /// directly beneath the fork's identity opens; shadowing left the
+    /// first store alive-but-unused for the whole command while every
+    /// arm ran on the identity-less store with default limits, so the
+    /// embedding-identity guard and the profiled limits never fired.
+    /// The pin is structural: the dispatch lives inline in `run()` and
+    /// the tree has no CLI test harness.
+    #[test]
+    fn standalone_and_backup_arms_open_only_the_identity_store() {
+        let source = include_str!("main.rs");
+        let backup_start = source
+            .find("\n            Commands::Backup { dir } => {")
+            .expect("the Backup arm exists");
+        let backup_end = source[backup_start..]
+            .find("Commands::Restore")
+            .map(|offset| backup_start + offset)
+            .expect("the Backup arm is followed by the Restore arm");
+        let backup = &source[backup_start..backup_end];
+        assert!(
+            backup.contains("new_with_identity_limits"),
+            "the Backup arm must open the identity-limits store"
+        );
+        assert!(
+            !backup.contains("LadybugStore::new("),
+            "the Backup arm must not shadow the identity store with the legacy constructor"
+        );
+
+        // The fallback dispatch opens its store between the startup
+        // resolution (the second one in the file; the Daemon arm's is
+        // the first) and the `match other` dispatch.
+        let match_other = source
+            .find("\n                match other {")
+            .expect("the fallback dispatch exists");
+        let opens_start = source[..match_other]
+            .rfind("let startup = resolve_startup(&config)?;")
+            .expect("the fallback resolves startup before opening the store");
+        let opens = &source[opens_start..match_other];
+        assert!(
+            opens.contains("new_with_identity_limits"),
+            "the fallback dispatch must open the identity-limits store"
+        );
+        assert!(
+            !opens.contains("LadybugStore::new("),
+            "the fallback dispatch must not shadow the identity store with the legacy constructor"
+        );
+        assert!(
+            opens.contains("ReadSource::Direct"),
+            "the fallback dispatch reads through the opened store"
+        );
+    }
+
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
@@ -5166,10 +5219,6 @@ async fn run() -> anyhow::Result<()> {
                         embed::configured_embedder_id()?,
                         profiled_store_limits(&config)?,
                     )?);
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                )?);
                 vector_store.export_database(&dir).await?;
                 println!("Backed up to {}", dir);
                 return Ok(());
@@ -5950,10 +5999,6 @@ async fn run() -> anyhow::Result<()> {
                         embedder.embedder_id().to_string(),
                         startup.limits,
                     )?);
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                )?);
                 let read = ReadSource::Direct(vector_store.clone());
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).
