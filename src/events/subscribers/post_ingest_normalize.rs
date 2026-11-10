@@ -55,7 +55,14 @@ fn normalize_payload_metadata(
                 continue;
             }
             if let Some(resolved) = known.resolve(s.as_str()) {
-                if resolved != *s {
+                // F7 (fork issue #85): never rewrite a declaration to a
+                // generation-scoped physical id. The pre-generation
+                // two-segment form this pass produces stays reachable
+                // (relink resolves it by logical path); a
+                // `<ns>::<gen>::<path>` form would freeze the declaration
+                // to one generation and strand the edge when the next
+                // generation publishes.
+                if resolved != *s && crate::parser::ingest::split_scoped_id(&resolved).is_none() {
                     *item = Value::String(resolved);
                     changed = true;
                 }

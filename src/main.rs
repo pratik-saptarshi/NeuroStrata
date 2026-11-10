@@ -6345,7 +6345,20 @@ async fn run() -> anyhow::Result<()> {
                                     for item in arr {
                                         if let Some(s) = item.as_str() {
                                             if let Some(resolved) = known.resolve(s) {
-                                                if resolved != s {
+                                                // F7 (fork issue #85): never
+                                                // rewrite a declaration to a
+                                                // generation-scoped physical
+                                                // id — it would freeze the
+                                                // declaration to one
+                                                // generation (see the AC4
+                                                // guard in
+                                                // events/subscribers/post_ingest_normalize.rs).
+                                                if resolved != s
+                                                    && crate::parser::ingest::split_scoped_id(
+                                                        &resolved,
+                                                    )
+                                                    .is_none()
+                                                {
                                                     new_arr.push(serde_json::Value::String(resolved));
                                                     changed = true;
                                                     continue;

@@ -3545,6 +3545,20 @@ const TOPOLOGY_KEYS: [&str; 5] = [
     "reason",
 ];
 
+/// The five metadata keys that carry author-written edge declarations;
+/// `parse_edge_specs` reads exactly these. F7 (fork issue #85): an upsert
+/// may resolve them to physical ids for edge materialization within the
+/// same call, but what the row persists must be the declared form —
+/// persisting the resolved form freezes a declaration to one
+/// generation's ids (see `remap_superseded_scoped_target`).
+const EDGE_DECLARATION_KEYS: [&str; 5] = [
+    "related_to",
+    "contained_by",
+    "governs",
+    "extracted_from",
+    "depends_on",
+];
+
 /// Validates a memory payload's metadata shape and extracts edge specs.
 /// Returns the valid edge specs and any shape warnings (never rejects the write).
 fn parse_edge_specs(
@@ -5962,11 +5976,24 @@ impl VectorStore for LadybugStore {
         if let Some(obj) = payload.metadata.as_object_mut() {
             obj.remove("edge_sources");
         }
+        // F7 (fork issue #85): snapshot the five edge declarations exactly
+        // as declared, before AC3 rewrites them below. The resolved form
+        // is what the in-call consumers need (edge materialization,
+        // mention detection, shape recomputation); the row write further
+        // down persists the declared form instead (see
+        // `persisted_metadata`), because persisting the resolved form
+        // freezes each declaration to the then-active generation's
+        // physical ids, which no later relink can resolve again.
+        let declared_edge_targets: Vec<(&'static str, Option<serde_json::Value>)> =
+            EDGE_DECLARATION_KEYS
+                .iter()
+                .map(|key| (*key, payload.metadata.get(*key).cloned()))
+                .collect();
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
         {
             let ids = self.mention_symbol_ids(&namespace).await?;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
-            for key in ["related_to", "contained_by", "governs", "extracted_from", "depends_on"] {
+            for key in EDGE_DECLARATION_KEYS {
                 if let Some(arr) = payload.metadata.get(key).and_then(|v| v.as_array()).cloned() {
                     let mut new_arr = Vec::with_capacity(arr.len());
                     for item in arr {
@@ -6223,6 +6250,26 @@ impl VectorStore for LadybugStore {
             }
         }
 
+        // F7: the metadata the row write persists — the fully-processed
+        // payload (facets, concept_iri, mentions and all other stamps
+        // applied above included) with the five declarations restored to
+        // their declared form from the pre-AC3 snapshot. Only the write
+        // closure's serializations use this copy; every in-call consumer
+        // has read `payload.metadata` (the resolved form), as before.
+        let mut persisted_metadata = payload.metadata.clone();
+        if let Some(obj) = persisted_metadata.as_object_mut() {
+            for (key, declared) in &declared_edge_targets {
+                match declared {
+                    Some(value) => {
+                        obj.insert((*key).to_string(), value.clone());
+                    }
+                    None => {
+                        obj.remove(*key);
+                    }
+                }
+            }
+        }
+
         let outcome = self.write_with_deadline("writing a memory", move |conn| {
 
             if let Some(generation) = &staged_generation {
@@ -6247,7 +6294,10 @@ impl VectorStore for LadybugStore {
             );
             let safe_location = escape_ladybug_string(&payload.location);
             let safe_location_lines = escape_ladybug_string(&payload.location_lines);
-            let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
+            // F7: serialize the persisted copy (declarations as declared),
+            // not the AC3-canonicalized working payload.
+            let safe_metadata =
+                escape_ladybug_string(&serde_json::to_string(&persisted_metadata)?);
 
             let vec_str = format!(
                 "[{}]",
@@ -6336,7 +6386,9 @@ impl VectorStore for LadybugStore {
                         ),
                         (
                             "metadata",
-                            lbug::Value::String(serde_json::to_string(&payload.metadata)?),
+                            // F7: the persisted copy (declarations as
+                            // declared), not the canonicalized payload.
+                            lbug::Value::String(serde_json::to_string(&persisted_metadata)?),
                         ),
                     ],
                 )?;
@@ -23399,6 +23451,72 @@ eurostrata\src\daemon.rs",
         assert!(
             kinds_after.iter().any(|k| k == "ExactFile"),
             "F7: rule must still surface as an ExactFile GOVERNS hit after re-ingestion; got {kinds_after:?}"
+        );
+    }
+
+    /// Acceptance 2 (issue #85): upsert persists all five declarations as
+    /// declared (logical), while the edges materialized by the same call
+    /// target the active generation's physical ids.
+    #[tokio::test]
+    async fn f7_upsert_persists_declarations_as_declared() {
+        let store = retired_test_store().await;
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        let gen1_id = f7_seed_file(&store, 1).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                "probe",
+                "rule-keys",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({
+                        "related_to": ["src/lib.rs"],
+                        "contained_by": ["src/lib.rs"],
+                        "governs": ["src/lib.rs"],
+                        "extracted_from": ["src/lib.rs"],
+                        "depends_on": ["src/lib.rs"]
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        for key in [
+            "related_to",
+            "contained_by",
+            "governs",
+            "extracted_from",
+            "depends_on",
+        ] {
+            assert_eq!(
+                f7_stored_values(&store, "rule-keys", key).await,
+                vec!["src/lib.rs".to_string()],
+                "F7: stored {key} must stay the declared logical path"
+            );
+        }
+        // Edge materialization in the same call still resolves to the
+        // active generation's physical id.
+        for rel in ["GOVERNS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"] {
+            assert_eq!(
+                f7_outgoing_targets(&store, rel, "rule-keys").await,
+                vec![gen1_id.clone()],
+                "F7: {rel} edge must target the generation-1 node"
+            );
+        }
+        // contained_by points the other way: parent CONTAINS the memory.
+        assert_eq!(
+            f7_incoming_sources(&store, "CONTAINS", "rule-keys").await,
+            vec![gen1_id.clone()],
+            "F7: CONTAINS edge must come from the generation-1 node"
         );
     }
 
