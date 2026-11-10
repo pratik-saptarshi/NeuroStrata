@@ -222,6 +222,36 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
+export declare function mutationCounterFilePath(sessionId?: string): string;
+export declare function readPersistedMutationCounter(sessionId?: string): number | null;
+/**
+ * Increment the persisted counter under its lock and return the new value,
+ * or null on any failure (callers fall back to the in-process increment).
+ */
+export declare function bumpPersistedMutationCounter(sessionId?: string): number | null;
+/** Persist a reset to 0 under the same lock. Best-effort; never throws. */
+export declare function resetPersistedMutationCounter(sessionId?: string): void;
+/**
+ * Checkpoint reset (C2-1): clear the counter of the session the task
+ * call named AND the counter the fallback chain resolves to without
+ * the call-named slot, when the two differ.
+ *
+ * The bump paths have no call-named slot: they credit the counter of
+ * the identity the hook event itself carries (or the process's active
+ * session when the event is silent), and the guard reads and forwards
+ * that same counter — it is the one that gates BreathRequired. A
+ * checkpoint whose task call names a different session would otherwise
+ * clear only the named session's counter and leave the gating counter
+ * hot, so the checkpoint never restores progress. The named counter is
+ * still cleared, exactly as before: the note was recorded under that
+ * session, so its count is zero by definition. When the two identities
+ * coincide, or either is absent, this is exactly the single reset the
+ * call sites performed before — including the internal active/shared
+ * fallback when both are absent. Each reset keeps the same lock
+ * discipline and fail-open behavior; the two resets run sequentially,
+ * never nested.
+ */
+export declare function resetPersistedMutationCounterForCheckpoint(callNamedSessionId?: string, chainSessionId?: string): void;
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
 /**

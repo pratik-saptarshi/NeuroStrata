@@ -18,7 +18,7 @@
 // ──────────────────────────────────────────────────────────────────────
 // Node built-ins only (ESM). Zero require(), zero external runtime deps.
 // ──────────────────────────────────────────────────────────────────────
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 // ──────────────────────────────────────────────────────────────────────
@@ -1008,6 +1008,15 @@ const MEMORY_MUTATION_TOOLS = new Set([
 function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
     if (!TASK_MUTATION_TOOLS.has(toolName) && !MEMORY_MUTATION_TOOLS.has(toolName))
         return;
+    // The chain identity is what the bump/guard paths resolve to without
+    // the call-named slot; capture the active session before this call's
+    // own adoption below overwrites it (C2-1).
+    const priorActiveSessionId = activeSessionId;
+    const callNamedSessionId = asString(payloadArgs.session_id) ?? undefined;
+    const chainSessionId = asString(outerInput?.session_id) ??
+        asString(outerInput?.sessionID) ??
+        priorActiveSessionId ??
+        undefined;
     const sessionId = asString(payloadArgs.session_id) ??
         asString(outerInput?.session_id) ??
         asString(outerInput?.sessionID);
@@ -1018,6 +1027,7 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
         toolName === "neurostrata_task_complete" ||
         payloadArgs.note !== undefined) {
         mutationsSinceNote = 0;
+        resetPersistedMutationCounterForCheckpoint(callNamedSessionId, chainSessionId);
     }
     if (MEMORY_MUTATION_TOOLS.has(toolName)) {
         cachedTaskInjection.clear();
@@ -1059,6 +1069,240 @@ export function resetClientForTesting() {
 }
 export function getTrackingState() {
     return { activeTaskId, activeSessionId, mutationsSinceNote };
+}
+// ──────────────────────────────────────────────────────────────────────
+// N2: mutation-counter persistence for stateless hook processes.
+//
+// Stateless CLI hooks run one Node process per tool invocation, so the
+// in-process `mutationsSinceNote` above resets to 0 every time and the
+// daemon's BreathRequired threshold can never trigger in that shape.
+// The counter is therefore also persisted per session in
+// <projectRoot>/.NeuroStrata/hook-state/mutations-<session-key>.json
+// (the plugin's existing local-state convention; see session_queries.json).
+// Every helper fails OPEN: bookkeeping must never block a tool call, so
+// any error falls back to today's in-process behaviour.
+// ──────────────────────────────────────────────────────────────────────
+function sanitizeMutationCounterKey(raw) {
+    const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+    return cleaned.length > 0 ? cleaned : "shared";
+}
+export function mutationCounterFilePath(sessionId) {
+    const key = sanitizeMutationCounterKey(sessionId ?? activeSessionId ?? "shared");
+    return join(findProjectRoot(), ".NeuroStrata", "hook-state", `mutations-${key}.json`);
+}
+export function readPersistedMutationCounter(sessionId) {
+    try {
+        const parsed = JSON.parse(readFileSync(mutationCounterFilePath(sessionId), "utf8"));
+        const value = parsed !== null && typeof parsed === "object"
+            ? parsed.mutations_since_note
+            : undefined;
+        return typeof value === "number" && Number.isFinite(value) && value >= 0
+            ? Math.floor(value)
+            : null;
+    }
+    catch {
+        return null;
+    }
+}
+function sleepMsSync(ms) {
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    }
+    catch {
+        // No SharedArrayBuffer/Atomics.wait: proceed without the pause; the
+        // bounded deadline below still caps the total wait.
+    }
+}
+const MUTATION_COUNTER_LOCK_TIMEOUT_MS = 2000;
+const MUTATION_COUNTER_LOCK_POLL_MS = 10;
+const MUTATION_COUNTER_LOCK_STALE_MS = 10_000;
+/**
+ * Steal a lock directory that was judged stale, ownership-safely.
+ *
+ * Path-based removal is NOT safe here: two processes can judge the same
+ * stale lock removable, and the second one's removal can land after the
+ * first has already created a FRESH lock at the same path — deleting the
+ * live lock and admitting both into the critical section (C-46-2). A
+ * rename, by contrast, atomically moves the directory OBJECT, and only
+ * one stealer can move a given generation. So: rename the lock to a
+ * unique sibling trash path, then re-stat the moved directory — its
+ * mtime must equal the exact mtime that was judged stale (a rename does
+ * not change a directory's mtime; a fresh lock always carries a current
+ * one). Only the judged generation may be deleted. If the moved
+ * directory is a live lock (mtime mismatch), it is renamed back
+ * untouched; if even that fails because the path was reoccupied, the
+ * live lock is left where it is — deleting a lock known to be live is
+ * the defect being fixed, never the recovery.
+ *
+ * Returns "stolen" (the judged stale generation was removed; retry the
+ * acquire promptly), or "blocked" (lost the steal race, moved a live
+ * lock and restored it, or the filesystem refused: caller polls within
+ * the same deadline as ordinary contention, so the wait stays bounded).
+ * Never throws.
+ */
+function stealStaleMutationCounterLock(lockDir, judgedMtimeMs) {
+    const trashDir = `${lockDir}.steal-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+    try {
+        renameSync(lockDir, trashDir);
+    }
+    catch {
+        return "blocked";
+    }
+    let movedMtimeMs = null;
+    try {
+        movedMtimeMs = statSync(trashDir).mtimeMs;
+    }
+    catch {
+        // The directory we just moved is the only handle on it; if it cannot
+        // be stat'ed, treat it as the judged generation and remove it rather
+        // than strand a lock no one else can find.
+    }
+    if (movedMtimeMs !== null && movedMtimeMs !== judgedMtimeMs) {
+        try {
+            renameSync(trashDir, lockDir);
+        }
+        catch {
+            // The lock path was reoccupied during the displacement. Leave the
+            // live lock at the trash path (its holder's release tolerates the
+            // path being gone) instead of deleting a live lock.
+        }
+        return "blocked";
+    }
+    try {
+        rmSync(trashDir, { recursive: true, force: true });
+    }
+    catch {
+        // Best effort: an orphaned trash dir is inert — nothing stats or
+        // acquires it, unlike the lock path itself.
+    }
+    return "stolen";
+}
+/**
+ * Acquire the exclusive lock directory for a counter file (mkdirSync is an
+ * atomic create). Polls briefly; a lock older than the stale threshold is
+ * presumed to belong to a crashed holder and is stolen. Returns the lock
+ * dir path, or null on timeout/failure (callers fail open).
+ */
+function acquireMutationCounterLock(filePath) {
+    const lockDir = `${filePath}.lock`;
+    const deadline = Date.now() + MUTATION_COUNTER_LOCK_TIMEOUT_MS;
+    while (true) {
+        if (Date.now() >= deadline)
+            return null;
+        try {
+            mkdirSync(lockDir);
+            return lockDir;
+        }
+        catch {
+            let staleMtimeMs = null;
+            try {
+                const mtimeMs = statSync(lockDir).mtimeMs;
+                if (Date.now() - mtimeMs > MUTATION_COUNTER_LOCK_STALE_MS)
+                    staleMtimeMs = mtimeMs;
+            }
+            catch {
+                // Lock vanished between attempts (or never existed): just retry.
+            }
+            if (staleMtimeMs !== null) {
+                // A successful steal retries promptly; a blocked steal (lost the
+                // race, or the filesystem refuses, e.g. removal is not permitted)
+                // must NOT spin: it falls through to the same deadline check +
+                // poll sleep as ordinary contention, so the wait stays bounded.
+                if (stealStaleMutationCounterLock(lockDir, staleMtimeMs) === "stolen")
+                    continue;
+            }
+            if (Date.now() >= deadline)
+                return null;
+            sleepMsSync(MUTATION_COUNTER_LOCK_POLL_MS);
+        }
+    }
+}
+function releaseMutationCounterLock(lockDir) {
+    try {
+        rmSync(lockDir, { recursive: true, force: true });
+    }
+    catch {
+        // best-effort; a stranded lock goes stale and is stolen later
+    }
+}
+/** Write under the caller's lock: tmp file + atomic rename, never torn. */
+function writePersistedMutationCounter(filePath, value) {
+    const tmpPath = `${filePath}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, JSON.stringify({ mutations_since_note: value, updated_at: Math.floor(Date.now() / 1000) }));
+    renameSync(tmpPath, filePath);
+}
+/**
+ * Increment the persisted counter under its lock and return the new value,
+ * or null on any failure (callers fall back to the in-process increment).
+ */
+export function bumpPersistedMutationCounter(sessionId) {
+    const filePath = mutationCounterFilePath(sessionId);
+    let lockDir = null;
+    try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        lockDir = acquireMutationCounterLock(filePath);
+        if (lockDir === null)
+            return null;
+        const next = (readPersistedMutationCounter(sessionId) ?? 0) + 1;
+        writePersistedMutationCounter(filePath, next);
+        return next;
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (lockDir !== null)
+            releaseMutationCounterLock(lockDir);
+    }
+}
+/** Persist a reset to 0 under the same lock. Best-effort; never throws. */
+export function resetPersistedMutationCounter(sessionId) {
+    const filePath = mutationCounterFilePath(sessionId);
+    let lockDir = null;
+    try {
+        mkdirSync(dirname(filePath), { recursive: true });
+        lockDir = acquireMutationCounterLock(filePath);
+        if (lockDir === null)
+            return;
+        writePersistedMutationCounter(filePath, 0);
+    }
+    catch {
+        // fail open: the in-process reset already happened
+    }
+    finally {
+        if (lockDir !== null)
+            releaseMutationCounterLock(lockDir);
+    }
+}
+/**
+ * Checkpoint reset (C2-1): clear the counter of the session the task
+ * call named AND the counter the fallback chain resolves to without
+ * the call-named slot, when the two differ.
+ *
+ * The bump paths have no call-named slot: they credit the counter of
+ * the identity the hook event itself carries (or the process's active
+ * session when the event is silent), and the guard reads and forwards
+ * that same counter — it is the one that gates BreathRequired. A
+ * checkpoint whose task call names a different session would otherwise
+ * clear only the named session's counter and leave the gating counter
+ * hot, so the checkpoint never restores progress. The named counter is
+ * still cleared, exactly as before: the note was recorded under that
+ * session, so its count is zero by definition. When the two identities
+ * coincide, or either is absent, this is exactly the single reset the
+ * call sites performed before — including the internal active/shared
+ * fallback when both are absent. Each reset keeps the same lock
+ * discipline and fail-open behavior; the two resets run sequentially,
+ * never nested.
+ */
+export function resetPersistedMutationCounterForCheckpoint(callNamedSessionId, chainSessionId) {
+    if (callNamedSessionId !== undefined &&
+        chainSessionId !== undefined &&
+        callNamedSessionId !== chainSessionId) {
+        resetPersistedMutationCounter(callNamedSessionId);
+        resetPersistedMutationCounter(chainSessionId);
+        return;
+    }
+    resetPersistedMutationCounter(callNamedSessionId ?? chainSessionId);
 }
 // ──────────────────────────────────────────────────────────────────────
 // Bug 5: execute.before / execute.after recall delivery
@@ -1245,10 +1489,24 @@ const executeBeforeHandler = async (input) => {
             cachedTaskInjection.delete(inspection.id);
             activeTaskId = inspection.id;
         }
+        // The chain identity is what the bump/guard paths resolve to
+        // without the in-code slot; capture it before the adoption on the
+        // next line overwrites the active session (C2-1).
+        const chainSessionId = asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined;
         if (inspection.sessionId)
             activeSessionId = inspection.sessionId;
         if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
             mutationsSinceNote = 0;
+            // Resolve the reset target like the bump/guard paths do: in-code
+            // session first, then the outer event's, then the active session —
+            // a fresh stateless process has no active session, so without the
+            // outer event the reset would fall back to the `shared` counter and
+            // never clear the real session's persisted count (C-46-1). When the
+            // in-code session differs from the chain identity, the checkpoint
+            // clears both: the bump paths credit the chain identity's counter,
+            // so clearing only the named one leaves the gating counter hot
+            // (C2-1).
+            resetPersistedMutationCounterForCheckpoint(inspection.sessionId ?? undefined, chainSessionId);
         }
         if (inspection.taskCompleted) {
             if (activeTaskId)
@@ -1360,6 +1618,9 @@ const executeBeforeHandler = async (input) => {
             if (!mcpClient) {
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): no MCP client`);
             }
+            const persistedMutations = readPersistedMutationCounter(session_id);
+            if (persistedMutations !== null)
+                mutationsSinceNote = persistedMutations;
             try {
                 const text = await mcpClient.callTool("neurostrata_guard_validate", {
                     namespace: config.namespace,
@@ -1391,7 +1652,8 @@ const executeBeforeHandler = async (input) => {
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
             }
         }
-        mutationsSinceNote++;
+        const bumpedMutations = bumpPersistedMutationCounter(asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined);
+        mutationsSinceNote = bumpedMutations ?? mutationsSinceNote + 1;
     }
     for (const fp of filePaths)
         confirmPrefetchDelivery(config.namespace, fp);
@@ -1501,10 +1763,23 @@ export async function handleHookEvent(event) {
                 cachedTaskInjection.delete(inspection.id);
                 activeTaskId = inspection.id;
             }
+            // The chain identity is what the bump/guard paths resolve to
+            // without the in-code slot; capture it before the adoption on the
+            // next line overwrites the active session (C2-1).
+            const chainSessionId = asString(event.session_id) ?? asString(event.sessionID) ?? activeSessionId ?? undefined;
             if (inspection.sessionId)
                 activeSessionId = inspection.sessionId;
             if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
                 mutationsSinceNote = 0;
+                // Same resolution as the bump/guard paths: in-code session, then
+                // the outer event's, then the active session — otherwise a fresh
+                // stateless process resets `shared` and the real session's
+                // persisted count survives the checkpoint (C-46-1). When the
+                // in-code session differs from the chain identity, the checkpoint
+                // clears both: the bump paths credit the chain identity's
+                // counter, so clearing only the named one leaves the gating
+                // counter hot (C2-1).
+                resetPersistedMutationCounterForCheckpoint(inspection.sessionId ?? undefined, chainSessionId);
             }
             if (inspection.taskCompleted) {
                 if (activeTaskId)
@@ -1596,6 +1871,9 @@ export async function handleHookEvent(event) {
                 try {
                     if (!mcpClient)
                         throw new Error("no MCP client");
+                    const persistedMutations = readPersistedMutationCounter(session_id);
+                    if (persistedMutations !== null)
+                        mutationsSinceNote = persistedMutations;
                     const text = await mcpClient.callTool("neurostrata_guard_validate", {
                         namespace: config.namespace,
                         session_id,
@@ -1623,7 +1901,8 @@ export async function handleHookEvent(event) {
                     return denyWithRecall(`Guard unavailable: ${message}`);
                 }
             }
-            mutationsSinceNote++;
+            const bumpedMutations = bumpPersistedMutationCounter(asString(event.session_id) ?? asString(event.sessionID) ?? activeSessionId ?? undefined);
+            mutationsSinceNote = bumpedMutations ?? mutationsSinceNote + 1;
         }
         for (const fp of recalledFilePaths)
             confirmPrefetchDelivery(config.namespace, fp);
