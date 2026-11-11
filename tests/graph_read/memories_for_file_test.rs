@@ -9,8 +9,8 @@
 mod memories_for_file;
 
 use memories_for_file::{
-    freshness_priority, memory_type_priority, rank_hits, GraphMatchKind, MemoryHit,
-    DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES, MAX_LIMIT,
+    freshness_priority, memory_type_priority, rank_hits, GraphMatchKind, MemoryHit, DEFAULT_LIMIT,
+    DEFAULT_MEMORY_TYPES, MAX_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -34,17 +34,11 @@ fn hit(
 
 #[test]
 fn match_kind_priority_orders_best_first() {
-    assert!(
-        GraphMatchKind::ExactSymbol.priority() < GraphMatchKind::ExactFile.priority()
-    );
+    assert!(GraphMatchKind::ExactSymbol.priority() < GraphMatchKind::ExactFile.priority());
     assert!(GraphMatchKind::ExactFile.priority() < GraphMatchKind::SymbolTwoHop.priority());
     assert!(GraphMatchKind::SymbolTwoHop.priority() < GraphMatchKind::AncestorDirectory.priority());
-    assert!(
-        GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority()
-    );
-    assert!(
-        GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority()
-    );
+    assert!(GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority());
+    assert!(GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority());
 }
 
 #[test]
@@ -53,19 +47,13 @@ fn memory_type_priority_ranks_enforced_rules_first() {
     let partial = json!({ "enforcement": "PARTIAL" });
     let shaped_fact = json!({ "topology": {} });
     let plain_fact = json!({});
+    assert!(memory_type_priority("rule", &enforced) < memory_type_priority("rule", &partial));
+    assert!(memory_type_priority("rule", &partial) < memory_type_priority("fact", &shaped_fact));
     assert!(
-        memory_type_priority("rule", &enforced) < memory_type_priority("rule", &partial)
+        memory_type_priority("fact", &shaped_fact) < memory_type_priority("procedure", &json!({}))
     );
     assert!(
-        memory_type_priority("rule", &partial) < memory_type_priority("fact", &shaped_fact)
-    );
-    assert!(
-        memory_type_priority("fact", &shaped_fact)
-            < memory_type_priority("procedure", &json!({}))
-    );
-    assert!(
-        memory_type_priority("procedure", &json!({}))
-            < memory_type_priority("fact", &plain_fact)
+        memory_type_priority("procedure", &json!({})) < memory_type_priority("fact", &plain_fact)
     );
 }
 
@@ -91,7 +79,13 @@ fn rank_hits_orders_by_kind_then_type_then_access_count() {
             100,
             json!({ "enforcement": "ENFORCED" }),
         ),
-        hit("exact-fact", GraphMatchKind::ExactFile, "fact", 100, json!({})),
+        hit(
+            "exact-fact",
+            GraphMatchKind::ExactFile,
+            "fact",
+            100,
+            json!({}),
+        ),
         hit(
             "exact-rule",
             GraphMatchKind::ExactFile,
