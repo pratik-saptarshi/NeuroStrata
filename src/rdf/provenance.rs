@@ -83,7 +83,10 @@ pub fn edge_assertion_iri(
     }
 }
 
-pub fn extract_node_provenance(metadata: &serde_json::Value, default_generation: i64) -> NodeProvenance {
+pub fn extract_node_provenance(
+    metadata: &serde_json::Value,
+    default_generation: i64,
+) -> NodeProvenance {
     let prov_obj = metadata.get("provenance").and_then(|v| v.as_object());
     let source = if let Some(p) = prov_obj {
         p.get("source").and_then(|v| v.as_str()).map(String::from)
@@ -102,7 +105,10 @@ pub fn extract_node_provenance(metadata: &serde_json::Value, default_generation:
                 } else {
                     let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                     let r = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-                    let cap = obj.get("captured_at").and_then(|v| v.as_str()).unwrap_or("");
+                    let cap = obj
+                        .get("captured_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     Some(if kind.is_empty() && r.is_empty() && cap.is_empty() {
                         // Structured source without the usual {kind, ref,
                         // captured_at} shape: serialize the object instead of
@@ -239,7 +245,8 @@ pub fn project_memory_rdf_star(
     let xsd_str = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#string".to_string());
     let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer".to_string());
     let xsd_dbl = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#double".to_string());
-    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string());
+    let rdf_type =
+        NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string());
     let rdf_reifies = NamedNode::new_unchecked(RDF_REIFIES.to_string());
 
     let mut quads = Vec::new();
@@ -254,9 +261,21 @@ pub fn project_memory_rdf_star(
         });
     };
 
-    push_str_quad(&mut base, &field_predicate("content"), payload.content.clone());
-    push_str_quad(&mut base, &field_predicate("user_id"), payload.user_id.clone());
-    push_str_quad(&mut base, &field_predicate("memory_type"), payload.memory_type.clone());
+    push_str_quad(
+        &mut base,
+        &field_predicate("content"),
+        payload.content.clone(),
+    );
+    push_str_quad(
+        &mut base,
+        &field_predicate("user_id"),
+        payload.user_id.clone(),
+    );
+    push_str_quad(
+        &mut base,
+        &field_predicate("memory_type"),
+        payload.memory_type.clone(),
+    );
     if let Some(agent) = &payload.agent_name {
         push_str_quad(&mut base, &field_predicate("agent_name"), agent.clone());
     }
@@ -281,7 +300,10 @@ pub fn project_memory_rdf_star(
     if let Some(concept) = payload.metadata.get("concept_iri") {
         let iris: Vec<String> = match concept {
             serde_json::Value::String(sval) => vec![sval.clone()],
-            serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
             _ => vec![],
         };
         for iri in iris {
@@ -329,7 +351,9 @@ pub fn project_memory_rdf_star(
     base.push(Quad {
         subject: s.clone(),
         predicate: rdf_type.clone(),
-        object: Term::NamedNode(NamedNode::new_unchecked("urn:neurostrata:Memory".to_string())),
+        object: Term::NamedNode(NamedNode::new_unchecked(
+            "urn:neurostrata:Memory".to_string(),
+        )),
         graph_name: graph.clone(),
     });
 
@@ -337,7 +361,8 @@ pub fn project_memory_rdf_star(
     let warnings = validate_node_provenance(&format!("urn:neurostrata:memory:{}", id), &prov);
 
     let assertion_iri = memory_assertion_iri(namespace, id, "memory", 0, prov.generation);
-    let assertion_subj = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(assertion_iri.clone()));
+    let assertion_subj =
+        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(assertion_iri.clone()));
 
     for b in &base {
         // emit base
@@ -352,7 +377,9 @@ pub fn project_memory_rdf_star(
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: rdf_type.clone(),
-            object: Term::NamedNode(NamedNode::new_unchecked("urn:neurostrata:ns#Assertion".to_string())),
+            object: Term::NamedNode(NamedNode::new_unchecked(
+                "urn:neurostrata:ns#Assertion".to_string(),
+            )),
             graph_name: b.graph_name.clone(),
         });
         // rdf:reifies << ( s p o ) >>
@@ -376,37 +403,55 @@ pub fn project_memory_rdf_star(
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: NamedNode::new_unchecked(ns_predicate("extractor")),
-            object: Term::Literal(Literal::new_typed_literal(prov.extractor.clone(), xsd_str.clone())),
+            object: Term::Literal(Literal::new_typed_literal(
+                prov.extractor.clone(),
+                xsd_str.clone(),
+            )),
             graph_name: b.graph_name.clone(),
         });
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: NamedNode::new_unchecked(ns_predicate("origin")),
-            object: Term::Literal(Literal::new_typed_literal(prov.origin.clone(), xsd_str.clone())),
+            object: Term::Literal(Literal::new_typed_literal(
+                prov.origin.clone(),
+                xsd_str.clone(),
+            )),
             graph_name: b.graph_name.clone(),
         });
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: NamedNode::new_unchecked(ns_predicate("confidence")),
-            object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.confidence), xsd_dbl.clone())),
+            object: Term::Literal(Literal::new_typed_literal(
+                format!("{}", prov.confidence),
+                xsd_dbl.clone(),
+            )),
             graph_name: b.graph_name.clone(),
         });
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: NamedNode::new_unchecked(ns_predicate("validFrom")),
-            object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.valid_from), xsd_int.clone())),
+            object: Term::Literal(Literal::new_typed_literal(
+                format!("{}", prov.valid_from),
+                xsd_int.clone(),
+            )),
             graph_name: b.graph_name.clone(),
         });
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: NamedNode::new_unchecked(ns_predicate("validTo")),
-            object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.valid_to), xsd_int.clone())),
+            object: Term::Literal(Literal::new_typed_literal(
+                format!("{}", prov.valid_to),
+                xsd_int.clone(),
+            )),
             graph_name: b.graph_name.clone(),
         });
         quads.push(Quad {
             subject: assertion_subj.clone(),
             predicate: NamedNode::new_unchecked(ns_predicate("generation")),
-            object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.generation), xsd_int.clone())),
+            object: Term::Literal(Literal::new_typed_literal(
+                format!("{}", prov.generation),
+                xsd_int.clone(),
+            )),
             graph_name: b.graph_name.clone(),
         });
     }
@@ -427,15 +472,13 @@ pub fn project_edge_rdf_star(
         "urn:neurostrata:memory:{}",
         from
     )));
-    let o_named = NamedNode::new_unchecked(format!(
-        "urn:neurostrata:memory:{}",
-        to
-    ));
+    let o_named = NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", to));
     let o_term = Term::NamedNode(o_named.clone());
     let xsd_str = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#string".to_string());
     let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer".to_string());
     let xsd_dbl = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#double".to_string());
-    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string());
+    let rdf_type =
+        NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string());
     let rdf_reifies = NamedNode::new_unchecked(RDF_REIFIES.to_string());
     let ns_predicate = |n: &str| NamedNode::new_unchecked(format!("urn:neurostrata:ns#{}", n));
 
@@ -446,18 +489,32 @@ pub fn project_edge_rdf_star(
         graph_name: graph_name.clone(),
     };
 
-    let assertions = edge_assertion_iri(namespace, relation, from, to, prov.generation, prov.valid_from, ordinal);
+    let assertions = edge_assertion_iri(
+        namespace,
+        relation,
+        from,
+        to,
+        prov.generation,
+        prov.valid_from,
+        ordinal,
+    );
     let assertion_subj = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(assertions));
 
     let mut quads = Vec::new();
     quads.push(base.clone());
 
     // assertion block
-    let triple_term = Term::Triple(Box::new(Triple::new(s.clone(), base.predicate.clone(), o_term.clone())));
+    let triple_term = Term::Triple(Box::new(Triple::new(
+        s.clone(),
+        base.predicate.clone(),
+        o_term.clone(),
+    )));
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: rdf_type.clone(),
-        object: Term::NamedNode(NamedNode::new_unchecked("urn:neurostrata:ns#Assertion".to_string())),
+        object: Term::NamedNode(NamedNode::new_unchecked(
+            "urn:neurostrata:ns#Assertion".to_string(),
+        )),
         graph_name: graph_name.clone(),
     });
     quads.push(Quad {
@@ -479,45 +536,70 @@ pub fn project_edge_rdf_star(
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: ns_predicate("extractor"),
-        object: Term::Literal(Literal::new_typed_literal(prov.extractor.clone(), xsd_str.clone())),
+        object: Term::Literal(Literal::new_typed_literal(
+            prov.extractor.clone(),
+            xsd_str.clone(),
+        )),
         graph_name: graph_name.clone(),
     });
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: ns_predicate("origin"),
-        object: Term::Literal(Literal::new_typed_literal(prov.origin.clone(), xsd_str.clone())),
+        object: Term::Literal(Literal::new_typed_literal(
+            prov.origin.clone(),
+            xsd_str.clone(),
+        )),
         graph_name: graph_name.clone(),
     });
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: ns_predicate("confidence"),
-        object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.confidence), xsd_dbl.clone())),
+        object: Term::Literal(Literal::new_typed_literal(
+            format!("{}", prov.confidence),
+            xsd_dbl.clone(),
+        )),
         graph_name: graph_name.clone(),
     });
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: ns_predicate("validFrom"),
-        object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.valid_from), xsd_int.clone())),
+        object: Term::Literal(Literal::new_typed_literal(
+            format!("{}", prov.valid_from),
+            xsd_int.clone(),
+        )),
         graph_name: graph_name.clone(),
     });
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: ns_predicate("validTo"),
-        object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.valid_to), xsd_int.clone())),
+        object: Term::Literal(Literal::new_typed_literal(
+            format!("{}", prov.valid_to),
+            xsd_int.clone(),
+        )),
         graph_name: graph_name.clone(),
     });
     quads.push(Quad {
         subject: assertion_subj.clone(),
         predicate: ns_predicate("generation"),
-        object: Term::Literal(Literal::new_typed_literal(format!("{}", prov.generation), xsd_int.clone())),
+        object: Term::Literal(Literal::new_typed_literal(
+            format!("{}", prov.generation),
+            xsd_int.clone(),
+        )),
         graph_name: graph_name.clone(),
     });
 
-    let warnings = validate_node_provenance(&format!("urn:neurostrata:edge:{}:{}:{}", namespace, relation, from), prov);
+    let warnings = validate_node_provenance(
+        &format!("urn:neurostrata:edge:{}:{}:{}", namespace, relation, from),
+        prov,
+    );
     (quads, warnings)
 }
 
-pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: bool) -> Result<String, String> {
+pub fn serialize_rdf_star(
+    quads: &[oxrdf::Quad],
+    format: &str,
+    flatten_graphs: bool,
+) -> Result<String, String> {
     if !matches!(
         format,
         "turtle-star" | "trig-star" | "n-triples-star" | "n-quads-star"
@@ -540,15 +622,25 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
 
     // Use TurtleSerializer for triple formats, TriG/NQuads for quad formats.
     let is_triple_format = format == "turtle-star"
-        || (flatten_graphs && format != "trig-star" && format != "n-triples-star" && format != "n-quads-star");
-    let is_trig = format == "trig-star" || (!flatten_graphs && format != "n-quads-star" && format != "n-triples-star" && format != "turtle-star");
+        || (flatten_graphs
+            && format != "trig-star"
+            && format != "n-triples-star"
+            && format != "n-quads-star");
+    let is_trig = format == "trig-star"
+        || (!flatten_graphs
+            && format != "n-quads-star"
+            && format != "n-triples-star"
+            && format != "turtle-star");
 
-    if format == "n-triples-star" || (flatten_graphs && is_triple_format && format != "turtle-star") {
+    if format == "n-triples-star" || (flatten_graphs && is_triple_format && format != "turtle-star")
+    {
         // NTriplesSerializer over triples
         let mut serializer = oxttl::NTriplesSerializer::new().for_writer(Vec::new());
         for q in sorted {
             let t = Triple::new(q.subject.clone(), q.predicate.clone(), q.object.clone());
-            serializer.serialize_triple(t.as_ref()).map_err(|e| format!("serialize: {}", e))?;
+            serializer
+                .serialize_triple(t.as_ref())
+                .map_err(|e| format!("serialize: {}", e))?;
         }
         let bytes = serializer.finish();
         return String::from_utf8(bytes).map_err(|_| "utf8".to_string());
@@ -558,7 +650,9 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
         let mut serializer = oxttl::TurtleSerializer::new().for_writer(Vec::new());
         for q in sorted {
             let t = Triple::new(q.subject.clone(), q.predicate.clone(), q.object.clone());
-            serializer.serialize_triple(t.as_ref()).map_err(|e| format!("serialize: {}", e))?;
+            serializer
+                .serialize_triple(t.as_ref())
+                .map_err(|e| format!("serialize: {}", e))?;
         }
         let bytes = serializer.finish().map_err(|e| format!("finish: {}", e))?;
         return String::from_utf8(bytes).map_err(|_| "utf8".to_string());
@@ -567,7 +661,9 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
     if format == "trig-star" || is_trig {
         let mut serializer = oxttl::TriGSerializer::new().for_writer(Vec::new());
         for q in sorted {
-            serializer.serialize_quad(q.as_ref()).map_err(|e| format!("serialize: {}", e))?;
+            serializer
+                .serialize_quad(q.as_ref())
+                .map_err(|e| format!("serialize: {}", e))?;
         }
         let bytes = serializer.finish().map_err(|e| format!("finish: {}", e))?;
         return String::from_utf8(bytes).map_err(|_| "utf8".to_string());
@@ -592,7 +688,9 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
             object: q.object.clone(),
             graph_name,
         };
-        serializer.serialize_quad(flattened.as_ref()).map_err(|e| format!("serialize: {}", e))?;
+        serializer
+            .serialize_quad(flattened.as_ref())
+            .map_err(|e| format!("serialize: {}", e))?;
     }
     let bytes = serializer.finish();
     String::from_utf8(bytes).map_err(|_| "utf8".to_string())
@@ -602,8 +700,8 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
 mod tests {
     use super::*;
     use crate::traits::MemoryPayload;
-    use serde_json::json;
     use oxrdf::{GraphName, NamedNode};
+    use serde_json::json;
 
     fn sample_payload() -> MemoryPayload {
         MemoryPayload {
@@ -656,17 +754,29 @@ mod tests {
 
     #[test]
     fn validate_assertion_iri_memory_and_edge() {
-        assert!(validate_assertion_iri("urn:neurostrata:assertion:ns:memory:m:sl:0:1"));
-        assert!(validate_assertion_iri("urn:neurostrata:assertion:ns:edge:r:a:b:g1:v0"));
+        assert!(validate_assertion_iri(
+            "urn:neurostrata:assertion:ns:memory:m:sl:0:1"
+        ));
+        assert!(validate_assertion_iri(
+            "urn:neurostrata:assertion:ns:edge:r:a:b:g1:v0"
+        ));
         assert!(!validate_assertion_iri("nope"));
     }
 
     #[test]
     fn project_memory_rdf_star_emits_base_and_assertion() {
-        let (qs, _w) = project_memory_rdf_star("ns", "m1", &sample_payload(), crate::rdf::types::Tier::Domain, 1);
+        let (qs, _w) = project_memory_rdf_star(
+            "ns",
+            "m1",
+            &sample_payload(),
+            crate::rdf::types::Tier::Domain,
+            1,
+        );
         assert!(!qs.is_empty());
         assert!(qs.iter().any(|q| q.predicate.as_str().contains("content")));
-        assert!(qs.iter().any(|q| q.object.to_string().contains("Assertion") || q.predicate.as_str().contains("type") && q.object.to_string().contains("Assertion")));
+        assert!(qs.iter().any(|q| q.object.to_string().contains("Assertion")
+            || q.predicate.as_str().contains("type")
+                && q.object.to_string().contains("Assertion")));
     }
 
     #[test]
@@ -680,14 +790,24 @@ mod tests {
             valid_to: 0,
             generation: 1,
         };
-        let (qs, _w) = project_edge_rdf_star("ns", "a", "GOVERNS", "b", &prov, None, GraphName::DefaultGraph);
+        let (qs, _w) = project_edge_rdf_star(
+            "ns",
+            "a",
+            "GOVERNS",
+            "b",
+            &prov,
+            None,
+            GraphName::DefaultGraph,
+        );
         assert!(!qs.is_empty());
     }
 
     #[test]
     fn serialize_rdf_star_formats() {
         let q = oxrdf::Quad {
-            subject: NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("urn:test:s".to_string())),
+            subject: NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
+                "urn:test:s".to_string(),
+            )),
             predicate: NamedNode::new_unchecked("urn:test:p".to_string()),
             object: Term::Literal(Literal::new_simple_literal("hello")),
             graph_name: GraphName::DefaultGraph,
