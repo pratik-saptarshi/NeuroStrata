@@ -75,3 +75,44 @@ from environments without the toolchain.
   baseline count reaches zero — same bar as Task 15b.
 - Changing gate semantics = code review on this file + the script.
   Never bypass the gate to land a PR; fix or `SKIP` loudly instead.
+
+## 7. Prior art: rocinante vs tachi-rust vs this gate
+
+Same goal (no red trunk, no bypass culture), three enforcement points:
+
+- **rocinante — CI-required, scope-aware, single aggregator.** No
+  local hooks. `ci.yml` has zero `continue-on-error`: `rust-quality-
+  gates` (`ci_gate_tests`), `rust-lint` (fmt+clippy matrix),
+  `rust-tests`, coverage and platform lanes all gate. A `ci-scope`
+  job does path-based delta/release profiling (PRs get delta scope,
+  `main`/`release/*` force full scope), and one aggregator `test`
+  job ("All required CI stages completed") is the required status
+  check alongside `codeql`. Supply chain is exception-proofed:
+  `.cargo/audit.toml` ignore-list plus `check-security-advisory-
+  exceptions.py` / `dependency-floor-proof.sh`. Lesson for us: an
+  aggregator job shrinks required-context sprawl, and a checked-in
+  ignore-list with proof scripts beats ad-hoc tracking comments.
+- **tachi-rust — shift-left local gates + strict per-concern CI.**
+  Local: `.pre-commit-config.yaml` (gitleaks wrapper + file-scoped
+  local hooks so clean commits pay zero cost), `Makefile *-gate`
+  targets (`supply-chain-gate`: `cargo audit` + `cargo deny check
+  advisories bans licenses sources`; `workflow-gate` pin hygiene;
+  `gitleaks-gate`), and manifest-driven `scripts/ci-local-runner.sh`
+  (`local-full` vs `local-route-equivalent`) for local/CI parity.
+  CI: dedicated `rustfmt.yml` (hard `--check` fail), `rust-clippy.yml`
+  (`-D warnings` + SARIF), `rust-supply-chain.yml` (pinned
+  cargo-audit 0.22.2 / cargo-deny 0.20.2, full deny policy incl.
+  licenses+sources). Rulesets gate on scan/quality results
+  (`code_quality`, CodeQL high+) with an *empty* required-checks
+  list — enforcement at the finding level, not named jobs. Lesson
+  for us: absolute gates work there because the tree is clean; our
+  baseline debt is why this gate is delta-based instead.
+- **This gate — local delta pre-push.** Fills the gap the other two
+  designs assume away: a tree with 212 fmt hunks / 210 clippy
+  diagnostics / 371 deny errors cannot adopt absolute gates without
+  a tree-wide sweep (forbidden by Task 15b), and CI report-only
+  means nothing stops new violations. Added-line attribution +
+  new-advisory-vs-base is the strictest posture compatible with
+  inherited debt. Borrow next (not in this PR): rocinante-style
+  aggregator job, checked-in advisory ignore-list with proof, a
+  `rust-toolchain.toml` pin, and `make quality-gate` discoverability.
