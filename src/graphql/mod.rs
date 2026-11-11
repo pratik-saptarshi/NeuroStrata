@@ -105,9 +105,10 @@ pub(crate) fn resolve_arg_i32<'a>(
 ) -> Option<i32> {
     match value {
         graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i as i32),
-        graphql_parser::query::Value::Variable(name) => {
-            variables.get(*name).and_then(|v| v.as_i64()).map(|i| i as i32)
-        }
+        graphql_parser::query::Value::Variable(name) => variables
+            .get(*name)
+            .and_then(|v| v.as_i64())
+            .map(|i| i as i32),
         _ => None,
     }
 }
@@ -118,9 +119,10 @@ pub(crate) fn resolve_arg_string<'a>(
 ) -> Option<String> {
     match value {
         graphql_parser::query::Value::String(s) => Some(s.clone()),
-        graphql_parser::query::Value::Variable(name) => {
-            variables.get(*name).and_then(|v| v.as_str()).map(|s| s.to_string())
-        }
+        graphql_parser::query::Value::Variable(name) => variables
+            .get(*name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -150,7 +152,9 @@ pub(crate) fn resolve_arg_id<'a>(
         graphql_parser::query::Value::String(s) => Some(s.clone()),
         graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i.to_string()),
         graphql_parser::query::Value::Variable(name) => variables.get(*name).and_then(|v| {
-            v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|i| i.to_string()))
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|i| i.to_string()))
         }),
         _ => None,
     }
@@ -236,8 +240,13 @@ fn sanitize_metadata(metadata: &Value, principal: &str, user_id: &str) -> Value 
 
 fn is_structural(memory_type: &str) -> bool {
     const STRUCTURAL: &[&str] = &[
-        "directory", "file", "markdown", "freshness_flag",
-        "guard_event", "community_summary", "digital_twin",
+        "directory",
+        "file",
+        "markdown",
+        "freshness_flag",
+        "guard_event",
+        "community_summary",
+        "digital_twin",
         "digital_twin_schema",
     ];
     STRUCTURAL.contains(&memory_type)
@@ -248,7 +257,10 @@ fn is_mesh_conflicting(metadata: &Value) -> bool {
 }
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)
+    metadata
+        .get("archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
@@ -289,8 +301,21 @@ fn build_memory_node(
     }
 
     let metadata_clean = sanitize_metadata(&payload.metadata, principal, &payload.user_id);
-    let location_lines: Vec<Value> = payload.location_lines.split(',').filter_map(|s| s.trim().parse::<i32>().ok().map(Value::from)).collect();
-    let mentions: Vec<Value> = payload.metadata.get("mentions").and_then(|v| v.as_array()).map(|arr| arr.iter().filter_map(|x| x.as_str().map(Value::from)).collect()).unwrap_or_default();
+    let location_lines: Vec<Value> = payload
+        .location_lines
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i32>().ok().map(Value::from))
+        .collect();
+    let mentions: Vec<Value> = payload
+        .metadata
+        .get("mentions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(Value::from))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Build edges selection (only if requested in selection, handled by caller; here build full for simplicity)
     let edges_data = edges_by_source.get(id).cloned().unwrap_or_default();
@@ -313,7 +338,8 @@ fn build_memory_node(
             .ok()
             .filter(|(key, _)| key == "edge")
             .and_then(|(_, value)| {
-                value.rsplit_once(':')
+                value
+                    .rsplit_once(':')
                     .filter(|(node, _)| *node == id)
                     .and_then(|(_, idx)| idx.parse::<usize>().ok())
             })
@@ -331,7 +357,10 @@ fn build_memory_node(
     let has_next = skipped + paginated_edges.len() < edges_data.len();
     // The cursor of the last returned edge carries the next page's resume point.
     let end_cursor = if !paginated_edges.is_empty() {
-        encode_cursor("edge", &format!("{id}:{}", skipped + paginated_edges.len() - 1))
+        encode_cursor(
+            "edge",
+            &format!("{id}:{}", skipped + paginated_edges.len() - 1),
+        )
     } else {
         String::new()
     };
@@ -368,14 +397,18 @@ pub fn execute_on_records(
 ) -> GraphQLResponse {
     let mut errors = Vec::new();
     if query.trim().is_empty() {
-        errors.push(GraphQLError { message: "parse error".into() });
+        errors.push(GraphQLError {
+            message: "parse error".into(),
+        });
         return GraphQLResponse { data: None, errors };
     }
 
     let parsed = match graphql_parser::query::parse_query::<&str>(query) {
         Ok(p) => p,
         Err(e) => {
-            errors.push(GraphQLError { message: format!("parse error: {}", e) });
+            errors.push(GraphQLError {
+                message: format!("parse error: {}", e),
+            });
             return GraphQLResponse { data: None, errors };
         }
     };
@@ -385,11 +418,15 @@ pub fn execute_on_records(
         if let graphql_parser::query::Definition::Operation(op) = def {
             match op {
                 graphql_parser::query::OperationDefinition::Mutation(_) => {
-                    errors.push(GraphQLError { message: "mutations are not supported".into() });
+                    errors.push(GraphQLError {
+                        message: "mutations are not supported".into(),
+                    });
                     return GraphQLResponse { data: None, errors };
                 }
                 graphql_parser::query::OperationDefinition::Subscription(_) => {
-                    errors.push(GraphQLError { message: "subscriptions are not supported".into() });
+                    errors.push(GraphQLError {
+                        message: "subscriptions are not supported".into(),
+                    });
                     return GraphQLResponse { data: None, errors };
                 }
                 _ => {}
@@ -417,15 +454,49 @@ pub fn execute_on_records(
 
     // Extract root selection fields from the query (simplified)
     // We'll do basic validation: root field must be in allowed set
-    let allowed_roots: HashSet<&str> = ["memory", "memories", "search", "__typename"].iter().cloned().collect();
+    let allowed_roots: HashSet<&str> = ["memory", "memories", "search", "__typename"]
+        .iter()
+        .cloned()
+        .collect();
     let allowed_memory_fields: HashSet<&str> = [
-        "id", "namespace", "memoryType", "content", "userId", "agentName",
-        "location", "locationLines", "validFrom", "validTo", "feedbackScore",
-        "metadata", "mentions", "edges", "__typename",
-    ].iter().cloned().collect();
-    let allowed_edge_fields: HashSet<&str> = ["targetId", "relation", "extractor", "cursor", "node", "__typename"].iter().cloned().collect();
-    let allowed_connection_fields: HashSet<&str> = ["edges", "pageInfo", "__typename"].iter().cloned().collect();
-    let allowed_pageinfo_fields: HashSet<&str> = ["hasNextPage", "endCursor", "__typename"].iter().cloned().collect();
+        "id",
+        "namespace",
+        "memoryType",
+        "content",
+        "userId",
+        "agentName",
+        "location",
+        "locationLines",
+        "validFrom",
+        "validTo",
+        "feedbackScore",
+        "metadata",
+        "mentions",
+        "edges",
+        "__typename",
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    let allowed_edge_fields: HashSet<&str> = [
+        "targetId",
+        "relation",
+        "extractor",
+        "cursor",
+        "node",
+        "__typename",
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    let allowed_connection_fields: HashSet<&str> = ["edges", "pageInfo", "__typename"]
+        .iter()
+        .cloned()
+        .collect();
+    let allowed_pageinfo_fields: HashSet<&str> = ["hasNextPage", "endCursor", "__typename"]
+        .iter()
+        .cloned()
+        .collect();
 
     // Basic field validation by scanning selection set names (simplified heuristics)
     // For the unit tests, we mainly need to detect unknown root and unknown selection on Memory/Edge/MemoryConnection/PageInfo
@@ -436,7 +507,9 @@ pub fn execute_on_records(
     for def in &parsed.definitions {
         if let graphql_parser::query::Definition::Operation(op_def) = def {
             let selection_set_opt = match op_def {
-                graphql_parser::query::OperationDefinition::Query(query_def) => Some(&query_def.selection_set),
+                graphql_parser::query::OperationDefinition::Query(query_def) => {
+                    Some(&query_def.selection_set)
+                }
                 graphql_parser::query::OperationDefinition::SelectionSet(sel_set) => Some(sel_set),
                 _ => None,
             };
@@ -453,22 +526,33 @@ pub fn execute_on_records(
                                     let sname: &str = sf.name;
                                     if !allowed_connection_fields.contains(sname) {
                                         has_unknown_root = true;
-                                        unknown_selection_errors.push(format!("unknown field {}", sname));
+                                        unknown_selection_errors
+                                            .push(format!("unknown field {}", sname));
                                     } else if sname == "edges" {
                                         for inner in &sf.selection_set.items {
-                                            if let graphql_parser::query::Selection::Field(inf) = inner {
+                                            if let graphql_parser::query::Selection::Field(inf) =
+                                                inner
+                                            {
                                                 if !allowed_edge_fields.contains(inf.name) {
                                                     has_unknown_root = true;
-                                                    unknown_selection_errors.push(format!("unknown field {}", inf.name));
+                                                    unknown_selection_errors.push(format!(
+                                                        "unknown field {}",
+                                                        inf.name
+                                                    ));
                                                 }
                                             }
                                         }
                                     } else if sname == "pageInfo" {
                                         for inner in &sf.selection_set.items {
-                                            if let graphql_parser::query::Selection::Field(inf) = inner {
+                                            if let graphql_parser::query::Selection::Field(inf) =
+                                                inner
+                                            {
                                                 if !allowed_pageinfo_fields.contains(inf.name) {
                                                     has_unknown_root = true;
-                                                    unknown_selection_errors.push(format!("unknown field {}", inf.name));
+                                                    unknown_selection_errors.push(format!(
+                                                        "unknown field {}",
+                                                        inf.name
+                                                    ));
                                                 }
                                             }
                                         }
@@ -481,7 +565,8 @@ pub fn execute_on_records(
                                     let sname: &str = sf.name;
                                     if !allowed_memory_fields.contains(sname) {
                                         has_unknown_root = true;
-                                        unknown_selection_errors.push(format!("unknown field {}", sname));
+                                        unknown_selection_errors
+                                            .push(format!("unknown field {}", sname));
                                     }
                                 }
                             }
@@ -510,7 +595,9 @@ pub fn execute_on_records(
     for def in &parsed.definitions {
         if let graphql_parser::query::Definition::Operation(op_def) = def {
             let selection_set_opt = match op_def {
-                graphql_parser::query::OperationDefinition::Query(query_def) => Some(&query_def.selection_set),
+                graphql_parser::query::OperationDefinition::Query(query_def) => {
+                    Some(&query_def.selection_set)
+                }
                 graphql_parser::query::OperationDefinition::SelectionSet(sel_set) => Some(sel_set),
                 _ => None,
             };
@@ -560,17 +647,15 @@ pub fn execute_on_records(
                                         var_include_retired = b;
                                     }
                                 }
-                                "text" => {
-                                    match v {
-                                        graphql_parser::query::Value::String(s) => var_text = s.clone(),
-                                        graphql_parser::query::Value::Variable(name) => {
-                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
-                                                var_text = s.to_string();
-                                            }
+                                "text" => match v {
+                                    graphql_parser::query::Value::String(s) => var_text = s.clone(),
+                                    graphql_parser::query::Value::Variable(name) => {
+                                        if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                            var_text = s.to_string();
                                         }
-                                        _ => {}
                                     }
-                                }
+                                    _ => {}
+                                },
                                 _ => {}
                             }
                         }
@@ -588,9 +673,12 @@ pub fn execute_on_records(
                             for (k, v) in &f.arguments {
                                 if *k == "namespace" {
                                     match v {
-                                        graphql_parser::query::Value::String(s) => ns_arg = s.clone(),
+                                        graphql_parser::query::Value::String(s) => {
+                                            ns_arg = s.clone()
+                                        }
                                         graphql_parser::query::Value::Variable(name) => {
-                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str())
+                                            {
                                                 ns_arg = s.to_string();
                                             }
                                         }
@@ -610,7 +698,8 @@ pub fn execute_on_records(
                             // this root field), never from the root field's
                             // pagination state — schema-invalid pagination
                             // arguments on the memory root itself are inert.
-                            let (nested_first, nested_after) = nested_edges_args(f, root_name, var_map);
+                            let (nested_first, nested_after) =
+                                nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && payload.memory_type != "" {
                                     root_result = build_memory_node(
@@ -633,16 +722,22 @@ pub fn execute_on_records(
                                 root_result = None;
                             }
                             if let Some(obj) = data.as_object_mut() {
-                                obj.insert(response_key.to_string(), root_result.unwrap_or(Value::Null));
+                                obj.insert(
+                                    response_key.to_string(),
+                                    root_result.unwrap_or(Value::Null),
+                                );
                             }
                         } else if root_name == "memories" || root_name == "search" {
                             let mut ns_arg = namespace.to_string();
                             for (k, v) in &f.arguments {
                                 if *k == "namespace" {
                                     match v {
-                                        graphql_parser::query::Value::String(s) => ns_arg = s.clone(),
+                                        graphql_parser::query::Value::String(s) => {
+                                            ns_arg = s.clone()
+                                        }
                                         graphql_parser::query::Value::Variable(name) => {
-                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str())
+                                            {
                                                 ns_arg = s.to_string();
                                             }
                                         }
@@ -657,19 +752,39 @@ pub fn execute_on_records(
                                 ) });
                                 return GraphQLResponse { data: None, errors };
                             }
-                            let first = if var_first < 1 { 1 } else if var_first > 100 { 100 } else { var_first };
+                            let first = if var_first < 1 {
+                                1
+                            } else if var_first > 100 {
+                                100
+                            } else {
+                                var_first
+                            };
                             if var_first > 100 {
-                                errors.push(GraphQLError { message: "first clamped to 100".into() });
+                                errors.push(GraphQLError {
+                                    message: "first clamped to 100".into(),
+                                });
                             }
-                            let after_cursor = if var_after.is_empty() { None } else { Some(var_after.as_str()) };
-                            let mut filtered: Vec<(String, crate::traits::MemoryPayload)> = Vec::new();
+                            let after_cursor = if var_after.is_empty() {
+                                None
+                            } else {
+                                Some(var_after.as_str())
+                            };
+                            let mut filtered: Vec<(String, crate::traits::MemoryPayload)> =
+                                Vec::new();
                             let now = chrono::Utc::now().timestamp();
                             for (id_str, payload) in records.iter() {
-                                if payload.memory_type == "" { continue; }
-                                if is_structural(&payload.memory_type) && (var_memory_type.is_empty() || var_memory_type != payload.memory_type) {
+                                if payload.memory_type == "" {
                                     continue;
                                 }
-                                if !var_memory_type.is_empty() && payload.memory_type != var_memory_type {
+                                if is_structural(&payload.memory_type)
+                                    && (var_memory_type.is_empty()
+                                        || var_memory_type != payload.memory_type)
+                                {
+                                    continue;
+                                }
+                                if !var_memory_type.is_empty()
+                                    && payload.memory_type != var_memory_type
+                                {
                                     continue;
                                 }
                                 if !var_include_archived && is_archived(&payload.metadata) {
@@ -678,10 +793,16 @@ pub fn execute_on_records(
                                 if !var_include_retired && is_retired_at(&payload.metadata, now) {
                                     continue;
                                 }
-                                if crate::registry::is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                                if crate::registry::is_registry_row(&payload.metadata)
+                                    || is_mesh_conflicting(&payload.metadata)
+                                {
                                     continue;
                                 }
-                                if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
+                                if !crate::rebac::can_read_memory(
+                                    principal,
+                                    &payload.user_id,
+                                    &payload.metadata,
+                                ) {
                                     continue;
                                 }
                                 filtered.push((id_str.clone(), payload.clone()));
@@ -690,9 +811,11 @@ pub fn execute_on_records(
                             // candidate by case-insensitive token/substring hits against
                             // content and metadata, combined with metadata.score. Records
                             // with no matching token/substring are dropped.
-                            let mut match_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+                            let mut match_scores: std::collections::HashMap<String, f64> =
+                                std::collections::HashMap::new();
                             if root_name == "search" && !var_text.trim().is_empty() {
-                                let tokens: Vec<String> = var_text.to_lowercase()
+                                let tokens: Vec<String> = var_text
+                                    .to_lowercase()
                                     .split_whitespace()
                                     .filter(|t| !t.is_empty())
                                     .map(|t| t.to_string())
@@ -706,17 +829,25 @@ pub fn execute_on_records(
                                     let mut hits = 0.0f64;
                                     for tok in &tokens {
                                         // Occurrence-counted so richer matches outrank single hits.
-                                        hits += 2.0 * content_lc.matches(tok.as_str()).count() as f64;
+                                        hits +=
+                                            2.0 * content_lc.matches(tok.as_str()).count() as f64;
                                         hits += 1.0 * meta_lc.matches(tok.as_str()).count() as f64;
                                     }
                                     // Full-text bonus when the whole query is a substring.
-                                    if !text_lc.is_empty() && (content_lc.contains(&text_lc) || meta_lc.contains(&text_lc)) {
+                                    if !text_lc.is_empty()
+                                        && (content_lc.contains(&text_lc)
+                                            || meta_lc.contains(&text_lc))
+                                    {
                                         hits += 1.0;
                                     }
                                     if hits <= 0.0 {
                                         return false;
                                     }
-                                    let meta_score = payload.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    let meta_score = payload
+                                        .metadata
+                                        .get("score")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
                                     match_scores.insert(id_str.clone(), hits + meta_score);
                                     true
                                 });
@@ -724,18 +855,39 @@ pub fn execute_on_records(
                             // Sort
                             if root_name == "memories" {
                                 filtered.sort_by(|a, b| {
-                                    b.1.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0).cmp(&a.1.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0))
+                                    b.1.metadata
+                                        .get("valid_from")
+                                        .and_then(|v| v.as_i64())
+                                        .unwrap_or(0)
+                                        .cmp(
+                                            &a.1.metadata
+                                                .get("valid_from")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0),
+                                        )
                                         .then_with(|| a.0.cmp(&b.0))
                                 });
                             } else {
                                 // search: match score DESC (match hits combined with
                                 // metadata.score), id ASC as tie-break
                                 filtered.sort_by(|a, b| {
-                                    let s_a = match_scores.get(&a.0).copied()
-                                        .unwrap_or_else(|| a.1.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0));
-                                    let s_b = match_scores.get(&b.0).copied()
-                                        .unwrap_or_else(|| b.1.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0));
-                                    s_b.partial_cmp(&s_a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+                                    let s_a =
+                                        match_scores.get(&a.0).copied().unwrap_or_else(|| {
+                                            a.1.metadata
+                                                .get("score")
+                                                .and_then(|v| v.as_f64())
+                                                .unwrap_or(0.0)
+                                        });
+                                    let s_b =
+                                        match_scores.get(&b.0).copied().unwrap_or_else(|| {
+                                            b.1.metadata
+                                                .get("score")
+                                                .and_then(|v| v.as_f64())
+                                                .unwrap_or(0.0)
+                                        });
+                                    s_b.partial_cmp(&s_a)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                        .then_with(|| a.0.cmp(&b.0))
                                 });
                             }
                             // Cursor pagination via after
@@ -756,24 +908,36 @@ pub fn execute_on_records(
                                 0
                             };
                             let filtered_len = filtered.len();
-                            let page: Vec<(String, crate::traits::MemoryPayload)> = if start_idx >= filtered_len {
-                                Vec::new()
-                            } else {
-                                filtered.into_iter().skip(start_idx).take(first as usize).collect()
-                            };
+                            let page: Vec<(String, crate::traits::MemoryPayload)> =
+                                if start_idx >= filtered_len {
+                                    Vec::new()
+                                } else {
+                                    filtered
+                                        .into_iter()
+                                        .skip(start_idx)
+                                        .take(first as usize)
+                                        .collect()
+                                };
                             let has_next = (start_idx + first as usize) < filtered_len;
                             let end_cursor_opt = if has_next && !page.is_empty() {
                                 let last_id = page.last().unwrap().0.clone();
-                                let sort_key = if root_name == "memories" { "valid_from" } else { "score" };
+                                let sort_key = if root_name == "memories" {
+                                    "valid_from"
+                                } else {
+                                    "score"
+                                };
                                 Some(encode_cursor(sort_key, &last_id))
-                            } else { None };
+                            } else {
+                                None
+                            };
 
                             // F3: each node's edges paginate from the
                             // node's own nested `edges` arguments, walked
                             // path-aware via edges { node { edges(…) } } —
                             // never from this root field's pagination state
                             // (which governs the connection page above only).
-                            let (nested_first, nested_after) = nested_edges_args(f, root_name, var_map);
+                            let (nested_first, nested_after) =
+                                nested_edges_args(f, root_name, var_map);
                             let memory_edges_fixed: Vec<Value> = page.iter().map(|(id_str, payload)| {
                                 let sort_key = if root_name == "memories" { "valid_from" } else { "score" };
                                 if let Some(node) = build_memory_node(
@@ -817,7 +981,10 @@ pub fn execute_on_records(
         data = Value::Null;
     }
 
-    GraphQLResponse { data: Some(data), errors }
+    GraphQLResponse {
+        data: Some(data),
+        errors,
+    }
 }
 
 pub async fn execute_async(
@@ -834,7 +1001,10 @@ pub async fn execute_async(
     // Edges declared in metadata (§ declared-edge replay): each record's
     // declared edges are surfaced beside their declaring row so the `edges`
     // selection resolves without a second traversal.
-    let mut edges_by_source: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
+    let mut edges_by_source: std::collections::HashMap<
+        String,
+        Vec<(String, String, Option<String>)>,
+    > = std::collections::HashMap::new();
     match res {
         Ok(search_results) => {
             for sr in search_results {
@@ -848,7 +1018,14 @@ pub async fn execute_async(
                 }
                 records.push((sr.id, sr.payload));
             }
-            execute_on_records(&records, &edges_by_source, namespace, principal, query, variables)
+            execute_on_records(
+                &records,
+                &edges_by_source,
+                namespace,
+                principal,
+                query,
+                variables,
+            )
         }
         Err(e) => GraphQLResponse {
             data: None,
@@ -873,10 +1050,20 @@ pub fn execute(
         })
     } else {
         // Fallback: build a current-thread runtime or use empty records.
-        if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             rt.block_on(execute_async(store, namespace, principal, query, variables))
         } else {
-            execute_on_records(&[], &std::collections::HashMap::new(), namespace, principal, query, variables)
+            execute_on_records(
+                &[],
+                &std::collections::HashMap::new(),
+                namespace,
+                principal,
+                query,
+                variables,
+            )
         }
     }
 }
@@ -893,10 +1080,7 @@ mod tests {
 
     #[test]
     fn introspection_serves_shipped_sdl() {
-        for q in [
-            "{ __schema { types { name } } }",
-            "{ _sdl }",
-        ] {
+        for q in ["{ __schema { types { name } } }", "{ _sdl }"] {
             let resp = execute_on_records(
                 &[],
                 &std::collections::HashMap::new(),
@@ -924,10 +1108,17 @@ mod tests {
         };
         let specs = crate::store::ladybug::edge_specs(&payload.metadata);
         assert!(!specs.is_empty(), "edge_specs must read the declaration");
-        let mut edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
+        let mut edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+            std::collections::HashMap::new();
         let mapped: Vec<(String, String, Option<String>)> = specs
             .iter()
-            .map(|e| (e.target_id.clone(), e.rel_type.to_string(), Some("metadata".to_string())))
+            .map(|e| {
+                (
+                    e.target_id.clone(),
+                    e.rel_type.to_string(),
+                    Some("metadata".to_string()),
+                )
+            })
             .collect();
         let (target, rel) = (mapped[0].0.clone(), mapped[0].1.clone());
         edges.insert("m1".into(), mapped);
@@ -959,18 +1150,39 @@ mod tests {
             metadata: meta,
         };
         let records = vec![
-            ("hit1".into(), mk("database writes are batched", serde_json::json!({}))),
-            ("hitmeta".into(), mk("", serde_json::json!({"content": "database lifecycle"}))),
+            (
+                "hit1".into(),
+                mk("database writes are batched", serde_json::json!({})),
+            ),
+            (
+                "hitmeta".into(),
+                mk("", serde_json::json!({"content": "database lifecycle"})),
+            ),
             ("miss".into(), mk("unrelated memory", serde_json::json!({}))),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ search(text: \"Database\") { edges { node { id content } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ search(text: \"Database\") { edges { node { id content } } } }",
+            None,
+        );
         let data = resp.data.as_ref().unwrap();
         let rows = data["search"]["edges"].as_array().unwrap();
         let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
-        assert!(ids.contains(&&serde_json::json!("hit1")), "content match included");
-        assert!(ids.contains(&&serde_json::json!("hitmeta")), "metadata match included");
-        assert!(!ids.contains(&&serde_json::json!("miss")), "non-matching record excluded");
+        assert!(
+            ids.contains(&&serde_json::json!("hit1")),
+            "content match included"
+        );
+        assert!(
+            ids.contains(&&serde_json::json!("hitmeta")),
+            "metadata match included"
+        );
+        assert!(
+            !ids.contains(&&serde_json::json!("miss")),
+            "non-matching record excluded"
+        );
     }
 
     #[test]
@@ -989,9 +1201,17 @@ mod tests {
             ("a".into(), mk("rule", 0.0)),
             ("b".into(), mk("rule rule", 0.0)),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ search(text: \"rule\") { edges { node { id } } } }", None);
-        let rows = resp.data.as_ref().unwrap()["search"]["edges"].as_array().unwrap();
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ search(text: \"rule\") { edges { node { id } } } }",
+            None,
+        );
+        let rows = resp.data.as_ref().unwrap()["search"]["edges"]
+            .as_array()
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["node"]["id"], "b");
         assert_eq!(rows[1]["node"]["id"], "a");
@@ -999,59 +1219,98 @@ mod tests {
 
     #[test]
     fn namespace_isolation_violation_rejects_cross_ns_queries() {
-        let records = vec![("m1".into(), crate::traits::MemoryPayload {
-            content: "x".into(),
-            user_id: "u".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "l".into(),
-            location_lines: "1".into(),
-            metadata: serde_json::json!({}),
-        })];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memory(id: \"m1\", namespace: \"other\") { id } }", None);
-        assert!(resp.data.is_none(), "cross-namespace query must be rejected");
-        assert!(resp.errors.iter().any(|e| e.message.contains("namespace isolation violation")
-            && e.message.contains("'other'") && e.message.contains("'ns'")));
+        let records = vec![(
+            "m1".into(),
+            crate::traits::MemoryPayload {
+                content: "x".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({}),
+            },
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\", namespace: \"other\") { id } }",
+            None,
+        );
+        assert!(
+            resp.data.is_none(),
+            "cross-namespace query must be rejected"
+        );
+        assert!(resp
+            .errors
+            .iter()
+            .any(|e| e.message.contains("namespace isolation violation")
+                && e.message.contains("'other'")
+                && e.message.contains("'ns'")));
     }
 
     #[test]
     fn namespace_isolation_violation_rejects_cross_ns_memories_and_search() {
-        let records = vec![("m1".into(), crate::traits::MemoryPayload {
-            content: "x".into(),
-            user_id: "u".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "l".into(),
-            location_lines: "1".into(),
-            metadata: serde_json::json!({}),
-        })];
+        let records = vec![(
+            "m1".into(),
+            crate::traits::MemoryPayload {
+                content: "x".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({}),
+            },
+        )];
         for q in [
             "{ memories(namespace: \"other\") { edges { node { id } } } }",
             "{ search(text: \"foo\", namespace: \"other\") { edges { node { id } } } }",
         ] {
             let resp = execute_on_records(&records, &Default::default(), "ns", "admin", q, None);
-            assert!(resp.data.is_none(), "cross-namespace query must be rejected: {}", q);
-            assert!(resp.errors.iter().any(|e| e.message.contains("namespace isolation violation")
-                && e.message.contains("'other'") && e.message.contains("'ns'")), "query: {}", q);
+            assert!(
+                resp.data.is_none(),
+                "cross-namespace query must be rejected: {}",
+                q
+            );
+            assert!(
+                resp.errors
+                    .iter()
+                    .any(|e| e.message.contains("namespace isolation violation")
+                        && e.message.contains("'other'")
+                        && e.message.contains("'ns'")),
+                "query: {}",
+                q
+            );
         }
         // Same-namespace argument is allowed.
-        let ok = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memories(namespace: \"ns\") { edges { node { id } } } }", None);
+        let ok = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories(namespace: \"ns\") { edges { node { id } } } }",
+            None,
+        );
         assert!(ok.errors.is_empty());
     }
 
     #[test]
     fn memory_id_via_variable_returns_record() {
-        let records = vec![("m1".into(), crate::traits::MemoryPayload {
-            content: "variable target".into(),
-            user_id: "u".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "l".into(),
-            location_lines: "1".into(),
-            metadata: serde_json::json!({}),
-        })];
+        let records = vec![(
+            "m1".into(),
+            crate::traits::MemoryPayload {
+                content: "variable target".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({}),
+            },
+        )];
         // Variable-backed id must resolve, not fall through to null.
         let resp = execute_on_records(
             &records,
@@ -1063,7 +1322,11 @@ mod tests {
         );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let data = resp.data.as_ref().unwrap();
-        assert!(!data["memory"].is_null(), "variable-backed id must return the record, got: {}", data);
+        assert!(
+            !data["memory"].is_null(),
+            "variable-backed id must return the record, got: {}",
+            data
+        );
         assert_eq!(data["memory"]["id"], "m1");
         assert_eq!(data["memory"]["content"], "variable target");
 
@@ -1084,15 +1347,18 @@ mod tests {
 
     #[test]
     fn memory_namespace_via_variable_is_resolved() {
-        let records = vec![("m1".into(), crate::traits::MemoryPayload {
-            content: "x".into(),
-            user_id: "u".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "l".into(),
-            location_lines: "1".into(),
-            metadata: serde_json::json!({}),
-        })];
+        let records = vec![(
+            "m1".into(),
+            crate::traits::MemoryPayload {
+                content: "x".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({}),
+            },
+        )];
         // Same-namespace variable is allowed and returns the record.
         let ok = execute_on_records(
             &records,
@@ -1115,9 +1381,16 @@ mod tests {
             "query($ns: String) { memory(id: \"m1\", namespace: $ns) { id } }",
             Some(&json!({"ns": "other"})),
         );
-        assert!(bad.data.is_none(), "cross-namespace variable must be rejected");
-        assert!(bad.errors.iter().any(|e| e.message.contains("namespace isolation violation")
-            && e.message.contains("'other'") && e.message.contains("'ns'")));
+        assert!(
+            bad.data.is_none(),
+            "cross-namespace variable must be rejected"
+        );
+        assert!(bad
+            .errors
+            .iter()
+            .any(|e| e.message.contains("namespace isolation violation")
+                && e.message.contains("'other'")
+                && e.message.contains("'ns'")));
     }
 
     #[test]
@@ -1143,7 +1416,10 @@ mod tests {
         );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let data = resp.data.as_ref().unwrap();
-        assert_eq!(data["memory"]["id"], "m1", "memory field must survive: {data}");
+        assert_eq!(
+            data["memory"]["id"], "m1",
+            "memory field must survive: {data}"
+        );
         assert_eq!(data["memory"]["content"], "one");
         let rows = data["memories"]["edges"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "memories field must survive: {data}");
@@ -1161,7 +1437,10 @@ mod tests {
         let data = resp.data.as_ref().unwrap();
         let rows = data["memories"]["edges"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "memories field must survive: {data}");
-        assert_eq!(data["memory"]["id"], "m2", "memory field must survive: {data}");
+        assert_eq!(
+            data["memory"]["id"], "m2",
+            "memory field must survive: {data}"
+        );
         assert_eq!(data["memory"]["content"], "two");
     }
 
@@ -1187,110 +1466,227 @@ mod tests {
         );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let data = resp.data.as_ref().unwrap();
-        assert_eq!(data["one"]["id"], "m1", "first alias must key its result: {data}");
-        assert_eq!(data["two"]["id"], "m2", "second alias must key its own result: {data}");
+        assert_eq!(
+            data["one"]["id"], "m1",
+            "first alias must key its result: {data}"
+        );
+        assert_eq!(
+            data["two"]["id"], "m2",
+            "second alias must key its own result: {data}"
+        );
         assert!(
             data["missing"].is_null(),
             "a missing aliased memory must be null, not a stale earlier result: {data}"
         );
         let rows = data["all"]["edges"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "aliased memories field must survive: {data}");
-        assert!(data.get("memory").is_none(), "unaliased key must not appear: {data}");
-        assert!(data.get("memories").is_none(), "unaliased key must not appear: {data}");
+        assert!(
+            data.get("memory").is_none(),
+            "unaliased key must not appear: {data}"
+        );
+        assert!(
+            data.get("memories").is_none(),
+            "unaliased key must not appear: {data}"
+        );
     }
 
     #[test]
     fn valid_to_treated_as_retired() {
         let now = chrono::Utc::now().timestamp();
-        let records = vec![("expired".into(), crate::traits::MemoryPayload {
-            content: "x".into(),
-            user_id: "u".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "l".into(),
-            location_lines: "1".into(),
-            metadata: serde_json::json!({ "valid_to": now - 10 }),
-        })];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memories { edges { node { id } } } }", None);
-        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
-        assert!(rows.is_empty(), "expired valid_to record must be treated as retired");
+        let records = vec![(
+            "expired".into(),
+            crate::traits::MemoryPayload {
+                content: "x".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({ "valid_to": now - 10 }),
+            },
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            None,
+        );
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "expired valid_to record must be treated as retired"
+        );
         // includeRetired restores it
-        let resp2 = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memories(includeRetired: true) { edges { node { id } } } }", None);
-        let rows2 = resp2.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        let resp2 = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories(includeRetired: true) { edges { node { id } } } }",
+            None,
+        );
+        let rows2 = resp2.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
         assert_eq!(rows2.len(), 1);
     }
 
     #[test]
     fn pagination_clamping_and_cursor() {
         let records: Vec<(String, crate::traits::MemoryPayload)> = vec![
-            ("m1".into(), crate::traits::MemoryPayload {
-                content: "c".into(), user_id: "u".into(), memory_type: "note".into(),
-                agent_name: None, location: "l".into(), location_lines: "1,2".into(),
-                metadata: serde_json::json!({"valid_from": 100}),
-            }),
-            ("m2".into(), crate::traits::MemoryPayload {
-                content: "c".into(), user_id: "u".into(), memory_type: "note".into(),
-                agent_name: None, location: "l".into(), location_lines: "1".into(),
-                metadata: serde_json::json!({"valid_from": 50}),
-            }),
+            (
+                "m1".into(),
+                crate::traits::MemoryPayload {
+                    content: "c".into(),
+                    user_id: "u".into(),
+                    memory_type: "note".into(),
+                    agent_name: None,
+                    location: "l".into(),
+                    location_lines: "1,2".into(),
+                    metadata: serde_json::json!({"valid_from": 100}),
+                },
+            ),
+            (
+                "m2".into(),
+                crate::traits::MemoryPayload {
+                    content: "c".into(),
+                    user_id: "u".into(),
+                    memory_type: "note".into(),
+                    agent_name: None,
+                    location: "l".into(),
+                    location_lines: "1".into(),
+                    metadata: serde_json::json!({"valid_from": 50}),
+                },
+            ),
         ];
-        let edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
-        let resp = execute_on_records(&records, &edges, "ns", "admin", "{ memories(namespace: \"ns\") { edges { node { id } } pageInfo { hasNextPage } } }", None);
-        assert!(resp.errors.is_empty() || resp.errors.iter().any(|e| e.message.contains("clamped")) == false); // default first=20, fine
+        let edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+            std::collections::HashMap::new();
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories(namespace: \"ns\") { edges { node { id } } pageInfo { hasNextPage } } }",
+            None,
+        );
+        assert!(
+            resp.errors.is_empty()
+                || resp.errors.iter().any(|e| e.message.contains("clamped")) == false
+        ); // default first=20, fine
 
         // first > 100 clamped
-        let resp2 = execute_on_records(&records, &edges, "ns", "admin", "{ memories(namespace: \"ns\", first: 200) { edges { node { id } } } }", Some(&json!({"first": 200})));
+        let resp2 = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories(namespace: \"ns\", first: 200) { edges { node { id } } } }",
+            Some(&json!({"first": 200})),
+        );
         assert!(resp2.errors.iter().any(|e| e.message.contains("clamped")));
 
         // Cursor decode
         let c = encode_cursor("valid_from", "m2");
         assert!(decode_cursor(&c).is_ok());
-        assert_eq!(decode_cursor(&c).unwrap(), ("valid_from".into(), "m2".into()));
+        assert_eq!(
+            decode_cursor(&c).unwrap(),
+            ("valid_from".into(), "m2".into())
+        );
         assert!(decode_cursor("badtamper").is_err());
-        assert_eq!(decode_cursor("badtamper").unwrap_err().as_str(), "invalid cursor");
+        assert_eq!(
+            decode_cursor("badtamper").unwrap_err().as_str(),
+            "invalid cursor"
+        );
     }
 
     #[test]
     fn memories_and_memory_filter_and_strip() {
         let records: Vec<(String, crate::traits::MemoryPayload)> = vec![
-            ("m1".into(), crate::traits::MemoryPayload {
-                content: "hello".into(), user_id: "alice".into(), memory_type: "note".into(),
-                agent_name: None, location: "l".into(), location_lines: "1".into(),
-                metadata: serde_json::json!({"mesh":{"conflict":true},"validation":"bad","visible_to":["bob"]}),
-            }),
-            ("m2".into(), crate::traits::MemoryPayload {
-                content: "world".into(), user_id: "bob".into(), memory_type: "directory".into(),
-                agent_name: None, location: "l".into(), location_lines: "1".into(),
-                metadata: serde_json::json!({}),
-            }),
+            (
+                "m1".into(),
+                crate::traits::MemoryPayload {
+                    content: "hello".into(),
+                    user_id: "alice".into(),
+                    memory_type: "note".into(),
+                    agent_name: None,
+                    location: "l".into(),
+                    location_lines: "1".into(),
+                    metadata: serde_json::json!({"mesh":{"conflict":true},"validation":"bad","visible_to":["bob"]}),
+                },
+            ),
+            (
+                "m2".into(),
+                crate::traits::MemoryPayload {
+                    content: "world".into(),
+                    user_id: "bob".into(),
+                    memory_type: "directory".into(),
+                    agent_name: None,
+                    location: "l".into(),
+                    location_lines: "1".into(),
+                    metadata: serde_json::json!({}),
+                },
+            ),
         ];
-        let edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
+        let edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+            std::collections::HashMap::new();
         // memory by id for excluded mesh-conflict -> null (hard exclude)
         let resp = execute_on_records(&records, &edges, "ns", "bob", "{ memory(id: \"m1\", namespace: \"ns\") { id metadata { mesh validation visible_to } } }", None);
         // m1 is mesh-conflicting -> excluded; should return null data for memory
-        assert!(resp.errors.is_empty() || resp.errors.iter().all(|e| !e.message.contains("unknown")));
+        assert!(
+            resp.errors.is_empty() || resp.errors.iter().all(|e| !e.message.contains("unknown"))
+        );
 
         // structural type excluded from memories unless requested
-        let resp_mem = execute_on_records(&records, &edges, "ns", "bob", "{ memories(namespace: \"ns\") { edges { node { id memoryType } } } }", None);
+        let resp_mem = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "bob",
+            "{ memories(namespace: \"ns\") { edges { node { id memoryType } } } }",
+            None,
+        );
         // m2 (directory) excluded; only m1 might appear if not filtered by privacy (bob != alice, but visible_to bob allows it; mesh conflict excludes)
         // m1 excluded by mesh_conflict. So empty edges.
         let data = resp_mem.data.as_ref().unwrap();
-        let edges_arr = data.get("memories").and_then(|m| m.get("edges")).and_then(|e| e.as_array()).unwrap();
+        let edges_arr = data
+            .get("memories")
+            .and_then(|m| m.get("edges"))
+            .and_then(|e| e.as_array())
+            .unwrap();
         assert!(edges_arr.is_empty());
     }
 
     #[test]
     fn mutation_rejected() {
-        let resp = execute_on_records(&[], &std::collections::HashMap::new(), "ns", "admin", "mutation { createMemory { id } }", None);
+        let resp = execute_on_records(
+            &[],
+            &std::collections::HashMap::new(),
+            "ns",
+            "admin",
+            "mutation { createMemory { id } }",
+            None,
+        );
         assert!(resp.data.is_none() || resp.data.as_ref().unwrap().is_null());
-        assert!(resp.errors.iter().any(|e| e.message == "mutations are not supported"));
+        assert!(resp
+            .errors
+            .iter()
+            .any(|e| e.message == "mutations are not supported"));
     }
 
     #[test]
     fn unknown_field_rejected() {
-        let resp = execute_on_records(&[], &std::collections::HashMap::new(), "ns", "admin", "{ memories(namespace: \"ns\") { badField } }", None);
+        let resp = execute_on_records(
+            &[],
+            &std::collections::HashMap::new(),
+            "ns",
+            "admin",
+            "{ memories(namespace: \"ns\") { badField } }",
+            None,
+        );
         assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
     }
 
@@ -1306,70 +1702,148 @@ mod tests {
             metadata: meta,
         };
         let records = vec![
-            ("reg1".into(), mk("alpha registry row", serde_json::json!({"domain_registry": {"domains": ["auth"]}}))),
+            (
+                "reg1".into(),
+                mk(
+                    "alpha registry row",
+                    serde_json::json!({"domain_registry": {"domains": ["auth"]}}),
+                ),
+            ),
             ("real1".into(), mk("alpha real row", serde_json::json!({}))),
         ];
         // memories surface
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memories { edges { node { id } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
         let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
-        assert!(ids.contains(&&serde_json::json!("real1")), "real row must be served in memories: {ids:?}");
-        assert!(!ids.contains(&&serde_json::json!("reg1")), "domain_registry row must be absent from memories: {ids:?}");
+        assert!(
+            ids.contains(&&serde_json::json!("real1")),
+            "real row must be served in memories: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&&serde_json::json!("reg1")),
+            "domain_registry row must be absent from memories: {ids:?}"
+        );
         // search surface
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ search(text: \"alpha\") { edges { node { id } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ search(text: \"alpha\") { edges { node { id } } } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        let rows = resp.data.as_ref().unwrap()["search"]["edges"].as_array().unwrap();
+        let rows = resp.data.as_ref().unwrap()["search"]["edges"]
+            .as_array()
+            .unwrap();
         let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
-        assert!(ids.contains(&&serde_json::json!("real1")), "real row must be served in search: {ids:?}");
-        assert!(!ids.contains(&&serde_json::json!("reg1")), "domain_registry row must be absent from search: {ids:?}");
+        assert!(
+            ids.contains(&&serde_json::json!("real1")),
+            "real row must be served in search: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&&serde_json::json!("reg1")),
+            "domain_registry row must be absent from search: {ids:?}"
+        );
         // memory(id:) surface
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memory(id: \"reg1\") { id } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"reg1\") { id } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert!(resp.data.as_ref().unwrap()["memory"].is_null(), "domain_registry row must be null from memory(id:): {}", resp.data.as_ref().unwrap());
+        assert!(
+            resp.data.as_ref().unwrap()["memory"].is_null(),
+            "domain_registry row must be null from memory(id:): {}",
+            resp.data.as_ref().unwrap()
+        );
         // by-id control: the real row is served by id
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memory(id: \"real1\") { id } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"real1\") { id } }",
+            None,
+        );
         assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "real1");
     }
 
     #[test]
     fn f2_domain_registry_row_consumes_no_page_slot_and_no_null_edge() {
-        let mk = |content: &str, valid_from: i64, meta: serde_json::Value| crate::traits::MemoryPayload {
-            content: content.into(),
-            user_id: "u".into(),
-            memory_type: "fact".into(),
-            agent_name: None,
-            location: "l".into(),
-            location_lines: "1".into(),
-            metadata: {
-                let mut m = meta;
-                m["valid_from"] = serde_json::json!(valid_from);
-                m
-            },
+        let mk = |content: &str, valid_from: i64, meta: serde_json::Value| {
+            crate::traits::MemoryPayload {
+                content: content.into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: {
+                    let mut m = meta;
+                    m["valid_from"] = serde_json::json!(valid_from);
+                    m
+                },
+            }
         };
         // Registry row sorts first in memories (highest valid_from), so if it
         // is not filtered before pagination it consumes the first page slot.
         let records = vec![
-            ("reg1".into(), mk("registry row", 300, serde_json::json!({"domain_registry": {"domains": ["auth"]}}))),
+            (
+                "reg1".into(),
+                mk(
+                    "registry row",
+                    300,
+                    serde_json::json!({"domain_registry": {"domains": ["auth"]}}),
+                ),
+            ),
             ("real1".into(), mk("real one", 200, serde_json::json!({}))),
             ("real2".into(), mk("real two", 100, serde_json::json!({}))),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memories(first: 2) { edges { node { id } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories(first: 2) { edges { node { id } } } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
         assert_eq!(rows.len(), 2, "both real rows must fill the page: {rows:?}");
-        assert!(rows.iter().all(|r| !r["node"].is_null()), "no edge may carry node: null: {rows:?}");
+        assert!(
+            rows.iter().all(|r| !r["node"].is_null()),
+            "no edge may carry node: null: {rows:?}"
+        );
         let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
-        assert_eq!(ids, vec![&serde_json::json!("real1"), &serde_json::json!("real2")], "page must contain exactly the real rows in order: {ids:?}");
+        assert_eq!(
+            ids,
+            vec![&serde_json::json!("real1"), &serde_json::json!("real2")],
+            "page must contain exactly the real rows in order: {ids:?}"
+        );
     }
 
     // ---- T3 oracle helpers ----
-    fn t3_payload(content: &str, memory_type: &str, metadata: serde_json::Value) -> crate::traits::MemoryPayload {
+    fn t3_payload(
+        content: &str,
+        memory_type: &str,
+        metadata: serde_json::Value,
+    ) -> crate::traits::MemoryPayload {
         crate::traits::MemoryPayload {
             content: content.into(),
             user_id: "u".into(),
@@ -1386,7 +1860,11 @@ mod tests {
             .map(|i| {
                 (
                     format!("m{i}"),
-                    t3_payload("c", "fact", serde_json::json!({"valid_from": 1000 - (i as i64) * 10})),
+                    t3_payload(
+                        "c",
+                        "fact",
+                        serde_json::json!({"valid_from": 1000 - (i as i64) * 10}),
+                    ),
                 )
             })
             .collect()
@@ -1398,16 +1876,26 @@ mod tests {
             .as_array()
             .expect("edges must be an array")
             .iter()
-            .map(|e| e["node"]["id"].as_str().expect("node id must be a string").to_string())
+            .map(|e| {
+                e["node"]["id"]
+                    .as_str()
+                    .expect("node id must be a string")
+                    .to_string()
+            })
             .collect()
     }
 
     #[test]
     fn t3_o1_renamed_variable_first() {
         let records = t3_numbered_records(3);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
-            Some(&json!({"n": 1})));
+            Some(&json!({"n": 1})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         assert_eq!(t3_edge_ids(&resp, "memories"), vec!["m1".to_string()]);
     }
@@ -1416,22 +1904,41 @@ mod tests {
     fn t3_o1_renamed_variable_after() {
         let records = t3_numbered_records(3);
         let cursor = encode_cursor("valid_from", "m1");
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($c: String) { memories(after: $c) { edges { node { id } } } }",
-            Some(&json!({"c": cursor})));
+            Some(&json!({"c": cursor})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["m2".to_string(), "m3".to_string()]);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["m2".to_string(), "m3".to_string()]
+        );
     }
 
     #[test]
     fn t3_o1_renamed_variable_memory_type() {
         let records = vec![
-            ("f1".into(), t3_payload("fact row", "fact", serde_json::json!({"valid_from": 200}))),
-            ("n1".into(), t3_payload("note row", "note", serde_json::json!({"valid_from": 100}))),
+            (
+                "f1".into(),
+                t3_payload("fact row", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "n1".into(),
+                t3_payload("note row", "note", serde_json::json!({"valid_from": 100})),
+            ),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($t: String) { memories(memoryType: $t) { edges { node { id } } } }",
-            Some(&json!({"t": "note"})));
+            Some(&json!({"t": "note"})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         assert_eq!(t3_edge_ids(&resp, "memories"), vec!["n1".to_string()]);
     }
@@ -1439,118 +1946,262 @@ mod tests {
     #[test]
     fn t3_o1_renamed_variable_include_archived() {
         let records = vec![
-            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
-            ("arch".into(), t3_payload("archived", "fact", serde_json::json!({"valid_from": 100, "archived": true}))),
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "arch".into(),
+                t3_payload(
+                    "archived",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "archived": true}),
+                ),
+            ),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($a: Boolean) { memories(includeArchived: $a) { edges { node { id } } } }",
-            Some(&json!({"a": true})));
+            Some(&json!({"a": true})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let ids = t3_edge_ids(&resp, "memories");
-        assert_eq!(ids.len(), 2, "archived row must be included via renamed variable: {ids:?}");
-        assert!(ids.contains(&"arch".to_string()), "archived row id missing: {ids:?}");
+        assert_eq!(
+            ids.len(),
+            2,
+            "archived row must be included via renamed variable: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"arch".to_string()),
+            "archived row id missing: {ids:?}"
+        );
     }
 
     #[test]
     fn t3_o1_renamed_variable_include_retired() {
         let now = chrono::Utc::now().timestamp();
         let records = vec![
-            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
-            ("old".into(), t3_payload("retired", "fact", serde_json::json!({"valid_from": 100, "valid_to": now - 10}))),
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "old".into(),
+                t3_payload(
+                    "retired",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "valid_to": now - 10}),
+                ),
+            ),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($r: Boolean) { memories(includeRetired: $r) { edges { node { id } } } }",
-            Some(&json!({"r": true})));
+            Some(&json!({"r": true})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let ids = t3_edge_ids(&resp, "memories");
-        assert_eq!(ids.len(), 2, "retired row must be included via renamed variable: {ids:?}");
-        assert!(ids.contains(&"old".to_string()), "retired row id missing: {ids:?}");
+        assert_eq!(
+            ids.len(),
+            2,
+            "retired row must be included via renamed variable: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"old".to_string()),
+            "retired row id missing: {ids:?}"
+        );
     }
 
     #[test]
     fn t3_o2_unreferenced_variable_first_does_not_paginate() {
         let records = t3_numbered_records(3);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "{ memories { edges { node { id } } } }",
-            Some(&json!({"first": 1})));
+            Some(&json!({"first": 1})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "unreferenced first=1 must not paginate: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "unreferenced first=1 must not paginate: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o2_unreferenced_variable_include_archived_does_not_include() {
         let records = vec![
-            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
-            ("arch".into(), t3_payload("archived", "fact", serde_json::json!({"valid_from": 100, "archived": true}))),
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "arch".into(),
+                t3_payload(
+                    "archived",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "archived": true}),
+                ),
+            ),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "{ memories { edges { node { id } } } }",
-            Some(&json!({"includeArchived": true})));
+            Some(&json!({"includeArchived": true})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["live".to_string()], "unreferenced includeArchived=true must not include archived rows: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["live".to_string()],
+            "unreferenced includeArchived=true must not include archived rows: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o3_absent_referenced_variable_ignores_stray_seed() {
         let records = t3_numbered_records(3);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
-            Some(&json!({"first": 1})));
+            Some(&json!({"first": 1})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "absent $n must page by default 20, not stray first=1: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "absent $n must page by default 20, not stray first=1: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o3_referenced_variable_wins_over_stray_seed() {
         let records = t3_numbered_records(8);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
-            Some(&json!({"n": 7, "first": 1})));
+            Some(&json!({"n": 7, "first": 1})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories").len(), 7, "referenced $n=7 must win over stray first=1: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            7,
+            "referenced $n=7 must win over stray first=1: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o4_definition_default_is_not_honoured() {
         let records = t3_numbered_records(3);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($n: Int = 1) { memories(first: $n) { edges { node { id } } } }",
-            Some(&json!({})));
+            Some(&json!({})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "definition default must NOT be honoured; default-20 page expected: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "definition default must NOT be honoured; default-20 page expected: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o5_string_first_variable_yields_default() {
         let records = t3_numbered_records(3);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
-            Some(&json!({"n": "1"})));
+            Some(&json!({"n": "1"})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "string \"1\" must not coerce; default 20 expected: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "string \"1\" must not coerce; default 20 expected: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o5_float_first_variable_yields_default() {
         let records = t3_numbered_records(3);
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
-            Some(&json!({"n": 1.5})));
+            Some(&json!({"n": 1.5})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories").len(), 3, "float 1.5 must not coerce; default 20 expected: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "float 1.5 must not coerce; default 20 expected: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o5_string_bool_variable_yields_default() {
         let records = vec![
-            ("live".into(), t3_payload("live", "fact", serde_json::json!({"valid_from": 200}))),
-            ("arch".into(), t3_payload("archived", "fact", serde_json::json!({"valid_from": 100, "archived": true}))),
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "arch".into(),
+                t3_payload(
+                    "archived",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "archived": true}),
+                ),
+            ),
         ];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($b: Boolean) { memories(includeArchived: $b) { edges { node { id } } } }",
-            Some(&json!({"b": "true"})));
+            Some(&json!({"b": "true"})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["live".to_string()], "string \"true\" must not coerce; archived stays excluded: {:?}", resp.data);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["live".to_string()],
+            "string \"true\" must not coerce; archived stays excluded: {:?}",
+            resp.data
+        );
     }
 
     #[test]
@@ -1561,7 +2212,10 @@ mod tests {
             None);
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         assert_eq!(t3_edge_ids(&resp, "a"), vec!["m1".to_string()]);
-        assert_eq!(t3_edge_ids(&resp, "b"), vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(
+            t3_edge_ids(&resp, "b"),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
     }
 
     #[test]
@@ -1572,33 +2226,72 @@ mod tests {
             Some(&json!({"x": 1, "y": 2})));
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         assert_eq!(t3_edge_ids(&resp, "a"), vec!["m1".to_string()]);
-        assert_eq!(t3_edge_ids(&resp, "b"), vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(
+            t3_edge_ids(&resp, "b"),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
     }
 
     #[test]
     fn t3_o7_int_literal_id_returns_row_42() {
-        let records = vec![("42".into(), t3_payload("answer", "fact", serde_json::json!({})))];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memory(id: 42) { id } }", None);
+        let records = vec![(
+            "42".into(),
+            t3_payload("answer", "fact", serde_json::json!({})),
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: 42) { id } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42", "Int literal id must return row 42: {:?}", resp.data);
+        assert_eq!(
+            resp.data.as_ref().unwrap()["memory"]["id"],
+            "42",
+            "Int literal id must return row 42: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o7_int_variable_id_returns_row_42() {
-        let records = vec![("42".into(), t3_payload("answer", "fact", serde_json::json!({})))];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+        let records = vec![(
+            "42".into(),
+            t3_payload("answer", "fact", serde_json::json!({})),
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
             "query($id: ID) { memory(id: $id) { id } }",
-            Some(&json!({"id": 42})));
+            Some(&json!({"id": 42})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42", "integer variable id must return row 42: {:?}", resp.data);
+        assert_eq!(
+            resp.data.as_ref().unwrap()["memory"]["id"],
+            "42",
+            "integer variable id must return row 42: {:?}",
+            resp.data
+        );
     }
 
     #[test]
     fn t3_o7_string_literal_id_control() {
-        let records = vec![("42".into(), t3_payload("answer", "fact", serde_json::json!({})))];
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memory(id: \"42\") { id } }", None);
+        let records = vec![(
+            "42".into(),
+            t3_payload("answer", "fact", serde_json::json!({})),
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"42\") { id } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42");
     }
@@ -1615,23 +2308,54 @@ mod tests {
             metadata: meta,
         };
         let records = vec![
-            ("boolreg".into(), mk("boolean registry row", serde_json::json!({"registry": true}))),
+            (
+                "boolreg".into(),
+                mk(
+                    "boolean registry row",
+                    serde_json::json!({"registry": true}),
+                ),
+            ),
             ("real1".into(), mk("real row", serde_json::json!({}))),
         ];
         // memories surface: a registry:true-only row carries no
         // domain_registry mark, so the canonical predicate serves it.
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memories { edges { node { id } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
         let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
-        assert!(ids.contains(&&serde_json::json!("boolreg")), "registry:true-only row must be served in memories: {ids:?}");
-        assert!(ids.contains(&&serde_json::json!("real1")), "real row must be served in memories: {ids:?}");
+        assert!(
+            ids.contains(&&serde_json::json!("boolreg")),
+            "registry:true-only row must be served in memories: {ids:?}"
+        );
+        assert!(
+            ids.contains(&&serde_json::json!("real1")),
+            "real row must be served in memories: {ids:?}"
+        );
         // memory(id:) surface
-        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
-            "{ memory(id: \"boolreg\") { id } }", None);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"boolreg\") { id } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "boolreg", "registry:true-only row must be served by id: {}", resp.data.as_ref().unwrap());
+        assert_eq!(
+            resp.data.as_ref().unwrap()["memory"]["id"],
+            "boolreg",
+            "registry:true-only row must be served by id: {}",
+            resp.data.as_ref().unwrap()
+        );
     }
 
     // ---- T4 (F3) nested edges oracles ----
@@ -1644,7 +2368,9 @@ mod tests {
         t3_payload("c", "fact", serde_json::json!({"valid_from": valid_from}))
     }
 
-    fn t4_edges_map(n: usize) -> std::collections::HashMap<String, Vec<(String, String, Option<String>)>> {
+    fn t4_edges_map(
+        n: usize,
+    ) -> std::collections::HashMap<String, Vec<(String, String, Option<String>)>> {
         let mut m = std::collections::HashMap::new();
         m.insert(
             "m1".to_string(),
@@ -1660,7 +2386,12 @@ mod tests {
             .as_array()
             .expect("node edges must be an array")
             .iter()
-            .map(|e| e["targetId"].as_str().expect("targetId must be a string").to_string())
+            .map(|e| {
+                e["targetId"]
+                    .as_str()
+                    .expect("targetId must be a string")
+                    .to_string()
+            })
             .collect()
     }
 
@@ -1682,15 +2413,24 @@ mod tests {
         let q2 = format!("{{ memory(id: \"m1\") {{ edges(first: 1, after: \"{end_cursor}\") {{ edges {{ targetId }} }} }} }}");
         let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
         assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
-        assert_eq!(t4_targets(&resp2.data.as_ref().unwrap()["memory"]), vec!["t1".to_string()]);
+        assert_eq!(
+            t4_targets(&resp2.data.as_ref().unwrap()["memory"]),
+            vec!["t1".to_string()]
+        );
     }
 
     #[test]
     fn t4_o2_connection_depth_nested_first() {
         let records = vec![("m1".into(), t4_payload(100))];
         let edges = t4_edges_map(25);
-        let resp = execute_on_records(&records, &edges, "ns", "admin",
-            "{ memories { edges { node { id edges(first: 1) { edges { targetId } } } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories { edges { node { id edges(first: 1) { edges { targetId } } } } } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
         assert_eq!(t4_targets(node), vec!["t0".to_string()]);
@@ -1719,12 +2459,23 @@ mod tests {
         // schema-default page of 20.
         let records = vec![("m1".into(), t4_payload(100))];
         let edges = t4_edges_map(25);
-        let resp = execute_on_records(&records, &edges, "ns", "admin",
-            "{ memories { edges(first: 99) { node { id edges { edges { targetId } } } } } }", None);
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories { edges(first: 99) { node { id edges { edges { targetId } } } } } }",
+            None,
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
         let targets = t4_targets(node);
-        assert_eq!(targets.len(), 20, "expected the default page of 20, got {}: {targets:?}", targets.len());
+        assert_eq!(
+            targets.len(),
+            20,
+            "expected the default page of 20, got {}: {targets:?}",
+            targets.len()
+        );
         assert_eq!(targets.first().map(String::as_str), Some("t0"));
         assert_eq!(targets.last().map(String::as_str), Some("t19"));
     }
@@ -1738,7 +2489,10 @@ mod tests {
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let data = resp.data.as_ref().unwrap();
         assert_eq!(t4_targets(&data["a"]), vec!["t0".to_string()]);
-        assert_eq!(t4_targets(&data["b"]), vec!["t0".to_string(), "t1".to_string(), "t2".to_string()]);
+        assert_eq!(
+            t4_targets(&data["b"]),
+            vec!["t0".to_string(), "t1".to_string(), "t2".to_string()]
+        );
     }
 
     #[test]
@@ -1765,18 +2519,33 @@ mod tests {
         // longer caps the node's edges — with no nested arguments the node
         // serves its edges under the default 20 (all 5 here).
         let edges5 = t4_edges_map(5);
-        let resp3 = execute_on_records(&records, &edges5, "ns", "admin",
-            "{ memory(id: \"m1\", first: 2) { edges { edges { targetId } } } }", None);
+        let resp3 = execute_on_records(
+            &records,
+            &edges5,
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\", first: 2) { edges { edges { targetId } } } }",
+            None,
+        );
         assert!(resp3.errors.is_empty(), "errors: {:?}", resp3.errors);
         assert_eq!(
             t4_targets(&resp3.data.as_ref().unwrap()["memory"]),
-            vec!["t0".to_string(), "t1".to_string(), "t2".to_string(), "t3".to_string(), "t4".to_string()]
+            vec![
+                "t0".to_string(),
+                "t1".to_string(),
+                "t2".to_string(),
+                "t3".to_string(),
+                "t4".to_string()
+            ]
         );
     }
 
     #[test]
     fn t4_o6_cursor_provenance_edge_resumes_root_restarts() {
-        let records = vec![("m1".into(), t4_payload(100)), ("m2".into(), t4_payload(50))];
+        let records = vec![
+            ("m1".into(), t4_payload(100)),
+            ("m2".into(), t4_payload(50)),
+        ];
         let edges = t4_edges_map(25);
         // Page 1 via the nested selection.
         let resp = execute_on_records(&records, &edges, "ns", "admin",
@@ -1793,11 +2562,24 @@ mod tests {
         let q2 = format!("{{ memory(id: \"m1\") {{ edges(first: 2, after: \"{edge_cursor}\") {{ edges {{ targetId }} }} }} }}");
         let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
         assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
-        assert_eq!(t4_targets(&resp2.data.as_ref().unwrap()["memory"]), vec!["t2".to_string(), "t3".to_string()]);
+        assert_eq!(
+            t4_targets(&resp2.data.as_ref().unwrap()["memory"]),
+            vec!["t2".to_string(), "t3".to_string()]
+        );
         // The ROOT connection's endCursor lives in a different cursor domain.
-        let resp_root = execute_on_records(&records, &edges, "ns", "admin",
-            "{ memories(first: 1) { pageInfo { hasNextPage endCursor } } }", None);
-        assert!(resp_root.errors.is_empty(), "errors: {:?}", resp_root.errors);
+        let resp_root = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories(first: 1) { pageInfo { hasNextPage endCursor } } }",
+            None,
+        );
+        assert!(
+            resp_root.errors.is_empty(),
+            "errors: {:?}",
+            resp_root.errors
+        );
         let root_cursor = resp_root.data.as_ref().unwrap()["memories"]["pageInfo"]["endCursor"]
             .as_str()
             .expect("root endCursor must be present when hasNextPage")
@@ -1807,18 +2589,29 @@ mod tests {
         let q3 = format!("{{ memory(id: \"m1\") {{ edges(first: 2, after: \"{root_cursor}\") {{ edges {{ targetId }} }} }} }}");
         let resp3 = execute_on_records(&records, &edges, "ns", "admin", &q3, None);
         assert!(resp3.errors.is_empty(), "errors: {:?}", resp3.errors);
-        assert_eq!(t4_targets(&resp3.data.as_ref().unwrap()["memory"]), vec!["t0".to_string(), "t1".to_string()]);
+        assert_eq!(
+            t4_targets(&resp3.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string(), "t1".to_string()]
+        );
     }
 
     #[test]
     fn t4_o7_variable_form_nested_first() {
         let records = vec![("m1".into(), t4_payload(100))];
         let edges = t4_edges_map(25);
-        let resp = execute_on_records(&records, &edges, "ns", "admin",
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
             "query($n: Int) { memory(id: \"m1\") { edges(first: $n) { edges { targetId } } } }",
-            Some(&json!({"n": 1})));
+            Some(&json!({"n": 1})),
+        );
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t4_targets(&resp.data.as_ref().unwrap()["memory"]), vec!["t0".to_string()]);
+        assert_eq!(
+            t4_targets(&resp.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string()]
+        );
     }
 
     #[test]
@@ -1831,6 +2624,9 @@ mod tests {
         let resp = execute_on_records(&records, &edges, "ns", "admin",
             "{ memory(id: \"m1\") { edges(first: 1) { edges { targetId } } e2: edges(first: 3) { edges { targetId } } } }", None);
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
-        assert_eq!(t4_targets(&resp.data.as_ref().unwrap()["memory"]), vec!["t0".to_string()]);
+        assert_eq!(
+            t4_targets(&resp.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string()]
+        );
     }
 }

@@ -22,7 +22,8 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
-static TASK_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<crate::receipts::store::ReceiptStore>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::receipts::store::ReceiptStore::new()));
+static TASK_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<crate::receipts::store::ReceiptStore>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::receipts::store::ReceiptStore::new()));
 
 // ── small helpers shared by every handler ──────────────────────────────────
 
@@ -423,15 +424,39 @@ pub async fn build_task_graph_context(
             continue;
         }
         let snippet: String = r.payload.content.chars().take(140).collect();
-        let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
-        let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
-        let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
-        let depends_on = r.payload.metadata.get("depends_on").cloned().unwrap_or(Value::Null);
+        let calls = r
+            .payload
+            .metadata
+            .get("calls")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let imports = r
+            .payload
+            .metadata
+            .get("imports")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let governs = r
+            .payload
+            .metadata
+            .get("governs")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let depends_on = r
+            .payload
+            .metadata
+            .get("depends_on")
+            .cloned()
+            .unwrap_or(Value::Null);
         prompt_lines.push(format!(
             "  - [{}] `{}` ({}): {}",
             r.payload.memory_type,
             r.id,
-            if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
+            if r.payload.location.is_empty() {
+                "memory"
+            } else {
+                &r.payload.location
+            },
             snippet.replace('\n', " ")
         ));
         hits_json.push(json!({
@@ -478,16 +503,30 @@ pub async fn record_graph_query(
         return;
     };
     let now = chrono::Utc::now().timestamp();
-    let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
+    let entry_str = format!(
+        "{}:{}",
+        tool_name,
+        query_hint.chars().take(80).collect::<String>()
+    );
     let mut project_root: Option<String> = None;
     for r in &rows {
         if project_root.is_none() && crate::registry::is_registry_row(&r.payload.metadata) {
-            if let Some(p) = r.payload.metadata.get("project_root").and_then(|v| v.as_str()) {
+            if let Some(p) = r
+                .payload
+                .metadata
+                .get("project_root")
+                .and_then(|v| v.as_str())
+            {
                 project_root = Some(p.to_string());
             }
         }
         if project_root.is_none() && r.payload.memory_type == "directory" {
-            if let Some(p) = r.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
+            if let Some(p) = r
+                .payload
+                .metadata
+                .get("absolute_path")
+                .and_then(|v| v.as_str())
+            {
                 if std::path::Path::new(p).join(".git").exists() {
                     project_root = Some(p.to_string());
                 }
@@ -496,13 +535,21 @@ pub async fn record_graph_query(
         if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
             if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
                 let obj = task_obj_mut(&mut payload);
-                let count = obj.get("graph_queries_count").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                let count = obj
+                    .get("graph_queries_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    + 1;
                 obj.insert("graph_queries_count".to_string(), json!(count));
                 obj.insert("graph_queried".to_string(), json!(true));
                 let mut recent: Vec<String> = obj
                     .get("recent_queries")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 recent.push(entry_str.clone());
                 if recent.len() > 10 {
@@ -535,7 +582,9 @@ pub async fn record_graph_query(
     }
     let governed_prefix = if query_hint.ends_with('/')
         || (project_root.is_some()
-            && std::path::Path::new(project_root.as_ref().unwrap()).join(query_hint).is_dir())
+            && std::path::Path::new(project_root.as_ref().unwrap())
+                .join(query_hint)
+                .is_dir())
     {
         // Explicit directory coverage: preserve trailing slash without
         // widening to the top-level directory.
@@ -710,9 +759,8 @@ pub async fn handle_task_create(
     {
         Ok((id, mut payload)) => {
             let vector = emb.embed(&payload.content).await.unwrap_or_default();
-            let (hits_json, subagent_prompt) = build_task_graph_context(
-                &store, &namespace, &id, &vector, &payload,
-            ).await;
+            let (hits_json, subagent_prompt) =
+                build_task_graph_context(&store, &namespace, &id, &vector, &payload).await;
             // Re-read the freshest row under the task claim lock so a
             // concurrent create/update cannot be overwritten mid-context-build.
             let claim_mutex = claim_lock(&id);
@@ -720,13 +768,19 @@ pub async fn handle_task_create(
             if let Ok((mut latest_task, latest_vec)) = load_task(&store, &namespace, &id).await {
                 {
                     let obj = task_obj_mut(&mut latest_task.payload);
-                    obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+                    obj.insert(
+                        "subagent_prompt_injection".to_string(),
+                        json!(subagent_prompt),
+                    );
                 }
                 let _ = save_task(&store, &namespace, &id, latest_vec, latest_task.payload).await;
             }
             {
                 let obj = task_obj_mut(&mut payload);
-                obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+                obj.insert(
+                    "subagent_prompt_injection".to_string(),
+                    json!(subagent_prompt),
+                );
             }
             encode(&json!({
                 "id": id,
@@ -917,20 +971,33 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // BEFORE the single save, while _claim_guard is still held, so a
     // concurrent claim cannot observe a row without the injection.
 
-    let (hits_json, subagent_prompt) = build_task_graph_context(
-        &store, &namespace, &id, &vector, &task.payload,
-    ).await;
+    let (hits_json, subagent_prompt) =
+        build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await;
     {
         let obj = task_obj_mut(&mut task.payload);
-        obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+        obj.insert(
+            "subagent_prompt_injection".to_string(),
+            json!(subagent_prompt),
+        );
     }
-    if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
+    if let Err(e) = save_task(
+        &store,
+        &namespace,
+        &id,
+        vector.clone(),
+        task.payload.clone(),
+    )
+    .await
+    {
         return e;
     }
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("claim-{}", id))
+        .to_string();
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding =
+            crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session.clone(),
             task_id: id.clone(),
@@ -1200,13 +1267,21 @@ pub async fn handle_task_update(
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("update-{}", id)).to_string();
-    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
-        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
-    });
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("update-{}", id))
+        .to_string();
+    let session_for_receipt = arg_str(&args, "session_id")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            task.task_field("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding =
+            crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt,
             task_id: id.clone(),
@@ -1218,10 +1293,18 @@ pub async fn handle_task_update(
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    let graph_queries_count = task.payload.metadata.get("task").and_then(|t| t.get("graph_queries_count")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let graph_queries_count = task
+        .payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("graph_queries_count"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let graph_lookup_nudge = if graph_queries_count == 0 {
         Some("Graph-First Lookup: run neurostrata_memories_for_file / neurostrata_related / neurostrata_search_memory before editing files.")
-    } else { None };
+    } else {
+        None
+    };
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -1467,13 +1550,14 @@ pub async fn handle_task_complete(
     // M3: optional inline follow_up_tasks. Validate everything before any
     // mutation so a bad entry cannot leave the parent half-completed.
     let mut follow_up_specs: Vec<(String, Option<String>, String, i64, Vec<String>)> = Vec::new();
-    
+
     // Task intent enforcement: reject if intent markers present without follow_up_tasks or task ID citation
     let mut full_text = String::new();
     if !reason.is_empty() {
         full_text.push_str(&reason);
     }
-    if let Some(mem_content) = memory.as_ref()
+    if let Some(mem_content) = memory
+        .as_ref()
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
     {
@@ -1541,10 +1625,7 @@ pub async fn handle_task_complete(
                 let priority = match item.get("priority") {
                     None => 2i64,
                     Some(Value::Number(n))
-                        if n
-                            .as_i64()
-                            .map(|p| (0..=4).contains(&p))
-                            .unwrap_or(false) =>
+                        if n.as_i64().map(|p| (0..=4).contains(&p)).unwrap_or(false) =>
                     {
                         n.as_i64().unwrap_or(2)
                     }
@@ -1568,8 +1649,7 @@ pub async fn handle_task_complete(
     // mutation of this completion — a trip on any spec refuses the whole
     // completion and spawns nothing.
     for (title, description, task_type, priority, labels) in &follow_up_specs {
-        let (task_meta, top_level) =
-            follow_up_maps(&id, description, task_type, *priority, labels);
+        let (task_meta, top_level) = follow_up_maps(&id, description, task_type, *priority, labels);
         let scan_meta = json!({ "fields": task_meta, "links": top_level });
         if let Some(rejection) = scan_for_task_create(title, &scan_meta) {
             return Err(rejection);
@@ -1764,8 +1844,7 @@ pub async fn handle_task_complete(
                     .get("register_domain")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                match crate::registry::check_domain(&store, &namespace, &raw, register_domain)
-                    .await
+                match crate::registry::check_domain(&store, &namespace, &raw, register_domain).await
                 {
                     Ok(check) => {
                         pending_registry = check.cache;
@@ -1894,15 +1973,23 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("complete-{}", id)).to_string();
-    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
-        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
-    });
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("complete-{}", id))
+        .to_string();
+    let session_for_receipt = arg_str(&args, "session_id")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            task.task_field("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         // Bind the completion receipt to the worktree state captured right now
         // (AC5): retention verification later re-checks this binding.
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding =
+            crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt.clone(),
             task_id: binding.task_id.clone(),
@@ -1932,8 +2019,7 @@ pub async fn handle_task_complete(
     let follow_agent = arg_str(&args, "agent_name").map(|s| s.to_string());
     let mut follow_up_created_ids: Vec<String> = Vec::new();
     for (title, description, task_type, priority, labels) in &follow_up_specs {
-        let (task_meta, top_level) =
-            follow_up_maps(&id, description, task_type, *priority, labels);
+        let (task_meta, top_level) = follow_up_maps(&id, description, task_type, *priority, labels);
         match store_new_task(
             &store,
             &emb,
@@ -1994,8 +2080,7 @@ pub async fn handle_task_complete(
         reply["registry_warning"] = json!(registry_warnings.join("; "));
     }
 
-    serde_json::to_string_pretty(&reply)
-        .map_err(|e| format!("Internal serialization error: {}", e))
+    serde_json::to_string_pretty(&reply).map_err(|e| format!("Internal serialization error: {}", e))
 }
 
 // ── tool: neurostrata_task_validate ────────────────────────────────────────
@@ -2021,10 +2106,13 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                         let count = edges.len();
                         let samples: Vec<_> = edges.into_iter().take(5).collect();
                         if let Some(obj) = json.as_object_mut() {
-                            obj.insert("dangling_edges".to_string(), serde_json::json!({
-                                "total": count,
-                                "samples": samples,
-                            }));
+                            obj.insert(
+                                "dangling_edges".to_string(),
+                                serde_json::json!({
+                                    "total": count,
+                                    "samples": samples,
+                                }),
+                            );
                         }
                     }
                     Err(e) => {
@@ -2043,7 +2131,10 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                 }
                 let ow = ls.ontology_warnings(&namespace).await;
                 if let Some(obj) = json.as_object_mut() {
-                    obj.insert("ontology_warnings".to_string(), serde_json::Value::Array(ow));
+                    obj.insert(
+                        "ontology_warnings".to_string(),
+                        serde_json::Value::Array(ow),
+                    );
                 }
                 // Enrichment state surface (F12/F14/F24), warn-first.
                 let rid = crate::registry::registry_row_id(&namespace);
@@ -2251,7 +2342,8 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
+    let harness_plugins =
+        harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -2974,7 +3066,9 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             set_executable(&pre_commit_target);
         }
     } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
-        if pc_content.contains("NeuroStrata pre-commit hook") && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK {
+        if pc_content.contains("NeuroStrata pre-commit hook")
+            && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK
+        {
             if std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
                 && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
             {
@@ -3649,7 +3743,8 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
+    let harness_plugins =
+        harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -3707,7 +3802,10 @@ pub async fn handle_task_setup(
         let count = std::fs::read_to_string(root.join(beads_rel))
             .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or_else(|e| {
-                tracing::warn!("failed to read beads file {}: {e}", root.join(beads_rel).display());
+                tracing::warn!(
+                    "failed to read beads file {}: {e}",
+                    root.join(beads_rel).display()
+                );
                 0
             });
         let title = format!("Migrate {} beads issues into NeuroStrata tasks", count);
@@ -3755,23 +3853,23 @@ pub async fn handle_task_setup(
         match emb.embed(&content).await {
             Ok(vec) => match store.search(&namespace, vec, 3, false, false).await {
                 Ok(hits) => {
-                for hit in hits {
-                    let preview: String = hit.payload.content.chars().take(160).collect();
-                    similar.push(json!({
-                        "id": hit.id,
-                        "memory_type": hit.payload.memory_type,
-                        "content": preview,
-                    }));
-                    if hit.payload.memory_type == "rule" {
-                        conflicts.push(json!({
+                    for hit in hits {
+                        let preview: String = hit.payload.content.chars().take(160).collect();
+                        similar.push(json!({
+                            "id": hit.id,
+                            "memory_type": hit.payload.memory_type,
+                            "content": preview,
+                        }));
+                        if hit.payload.memory_type == "rule" {
+                            conflicts.push(json!({
                             "kind": "suggested_rule_overlap",
                             "suggestion": content,
                             "existing_id": hit.id,
                             "existing": preview,
                             "resolution": "review both; supersede the stale one instead of accepting a contradiction",
                         }));
+                        }
                     }
-                }
                 }
                 Err(e) => {
                     tracing::warn!("rule similarity search failed for '{namespace}': {e}");
@@ -3857,10 +3955,16 @@ pub async fn handle_task_setup(
     if let Ok(Some((reg_vec, mut reg_payload))) = store.get(&namespace, &rid).await {
         if let Some(ds) = reg_payload.metadata.get("doctor_state") {
             if let Some(arr) = ds.get("configured_wires").and_then(|v| v.as_array()) {
-                prev_wires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                prev_wires = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
             }
             if let Some(arr) = ds.get("configured_fires_on").and_then(|v| v.as_array()) {
-                prev_fires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                prev_fires = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
             }
         }
         if let Some(obj) = reg_payload.metadata.as_object_mut() {
@@ -4647,7 +4751,10 @@ mod tests {
         );
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
         // the task-coverage gate is wired by design; it is a real guard, not faked
-        assert_eq!(verified["hook_project_guards"], json!(["./scripts/task-coverage-gate.sh"]));
+        assert_eq!(
+            verified["hook_project_guards"],
+            json!(["./scripts/task-coverage-gate.sh"])
+        );
         // and no per-guard claim of client-side coverage survives
         assert!(
             wiring_block["automatic"]
@@ -4677,7 +4784,11 @@ mod tests {
         assert_eq!(verified["hook_installed"], json!(true));
         assert_eq!(
             verified["hook_project_guards"],
-            json!(["./scripts/task-coverage-gate.sh", "./scripts/rules-gate.sh", "./scripts/typecheck.sh"])
+            json!([
+                "./scripts/task-coverage-gate.sh",
+                "./scripts/rules-gate.sh",
+                "./scripts/typecheck.sh"
+            ])
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4977,14 +5088,12 @@ mod tests {
             root.join("scripts").join("task-coverage-gate.sh"),
             "#!/bin/bash\n# stub gate for test\ntask-coverage-gate: no untracked work items found\nexit 0\n",
         ).unwrap();
-        let mut perms = std::fs::metadata(
-            root.join("scripts").join("task-coverage-gate.sh")
-        ).unwrap().permissions();
+        let mut perms = std::fs::metadata(root.join("scripts").join("task-coverage-gate.sh"))
+            .unwrap()
+            .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(
-            root.join("scripts").join("task-coverage-gate.sh"),
-            perms,
-        ).unwrap();
+        std::fs::set_permissions(root.join("scripts").join("task-coverage-gate.sh"), perms)
+            .unwrap();
 
         let run_gate = |code: i32| {
             std::process::Command::new("bash")
@@ -5632,7 +5741,10 @@ mod tests {
             holder
         );
         assert_eq!(
-            payload.metadata["task"]["history"].as_array().unwrap().len(),
+            payload.metadata["task"]["history"]
+                .as_array()
+                .unwrap()
+                .len(),
             1,
             "only the winning claim is persisted"
         );
@@ -6486,11 +6598,11 @@ mod tests {
         }
     }
 
-impl crate::traits::AsAny for ListHidingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    impl crate::traits::AsAny for ListHidingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
-}
 
     /// The ordering invariant the emit site carries: a `Superseded` published
     /// on the inline path claims the task gave way to a lesson. If the Lock 2
@@ -6631,7 +6743,10 @@ impl crate::traits::AsAny for ListHidingStore {
         .await
         .expect_err("a secret must not be stored as an extraction");
         assert!(err.contains("ERROR [SECURITY]"), "{}", err);
-        assert_eq!(store.list("MyProj", None, None).await.unwrap().len(), before);
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
@@ -6730,7 +6845,10 @@ impl crate::traits::AsAny for ListHidingStore {
         assert!(reply.contains("ERROR [SECURITY]"), "got {}", reply);
 
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.content, "the work", "the refused update never wrote");
+        assert_eq!(
+            payload.content, "the work",
+            "the refused update never wrote"
+        );
     }
 
     /// Task 6 fix round: the follow-up specs a completion spawns are
@@ -6894,7 +7012,10 @@ impl crate::traits::AsAny for ListHidingStore {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(payload.metadata["summary"], json!("an ordinary progress note"));
+        assert_eq!(
+            payload.metadata["summary"],
+            json!("an ordinary progress note")
+        );
 
         // Ingest (a clean document's extracted text).
         store.init("clean-ingest").await.expect("create the schema");
@@ -6913,12 +7034,15 @@ impl crate::traits::AsAny for ListHidingStore {
             &[],
         )
         .await;
-        assert!(outcome.is_ok(), "clean ingest succeeds: {:?}", outcome.err());
+        assert!(
+            outcome.is_ok(),
+            "clean ingest succeeds: {:?}",
+            outcome.err()
+        );
         // Merge integration: the generation pipeline scopes the published
         // file node's id by generation (the fork pipeline published under
         // the unscoped qualified id this assertion originally used).
-        let file_id =
-            crate::parser::ingest::generation_scoped_id("clean-ingest", 1, "notes.rs");
+        let file_id = crate::parser::ingest::generation_scoped_id("clean-ingest", 1, "notes.rs");
         assert!(
             store
                 .get("clean-ingest", &file_id)
@@ -6929,7 +7053,6 @@ impl crate::traits::AsAny for ListHidingStore {
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
-
 
     #[tokio::test]
     async fn completing_an_already_done_task_is_refused_clearly() {
