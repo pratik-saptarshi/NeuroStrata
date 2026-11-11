@@ -3864,23 +3864,43 @@ impl<'a> KnownIds<'a> {
         Self::build(ids, Some(active_gen))
     }
 
+    /// Index only the ids that are not generation-scoped. The
+    /// ingest-publication replay resolves against this: its destination
+    /// mixes the just-promoted unscoped tree with retained rows from
+    /// superseded generations, and a retained scoped row sharing a
+    /// logical path with the promoted row makes the by-path slot
+    /// ambiguous, stranding the declarations the replay exists to heal
+    /// (F7 M1, decoy-holder probe). Scoped targets a declaration names
+    /// exactly are unaffected -- edge creation matches them against the
+    /// database, not this index.
+    pub fn unscoped(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::build_filtered(ids, |id| {
+            crate::parser::ingest::split_scoped_id(id).is_none()
+        })
+    }
+
     fn build(ids: impl IntoIterator<Item = &'a str>, active_gen: Option<u64>) -> Self {
-        let mut id_set: std::collections::HashSet<&'a str> =
-            std::collections::HashSet::new();
+        match active_gen {
+            Some(active) => Self::build_filtered(ids, move |id| {
+                match crate::parser::ingest::split_scoped_id(id) {
+                    // Only the active generation is reachable.
+                    Some((_, gen, _)) => gen == active,
+                    // Not generation-scoped: not part of any active generation.
+                    None => false,
+                }
+            }),
+            None => Self::build_filtered(ids, |_| true),
+        }
+    }
+
+    fn build_filtered(ids: impl IntoIterator<Item = &'a str>, keep: impl Fn(&str) -> bool) -> Self {
+        let mut id_set: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
         let mut by_path: std::collections::HashMap<&'a str, Option<&'a str>> =
             std::collections::HashMap::new();
 
         for id in ids.into_iter().filter(|id| !id.is_empty()) {
-            if let Some(active) = active_gen {
-                match crate::parser::ingest::split_scoped_id(id) {
-                    Some((_, gen, _)) => {
-                        if gen != active {
-                            continue; // a stale generation is not reachable
-                        }
-                    }
-                    // Not generation-scoped: not part of any active generation.
-                    None => continue,
-                }
+            if !keep(id) {
+                continue;
             }
 
             id_set.insert(id);
@@ -3974,6 +3994,65 @@ impl<'a> KnownIds<'a> {
         }
         only.map(|id| id.to_string())
     }
+}
+
+/// F7 (fork issue #85): remap a declaration that was persisted in
+/// generation-scoped form for a superseded generation.
+///
+/// Stores written before the persist-logical fix (or by operator tools)
+/// can hold a declaration as a physical id — `probe::1::src/lib.rs` —
+/// instead of the logical path the author declared. Once generation 2 is
+/// active, `KnownIds::resolve` cannot reach that string: it is not an
+/// active id, and neither its path key nor any `/`-suffix of it names an
+/// active node. Before the caller falls back to keeping the declaration
+/// verbatim (which strands the edge on the superseded generation's row),
+/// recognise the shape — `split_scoped_id` parses it, its namespace is
+/// this one, and its generation is not the active one — and resolve the
+/// logical path it carries against the active index instead.
+///
+/// Returns `None` when the declaration is not a superseded scoped id for
+/// this namespace, or when its logical path names nothing the index
+/// holds (a file deleted in the active generation correctly resolves to
+/// nothing, and the caller keeps the declaration verbatim as before).
+fn remap_superseded_scoped_target(
+    known: &KnownIds,
+    namespace: &str,
+    declared: &str,
+    active_gen: u64,
+) -> Option<String> {
+    remap_scoped_target(known, namespace, declared, Some(active_gen))
+}
+
+/// The publication-replay form of [`remap_superseded_scoped_target`]:
+/// no generation guard. `publish_ingested` promotes its staged tree to
+/// *unscoped* ids and writes no `IngestGeneration` pointer, so it has no
+/// current scoped generation of its own — every generation-scoped
+/// declaration in the destination names a superseded pointer-pipeline
+/// generation by construction, and gating the remap on the pointer
+/// table's namespace-wide MAX (state other publications wrote) let a
+/// stale pointer at the frozen generation suppress the remap entirely,
+/// silently dropping the edge (F7 M1; panel verdict Ruling 2). A
+/// retained row the declaration names exactly is still claimed by
+/// `KnownIds::resolve` before this fallback runs, exactly as in relink.
+fn remap_superseded_scoped_target_at_publication(
+    known: &KnownIds,
+    namespace: &str,
+    declared: &str,
+) -> Option<String> {
+    remap_scoped_target(known, namespace, declared, None)
+}
+
+fn remap_scoped_target(
+    known: &KnownIds,
+    namespace: &str,
+    declared: &str,
+    active_gen: Option<u64>,
+) -> Option<String> {
+    let (decl_namespace, decl_generation, _) = crate::parser::ingest::split_scoped_id(declared)?;
+    if decl_namespace != namespace || active_gen == Some(decl_generation) {
+        return None;
+    }
+    known.resolve(crate::parser::ingest::logical_path_of(declared))
 }
 
 /// One edge a memory asks for, read off its metadata.
@@ -4614,6 +4693,11 @@ impl LadybugStore {
         .await
     }
 
+    /// Hygiene repair for one namespace. Returns `(shape_fixes,
+    /// dangling_reports)`: rows whose stored shape/content this run
+    /// actually repaired, and rows in which at least one edge
+    /// declaration's target does not currently resolve. Declarations are
+    /// reported, never removed (R5 — see block (b) below).
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         let namespace = namespace.to_string();
         self.write_with_deadline("repairing namespace hygiene", move |conn| {
@@ -4634,12 +4718,13 @@ impl LadybugStore {
                 rows.push((id, mtype, loc, content_str, meta_str));
             }
             let mut shape_updates = 0usize;
-            let mut dangling_updates = 0usize;
+            let mut dangling_reports = 0usize;
             for (id, mtype, loc, content_str, meta_str) in &rows {
                 let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
                 if !meta.is_object() { meta = serde_json::json!({}); }
                 let mut shape_changed = false;
-                let mut dangling_changed = false;
+                let mut arrays_changed = false;
+                let mut row_dangling = false;
                 // (a) rule source
                 if mtype == "rule" {
                     // A source is usable provenance when it is a non-empty string
@@ -4717,18 +4802,32 @@ impl LadybugStore {
                         .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
                         .unwrap_or_else(|| "legacy".to_string()));
                 }
-                // (b) dangling refs in edge arrays
+                // (b) edge-declaration arrays: residue cleanup + report.
+                //
+                // R5 (half1-readjudication.md, fork issue #85): repair
+                // never existence-prunes a declaration. A declaration is
+                // authorial data, and every other consumer preserves an
+                // unresolved one verbatim — relink and the publication
+                // replay keep it as declared, upsert materializes stub
+                // targets rather than dropping it. The old prune moved
+                // declarations to `archived_refs`, which has no reader,
+                // so the loss was permanent — including declarations
+                // whose targets were merely outside the active
+                // generation at repair time, which a later relink would
+                // have healed (the F7 loss shape). Repair therefore only
+                // COUNTS rows with unresolvable declarations (the second
+                // return value: rows reported, not rows "fixed") and
+                // still removes the `samples`/`total` literals, which
+                // are test residue, not declarations. `archived_refs`
+                // is left as stored; this prune was its only writer.
                 let keys = ["governs","related_to","relates_to","contained_by","extracted_from","depends_on"];
-                let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-                let mut unresolvable = Vec::new();
                 for k in &keys {
                     if let Some(arr) = meta.get(k).and_then(|v| v.as_array()).cloned() {
                         let mut kept = Vec::new();
                         for item in &arr {
                             if let Some(t) = item.as_str() {
-                                // Remove residual unresolved string targets (samples/total) and check existence
+                                // Remove the residual test-data literals (samples/total)
                                 if t == "samples" || t == "total" {
-                                    unresolvable.push(t.to_string());
                                     continue;
                                 }
                                 // Check existence against known_ids, resolved targets, and prefix-unqualified resolution
@@ -4743,7 +4842,8 @@ impl LadybugStore {
                                         false
                                     }
                                     || (t.len() >= 7 && known_ids.iter().filter(|k| k.starts_with(t)).count() == 1);
-                                if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
+                                if !exists { row_dangling = true; }
+                                kept.push(item.clone());
                             } else { kept.push(item.clone()); }
                         }
                         // Materialize missing graph edges for kept targets (borrow; move happens below)
@@ -4775,17 +4875,11 @@ impl LadybugStore {
                                 }
                             }
                         } // end for item in &kept
-                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; } }
+                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); arrays_changed = true; } }
                     }
                 }
-                if !unresolvable.is_empty() {
-                    archived_refs.extend(unresolvable);
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-                    }
-                    dangling_changed = true;
-                }
-                if shape_changed || dangling_changed || content_backfill.is_some() {
+                if row_dangling { dangling_reports += 1; }
+                if shape_changed || arrays_changed || content_backfill.is_some() {
                     let has_backfill = content_backfill.is_some();
                     let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
                     if let Err(e) = conn.query(&q_meta) {
@@ -4799,11 +4893,10 @@ impl LadybugStore {
                             }
                         }
                         if shape_changed || has_backfill { shape_updates += 1; }
-                        if dangling_changed { dangling_updates += 1; }
                     }
                 }
             }
-            Ok((shape_updates, dangling_updates))
+            Ok((shape_updates, dangling_reports))
         }).await
     }
 
@@ -7596,6 +7689,7 @@ impl VectorStore for LadybugStore {
         let mut wanted: std::collections::HashMap<&'static str, Vec<(String, String)>> =
             std::collections::HashMap::new();
         let mut by_suffix = 0usize;
+        let mut by_remap = 0usize;
         let mut mention_pairs: Vec<(String, String)> = Vec::new();
         let mut mention_updates: Vec<(String, String)> = Vec::new();
 
@@ -7630,11 +7724,26 @@ impl VectorStore for LadybugStore {
                         }
                         resolved
                     }
-                    // Kept as declared rather than dropped: it names nothing this
-                    // namespace holds, but the match is not namespaced, so it can
-                    // still land on a node another namespace ingested -- which is
-                    // what the statement-per-edge loop did.
-                    None => edge.target_id.clone(),
+                    // F7 (fork issue #85): a declaration persisted as a
+                    // superseded generation's physical id resolves to
+                    // nothing above; remap it to the active generation
+                    // before falling back to the verbatim keep.
+                    None => match remap_superseded_scoped_target(
+                        &known,
+                        namespace,
+                        &edge.target_id,
+                        active_gen,
+                    ) {
+                        Some(remapped) => {
+                            by_remap += 1;
+                            remapped
+                        }
+                        // Kept as declared rather than dropped: it names nothing this
+                        // namespace holds, but the match is not namespaced, so it can
+                        // still land on a node another namespace ingested -- which is
+                        // what the statement-per-edge loop did.
+                        None => edge.target_id.clone(),
+                    },
                 };
                 let pair = if edge.points_at_target {
                     (memory.id.clone(), target)
@@ -7682,6 +7791,13 @@ impl VectorStore for LadybugStore {
             println!(
                 "Relinked {} edge(s) whose declared target was an older absolute path",
                 by_suffix
+            );
+        }
+
+        if by_remap > 0 {
+            println!(
+                "Remapped {} edge(s) whose declared target was a superseded generation-scoped id",
+                by_remap
             );
         }
 
@@ -7961,7 +8077,13 @@ impl VectorStore for LadybugStore {
                     known_ids.push(id.clone());
                     edge_rows.push((id, user_id, metadata));
                 }
-                let known = KnownIds::new(known_ids.iter().map(String::as_str));
+                // The replay index holds only non-generation-scoped ids:
+                // a retained scoped row sharing a logical path with the
+                // just-promoted row would make the by-path slot ambiguous
+                // and strand the declarations this replay heals (M1,
+                // decoy-holder probe). See `KnownIds::unscoped`.
+                let known = KnownIds::unscoped(known_ids.iter().map(String::as_str));
+                let active_gen = active_generation_of(conn, &namespace);
                 let mut wanted: std::collections::HashMap<
                     &'static str,
                     Vec<(String, String)>,
@@ -7971,8 +8093,24 @@ impl VectorStore for LadybugStore {
                         continue;
                     }
                     for edge in edge_specs(metadata) {
+                        // F7 (fork issue #85): same superseded-generation
+                        // remap as relink — a declaration persisted as an
+                        // old generation's physical id resolves its
+                        // logical path against the just-published tree.
+                        // The publication form of the helper takes no
+                        // active generation: this publication wrote no
+                        // pointer, so pointer state must not gate the
+                        // remap (M1, Arm A). `active_gen` is still read
+                        // above for the created edges' generation stamp.
                         let target = known
                             .resolve(&edge.target_id)
+                            .or_else(|| {
+                                remap_superseded_scoped_target_at_publication(
+                                    &known,
+                                    &namespace,
+                                    &edge.target_id,
+                                )
+                            })
                             .unwrap_or_else(|| edge.target_id.clone());
                         let pair = if edge.points_at_target {
                             (id.clone(), target)
@@ -7982,7 +8120,6 @@ impl VectorStore for LadybugStore {
                         wanted.entry(edge.rel_type).or_default().push(pair);
                     }
                 }
-                let active_gen = active_generation_of(conn, &namespace);
                 let mut created = 0;
                 for (rel_type, pairs) in &wanted {
                     created += create_missing_edges(
@@ -23145,6 +23282,621 @@ eurostrata\src\daemon.rs",
             "oversized neighbor content is truncated with indicator"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== F7 (fork issue #85): generation-scoped declaration freeze =====
+    // A rule upserted while a generation is active had its logical edge
+    // declarations (`governs: ["src/lib.rs"]`) rewritten at write time to
+    // that generation's physical id (`probe::1::src/lib.rs`) and persisted
+    // in that form. After the next ingest published generation 2, nothing
+    // could resolve, repair, or match the frozen declaration, and the rule
+    // silently vanished from `memories_for_file`. These tests pin the
+    // two-half fix: upsert persists declarations as declared (edges still
+    // materialize to the active generation's ids), and edge replay remaps
+    // a superseded generation-scoped target to the active generation.
+
+    async fn f7_seed_file(store: &LadybugStore, gen: u64) -> String {
+        let id = crate::parser::ingest::generation_scoped_id("probe", gen, "src/lib.rs");
+        // Ingestion stores the node's location as its logical path
+        // (parser/ingest.rs `location: node_path`); `memories_for_file`
+        // discovers candidates by `location`, so the seed must carry it too.
+        let mut payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        payload.location = "src/lib.rs".to_string();
+        store
+            .upsert("probe", &id, vec![0.0; 4], payload)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn f7_stored_values(store: &LadybugStore, rule: &str, key: &str) -> Vec<String> {
+        let (_, payload) = store.get("probe", rule).await.unwrap().expect("rule row");
+        payload
+            .metadata
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn f7_hit_kinds(store: &LadybugStore, rule: &str) -> Vec<String> {
+        let hits = store
+            .memories_for_file(
+                "probe",
+                Some(PROBE_SOURCE),
+                "src/lib.rs",
+                None,
+                false,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .unwrap();
+        hits.iter()
+            .filter(|h| h.id == rule)
+            .map(|h| format!("{:?}", h.match_kind))
+            .collect()
+    }
+
+    async fn f7_outgoing_targets(store: &LadybugStore, rel: &str, rule: &str) -> Vec<String> {
+        let rule_owned = rule.to_string();
+        let rel_owned = rel.to_string();
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!(
+                    "MATCH (a:Memory {{id: '{}'}})-[:{}]->(b:Memory) RETURN b.id",
+                    escape_ladybug_string(&rule_owned),
+                    rel_owned
+                ))?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    out.push(format!("{}", row[0]));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("list outgoing edge targets")
+    }
+
+    async fn f7_incoming_sources(store: &LadybugStore, rel: &str, rule: &str) -> Vec<String> {
+        let rule_owned = rule.to_string();
+        let rel_owned = rel.to_string();
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!(
+                    "MATCH (a:Memory)-[:{}]->(b:Memory {{id: '{}'}}) RETURN a.id",
+                    rel_owned,
+                    escape_ladybug_string(&rule_owned)
+                ))?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    out.push(format!("{}", row[0]));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("list incoming edge sources")
+    }
+
+    /// The replay remap itself: only a superseded generation-scoped id
+    /// for this namespace is remapped, and only when its logical path
+    /// still names a node in the active generation.
+    #[test]
+    fn f7_remap_superseded_scoped_target_cases() {
+        let known = KnownIds::active(["probe::2::src/lib.rs"], 2);
+        // Superseded generation, same namespace: remaps to the active id.
+        assert_eq!(
+            remap_superseded_scoped_target(&known, "probe", "probe::1::src/lib.rs", 2),
+            Some("probe::2::src/lib.rs".to_string())
+        );
+        // The active generation itself is never remapped.
+        assert_eq!(
+            remap_superseded_scoped_target(&known, "probe", "probe::2::src/lib.rs", 2),
+            None
+        );
+        // A scoped id from another namespace is left alone.
+        assert_eq!(
+            remap_superseded_scoped_target(&known, "probe", "other::1::src/lib.rs", 2),
+            None
+        );
+        // A file deleted in the active generation resolves to nothing.
+        assert_eq!(
+            remap_superseded_scoped_target(&known, "probe", "probe::1::src/gone.rs", 2),
+            None
+        );
+        // An unscoped declaration is not this helper's concern.
+        assert_eq!(
+            remap_superseded_scoped_target(&known, "probe", "src/lib.rs", 2),
+            None
+        );
+    }
+
+    /// Acceptance 1 (issue #85): a rule written after the first ingest,
+    /// declaring the logical path, still surfaces after the second ingest.
+    #[tokio::test]
+    async fn f7_rule_written_after_first_ingest_survives_second_ingest() {
+        let store = retired_test_store().await;
+        // Ingest 1: stage generation 1 and publish it.
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        f7_seed_file(&store, 1).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+
+        // Rule declares the logical path after ingestion.
+        store
+            .upsert(
+                "probe",
+                "rule-a",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/lib.rs"] })),
+            )
+            .await
+            .unwrap();
+        let kinds_before = f7_hit_kinds(&store, "rule-a").await;
+        assert!(
+            kinds_before.iter().any(|k| k == "ExactFile"),
+            "F7: rule must surface as an ExactFile hit while gen 1 is active; got {kinds_before:?}"
+        );
+
+        // Ingest 2: stage + publish generation 2, then relink (the
+        // production ingest sequence relinks inside the ingest).
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            2
+        );
+        let gen2_id = f7_seed_file(&store, 2).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 2)
+            .await
+            .unwrap();
+        store.relink_edges("probe", PROBE_SOURCE).await.unwrap();
+
+        let targets = f7_outgoing_targets(&store, "GOVERNS", "rule-a").await;
+        assert!(
+            targets.iter().any(|t| t == &gen2_id),
+            "F7: GOVERNS edge must reach the generation-2 node {gen2_id}; got {targets:?}"
+        );
+        let kinds_after = f7_hit_kinds(&store, "rule-a").await;
+        assert!(
+            kinds_after.iter().any(|k| k == "ExactFile"),
+            "F7: rule must still surface as an ExactFile GOVERNS hit after re-ingestion; got {kinds_after:?}"
+        );
+    }
+
+    /// Acceptance 3 (issue #85): a declaration already frozen in
+    /// generation-1 physical form (written before the fix, or by an
+    /// operator tool) is remapped to the new generation by relink.
+    #[tokio::test]
+    async fn f7_frozen_declaration_is_remapped_by_relink() {
+        let store = retired_test_store().await;
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        let gen1_id = f7_seed_file(&store, 1).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+
+        // Seed the frozen state directly: the declaration already carries
+        // the generation-1 physical id, as a pre-fix store would hold it.
+        store
+            .upsert(
+                "probe",
+                "rule-frozen",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [gen1_id.clone()] })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f7_stored_values(&store, "rule-frozen", "governs").await,
+            vec![gen1_id.clone()],
+            "precondition: the frozen declaration is stored verbatim"
+        );
+
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            2
+        );
+        let gen2_id = f7_seed_file(&store, 2).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 2)
+            .await
+            .unwrap();
+        store.relink_edges("probe", PROBE_SOURCE).await.unwrap();
+
+        let targets = f7_outgoing_targets(&store, "GOVERNS", "rule-frozen").await;
+        assert!(
+            targets.iter().any(|t| t == &gen2_id),
+            "F7: relink must remap the frozen declaration to the generation-2 node {gen2_id}; got {targets:?}"
+        );
+        let kinds_after = f7_hit_kinds(&store, "rule-frozen").await;
+        assert!(
+            kinds_after.iter().any(|k| k == "ExactFile"),
+            "F7: healed rule must surface as an ExactFile hit; got {kinds_after:?}"
+        );
+    }
+
+    /// Guard for the non-defect path: a rule written before any ingestion
+    /// was never rewritten, and re-resolves at every relink. This passed
+    /// before the fix and must keep passing.
+    #[tokio::test]
+    async fn f7_rule_written_before_ingest_survives_second_ingest() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "rule-b",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/lib.rs"] })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f7_stored_values(&store, "rule-b", "governs").await,
+            vec!["src/lib.rs".to_string()],
+            "precondition: nothing to resolve against yet, declaration stays logical"
+        );
+
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        f7_seed_file(&store, 1).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+        store.relink_edges("probe", PROBE_SOURCE).await.unwrap();
+        let kinds_1 = f7_hit_kinds(&store, "rule-b").await;
+        assert!(
+            kinds_1.iter().any(|k| k == "ExactFile"),
+            "F7: pre-existing rule must surface after gen 1; got {kinds_1:?}"
+        );
+
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            2
+        );
+        f7_seed_file(&store, 2).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 2)
+            .await
+            .unwrap();
+        store.relink_edges("probe", PROBE_SOURCE).await.unwrap();
+        let kinds_2 = f7_hit_kinds(&store, "rule-b").await;
+        assert!(
+            kinds_2.iter().any(|k| k == "ExactFile"),
+            "F7: pre-existing rule must still surface after gen 2; got {kinds_2:?}"
+        );
+    }
+
+    /// T3 (half1-readjudication §Q4, the Q5-A/Q5-B pair as assertions):
+    /// a frozen declaration whose named generation row has been
+    /// hard-deleted must survive a hygiene-repair run so the replay
+    /// remap can still heal it. Before R5 (repair report-only for
+    /// declarations) repair pruned the declaration into `archived_refs`
+    /// at the repair step and the rule was gone for good, although its
+    /// file was live in generation 2.
+    #[tokio::test]
+    async fn f7_repair_report_only_keeps_frozen_declaration_after_row_deletion() {
+        let store = retired_test_store().await;
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        let gen1_id = f7_seed_file(&store, 1).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-r5-t3",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [gen1_id.clone()] })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f7_stored_values(&store, "rule-r5-t3", "governs").await,
+            vec![gen1_id.clone()],
+            "precondition: frozen declaration stored verbatim"
+        );
+
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            2
+        );
+        let gen2_id = f7_seed_file(&store, 2).await;
+        store
+            .publish_generation("probe", PROBE_SOURCE, 2)
+            .await
+            .unwrap();
+        // Hard-delete the superseded generation-1 row (clear-ingested /
+        // explicit delete / history-dropping rebuild all reach this state).
+        store.delete("probe", &gen1_id).await.unwrap();
+
+        let (_shape, reported) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert!(
+            reported >= 1,
+            "the unresolvable declaration must still be counted in repair's report; got {reported}"
+        );
+        assert_eq!(
+            f7_stored_values(&store, "rule-r5-t3", "governs").await,
+            vec![gen1_id.clone()],
+            "R5: repair must not prune the frozen declaration"
+        );
+        assert!(
+            f7_stored_values(&store, "rule-r5-t3", "archived_refs")
+                .await
+                .is_empty(),
+            "R5: repair must not archive the declaration either"
+        );
+
+        store.relink_edges("probe", PROBE_SOURCE).await.unwrap();
+        assert_eq!(
+            f7_outgoing_targets(&store, "GOVERNS", "rule-r5-t3").await,
+            vec![gen2_id],
+            "the remap must heal the declaration repair preserved"
+        );
+        assert_eq!(
+            f7_hit_kinds(&store, "rule-r5-t3").await,
+            vec!["ExactFile".to_string()]
+        );
+    }
+
+    /// T4 (half1-readjudication §Q4): R5 keeps repair's other functions.
+    /// The `samples`/`total` residue literals are still removed,
+    /// resolvable and unresolvable declarations are both kept (the
+    /// unresolvable one is counted in repair's report, not archived),
+    /// and the shape repairs still apply.
+    #[tokio::test]
+    async fn repair_hygiene_report_only_declarations_residue_and_shape() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "real-target",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "row-mixed",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "governs": ["samples", "total", "real-target", "gone/file.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-needs-source",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        let source_before = store
+            .get("probe", "rule-needs-source")
+            .await
+            .unwrap()
+            .expect("rule row")
+            .1
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let (shape_fixes, reported) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert!(
+            reported >= 1,
+            "rows with unresolvable declarations must be counted in repair's report; got {reported}"
+        );
+        assert_eq!(
+            f7_stored_values(&store, "row-mixed", "governs").await,
+            vec!["real-target".to_string(), "gone/file.rs".to_string()],
+            "residue removed; resolvable and unresolvable declarations both kept"
+        );
+        assert!(
+            f7_stored_values(&store, "row-mixed", "archived_refs")
+                .await
+                .is_empty(),
+            "R5: repair archives nothing from the declaration keys"
+        );
+        // The rule-source shape repair still fires: a rule that had no
+        // usable source before the run has one after it.
+        let source_after = store
+            .get("probe", "rule-needs-source")
+            .await
+            .unwrap()
+            .expect("rule row")
+            .1
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            source_before.is_empty() && !source_after.is_empty(),
+            "shape repair must still backfill a rule source (before={source_before:?}, after={source_after:?}, shape_fixes={shape_fixes})"
+        );
+    }
+
+    // ===== M1 (panel Ruling 2, Arm A): publication-replay remap =====
+    // The two discriminating tests for the `publish_ingested` replay.
+    // Both drive `publish_ingested` end-to-end with NO `relink_edges`
+    // call anywhere: the publication itself must restore the frozen
+    // rule's GOVERNS edge onto the promoted (unscoped) id, while the
+    // stored declaration stays in its frozen verbatim form (edges-only
+    // healing). Variant B is the stale-pointer state the panel executed
+    // against the bundled head: a pointer at the frozen generation used
+    // to suppress the remap entirely (0 edges created), because the
+    // replay fed the helper a namespace-wide pointer MAX it never wrote.
+
+    /// Seed the frozen rule the publication-replay tests share: an
+    /// owner-owned row whose `governs` already carries the generation-1
+    /// physical id, as a pre-fix store would hold it. "owner" is not
+    /// `auto-ingestor`, so promotion preserves the row.
+    async fn f7_seed_frozen_rule_pub(store: &LadybugStore) {
+        store
+            .upsert(
+                "probe",
+                "rule-pub",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "owner",
+                    json!({ "governs": ["probe::1::src/lib.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f7_stored_values(store, "rule-pub", "governs").await,
+            vec!["probe::1::src/lib.rs".to_string()],
+            "precondition: the frozen declaration is stored verbatim"
+        );
+        assert!(
+            f7_outgoing_targets(store, "GOVERNS", "rule-pub")
+                .await
+                .is_empty(),
+            "precondition: no GOVERNS edge exists yet"
+        );
+    }
+
+    /// Stage a one-file tree (`src/lib.rs`) and publish it into "probe"
+    /// with `publish_ingested`; returns the edges the publication created.
+    async fn f7_publish_staged_tree(store: &LadybugStore) -> usize {
+        let stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let lease = store.begin_ingest_stage(&stage).await.unwrap();
+        let staged_id = format!(
+            "{}{}{}",
+            stage,
+            crate::parser::ingest::NAMESPACE_SEPARATOR,
+            "src/lib.rs"
+        );
+        let mut payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        payload.location = "src/lib.rs".to_string();
+        store
+            .upsert(&stage, &staged_id, vec![0.0; 4], payload)
+            .await
+            .unwrap();
+        drop(lease);
+        store.publish_ingested("probe", &stage).await.unwrap()
+    }
+
+    /// The healed end state both variants must reach: the GOVERNS edge
+    /// lands exactly on the promoted id, the rule surfaces as an
+    /// ExactFile hit, and the stored declaration is still the frozen
+    /// string (the replay heals edges, never stored strings).
+    async fn f7_assert_publication_healed(store: &LadybugStore, created: usize) {
+        assert!(
+            created >= 1,
+            "publication must create the healed GOVERNS edge; created {created}"
+        );
+        assert_eq!(
+            f7_outgoing_targets(store, "GOVERNS", "rule-pub").await,
+            vec!["probe::src/lib.rs".to_string()],
+            "the replay remap must land the edge on the promoted id"
+        );
+        assert_eq!(
+            f7_hit_kinds(store, "rule-pub").await,
+            vec!["ExactFile".to_string()],
+            "the healed rule must surface via memories_for_file"
+        );
+        assert_eq!(
+            f7_stored_values(store, "rule-pub", "governs").await,
+            vec!["probe::1::src/lib.rs".to_string()],
+            "edges-only healing: the stored declaration remains frozen verbatim"
+        );
+    }
+
+    /// Variant A (no-pointer): no `IngestGeneration` pointer exists for
+    /// "probe". Discriminates the dead-call-site mutation: with the
+    /// replay's remap call removed, this test fails.
+    #[tokio::test]
+    async fn f7_publish_ingested_remaps_frozen_declaration_without_pointer() {
+        let store = retired_test_store().await;
+        f7_seed_frozen_rule_pub(&store).await;
+        let created = f7_publish_staged_tree(&store).await;
+        f7_assert_publication_healed(&store, created).await;
+    }
+
+    /// Variant B (stale pointer): a pointer published at generation 1 —
+    /// exactly the frozen declaration's generation, the state a previous
+    /// pointer-publish leaves behind and one `publish_ingested`'s own
+    /// transaction preserves. On the pre-Arm-A wiring this created zero
+    /// edges; the corrected parameterization must heal identically to
+    /// Variant A.
+    #[tokio::test]
+    async fn f7_publish_ingested_remaps_frozen_declaration_with_stale_pointer() {
+        let store = retired_test_store().await;
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+        let active = store
+            .with_conn(|conn| Ok(active_generation_of(conn, "probe")))
+            .await
+            .unwrap();
+        assert_eq!(
+            active, 1,
+            "precondition: the pointer sits at the frozen generation"
+        );
+        f7_seed_frozen_rule_pub(&store).await;
+        let created = f7_publish_staged_tree(&store).await;
+        f7_assert_publication_healed(&store, created).await;
+    }
+
+    /// Decoy-holder probe (panel Ruling 2(c)): a retained
+    /// non-`auto-ingestor` row holding the same logical path under a
+    /// generation-2 scoped id sits in the destination while the replay
+    /// runs. Against the unfiltered index this failed — both rows index
+    /// under `src/lib.rs`, the by-path slot is ambiguous, and zero edges
+    /// were created (probe executed, armA-build-log.md). The replay
+    /// index therefore holds only non-generation-scoped ids
+    /// (`KnownIds::unscoped`), and this test pins that the frozen
+    /// declaration's edge lands on the promoted row regardless.
+    #[tokio::test]
+    async fn f7_publish_ingested_replay_with_decoy_holder() {
+        let store = retired_test_store().await;
+        f7_seed_frozen_rule_pub(&store).await;
+        let decoy_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/lib.rs");
+        let mut decoy = retired_test_payload("file", "owner", json!({}));
+        decoy.location = "src/lib.rs".to_string();
+        store
+            .upsert("probe", &decoy_id, vec![0.0; 4], decoy)
+            .await
+            .unwrap();
+        let created = f7_publish_staged_tree(&store).await;
+        f7_assert_publication_healed(&store, created).await;
     }
 }
 

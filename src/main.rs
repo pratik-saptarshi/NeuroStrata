@@ -6382,24 +6382,24 @@ async fn run() -> anyhow::Result<()> {
                         if all {
                             let namespaces = vector_store.list_namespaces().await?;
                             let mut total_shape = 0usize;
-                            let mut total_dangling = 0usize;
+                            let mut total_dangling_reports = 0usize;
                             for ns in &namespaces {
-                                let (fixed_shape, fixed_dangling) =
+                                let (fixed_shape, reported_dangling) =
                                     direct.repair_namespace_hygiene(ns).await?;
                                 total_shape += fixed_shape;
-                                total_dangling += fixed_dangling;
+                                total_dangling_reports += reported_dangling;
                             }
                             println!(
-                                "Namespace hygiene repaired across {} namespaces: {} shape fixes, {} dangling fixes.",
+                                "Namespace hygiene repaired across {} namespaces: {} shape fixes, {} rows with dangling refs reported (declarations kept).",
                                 namespaces.len(),
                                 total_shape,
-                                total_dangling
+                                total_dangling_reports
                             );
                         } else {
                             let ns = namespace.ok_or_else(|| anyhow::anyhow!("Provide <NAMESPACE> or --all"))?;
-                            let (fixed_shape, fixed_dangling) =
+                            let (fixed_shape, reported_dangling) =
                                 direct.repair_namespace_hygiene(&ns).await?;
-                            println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
+                            println!("Namespace hygiene repaired: {} shape fixes, {} rows with dangling refs reported (declarations kept).", fixed_shape, reported_dangling);
                         }
                     }
                     Commands::Delete { namespace, id } => {

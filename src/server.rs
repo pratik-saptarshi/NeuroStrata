@@ -3787,11 +3787,13 @@ async fn handle_get_snapshot(
             if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
                 .downcast_ref::<crate::store::ladybug::LadybugStore>()
             {
-                if let Ok((shape_fixes, dangling_fixes)) = ls.repair_namespace_hygiene(namespace).await {
-                    if shape_fixes > 0 || dangling_fixes > 0 {
+                if let Ok((shape_fixes, dangling_reports)) =
+                    ls.repair_namespace_hygiene(namespace).await
+                {
+                    if shape_fixes > 0 || dangling_reports > 0 {
                         findings.push(format!(
-                            "  auto-upgraded namespace hygiene (v{} -> v{}): {} shape fixes, {} dangling fixes",
-                            last_run_version, current_version, shape_fixes, dangling_fixes
+                            "  auto-upgraded namespace hygiene (v{} -> v{}): {} shape fixes, {} dangling refs reported (declarations kept)",
+                            last_run_version, current_version, shape_fixes, dangling_reports
                         ));
                     }
                 }
