@@ -20,7 +20,11 @@ fn cross_scope_default_same_namespace() {
     assert!(source::same_namespace("ns", "ns"));
     assert!(source::cross_scope_authorized("ns", "ns", &[]));
     assert!(!source::cross_scope_authorized("ns", "other", &[]));
-    assert!(source::cross_scope_authorized("ns", "other", &["other".to_string()]));
+    assert!(source::cross_scope_authorized(
+        "ns",
+        "other",
+        &["other".to_string()]
+    ));
 }
 
 #[test]

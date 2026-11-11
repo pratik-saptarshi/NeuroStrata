@@ -52,12 +52,10 @@ static LAST_CHECKPOINT_DURATION_MS: std::sync::atomic::AtomicU64 =
 /// Unix-seconds timestamp of the most recent checkpoint recorded in this
 /// process (0 = none recorded yet). The directory mtime is only a proxy;
 /// this records the real event the moment it happens.
-static LAST_CHECKPOINT_AT_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LAST_CHECKPOINT_AT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Count of failed checkpoints since process start (monotonic, never reset).
-static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Record a finished checkpoint. Called from the store's checkpoint path so
 /// `compute_storage_status` reports real hygiene data instead of constants.
@@ -73,10 +71,7 @@ pub fn record_checkpoint_outcome(duration_ms: u64, ok: bool) {
     }
 }
 
-pub fn compute_storage_status(
-    store_path: &Path,
-    config: &StorageHygieneConfig,
-) -> StorageStatus {
+pub fn compute_storage_status(store_path: &Path, config: &StorageHygieneConfig) -> StorageStatus {
     let store_bytes = fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
     let mut wal_os = store_path.as_os_str().to_os_string();
     wal_os.push(".wal");
@@ -125,9 +120,8 @@ pub fn compute_storage_status(
                         .ok()
                         .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| {
-                            let dt = chrono::DateTime::<chrono::Utc>::from(
-                                std::time::UNIX_EPOCH + d,
-                            );
+                            let dt =
+                                chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + d);
                             dt.to_rfc3339()
                         })
                 })
@@ -137,9 +131,7 @@ pub fn compute_storage_status(
                 .ok()
                 .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| {
-                    let dt = chrono::DateTime::<chrono::Utc>::from(
-                        std::time::UNIX_EPOCH + d,
-                    );
+                    let dt = chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + d);
                     dt.to_rfc3339()
                 })
         }
@@ -159,7 +151,9 @@ pub fn compute_storage_status(
         // reporting `Some(0)` would be a fabricated metric. Mirrors the
         // `last_checkpoint_at` guard above, which falls back to the
         // directory mtime for the timestamp.
-        last_checkpoint_duration_ms: if LAST_CHECKPOINT_AT_SECS.load(std::sync::atomic::Ordering::Relaxed) > 0
+        last_checkpoint_duration_ms: if LAST_CHECKPOINT_AT_SECS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
         {
             Some(LAST_CHECKPOINT_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed))
         } else {
@@ -252,9 +246,7 @@ pub fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
                     None
                 }
             })
-            .filter(|e| {
-                e.path().is_file() || e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-            })
+            .filter(|e| e.path().is_file() || e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .collect();
         entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         for entry in entries {
@@ -281,7 +273,10 @@ pub fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
         }
     }
     let digest = hasher.finalize();
-    Ok(digest.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+    Ok(digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>())
 }
 
 pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
@@ -290,14 +285,10 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
     let manifest = dir.join("manifest.json");
 
     if !ladybug.exists() && !ladybug.is_dir() {
-        return Err(SnapshotError::MissingFile(
-            "ladybug.store".into(),
-        ));
+        return Err(SnapshotError::MissingFile("ladybug.store".into()));
     }
     if !manifest.exists() {
-        return Err(SnapshotError::MissingFile(
-            "manifest.json".into(),
-        ));
+        return Err(SnapshotError::MissingFile("manifest.json".into()));
     }
 
     let ladybug_sha = sha256_file(&ladybug)?;
@@ -335,14 +326,18 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
 pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError> {
     let manifest_path = dir.join("manifest.json");
     if !manifest_path.exists() {
-        return Err(SnapshotError::MissingFile(
-            "manifest.json".into(),
-        ));
+        return Err(SnapshotError::MissingFile("manifest.json".into()));
     }
     let manifest_str = fs::read_to_string(&manifest_path)?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
-    let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
-    let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let format = manifest
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     if format != SNAPSHOT_FORMAT || version != SNAPSHOT_VERSION {
         return Err(SnapshotError::InvalidManifest(format!(
             "expected format={} version={}, got format={:?} version={:?}",
@@ -352,9 +347,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
 
     let checksums_path = dir.join("checksums.json");
     if !checksums_path.exists() {
-        return Err(SnapshotError::MissingFile(
-            "checksums.json".into(),
-        ));
+        return Err(SnapshotError::MissingFile("checksums.json".into()));
     }
     let checksums_str = fs::read_to_string(&checksums_path)?;
     let checksums: SnapshotChecksums = serde_json::from_str(&checksums_str)?;
@@ -364,9 +357,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     let wal = dir.join("ladybug.store.wal");
 
     if !ladybug.exists() && !ladybug.is_dir() {
-        return Err(SnapshotError::MissingFile(
-            "ladybug.store".into(),
-        ));
+        return Err(SnapshotError::MissingFile("ladybug.store".into()));
     }
 
     let computed_ladybug = sha256_file(&ladybug)?;
@@ -417,9 +408,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
             &raw,
             crate::compression::zstd::DEFAULT_SNAPSHOT_MAX_DECOMPRESSED_BYTES,
         )
-        .map_err(|e| {
-            SnapshotError::InvalidManifest(format!("manifest.json.zst: {}", e))
-        })?;
+        .map_err(|e| SnapshotError::InvalidManifest(format!("manifest.json.zst: {}", e)))?;
         let expected_raw = fs::read(&manifest_path)?;
         if decompressed != expected_raw {
             return Err(SnapshotError::InvalidManifest(
@@ -477,21 +466,28 @@ pub fn select_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>
                 continue;
             }
         };
-        let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
-        let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let format = manifest
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let version = manifest
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         if format != SNAPSHOT_FORMAT || version != SNAPSHOT_VERSION {
             continue;
         }
-        let created_at = manifest.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let created_at = manifest
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if created_at.is_empty() {
             continue;
         }
         valid.push((path.clone(), created_at.to_string(), name));
     }
 
-    valid.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2))
-    });
+    valid.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
 
     let expired = if valid.len() > keep {
         valid[keep..].iter().map(|(p, _, _)| p.clone()).collect()
@@ -586,14 +582,13 @@ mod tests {
         let d = temp_dir("invalid_manifest");
         write_store(&d);
         let mut manifest = File::create(d.join("manifest.json")).unwrap();
-        manifest.write_all(b"{\"format\":\"bad\",\"version\":99}").unwrap();
+        manifest
+            .write_all(b"{\"format\":\"bad\",\"version\":99}")
+            .unwrap();
         let mut f = File::create(d.join("checksums.json")).unwrap();
         f.write_all(b"{}").unwrap();
         let result = verify_snapshot(&d);
-        assert!(matches!(
-            result,
-            Err(SnapshotError::InvalidManifest(..))
-        ));
+        assert!(matches!(result, Err(SnapshotError::InvalidManifest(..))));
     }
 
     #[test]
@@ -613,7 +608,11 @@ mod tests {
 
         let expired = select_expired_snapshots(&root, 2).unwrap();
         assert_eq!(expired.len(), 1);
-        assert!(expired[0].file_name().unwrap().to_string_lossy().contains("old1"));
+        assert!(expired[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("old1"));
     }
 
     #[test]
