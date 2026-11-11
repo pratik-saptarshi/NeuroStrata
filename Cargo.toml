@@ -64,7 +64,11 @@ name = "lexical_test"
 path = "tests/fts/lexical_test.rs"
 
 [dependencies]
-tokio = { version = "1.53", features = ["full"] }
+# tokio < 1.54 until Phase 1 lands: 1.54's accepted-socket readiness change
+# (tokio PR #8435) breaks the two federation test fixtures, which respond
+# without reading the request. The Phase 1/2 tracked item in this change's
+# PR body is the exit: fixture fix first, then the bound relaxes to a caret.
+tokio = { version = ">=1.53.3, <1.54", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -92,8 +96,8 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 regex = "1.13"
 tempfile = "3.14"
-cxx = "=1.0.138"
-lbug = "0.20.4"
+cxx = "=1.0.195"
+lbug = "0.22.1"
 arc-swap = "1"
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "blocking"] }
@@ -139,7 +143,7 @@ tantivy = { version = "0.27" }
 openssl = { version = "0.10.81", features = ["vendored"] }
 
 [build-dependencies]
-cxx-build = "=1.0.138"
+cxx-build = "=1.0.195"
 
 [features]
 default = []
