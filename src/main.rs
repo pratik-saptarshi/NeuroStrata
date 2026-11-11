@@ -7,63 +7,58 @@ mod config;
 // The context DTOs are shipped ahead of the service that builds plans
 // (plan Task 2 of the agent-adoption plan). Nothing constructs them yet,
 // so the dead-code lint has no honest answer to give.
+mod compression;
 #[allow(dead_code)]
 mod context;
 mod crash;
 mod daemon;
 mod domain;
 mod embed;
-mod compression;
-
-
-
 
 mod did;
 mod digital_twin;
 
-
-mod fts;
-mod gliner;
-mod graphql;
-mod kge;
 mod community;
 mod events;
+mod fts;
+mod gliner;
 mod graph_read;
+mod graphql;
 mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+mod kge;
+mod learning;
 mod lexical;
-mod model_downloader;
 mod mention;
+mod model_downloader;
 mod multimodal;
 mod ontology_grounding;
-mod learning;
 mod parser;
 mod rag_chat;
+mod rdf;
 mod rebac;
 mod recall_metrics;
 mod receipts;
-mod rdf;
 mod registry;
 mod search;
 mod secrets;
 mod server;
 mod setup;
 mod source_context;
+mod storage;
 mod store;
 mod synaptic_mesh;
 mod task;
 #[cfg(test)]
 mod test_support;
-mod storage;
 
 mod streaming;
 
-
-mod telemetry;
-mod retention;
 mod diagnostic;
+mod retention;
+mod telemetry;
 mod time_series;
 mod tools;
 mod traits;
@@ -684,10 +679,7 @@ fn resolve_startup(config: &Config) -> anyhow::Result<StartupResolution> {
     if let Some(disagreement) = embed::profile_disagreement(&resolution, profile) {
         eprintln!("{}", embed::format_disagreement_warning(&disagreement));
     }
-    Ok(StartupResolution {
-        resolution,
-        limits,
-    })
+    Ok(StartupResolution { resolution, limits })
 }
 
 /// Store limits for a store-opening surface that is not a startup path:
@@ -943,7 +935,10 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     match open_daemon_lock(db_path) {
         Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         Err(e) => {
-            tracing::warn!("daemon_holds_lock probe failed for {}: {e}", db_path.display());
+            tracing::warn!(
+                "daemon_holds_lock probe failed for {}: {e}",
+                db_path.display()
+            );
             false
         }
     }
@@ -1128,7 +1123,9 @@ fn set_hook_executable(_path: &std::path::Path) -> std::io::Result<()> {
 /// Install the pre-commit hook; non-git repos skip this (session ledger is primary mechanism).
 fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let hooks_dir = crate::task::git_hooks_dir(root);
-    if !hooks_dir.is_dir() { std::fs::create_dir_all(&hooks_dir)?; }
+    if !hooks_dir.is_dir() {
+        std::fs::create_dir_all(&hooks_dir)?;
+    }
     let target = hooks_dir.join("pre-commit");
     // A pre-existing hook we did not scaffold is the user's; back it up
     // rather than silently destroying it by overwriting.
@@ -1437,10 +1434,10 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
             eval_path.display()
         )
     })?;
-    let eval_report: crate::learning::trainer::EvaluationReport =
-        serde_json::from_str(&eval_raw).map_err(|e| {
-            anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
-        })?;
+    let eval_report: crate::learning::trainer::EvaluationReport = serde_json::from_str(&eval_raw)
+        .map_err(|e| {
+        anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
+    })?;
     let score = trainer.evaluate_candidate(&eval_report)?;
     job_state = trainer.transition(
         &job_state,
@@ -1457,8 +1454,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
             .and_then(|raw| {
                 serde_json::from_str::<crate::learning::trainer::ActiveManifest>(&raw)
                     .map_err(|e| e.to_string())
-            })
-        {
+            }) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
@@ -1478,10 +1474,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     )?;
 
     std::fs::create_dir_all(paths.root_dir())?;
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
 
     // Mirror promoted versions into status.json.
     let mut status = crate::learning::control::load_status(&paths.root_dir());
@@ -1490,8 +1483,12 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     status.candidate_version = None;
     status.training_state = job_state;
     status.runtime_state = match rt_state {
-        crate::judgment::laya_onnx::LayaReadiness::Ready => crate::judgment::laya_onnx::RuntimeState::Ready,
-        crate::judgment::laya_onnx::LayaReadiness::Degraded { .. } => crate::judgment::laya_onnx::RuntimeState::Unavailable,
+        crate::judgment::laya_onnx::LayaReadiness::Ready => {
+            crate::judgment::laya_onnx::RuntimeState::Ready
+        }
+        crate::judgment::laya_onnx::LayaReadiness::Degraded { .. } => {
+            crate::judgment::laya_onnx::RuntimeState::Unavailable
+        }
     };
     status.latest_evaluation = Some(eval_report);
     std::fs::write(
@@ -1692,10 +1689,7 @@ mod tests {
             &sources,
             Some(std::time::Duration::from_secs(300)),
         );
-        assert!(
-            line.contains("idle unload: on (threshold 300s)"),
-            "{line}"
-        );
+        assert!(line.contains("idle unload: on (threshold 300s)"), "{line}");
     }
 
     /// T19: the auto-spawned daemon's stderr goes to daemon.log via the
@@ -1768,9 +1762,7 @@ mod tests {
         let normal_names = |path: &std::path::Path| -> Vec<String> {
             path.components()
                 .filter_map(|component| match component {
-                    std::path::Component::Normal(name) => {
-                        Some(name.to_string_lossy().into_owned())
-                    }
+                    std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
                     _ => None,
                 })
                 .collect()
@@ -1937,7 +1929,10 @@ mod tests {
     #[test]
     fn gate_and_restore_store_opens_route_through_profiled_limits() {
         let source = include_str!("main.rs");
-        for signature in ["async fn direct_report(", "async fn restore_snapshot_bundle("] {
+        for signature in [
+            "async fn direct_report(",
+            "async fn restore_snapshot_bundle(",
+        ] {
             let body = source_fn_body(source, signature);
             assert!(
                 body.contains("profiled_store_limits(config)"),
@@ -2834,7 +2829,10 @@ mod tests {
             )
             .await
             .unwrap();
-        source_store.relink_edges("wal-data", "wal-source").await.unwrap();
+        source_store
+            .relink_edges("wal-data", "wal-source")
+            .await
+            .unwrap();
 
         let stage = format!(
             "{}{}",
@@ -3322,7 +3320,10 @@ mod tests {
         let root = t4_repo(tag);
         let remote = root.join("remote.git");
         t4_git_ok(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
-        t4_git_ok(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        t4_git_ok(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         std::fs::write(root.join("file.txt"), "task 4\n").unwrap();
         t4_git_ok(&root, &["add", "file.txt"]);
         t4_git_ok(&root, &["commit", "-q", "-m", "task 4 seed"]);
@@ -3577,9 +3578,8 @@ mod tests {
             String::from_utf8_lossy(&skipped.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&skipped.stdout).contains(
-                "Task gate: skipped in 't4cli' (NEUROSTRATA_SKIP_GATE=1)."
-            ),
+            String::from_utf8_lossy(&skipped.stdout)
+                .contains("Task gate: skipped in 't4cli' (NEUROSTRATA_SKIP_GATE=1)."),
             "the skip appears in the stdout gate report: {}",
             String::from_utf8_lossy(&skipped.stdout)
         );
@@ -4244,7 +4244,9 @@ mod tests {
             "stdout carries protocol bytes only — no log output"
         );
         assert!(
-            captured.text().contains("stdout_carries_no_log_output marker"),
+            captured
+                .text()
+                .contains("stdout_carries_no_log_output marker"),
             "the log line went to the stderr slot instead"
         );
     }
@@ -4972,8 +4974,12 @@ async fn run() -> anyhow::Result<()> {
             Commands::Laya { model, out_dir } => {
                 let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
                 let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
-                crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir).await?;
-                println!("Laya model '{}' fetched and verified to '{}'", model_id, target_dir);
+                crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir)
+                    .await?;
+                println!(
+                    "Laya model '{}' fetched and verified to '{}'",
+                    model_id, target_dir
+                );
             }
             Commands::Learn { action } => match action {
                 LearnCommands::Status => {
@@ -5013,9 +5019,12 @@ async fn run() -> anyhow::Result<()> {
                                 purge_observations: true,
                             });
                         } else {
-                            let result = crate::learning::control::purge_observations_offline(confirm_purge);
+                            let result =
+                                crate::learning::control::purge_observations_offline(confirm_purge);
                             match result {
-                                Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
+                                Ok(res) => {
+                                    println!("{}", serde_json::to_string_pretty(&res).unwrap())
+                                }
                                 Err(e) => {
                                     eprintln!("{}", e);
                                     std::process::exit(1);
@@ -5057,7 +5066,8 @@ async fn run() -> anyhow::Result<()> {
                 };
                 let mut svc = crate::synaptic_mesh::MeshService::new(project_root);
                 let reply =
-                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc).await;
+                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc)
+                        .await;
                 println!("{}", reply);
                 // Hook piggyback contract (spec §Hooks): the hook target
                 // ALWAYS exits 0, even when its reply carries a failure —
@@ -5073,13 +5083,14 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             Commands::Kge {
-                action: KgeCommands::Train {
-                    namespace,
-                    all,
-                    epochs,
-                    dim,
-                    kge_weight,
-                },
+                action:
+                    KgeCommands::Train {
+                        namespace,
+                        all,
+                        epochs,
+                        dim,
+                        kge_weight,
+                    },
             } => {
                 if !all && namespace.is_none() {
                     anyhow::bail!("--namespace <ns> or --all is required");
@@ -5091,7 +5102,13 @@ async fn run() -> anyhow::Result<()> {
                     anyhow::bail!("--kge-weight must be in [0, 0.3]");
                 }
                 // Run TransE KGE training over the namespace graph (spec §5.4).
-                crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim), Some(kge_weight))?;
+                crate::kge::cli_train(
+                    namespace.as_deref(),
+                    all,
+                    Some(epochs),
+                    Some(dim),
+                    Some(kge_weight),
+                )?;
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;
@@ -5386,9 +5403,8 @@ async fn run() -> anyhow::Result<()> {
                     }
 
                     // Both policies print the escape hatch (section 5.1).
-                    if skip_gate_value_skips(
-                        std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref(),
-                    ) {
+                    if skip_gate_value_skips(std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref())
+                    {
                         eprintln!(
                             "[neurostrata:gate] NEUROSTRATA_SKIP_GATE=1 is set; skipping the gate for '{}'.",
                             namespace
@@ -5424,30 +5440,24 @@ async fn run() -> anyhow::Result<()> {
                                 .send()
                                 .await
                             {
-                                Ok(resp) if resp.status().is_success() => {
-                                    match resp.text().await {
-                                        Ok(body) => {
-                                            serde_json::from_str::<serde_json::Value>(&body)
-                                                .map_err(|e| {
-                                                    format!(
-                                                        "the daemon's gate reply could not be read: {}",
-                                                        e
-                                                    )
-                                                })
-                                        }
-                                        Err(e) => Err(format!(
-                                            "the daemon's gate reply could not be read: {}",
-                                            e
-                                        )),
-                                    }
-                                }
+                                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                                    Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                                        .map_err(|e| {
+                                            format!(
+                                                "the daemon's gate reply could not be read: {}",
+                                                e
+                                            )
+                                        }),
+                                    Err(e) => Err(format!(
+                                        "the daemon's gate reply could not be read: {}",
+                                        e
+                                    )),
+                                },
                                 Ok(resp) => Err(format!(
                                     "the daemon answered {} on /tasks/gate",
                                     resp.status()
                                 )),
-                                Err(e) => {
-                                    Err(format!("the request to the daemon failed: {}", e))
-                                }
+                                Err(e) => Err(format!("the request to the daemon failed: {}", e)),
                             },
                         }
                     } else {
@@ -5832,7 +5842,14 @@ async fn run() -> anyhow::Result<()> {
 
                 // AW-C4: `--dry-run` is read-only — it never opens the store —
                 // so it runs even while the daemon holds the lock.
-                if let Commands::Ingest { dry_run: true, dir, namespace, schema_path, dry_run_mode } = &other {
+                if let Commands::Ingest {
+                    dry_run: true,
+                    dir,
+                    namespace,
+                    schema_path,
+                    dry_run_mode,
+                } = &other
+                {
                     let dir_str = cli_ingest_root(dir);
                     let dir_path_owned = std::path::PathBuf::from(&dir_str);
                     let schema_str = if let Some(path) = schema_path {
@@ -5850,7 +5867,12 @@ async fn run() -> anyhow::Result<()> {
                             return Err(e.into());
                         }
                     };
-                    let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                    let report = crate::parser::ingest::dry_run_directory(
+                        &dir_path_owned,
+                        &schema,
+                        &dry_run_mode,
+                    )
+                    .await?;
                     println!("Namespace: {}", namespace);
                     println!("{}", report);
                     return Ok(());
@@ -5971,7 +5993,13 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("{}", body);
                             std::process::exit(1);
                         }
-                        Commands::Edit { namespace, id, new_namespace, content, location } => {
+                        Commands::Edit {
+                            namespace,
+                            id,
+                            new_namespace,
+                            content,
+                            location,
+                        } => {
                             let res = daemon_http_client()
                                 .post(format!("http://{DAEMON_ADDR}/edit"))
                                 .json(&serde_json::json!({
@@ -6001,8 +6029,13 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Edit failed: {}", body);
                             std::process::exit(1);
                         }
-                        Commands::SetMetadata { namespace, id, metadata } => {
-                            let new_metadata: serde_json::Value = serde_json::from_str(metadata).map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
+                        Commands::SetMetadata {
+                            namespace,
+                            id,
+                            metadata,
+                        } => {
+                            let new_metadata: serde_json::Value = serde_json::from_str(metadata)
+                                .map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
                             let res = daemon_http_client()
                                 .post(format!("http://{DAEMON_ADDR}/set-metadata"))
                                 .json(&serde_json::json!({
@@ -6024,7 +6057,10 @@ async fn run() -> anyhow::Result<()> {
                                 std::process::exit(1);
                             }
                             if status == reqwest::StatusCode::CONFLICT {
-                                eprintln!("{} was written by directory ingestion and cannot be updated.", id);
+                                eprintln!(
+                                    "{} was written by directory ingestion and cannot be updated.",
+                                    id
+                                );
                                 std::process::exit(1);
                             }
                             eprintln!("Set-metadata failed: {}", body);

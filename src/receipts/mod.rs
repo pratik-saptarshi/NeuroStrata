@@ -10,6 +10,3 @@ pub use store::{Receipt, ReceiptStore};
 // worktree binding captured at completion time. `store::ReceiptStore` is the
 // in-process sink; the IPC/task surface stamps what it ran and whether the
 // worktree state it captured is still current.
-
-
-

@@ -390,12 +390,16 @@ impl VectorStore for MockStore {
         Ok(0)
     }
 
-
     async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> Result<usize> {
         Ok(0)
     }
 
-    async fn list(&self, namespace: &str, user_id: Option<&str>, _memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+    async fn list(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        _memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()
