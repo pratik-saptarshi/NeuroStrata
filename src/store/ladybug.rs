@@ -3864,23 +3864,43 @@ impl<'a> KnownIds<'a> {
         Self::build(ids, Some(active_gen))
     }
 
+    /// Index only the ids that are not generation-scoped. The
+    /// ingest-publication replay resolves against this: its destination
+    /// mixes the just-promoted unscoped tree with retained rows from
+    /// superseded generations, and a retained scoped row sharing a
+    /// logical path with the promoted row makes the by-path slot
+    /// ambiguous, stranding the declarations the replay exists to heal
+    /// (F7 M1, decoy-holder probe). Scoped targets a declaration names
+    /// exactly are unaffected -- edge creation matches them against the
+    /// database, not this index.
+    pub fn unscoped(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::build_filtered(ids, |id| {
+            crate::parser::ingest::split_scoped_id(id).is_none()
+        })
+    }
+
     fn build(ids: impl IntoIterator<Item = &'a str>, active_gen: Option<u64>) -> Self {
-        let mut id_set: std::collections::HashSet<&'a str> =
-            std::collections::HashSet::new();
+        match active_gen {
+            Some(active) => Self::build_filtered(ids, move |id| {
+                match crate::parser::ingest::split_scoped_id(id) {
+                    // Only the active generation is reachable.
+                    Some((_, gen, _)) => gen == active,
+                    // Not generation-scoped: not part of any active generation.
+                    None => false,
+                }
+            }),
+            None => Self::build_filtered(ids, |_| true),
+        }
+    }
+
+    fn build_filtered(ids: impl IntoIterator<Item = &'a str>, keep: impl Fn(&str) -> bool) -> Self {
+        let mut id_set: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
         let mut by_path: std::collections::HashMap<&'a str, Option<&'a str>> =
             std::collections::HashMap::new();
 
         for id in ids.into_iter().filter(|id| !id.is_empty()) {
-            if let Some(active) = active_gen {
-                match crate::parser::ingest::split_scoped_id(id) {
-                    Some((_, gen, _)) => {
-                        if gen != active {
-                            continue; // a stale generation is not reachable
-                        }
-                    }
-                    // Not generation-scoped: not part of any active generation.
-                    None => continue,
-                }
+            if !keep(id) {
+                continue;
             }
 
             id_set.insert(id);
@@ -4000,8 +4020,36 @@ fn remap_superseded_scoped_target(
     declared: &str,
     active_gen: u64,
 ) -> Option<String> {
+    remap_scoped_target(known, namespace, declared, Some(active_gen))
+}
+
+/// The publication-replay form of [`remap_superseded_scoped_target`]:
+/// no generation guard. `publish_ingested` promotes its staged tree to
+/// *unscoped* ids and writes no `IngestGeneration` pointer, so it has no
+/// current scoped generation of its own — every generation-scoped
+/// declaration in the destination names a superseded pointer-pipeline
+/// generation by construction, and gating the remap on the pointer
+/// table's namespace-wide MAX (state other publications wrote) let a
+/// stale pointer at the frozen generation suppress the remap entirely,
+/// silently dropping the edge (F7 M1; panel verdict Ruling 2). A
+/// retained row the declaration names exactly is still claimed by
+/// `KnownIds::resolve` before this fallback runs, exactly as in relink.
+fn remap_superseded_scoped_target_at_publication(
+    known: &KnownIds,
+    namespace: &str,
+    declared: &str,
+) -> Option<String> {
+    remap_scoped_target(known, namespace, declared, None)
+}
+
+fn remap_scoped_target(
+    known: &KnownIds,
+    namespace: &str,
+    declared: &str,
+    active_gen: Option<u64>,
+) -> Option<String> {
     let (decl_namespace, decl_generation, _) = crate::parser::ingest::split_scoped_id(declared)?;
-    if decl_namespace != namespace || decl_generation == active_gen {
+    if decl_namespace != namespace || active_gen == Some(decl_generation) {
         return None;
     }
     known.resolve(crate::parser::ingest::logical_path_of(declared))
@@ -8029,7 +8077,12 @@ impl VectorStore for LadybugStore {
                     known_ids.push(id.clone());
                     edge_rows.push((id, user_id, metadata));
                 }
-                let known = KnownIds::new(known_ids.iter().map(String::as_str));
+                // The replay index holds only non-generation-scoped ids:
+                // a retained scoped row sharing a logical path with the
+                // just-promoted row would make the by-path slot ambiguous
+                // and strand the declarations this replay heals (M1,
+                // decoy-holder probe). See `KnownIds::unscoped`.
+                let known = KnownIds::unscoped(known_ids.iter().map(String::as_str));
                 let active_gen = active_generation_of(conn, &namespace);
                 let mut wanted: std::collections::HashMap<
                     &'static str,
@@ -8044,14 +8097,18 @@ impl VectorStore for LadybugStore {
                         // remap as relink — a declaration persisted as an
                         // old generation's physical id resolves its
                         // logical path against the just-published tree.
+                        // The publication form of the helper takes no
+                        // active generation: this publication wrote no
+                        // pointer, so pointer state must not gate the
+                        // remap (M1, Arm A). `active_gen` is still read
+                        // above for the created edges' generation stamp.
                         let target = known
                             .resolve(&edge.target_id)
                             .or_else(|| {
-                                remap_superseded_scoped_target(
+                                remap_superseded_scoped_target_at_publication(
                                     &known,
                                     &namespace,
                                     &edge.target_id,
-                                    active_gen,
                                 )
                             })
                             .unwrap_or_else(|| edge.target_id.clone());
@@ -23686,6 +23743,160 @@ eurostrata\src\daemon.rs",
             source_before.is_empty() && !source_after.is_empty(),
             "shape repair must still backfill a rule source (before={source_before:?}, after={source_after:?}, shape_fixes={shape_fixes})"
         );
+    }
+
+    // ===== M1 (panel Ruling 2, Arm A): publication-replay remap =====
+    // The two discriminating tests for the `publish_ingested` replay.
+    // Both drive `publish_ingested` end-to-end with NO `relink_edges`
+    // call anywhere: the publication itself must restore the frozen
+    // rule's GOVERNS edge onto the promoted (unscoped) id, while the
+    // stored declaration stays in its frozen verbatim form (edges-only
+    // healing). Variant B is the stale-pointer state the panel executed
+    // against the bundled head: a pointer at the frozen generation used
+    // to suppress the remap entirely (0 edges created), because the
+    // replay fed the helper a namespace-wide pointer MAX it never wrote.
+
+    /// Seed the frozen rule the publication-replay tests share: an
+    /// owner-owned row whose `governs` already carries the generation-1
+    /// physical id, as a pre-fix store would hold it. "owner" is not
+    /// `auto-ingestor`, so promotion preserves the row.
+    async fn f7_seed_frozen_rule_pub(store: &LadybugStore) {
+        store
+            .upsert(
+                "probe",
+                "rule-pub",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "owner",
+                    json!({ "governs": ["probe::1::src/lib.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f7_stored_values(store, "rule-pub", "governs").await,
+            vec!["probe::1::src/lib.rs".to_string()],
+            "precondition: the frozen declaration is stored verbatim"
+        );
+        assert!(
+            f7_outgoing_targets(store, "GOVERNS", "rule-pub")
+                .await
+                .is_empty(),
+            "precondition: no GOVERNS edge exists yet"
+        );
+    }
+
+    /// Stage a one-file tree (`src/lib.rs`) and publish it into "probe"
+    /// with `publish_ingested`; returns the edges the publication created.
+    async fn f7_publish_staged_tree(store: &LadybugStore) -> usize {
+        let stage = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
+        let lease = store.begin_ingest_stage(&stage).await.unwrap();
+        let staged_id = format!(
+            "{}{}{}",
+            stage,
+            crate::parser::ingest::NAMESPACE_SEPARATOR,
+            "src/lib.rs"
+        );
+        let mut payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        payload.location = "src/lib.rs".to_string();
+        store
+            .upsert(&stage, &staged_id, vec![0.0; 4], payload)
+            .await
+            .unwrap();
+        drop(lease);
+        store.publish_ingested("probe", &stage).await.unwrap()
+    }
+
+    /// The healed end state both variants must reach: the GOVERNS edge
+    /// lands exactly on the promoted id, the rule surfaces as an
+    /// ExactFile hit, and the stored declaration is still the frozen
+    /// string (the replay heals edges, never stored strings).
+    async fn f7_assert_publication_healed(store: &LadybugStore, created: usize) {
+        assert!(
+            created >= 1,
+            "publication must create the healed GOVERNS edge; created {created}"
+        );
+        assert_eq!(
+            f7_outgoing_targets(store, "GOVERNS", "rule-pub").await,
+            vec!["probe::src/lib.rs".to_string()],
+            "the replay remap must land the edge on the promoted id"
+        );
+        assert_eq!(
+            f7_hit_kinds(store, "rule-pub").await,
+            vec!["ExactFile".to_string()],
+            "the healed rule must surface via memories_for_file"
+        );
+        assert_eq!(
+            f7_stored_values(store, "rule-pub", "governs").await,
+            vec!["probe::1::src/lib.rs".to_string()],
+            "edges-only healing: the stored declaration remains frozen verbatim"
+        );
+    }
+
+    /// Variant A (no-pointer): no `IngestGeneration` pointer exists for
+    /// "probe". Discriminates the dead-call-site mutation: with the
+    /// replay's remap call removed, this test fails.
+    #[tokio::test]
+    async fn f7_publish_ingested_remaps_frozen_declaration_without_pointer() {
+        let store = retired_test_store().await;
+        f7_seed_frozen_rule_pub(&store).await;
+        let created = f7_publish_staged_tree(&store).await;
+        f7_assert_publication_healed(&store, created).await;
+    }
+
+    /// Variant B (stale pointer): a pointer published at generation 1 —
+    /// exactly the frozen declaration's generation, the state a previous
+    /// pointer-publish leaves behind and one `publish_ingested`'s own
+    /// transaction preserves. On the pre-Arm-A wiring this created zero
+    /// edges; the corrected parameterization must heal identically to
+    /// Variant A.
+    #[tokio::test]
+    async fn f7_publish_ingested_remaps_frozen_declaration_with_stale_pointer() {
+        let store = retired_test_store().await;
+        assert_eq!(
+            store.begin_generation("probe", PROBE_SOURCE).await.unwrap(),
+            1
+        );
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .unwrap();
+        let active = store
+            .with_conn(|conn| Ok(active_generation_of(conn, "probe")))
+            .await
+            .unwrap();
+        assert_eq!(
+            active, 1,
+            "precondition: the pointer sits at the frozen generation"
+        );
+        f7_seed_frozen_rule_pub(&store).await;
+        let created = f7_publish_staged_tree(&store).await;
+        f7_assert_publication_healed(&store, created).await;
+    }
+
+    /// Decoy-holder probe (panel Ruling 2(c)): a retained
+    /// non-`auto-ingestor` row holding the same logical path under a
+    /// generation-2 scoped id sits in the destination while the replay
+    /// runs. Against the unfiltered index this failed — both rows index
+    /// under `src/lib.rs`, the by-path slot is ambiguous, and zero edges
+    /// were created (probe executed, armA-build-log.md). The replay
+    /// index therefore holds only non-generation-scoped ids
+    /// (`KnownIds::unscoped`), and this test pins that the frozen
+    /// declaration's edge lands on the promoted row regardless.
+    #[tokio::test]
+    async fn f7_publish_ingested_replay_with_decoy_holder() {
+        let store = retired_test_store().await;
+        f7_seed_frozen_rule_pub(&store).await;
+        let decoy_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/lib.rs");
+        let mut decoy = retired_test_payload("file", "owner", json!({}));
+        decoy.location = "src/lib.rs".to_string();
+        store
+            .upsert("probe", &decoy_id, vec![0.0; 4], decoy)
+            .await
+            .unwrap();
+        let created = f7_publish_staged_tree(&store).await;
+        f7_assert_publication_healed(&store, created).await;
     }
 }
 
