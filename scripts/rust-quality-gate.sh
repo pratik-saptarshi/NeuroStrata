@@ -135,7 +135,12 @@ fi
 # cannot be verified. Deny-level lints elsewhere in the tree are backlog
 # (same rule as warnings): only added lines gate the push.
 # (ADDED_LINES computed once above and reused here.)
-CLIPPY_OUT="$(cargo clippy --locked --message-format=short 2>&1)"
+# --workspace: the root package alone would skip workspace members
+# (e.g. crates/neurostrata-wasm, which ships without its own lockfile
+# and is covered by the root lockfile for audit). Diagnostics stay
+# attributed per added line below, so the wider scope costs build time,
+# not false blocks.
+CLIPPY_OUT="$(cargo clippy --locked --workspace --message-format=short 2>&1)"
 CLIPPY_CODE=$?
 CLIPPY_DIAG="$(printf '%s\n' "$CLIPPY_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' || true)"
 if [ -z "$CLIPPY_DIAG" ] && [ "$CLIPPY_CODE" -ne 0 ]; then

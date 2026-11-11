@@ -2520,6 +2520,30 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
+# ── Project guards (run before the task gate, independently of it) ───────
+# These run BEFORE the task gate below on purpose: the gate exits 0 early
+# when the neurostrata-mcp binary is missing or NEUROSTRATA_SKIP_GATE=1,
+# and project guards must not be bypassed by task-tool availability.
+# A guard that belongs here does NOT need a CI workflow to be real.
+PROJECT_GATES=(
+    # Rust quality gate: fmt/clippy deltas + audit delta on pushes that
+    # touch Rust sources or manifests. Never blocks on legacy backlog
+    # (the quality-baseline file owns that); see
+    # docs/SECDEVOPS-CHECKLIST.md. Bypass: RUST_QUALITY_SKIP=1.
+    ./scripts/rust-quality-gate.sh
+    # Task-coverage gate: blocks pushes when changed docs contain work-item
+    # language without a NeuroStrata task ID citation.
+    ./scripts/task-coverage-gate.sh
+    # ./scripts/rules-gate.sh
+)
+
+if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
+    for g in "${PROJECT_GATES[@]}"; do
+        [ -f "$g" ] || { echo "project guard $g missing — skipping" >&2; continue; }
+        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
+    done
+fi
+
 command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
@@ -2546,25 +2570,8 @@ if [ $code -eq 2 ]; then
     echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
 fi
 
-# ── project guards (add yours here) ────────────────────────────────────────
-# Add the path of each local guard; it runs before every push on every host.
-# A guard that belongs here does NOT need a CI workflow to be real.
-PROJECT_GATES=(
-    # Task-coverage gate: blocks pushes when changed docs contain work-item
-    # language without a NeuroStrata task ID citation.
-    ./scripts/task-coverage-gate.sh
-    # ./scripts/rules-gate.sh
-)
-
-if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
-    for g in "${PROJECT_GATES[@]}"; do
-        [ -f "$g" ] || { echo "task-coverage-gate: guard $g missing — skipping" >&2; continue; }
-        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
-    done
-fi
-
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: 9def1d7f9f1b07d6d81ba0ca61c7ae4584248f5af93649d48c617cb0a9fd7d77
+# neurostrata-hook-sha256: 258f2499befde2c5315e80c13cb2d13a048e220a412497ab32b5378687450e84
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -4336,6 +4343,37 @@ mod tests {
         );
     }
 
+    /// Codex P1s on PR #93 (SECDevOps gate round): (a) hook hygiene
+    /// rewrites a stale installed hook with this scaffold, so the
+    /// scaffold itself must carry the Rust gate entry — otherwise a
+    /// normal session init silently drops enforcement; (b) Guard 2
+    /// exits 0 early when the binary is missing or skipped, so project
+    /// guards must run BEFORE the task gate, not after its early
+    /// returns; (c) root-only `cargo clippy` skips workspace members.
+    #[test]
+    fn scaffolded_pre_push_hook_carries_rust_gate_before_the_gate() {
+        let hook = SCAFFOLDED_PRE_PUSH_HOOK;
+        let rust_gate = hook
+            .find("./scripts/rust-quality-gate.sh")
+            .expect("the scaffold must carry the Rust gate entry");
+        let project_guards = hook
+            .find("PROJECT_GATES=(")
+            .expect("the scaffold must carry the project-guards block");
+        let gate_binary_check = hook
+            .find("command -v neurostrata-mcp")
+            .expect("the scaffold must carry the task gate");
+        assert!(
+            rust_gate > project_guards && project_guards < gate_binary_check,
+            "the Rust gate entry must live in PROJECT_GATES ahead of the task gate's early exits"
+        );
+        let gate_script = std::fs::read_to_string("scripts/rust-quality-gate.sh")
+            .expect("the Rust gate script must exist at scripts/rust-quality-gate.sh");
+        assert!(
+            gate_script.contains("cargo clippy --locked --workspace"),
+            "clippy must cover workspace members (crates/neurostrata-wasm), not just the root package"
+        );
+    }
+
     /// The behavioral half of the same finding: the scaffolded hook, run
     /// the way git runs it (`pre-push <remote-name> <remote-url>`), must
     /// reject the upstream remote in its canonical forms — even with the
@@ -4729,8 +4767,8 @@ mod tests {
 
     /// The mirror: with the scaffolded hook installed the gate verifies. But a
     /// hook file existing is NOT a project-pipeline guard running — the
-    /// scaffold ships PROJECT_GATES empty — so the panel must not claim the
-    /// pipeline guards are enforced (fix round 1, Important #1).
+    /// per-guard half of coverage comes from parsing PROJECT_GATES, not
+    /// from any hardcoded list (fix round 1, Important #1).
     #[test]
     fn installed_scaffolded_hook_verifies_the_gate_without_faking_pipeline_coverage() {
         let root = std::env::temp_dir().join(format!("ns-hooked-{}", std::process::id()));
@@ -4750,10 +4788,13 @@ mod tests {
             json!(["task-gate"])
         );
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
-        // the task-coverage gate is wired by design; it is a real guard, not faked
+        // both shipped guards are wired by design; they are real guards, not faked
         assert_eq!(
             verified["hook_project_guards"],
-            json!(["./scripts/task-coverage-gate.sh"])
+            json!([
+                "./scripts/rust-quality-gate.sh",
+                "./scripts/task-coverage-gate.sh"
+            ])
         );
         // and no per-guard claim of client-side coverage survives
         assert!(
@@ -4785,6 +4826,7 @@ mod tests {
         assert_eq!(
             verified["hook_project_guards"],
             json!([
+                "./scripts/rust-quality-gate.sh",
                 "./scripts/task-coverage-gate.sh",
                 "./scripts/rules-gate.sh",
                 "./scripts/typecheck.sh"
