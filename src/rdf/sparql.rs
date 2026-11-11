@@ -9,9 +9,9 @@
 //! See docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md for detailed spec.
 
 use oxrdf::{Dataset, Variable};
-use spargebra::SparqlParser;
-use spareval::QueryEvaluator;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+use spareval::QueryEvaluator;
+use spargebra::SparqlParser;
 
 /// Configuration for SPARQL query execution.
 #[derive(Debug, Clone)]
@@ -44,19 +44,32 @@ fn escape_ladybug_string(s: &str) -> String {
 /// Create a SparqlParser with all 9 pre-registered prefixes from spec §6.
 pub fn parser_with_prefixes() -> SparqlParser {
     SparqlParser::new()
-        .with_prefix("ns", "urn:neurostrata:ns#").unwrap()
-        .with_prefix("mem", "urn:neurostrata:memory:").unwrap()
-        .with_prefix("class", "urn:neurostrata:class:").unwrap()
-        .with_prefix("dom", "urn:neurostrata:domain:").unwrap()
-        .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#").unwrap()
-        .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#").unwrap()
-        .with_prefix("owl", "http://www.w3.org/2002/07/owl#").unwrap()
-        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#").unwrap()
-        .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#").unwrap()
+        .with_prefix("ns", "urn:neurostrata:ns#")
+        .unwrap()
+        .with_prefix("mem", "urn:neurostrata:memory:")
+        .unwrap()
+        .with_prefix("class", "urn:neurostrata:class:")
+        .unwrap()
+        .with_prefix("dom", "urn:neurostrata:domain:")
+        .unwrap()
+        .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        .unwrap()
+        .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#")
+        .unwrap()
+        .with_prefix("owl", "http://www.w3.org/2002/07/owl#")
+        .unwrap()
+        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#")
+        .unwrap()
+        .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#")
+        .unwrap()
 }
 
 fn is_archived(metadata: &serde_json::Value) -> bool {
-    metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)}
+    metadata
+        .get("archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
 fn is_mesh_conflicting(metadata: &serde_json::Value) -> bool {
     crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
@@ -74,10 +87,22 @@ pub fn compute_memory_salience(metadata: &serde_json::Value, now: i64) -> f64 {
     if is_archived(metadata) || is_retired_at(metadata, now) || is_mesh_conflicting(metadata) {
         return 0.0;
     }
-    let access_count = metadata.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+    let access_count = metadata
+        .get("access_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as f64;
     let access_term = (1.0 + access_count).ln() * 0.1;
-    let feedback = metadata.get("feedback_score").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(-1.0, 1.0) * 0.05;
-    let neural_gain = metadata.get("neural_gain").and_then(|v| v.as_f64()).unwrap_or(1.0).clamp(0.0, 10.0);
+    let feedback = metadata
+        .get("feedback_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .clamp(-1.0, 1.0)
+        * 0.05;
+    let neural_gain = metadata
+        .get("neural_gain")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .clamp(0.0, 10.0);
     ((1.0 + access_term + feedback) * neural_gain).max(0.0)
 }
 
@@ -87,7 +112,13 @@ pub async fn project_sparql_dataset_with_meta_async(
     include_retired: bool,
     include_archived: bool,
     store: &crate::store::ladybug::LadybugStore,
-) -> Result<(Dataset, std::collections::HashMap<String, serde_json::Value>), String> {
+) -> Result<
+    (
+        Dataset,
+        std::collections::HashMap<String, serde_json::Value>,
+    ),
+    String,
+> {
     let mut dataset = Dataset::new();
     let mut meta_map = std::collections::HashMap::new();
 
@@ -115,7 +146,10 @@ pub async fn project_sparql_dataset_with_meta_async(
         }
 
         let payload = m.payload.clone();
-        meta_map.insert(format!("urn:neurostrata:memory:{}", m.id), m.payload.metadata.clone());
+        meta_map.insert(
+            format!("urn:neurostrata:memory:{}", m.id),
+            m.payload.metadata.clone(),
+        );
         meta_map.insert(m.id.clone(), m.payload.metadata.clone());
 
         let qs = crate::rdf::projection::memory_to_quads(
@@ -167,65 +201,61 @@ fn custom_functions_on(
     meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
     now: i64,
 ) -> QueryEvaluator {
-    use oxrdf::{NamedNode, Term, Literal};
-    base
-        .with_custom_function(
-            NamedNode::new("urn:neurostrata:ns#salience").unwrap(),
-            {
-                let meta_map = meta_map.clone();
-                move |args: &[Term]| -> Option<Term> {
-                    let key = args.first()?;
-                    let key_str = match key {
-                        Term::NamedNode(n) => n.as_str().to_string(),
-                        Term::Literal(l) => l.value().to_string(),
-                        _ => return Some(Literal::from(0.0f64).into()),
-                    };
-                    let score = meta_map.get(&key_str).map(|m| compute_memory_salience(m, now)).unwrap_or(0.0);
-                    Some(Literal::from(score).into())
-                }
-            },
-        )
-        .with_custom_function(
-            NamedNode::new("urn:neurostrata:ns#validAt").unwrap(),
-            {
-                let meta_map = meta_map.clone();
-                move |args: &[Term]| -> Option<Term> {
-                    let mem_term = args.get(0)?;
-                    let ts_term = args.get(1)?;
-                    let key_str = match mem_term {
-                        Term::NamedNode(n) => n.as_str().to_string(),
-                        Term::Literal(l) => l.value().to_string(),
-                        _ => return Some(Literal::from(false).into()),
-                    };
-                    let ts: i64 = match ts_term {
-                        Term::Literal(l) => l.value().parse::<i64>().ok()?,
-                        _ => return Some(Literal::from(false).into()),
-                    };
-                    let meta = meta_map.get(&key_str)?;
-                    let valid_from = meta.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let valid_to = meta.get("valid_to").and_then(|v| v.as_i64()).filter(|v| *v != 0);
-                    let is_valid = valid_from <= ts && (valid_to.is_none() || ts < valid_to.unwrap());
-                    Some(Literal::from(is_valid).into())
-                }
-            },
-        )
-        .with_custom_function(
-            NamedNode::new("urn:neurostrata:ns#isRetired").unwrap(),
-            {
-                let meta_map = meta_map.clone();
-                move |args: &[Term]| -> Option<Term> {
-                    let mem_term = args.first()?;
-                    let key_str = match mem_term {
-                        Term::NamedNode(n) => n.as_str().to_string(),
-                        Term::Literal(l) => l.value().to_string(),
-                        _ => return Some(Literal::from(false).into()),
-                    };
-                    let meta = meta_map.get(&key_str)?;
-                    let retired = is_retired_at(meta, now);
-                    Some(Literal::from(retired).into())
-                }
-            },
-        )
+    use oxrdf::{Literal, NamedNode, Term};
+    base.with_custom_function(NamedNode::new("urn:neurostrata:ns#salience").unwrap(), {
+        let meta_map = meta_map.clone();
+        move |args: &[Term]| -> Option<Term> {
+            let key = args.first()?;
+            let key_str = match key {
+                Term::NamedNode(n) => n.as_str().to_string(),
+                Term::Literal(l) => l.value().to_string(),
+                _ => return Some(Literal::from(0.0f64).into()),
+            };
+            let score = meta_map
+                .get(&key_str)
+                .map(|m| compute_memory_salience(m, now))
+                .unwrap_or(0.0);
+            Some(Literal::from(score).into())
+        }
+    })
+    .with_custom_function(NamedNode::new("urn:neurostrata:ns#validAt").unwrap(), {
+        let meta_map = meta_map.clone();
+        move |args: &[Term]| -> Option<Term> {
+            let mem_term = args.get(0)?;
+            let ts_term = args.get(1)?;
+            let key_str = match mem_term {
+                Term::NamedNode(n) => n.as_str().to_string(),
+                Term::Literal(l) => l.value().to_string(),
+                _ => return Some(Literal::from(false).into()),
+            };
+            let ts: i64 = match ts_term {
+                Term::Literal(l) => l.value().parse::<i64>().ok()?,
+                _ => return Some(Literal::from(false).into()),
+            };
+            let meta = meta_map.get(&key_str)?;
+            let valid_from = meta.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
+            let valid_to = meta
+                .get("valid_to")
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v != 0);
+            let is_valid = valid_from <= ts && (valid_to.is_none() || ts < valid_to.unwrap());
+            Some(Literal::from(is_valid).into())
+        }
+    })
+    .with_custom_function(NamedNode::new("urn:neurostrata:ns#isRetired").unwrap(), {
+        let meta_map = meta_map.clone();
+        move |args: &[Term]| -> Option<Term> {
+            let mem_term = args.first()?;
+            let key_str = match mem_term {
+                Term::NamedNode(n) => n.as_str().to_string(),
+                Term::Literal(l) => l.value().to_string(),
+                _ => return Some(Literal::from(false).into()),
+            };
+            let meta = meta_map.get(&key_str)?;
+            let retired = is_retired_at(meta, now);
+            Some(Literal::from(retired).into())
+        }
+    })
 }
 
 /// The algebra tree of a parsed query (SELECT/ASK/CONSTRUCT/DESCRIBE share the
@@ -244,18 +274,10 @@ pub(crate) fn sparql_pattern(query: &spargebra::Query) -> &spargebra::algebra::G
 pub(crate) fn count_algebra_nodes(pattern: &spargebra::algebra::GraphPattern) -> usize {
     use spargebra::algebra::GraphPattern as GP;
     1 + match pattern {
-        GP::Join { left, right } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
-        GP::Union { left, right } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
-        GP::Minus { left, right } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
-        GP::LeftJoin { left, right, .. } => {
-            count_algebra_nodes(left) + count_algebra_nodes(right)
-        }
+        GP::Join { left, right } => count_algebra_nodes(left) + count_algebra_nodes(right),
+        GP::Union { left, right } => count_algebra_nodes(left) + count_algebra_nodes(right),
+        GP::Minus { left, right } => count_algebra_nodes(left) + count_algebra_nodes(right),
+        GP::LeftJoin { left, right, .. } => count_algebra_nodes(left) + count_algebra_nodes(right),
         GP::Filter { inner, .. } => count_algebra_nodes(inner),
         GP::Graph { inner, .. } => count_algebra_nodes(inner),
         GP::Extend { inner, .. } => count_algebra_nodes(inner),
@@ -431,17 +453,17 @@ pub async fn execute_sparql_query_with_config(
                 collected.truncate(config.max_solutions);
             }
 
-            let mut serializer_solutions =
-                serializer
-                    .serialize_solutions_to_writer(&mut output, results_vars)
-                    .map_err(|e| format!("serialize solutions start: {}", e))?;
+            let mut serializer_solutions = serializer
+                .serialize_solutions_to_writer(&mut output, results_vars)
+                .map_err(|e| format!("serialize solutions start: {}", e))?;
             for sol in &collected {
                 serializer_solutions
                     .serialize(sol)
                     .map_err(|e| format!("serialize solution: {}", e))?;
             }
             solution_count = collected.len();
-            serializer_solutions.finish()
+            serializer_solutions
+                .finish()
                 .map_err(|e| format!("serialize finish: {}", e))?;
         }
         spareval::QueryResults::Graph(triples) => {
@@ -462,8 +484,7 @@ pub async fn execute_sparql_query_with_config(
     // the sleep task nor races with the timed-out flag afterwards.
     timer_handle.abort();
 
-    let results_string = String::from_utf8(output)
-        .map_err(|e| format!("UTF-8 error: {}", e))?;
+    let results_string = String::from_utf8(output).map_err(|e| format!("UTF-8 error: {}", e))?;
     let timed_out = timed_out || timed_out_flag.load(std::sync::atomic::Ordering::SeqCst);
 
     Ok((results_string, solution_count, truncated, timed_out))
@@ -588,7 +609,10 @@ mod tests {
         )
         .await
         .expect("sparql query succeeds");
-        assert!(count > 0, "expected projected triples in default union graph");
+        assert!(
+            count > 0,
+            "expected projected triples in default union graph"
+        );
         assert!(!truncated);
         assert!(!timed_out);
         assert!(serialized.contains("urn:neurostrata:memory:mem-1"));
@@ -597,37 +621,53 @@ mod tests {
 
     #[test]
     fn test_preregistered_prefixes_parse() {
-        let q = parser_with_prefixes().parse_query("SELECT ?s WHERE { ?s a class:Fact ; ns:domain dom:auth }");
-        assert!(q.is_ok(), "pre-registered prefixes should parse without explicit PREFIX");
+        let q = parser_with_prefixes()
+            .parse_query("SELECT ?s WHERE { ?s a class:Fact ; ns:domain dom:auth }");
+        assert!(
+            q.is_ok(),
+            "pre-registered prefixes should parse without explicit PREFIX"
+        );
     }
 
     #[test]
     fn test_custom_functions_salience_valid_at_is_retired() {
-        use std::collections::HashMap;
         use oxrdf::Dataset;
-        
-        
+        use std::collections::HashMap;
 
         let mut meta_map = HashMap::new();
-        meta_map.insert("urn:neurostrata:memory:m1".into(), serde_json::json!({
-            "access_count": 10,
-            "feedback_score": 0.8,
-            "neural_gain": 1.5,
-            "valid_from": 100
-        }));
-        meta_map.insert("m1".into(), meta_map.get("urn:neurostrata:memory:m1").unwrap().clone());
+        meta_map.insert(
+            "urn:neurostrata:memory:m1".into(),
+            serde_json::json!({
+                "access_count": 10,
+                "feedback_score": 0.8,
+                "neural_gain": 1.5,
+                "valid_from": 100
+            }),
+        );
+        meta_map.insert(
+            "m1".into(),
+            meta_map.get("urn:neurostrata:memory:m1").unwrap().clone(),
+        );
 
-        meta_map.insert("urn:neurostrata:memory:m2".into(), serde_json::json!({
-            "valid_to": 500
-        }));
-        meta_map.insert("m2".into(), meta_map.get("urn:neurostrata:memory:m2").unwrap().clone());
+        meta_map.insert(
+            "urn:neurostrata:memory:m2".into(),
+            serde_json::json!({
+                "valid_to": 500
+            }),
+        );
+        meta_map.insert(
+            "m2".into(),
+            meta_map.get("urn:neurostrata:memory:m2").unwrap().clone(),
+        );
 
         let meta_arc = std::sync::Arc::new(meta_map);
         let now = 600i64; // past m2's valid_to 500 so it is retired
         let evaluator = evaluator_with_custom_functions(meta_arc, now);
 
         let query_str = "SELECT (ns:salience(<urn:neurostrata:memory:m1>) AS ?s1) (ns:salience(<urn:neurostrata:memory:m2>) AS ?s2) (ns:validAt(<urn:neurostrata:memory:m1>, 200) AS ?v1) (ns:isRetired(<urn:neurostrata:memory:m2>) AS ?r2) WHERE {}";
-        let query = parser_with_prefixes().parse_query(query_str).expect("parse");
+        let query = parser_with_prefixes()
+            .parse_query(query_str)
+            .expect("parse");
         let dataset = Dataset::new();
         let prepared = evaluator.prepare(&query);
         let results = prepared.execute(&dataset).expect("execute");
@@ -644,7 +684,11 @@ mod tests {
                 oxrdf::Term::Literal(l) => l.value().parse::<f64>().unwrap(),
                 _ => 0.0,
             };
-            assert!(s1_val > 1.0, "salience of active memory should be > 1.0 (got {})", s1_val);
+            assert!(
+                s1_val > 1.0,
+                "salience of active memory should be > 1.0 (got {})",
+                s1_val
+            );
 
             // Assert s2 == 0.0
             let s2_val = match s2 {
@@ -665,7 +709,10 @@ mod tests {
                 oxrdf::Term::Literal(l) => l.value().to_string(),
                 _ => "false".into(),
             };
-            assert_eq!(r2_str, "true", "isRetired for m2 at now=600 should be true (valid_to 500 <= 600)");
+            assert_eq!(
+                r2_str, "true",
+                "isRetired for m2 at now=600 should be true (valid_to 500 <= 600)"
+            );
         } else {
             panic!("expected solutions");
         }

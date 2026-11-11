@@ -46,12 +46,10 @@ pub fn last_observed_latencies_ms() -> (u64, u64) {
 /// Rolling latency windows (milliseconds) the AC5 gate verifies over. Capped
 /// at [`SAMPLE_WINDOW_CAP`] so one pathological spike cannot fold into every
 /// future percentile the way a monotonically growing list would.
-static PLAN_SAMPLES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::VecDeque<f64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
-static UPSERT_SAMPLES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::VecDeque<f64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+static PLAN_SAMPLES: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<f64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+static UPSERT_SAMPLES: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<f64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
 
 const SAMPLE_WINDOW_CAP: usize = 100;
 
@@ -85,12 +83,7 @@ pub fn current_p95_plan_ms() -> f64 {
 
 /// Current AC5 p95 over the rolling upsert-latency window.
 pub fn current_p95_upsert_ms() -> f64 {
-    p95_ms(
-        window_guard(&UPSERT_SAMPLES)
-            .iter()
-            .copied()
-            .collect(),
-    )
+    p95_ms(window_guard(&UPSERT_SAMPLES).iter().copied().collect())
 }
 
 /// Record one latency sample pair (milliseconds). Stored as `f64::to_bits` in
@@ -176,8 +169,8 @@ pub fn verify_task_receipt_retention(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{MemoryPayload, VectorStore};
     use crate::store::ladybug::LadybugStore;
+    use crate::traits::{MemoryPayload, VectorStore};
     use std::time::Instant;
 
     fn request() -> crate::context::ContextRequest {
@@ -225,21 +218,25 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_millis()
         ));
-        let store = LadybugStore::for_testing(&dir, 4)
-            .expect("test store");
+        let store = LadybugStore::for_testing(&dir, 4).expect("test store");
         store.init("ac5-ns").await.expect("init");
         for i in 0..10 {
             let id = format!("Ac5::src/lib{}.rs", i);
             store
-                .upsert("ac5-ns", &id, vec![0.1; 4], MemoryPayload {
-                    content: format!("node {}", i),
-                    user_id: "auto-ingestor".to_string(),
-                    memory_type: "file".to_string(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: serde_json::json!({}),
-                })
+                .upsert(
+                    "ac5-ns",
+                    &id,
+                    vec![0.1; 4],
+                    MemoryPayload {
+                        content: format!("node {}", i),
+                        user_id: "auto-ingestor".to_string(),
+                        memory_type: "file".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )
                 .await
                 .expect("seed node");
         }
@@ -349,10 +346,9 @@ mod tests {
         // anything else is stale.
         assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
 
-        let (expected_sha, expected_dirty) =
-            crate::task::receipt::compute_worktree_state(std::path::Path::new(
-                "/tmp/opencode/definitely-not-a-worktree",
-            ));
+        let (expected_sha, expected_dirty) = crate::task::receipt::compute_worktree_state(
+            std::path::Path::new("/tmp/opencode/definitely-not-a-worktree"),
+        );
         // An empty binding matching the computed unreadable-worktree state
         // verifies as current.
         store.record(crate::receipts::store::Receipt {

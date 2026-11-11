@@ -1,7 +1,7 @@
-use crate::traits::{EvidenceEdge, EvidenceKind, MemoryPayload, SearchEvidence, SearchResult};
 use crate::rdf::ontology::ClosureResult;
 use crate::rdf::ontology::OntologyIndex;
 use crate::rdf::ontology::QueryBudget;
+use crate::traits::{EvidenceEdge, EvidenceKind, MemoryPayload, SearchEvidence, SearchResult};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -36,11 +36,17 @@ pub struct ReasoningAdapter {
 
 impl ReasoningAdapter {
     pub fn new() -> Self {
-        Self { config: ReasoningConfig::default(), payloads: HashMap::new() }
+        Self {
+            config: ReasoningConfig::default(),
+            payloads: HashMap::new(),
+        }
     }
 
     pub fn new_with(config: ReasoningConfig) -> Self {
-        Self { config, payloads: HashMap::new() }
+        Self {
+            config,
+            payloads: HashMap::new(),
+        }
     }
 
     /// Builder: register a payload lookup map (id -> MemoryPayload).
@@ -51,7 +57,10 @@ impl ReasoningAdapter {
 
     /// Hydrate a payload for `id`, falling back to the empty stub.
     fn payload_for(&self, id: &str) -> MemoryPayload {
-        self.payloads.get(id).cloned().unwrap_or_else(Self::empty_payload)
+        self.payloads
+            .get(id)
+            .cloned()
+            .unwrap_or_else(Self::empty_payload)
     }
 
     fn empty_payload() -> MemoryPayload {
@@ -68,9 +77,7 @@ impl ReasoningAdapter {
 
     /// Expand domain via subClassOf* closure (RDFS §5.3 query-time expansion).
     pub fn expand_domain(&self, ontology: &OntologyIndex, domain: &str) -> Vec<String> {
-        if self.config.governs_max_hops == 0
-            || self.config.closure_budget.max_nodes == 0
-        {
+        if self.config.governs_max_hops == 0 || self.config.closure_budget.max_nodes == 0 {
             return vec![domain.to_string()];
         }
         ontology.expand_domain(domain)
@@ -100,7 +107,12 @@ impl ReasoningAdapter {
     }
 
     /// Bounded transitive GOVERNS closure (default 2 hops, §5.5).
-    pub fn closure_governs(&self, ontology: &OntologyIndex, root: &str, edges: &[String]) -> ClosureResult {
+    pub fn closure_governs(
+        &self,
+        ontology: &OntologyIndex,
+        root: &str,
+        edges: &[String],
+    ) -> ClosureResult {
         // GOVERNS closure expands over subPropertyOf*: an edge carrying any
         // sub-relation of GOVERNS (e.g. a strict-governs variant) participates.
         let governed_rels: Vec<String> = self
@@ -124,8 +136,8 @@ impl ReasoningAdapter {
             }
             // 2-part edges carry no explicit relation; 3-part "src::tgt::rel" must be a
             // GOVERNS sub-relation (lowercase compare) to participate.
-            let relates = parts.len() == 2
-                || governed_rels.iter().any(|r| *r == parts[2].to_lowercase());
+            let relates =
+                parts.len() == 2 || governed_rels.iter().any(|r| *r == parts[2].to_lowercase());
             if !relates {
                 continue;
             }
@@ -274,7 +286,10 @@ impl ReasoningAdapter {
             if d.is_empty() || !out.insert(d.clone()) {
                 continue;
             }
-            for r in index.closure_subclasses(d, &self.config.closure_budget).results {
+            for r in index
+                .closure_subclasses(d, &self.config.closure_budget)
+                .results
+            {
                 out.insert(r);
             }
             for p in index.expand_class(d) {
@@ -360,8 +375,12 @@ mod tests {
             }
         }));
         let adapter = ReasoningAdapter::new_with(ReasoningConfig::default());
-        assert!(adapter.expand_domain(&idx, "auth").contains(&"tls".to_string()));
-        assert!(adapter.expand_identifiers(&idx, "ssl").contains(&"tls".to_string()));
+        assert!(adapter
+            .expand_domain(&idx, "auth")
+            .contains(&"tls".to_string()));
+        assert!(adapter
+            .expand_identifiers(&idx, "ssl")
+            .contains(&"tls".to_string()));
         assert!(!adapter.expand_relation(&idx, "GOVERNS").is_empty());
         let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
         assert!(results.iter().any(|r| r.id == "src/tls.rs"));
@@ -390,8 +409,8 @@ mod tests {
                 metadata: json!({"domain": "tls"}),
             },
         );
-        let adapter = ReasoningAdapter::new_with(ReasoningConfig::default())
-            .with_payloads(payloads);
+        let adapter =
+            ReasoningAdapter::new_with(ReasoningConfig::default()).with_payloads(payloads);
 
         let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
         let hit = results

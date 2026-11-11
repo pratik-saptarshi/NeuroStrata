@@ -41,14 +41,30 @@ pub struct DeduplicationConfig {
     pub cb_backoff_max_seconds: u64,
 }
 
-fn default_timeout() -> u64 { 5 }
-fn default_similarity_threshold() -> f32 { 0.85 }
-fn default_confidence_threshold() -> f32 { 0.8 }
-fn default_laya_bundle_path() -> String { "artifacts/laya-bundle".to_string() }
-fn default_max_candidates() -> usize { 5 }
-fn default_cb_failure_threshold() -> u32 { 3 }
-fn default_cb_backoff_initial() -> u64 { 30 }
-fn default_cb_backoff_max() -> u64 { 3600 }
+fn default_timeout() -> u64 {
+    5
+}
+fn default_similarity_threshold() -> f32 {
+    0.85
+}
+fn default_confidence_threshold() -> f32 {
+    0.8
+}
+fn default_laya_bundle_path() -> String {
+    "artifacts/laya-bundle".to_string()
+}
+fn default_max_candidates() -> usize {
+    5
+}
+fn default_cb_failure_threshold() -> u32 {
+    3
+}
+fn default_cb_backoff_initial() -> u64 {
+    30
+}
+fn default_cb_backoff_max() -> u64 {
+    3600
+}
 
 /// Pure resolution of the store ceilings, so the precedence order can be tested
 /// without mutating the process environment.
@@ -102,7 +118,9 @@ fn resolve_store_limits(
 }
 
 impl Default for DedupProviderMode {
-    fn default() -> Self { Self::Auto }
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 impl Default for DeduplicationConfig {
@@ -146,9 +164,7 @@ impl CapacityProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "low" => Ok(Self::Low),
             "standard" => Ok(Self::Standard),
-            _ => anyhow::bail!(
-                "NEUROSTRATA_PROFILE must be \"low\" or \"standard\", got {raw:?}"
-            ),
+            _ => anyhow::bail!("NEUROSTRATA_PROFILE must be \"low\" or \"standard\", got {raw:?}"),
         }
     }
 
@@ -398,7 +414,6 @@ impl Config {
     }
 }
 
-
 fn default_metrics_ring_capacity() -> usize {
     1024
 }
@@ -537,7 +552,10 @@ impl Config {
             file.write_all(b"\n")?;
             if let Some(permissions) = existing_permissions {
                 file.set_permissions(permissions).with_context(|| {
-                    format!("Could not preserve config permissions at {}", path.display())
+                    format!(
+                        "Could not preserve config permissions at {}",
+                        path.display()
+                    )
                 })?;
             }
             file.sync_all()?;
@@ -673,10 +691,7 @@ mod tests {
 
     #[test]
     fn profile_parse_is_case_insensitive_and_rejects_unknown_values() {
-        assert_eq!(
-            CapacityProfile::parse("low").unwrap(),
-            CapacityProfile::Low
-        );
+        assert_eq!(CapacityProfile::parse("low").unwrap(), CapacityProfile::Low);
         assert_eq!(
             CapacityProfile::parse(" LoW ").unwrap(),
             CapacityProfile::Low
@@ -722,13 +737,11 @@ mod tests {
     fn standard_profile_is_a_noop() {
         // Spec AC3: profile=standard with nothing explicit resolves to
         // today's defaults exactly.
-        let (limits, _sources) = resolve_store_limits_with_profile(
-            None,
-            None,
-            Some(CapacityProfile::Standard),
-            |_| Ok(None),
-        )
-        .unwrap();
+        let (limits, _sources) =
+            resolve_store_limits_with_profile(None, None, Some(CapacityProfile::Standard), |_| {
+                Ok(None)
+            })
+            .unwrap();
         assert_eq!(limits, crate::store::StoreLimits::default());
     }
 
@@ -1042,10 +1055,9 @@ mod tests {
             serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#)
                 .unwrap();
         std::env::remove_var("TYPESAFE_API_KEY");
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#)
+                .unwrap();
         assert_eq!(config.deduplication.provider, DedupProviderMode::Jev);
         assert!(config.deduplication.judgment_api_key.is_none());
         assert!(config.deduplication.judgment_api_key_env.is_none());
@@ -1054,10 +1066,9 @@ mod tests {
     /// `none` disables dedup learning entirely.
     #[test]
     fn dedup_provider_config_none_disables_dedup_learning() {
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#,
-        )
-        .unwrap();
+        let config: Config =
+            serde_json::from_str(r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#)
+                .unwrap();
         assert_eq!(config.deduplication.provider, DedupProviderMode::None);
     }
 
