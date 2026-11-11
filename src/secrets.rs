@@ -183,7 +183,6 @@ impl SecretScanner {
         })
     }
 
-
     fn instance() -> &'static SecretScanner {
         static SCANNER: OnceLock<SecretScanner> = OnceLock::new();
         // Fail closed: if a built-in regex fails to compile this must panic at
@@ -212,7 +211,6 @@ impl SecretScanner {
         let scanner = Self::instance();
         scanner.scan_value_inner(value, location, 0)
     }
-
 
     fn scan_inner(&self, text: &str, location: &str) -> Option<Rejection> {
         if text.len() > MAX_SCAN_BYTES {
@@ -843,18 +841,20 @@ mod tests {
     #[test]
     fn high_entropy_low_entropy_value_falls_back_to_password() {
         // >=24 chars but (almost) all the same character → entropy below 4.2.
-        let r = SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content")
-            .unwrap();
+        let r =
+            SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content").unwrap();
         assert_eq!(r.category, "password");
     }
 
     #[test]
     fn short_value_not_high_entropy_detected() {
         // 20 chars, below the 24-char threshold.
-        assert!(SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
-            || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
-                .map(|r| r.category == "password")
-                .unwrap_or(false));
+        assert!(
+            SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
+                || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
+                    .map(|r| r.category == "password")
+                    .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -949,7 +949,10 @@ mod tests {
         // A document that starts with `${` likewise.
         let xml = r#"<config>api_key = "sk-live-1234567890abcdefghijklmnop"</config>"#;
         let r = SecretScanner::scan_str(xml, "content");
-        assert!(r.is_some(), "secret inside <config> document must be rejected");
+        assert!(
+            r.is_some(),
+            "secret inside <config> document must be rejected"
+        );
         assert!(
             matches!(
                 r.as_ref().map(|r| r.category),

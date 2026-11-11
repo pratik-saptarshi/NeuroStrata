@@ -142,8 +142,7 @@ pub struct SearchEvidence {
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
     evidence.as_ref().map_or(false, |evs| {
-        evs.iter()
-            .any(|e| e.kind == EvidenceKind::DirectMatch)
+        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
     })
 }
 
@@ -195,7 +194,6 @@ pub enum RelocateOutcome {
     /// Source and target are the same namespace, so there is nothing to do.
     SameNamespace,
 }
-
 
 /// Embedding-space identity persisted on namespace metadata. Enforcement on
 /// every vector path ensures incompatible spaces are never mixed.
@@ -474,18 +472,19 @@ pub trait VectorStore: Send + Sync + AsAny {
 
     /// The ids of every node in `generation`. A storage-level primitive for
     /// generation-scoped filtering and tests; the default returns nothing.
-    async fn generation_nodes(
-        &self,
-        _namespace: &str,
-        _generation: u64,
-    ) -> Result<Vec<String>> {
+    async fn generation_nodes(&self, _namespace: &str, _generation: u64) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
     /// List all memories, optionally filtered by user_id and/or memory_type.
     /// Pushing filters into the query (rather than filtering in Rust) avoids
     /// deserialising every row in large namespaces (R15).
-    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>>;
+    async fn list(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>>;
 
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
@@ -980,5 +979,4 @@ mod tests {
             assert!(has_source(&real), "real source is provenance: {}", real);
         }
     }
-
 }

@@ -40,9 +40,18 @@ pub fn type_allowed(memory_type: &str, filters: &SearchFilters) -> bool {
 /// Whether a fact shape matches the requested shape.
 pub fn fact_shape_matches(metadata: &Value, shape: &str) -> bool {
     match shape {
-        "decision" => metadata.get("decision").map(|v| !v.is_null()).unwrap_or(false),
-        "topology" => metadata.get("topology").map(|v| !v.is_null()).unwrap_or(false),
-        "attempt" => metadata.get("attempt").map(|v| !v.is_null()).unwrap_or(false),
+        "decision" => metadata
+            .get("decision")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        "topology" => metadata
+            .get("topology")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        "attempt" => metadata
+            .get("attempt")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
         "any" | "" => true,
         _ => false,
     }
@@ -87,7 +96,12 @@ pub fn is_stale_for_filter(metadata: &Value) -> bool {
     source == "changed" && semantic != "verified"
 }
 
-pub fn passes_filters(memory_type: &str, metadata: &Value, location: &str, filters: &SearchFilters) -> bool {
+pub fn passes_filters(
+    memory_type: &str,
+    metadata: &Value,
+    location: &str,
+    filters: &SearchFilters,
+) -> bool {
     if !type_allowed(memory_type, filters) {
         return false;
     }
@@ -217,7 +231,8 @@ mod tests {
         // wrong path
         assert!(!passes_filters("fact", &meta, "lib/x.rs", &f));
         // stale excluded
-        let stale_meta = json!({"source_currency":"changed","verification":{"status":"unverified"}});
+        let stale_meta =
+            json!({"source_currency":"changed","verification":{"status":"unverified"}});
         assert!(!passes_filters("fact", &stale_meta, "src/x.rs", &f));
         // fact_shape filter
         let mut f2 = f.clone();
