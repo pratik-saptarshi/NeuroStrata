@@ -96,6 +96,11 @@ fi
 # Add the path of each local guard; it runs before every push on every host.
 # A guard that belongs here does NOT need a CI workflow to be real.
 PROJECT_GATES=(
+    # Rust quality gate: fmt/clippy deltas + audit delta on pushes that
+    # touch Rust sources or manifests. Never blocks on legacy backlog
+    # (.github/quality-baseline.md owns that); see
+    # docs/SECDEVOPS-CHECKLIST.md. Bypass: RUST_QUALITY_SKIP=1.
+    ./scripts/rust-quality-gate.sh
     # Task-coverage gate: blocks pushes when changed docs contain work-item
     # language without a NeuroStrata task ID citation.
     ./scripts/task-coverage-gate.sh
