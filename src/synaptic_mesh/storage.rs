@@ -80,7 +80,6 @@ impl MeshStorage {
         Ok(mesh)
     }
 
-
     /// Open an EXISTING mesh checkout. Refuses any manifest whose
     /// `schema_version` is not `synaptic-mesh/v1`, naming the offending
     /// version, so an old daemon cannot silently misread a newer mesh.
@@ -249,7 +248,6 @@ impl MeshStorage {
         Ok(())
     }
 
-
     fn require_remote(&self) -> Result<()> {
         match &self.manifest.remote {
             Some(url) if !url.trim().is_empty() => Ok(()),
@@ -259,7 +257,6 @@ impl MeshStorage {
             ),
         }
     }
-
 
     /// Keep the local Ed25519 signing key out of the published history.
     ///
@@ -359,9 +356,8 @@ impl MeshStorage {
             text.push_str(entry);
             text.push('\n');
         }
-        std::fs::write(&path, text).with_context(|| {
-            format!(".gitignore could not be written to {}", path.display())
-        })?;
+        std::fs::write(&path, text)
+            .with_context(|| format!(".gitignore could not be written to {}", path.display()))?;
         Ok(())
     }
 
@@ -423,7 +419,9 @@ pub(crate) async fn run(root: &Path, args: &[&str]) -> Result<std::process::Outp
         .kill_on_drop(true);
     match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(Ok(out)) => Ok(out),
-        Ok(Err(e)) => Err(e).with_context(|| format!("git {} could not be executed", args.join(" "))),
+        Ok(Err(e)) => {
+            Err(e).with_context(|| format!("git {} could not be executed", args.join(" ")))
+        }
         Err(_) => bail!(
             "git {} timed out after {}s — process killed (mesh git timeout; \
              override with NEUROSTRATA_GIT_TIMEOUT_SECS)",
@@ -542,7 +540,6 @@ mod tests {
         assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     }
 
-
     #[tokio::test]
     async fn manifest_round_trips_to_disk() {
         let base = scratch("roundtrip");
@@ -553,7 +550,6 @@ mod tests {
         assert_eq!(reopened.manifest(), &original);
         assert_eq!(reopened.root(), mesh.root());
     }
-
 
     #[tokio::test]
     async fn open_refuses_unknown_schema_version() {
@@ -574,7 +570,6 @@ mod tests {
             "error must name the offending version, got: {err}"
         );
     }
-
 
     #[test]
     fn pointer_round_trips() {
@@ -631,13 +626,13 @@ mod tests {
         assert_eq!(git_out(mesh.root(), &["rev-list", "--count", "HEAD"]), "1");
 
         assert!(
-            !mesh.commit_all("nothing changed", "node-author-1")
+            !mesh
+                .commit_all("nothing changed", "node-author-1")
                 .await
                 .unwrap(),
             "a clean tree is Ok(false), never an empty commit"
         );
     }
-
 
     #[tokio::test]
     async fn push_and_pull_between_two_checkouts() {
@@ -720,25 +715,29 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn push_without_remote_errors() {
         let base = scratch("no-remote");
         let mesh = init_under(&base).await;
         assert!(mesh.manifest().remote.is_none());
 
-        let pull_err = mesh.pull().await.expect_err("pull with no remote must error");
+        let pull_err = mesh
+            .pull()
+            .await
+            .expect_err("pull with no remote must error");
         assert!(
             pull_err.to_string().contains("no remote"),
             "got: {pull_err}"
         );
-        let push_err = mesh.push().await.expect_err("push with no remote must error");
+        let push_err = mesh
+            .push()
+            .await
+            .expect_err("push with no remote must error");
         assert!(
             push_err.to_string().contains("no remote"),
             "got: {push_err}"
         );
     }
-
 
     // --- Task 13 (J12, DR-4): the git funnel is timed ---------------------
 
@@ -943,9 +942,12 @@ mod tests {
         let base = scratch("pin-failure");
         let mesh = init_under(&base).await;
 
-        let err = run_ok(mesh.root(), &["rev-parse", "--verify", "refs/heads/no-such-ref"])
-            .await
-            .expect_err("verifying a missing ref must fail");
+        let err = run_ok(
+            mesh.root(),
+            &["rev-parse", "--verify", "refs/heads/no-such-ref"],
+        )
+        .await
+        .expect_err("verifying a missing ref must fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("git rev-parse --verify refs/heads/no-such-ref failed"),
@@ -971,7 +973,10 @@ mod tests {
         let memories = mesh.root().join("stripe-api").join("memories");
         std::fs::create_dir_all(&memories).unwrap();
         std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
-        assert!(mesh.commit_all("first record with a local key", "node-key").await.unwrap());
+        assert!(mesh
+            .commit_all("first record with a local key", "node-key")
+            .await
+            .unwrap());
 
         let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
         assert!(
@@ -984,7 +989,10 @@ mod tests {
             "the signing key must never be staged or committed"
         );
         assert_eq!(
-            git_out(mesh.root(), &["check-ignore", "--quiet", ".neurostrata-mesh/signing.key"]),
+            git_out(
+                mesh.root(),
+                &["check-ignore", "--quiet", ".neurostrata-mesh/signing.key"]
+            ),
             "",
             "check-ignore must flag the signing key"
         );
@@ -992,7 +1000,10 @@ mod tests {
         // Idempotent: a second pass never duplicates or rewrites the rules.
         let before = gitignore.clone();
         mesh.ensure_signing_key_ignored().unwrap();
-        assert_eq!(std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -1015,11 +1026,16 @@ mod tests {
 
         let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
         assert!(
-            gitignore.lines().any(|l| l.trim() == "/bundles/*.bundle.zst"),
+            gitignore
+                .lines()
+                .any(|l| l.trim() == "/bundles/*.bundle.zst"),
             ".gitignore must carry the /bundles/*.bundle.zst pattern, got: {gitignore:?}"
         );
         assert_eq!(
-            git_out(mesh.root(), &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]),
+            git_out(
+                mesh.root(),
+                &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]
+            ),
             "",
             "check-ignore must flag a drain bundle artifact"
         );

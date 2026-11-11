@@ -269,7 +269,9 @@ mod tests {
         let digest = image.strip_prefix("alpine@sha256:").unwrap();
         assert_eq!(digest.len(), 64, "a full sha256 hex digest: {image}");
         assert!(
-            digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "lowercase hex digest: {image}"
         );
         assert_eq!(
