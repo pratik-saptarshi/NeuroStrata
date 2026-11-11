@@ -17,7 +17,7 @@ the gate never demands a tree-wide sweep.
 | Check | Where | Scope | Verdict on failure |
 |---|---|---|---|
 | `rustfmt` per-file unified diff | pre-push hook (`scripts/rust-quality-gate.sh`, wired in `scripts/hooks/pre-push` `PROJECT_GATES` **ahead of the task gate** so task-tool bypasses can't skip it; mirrored in the `SCAFFOLDED_PRE_PUSH_HOOK` const so hook hygiene preserves it) | unified hunks overlapping added lines only (per-file `rustfmt --emit stdout` via stdin — never parse `--check` output, which has no `@@` hunks) | **block** (`cargo fmt` fixes) |
-| `cargo clippy --locked --workspace` (short format) | same | diagnostics on added lines only (covers `crates/neurostrata-wasm`; audit covers it via the root lockfile — it ships without its own) | **block** |
+| `cargo clippy --locked --workspace --all-targets` (short format) | same | diagnostics on added lines only (covers workspace members incl. test/example targets; audit covers the wasm crate via the root lockfile) | **block** |
 | `cargo audit` (human-readable report) | same, manifest changes only | NEW `high`/`critical` advisory IDs vs base lockfile, severity from the report's `Severity:` lines (JSON advisories lack it) | **block** |
 | `cargo deny` | CI report-only (no `deny.toml`; 358 license defaults unresolved) | advisories/bans deltas only | warn |
 | `cargo fmt`/`clippy`/`audit`/`deny`/`gui`/win+mac legs | CI report-only | baseline counts | never gate |
@@ -65,8 +65,11 @@ the range into false blocks. Last resort: `HEAD~1..HEAD`.
 - Codex review rounds on PR #93: (1) JSON advisories lack `severity`
   → parse report `Severity:` lines; (2) `rustfmt --check` has no `@@`
   hunks → diff `--emit stdout` output; (3) project guards must precede
-  task-gate early exits; (4) clippy needs `--workspace` for member
-  crates. Each fixed, unit-tested, and re-validated e2e.
+  task-gate early exits; (4) clippy needs `--workspace` (later
+  extended to `--all-targets` for test/example code); (5) no-upstream
+  branches take the merge-base path so first pushes check every
+  commit; (6) missing base lockfile warn-skips audit instead of
+  false-blocking. Each fixed, unit-tested, and re-validated e2e.
 - Codex review (PR #93) caught two vacuous-gate bugs in v1, fixed and
   re-validated: (a) JSON advisory objects carry `cvss` but no
   `severity` key — severity now comes from the report's `Severity:`

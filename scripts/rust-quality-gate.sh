@@ -44,7 +44,9 @@ fi
 # which then false-block as "added" lines. Detect the rewrite (remote
 # tip no longer an ancestor of HEAD) and fall back to the merge-base
 # with the integration target, so the range is always the branch's own
-# delta. Last resort: the last commit only.
+# delta. A branch with no upstream takes the same merge-base path, so
+# first pushes check every commit, not just HEAD~1. Last resort
+# (no origin/develop available, e.g. offline): the last commit only.
 if git rev-parse --verify --quiet "@{u}" >/dev/null 2>&1 \
     && git merge-base --is-ancestor "@{u}" HEAD 2>/dev/null; then
     RANGE="@{u}..HEAD"
@@ -156,10 +158,12 @@ fi
 # (ADDED_LINES computed once above and reused here.)
 # --workspace: the root package alone would skip workspace members
 # (e.g. crates/neurostrata-wasm, which ships without its own lockfile
-# and is covered by the root lockfile for audit). Diagnostics stay
-# attributed per added line below, so the wider scope costs build time,
-# not false blocks.
-CLIPPY_OUT="$(cargo clippy --locked --workspace --message-format=short 2>&1)"
+# and is covered by the root lockfile for audit). --all-targets: the
+# default lib+bins scope skips #[cfg(test)] modules, integration tests
+# in tests/, and examples/ — new test/example code must be linted too.
+# Diagnostics stay attributed per added line below, so the wider scope
+# costs build time, not false blocks.
+CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --message-format=short 2>&1)"
 CLIPPY_CODE=$?
 CLIPPY_DIAG="$(printf '%s\n' "$CLIPPY_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' || true)"
 if [ -z "$CLIPPY_DIAG" ] && [ "$CLIPPY_CODE" -ne 0 ]; then
@@ -184,8 +188,7 @@ fi
 # Severity source: the human-readable `cargo audit` report (`Severity:
 # 7.5 (high)`). The JSON advisory objects carry `cvss` but NO `severity`
 # key, so filtering JSON on severity silently matches nothing and the
-# gate would never fire. IDs come from --json structure; the text report
-# above it is authoritative for severity.
+# gate would never fire. Both sides parsed from text; IDs compared.
 if [ -n "$CHANGED_MANIFEST" ]; then
     if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
         echo "$GATE: warning: cargo-audit not installed — audit NOT run (run \`cargo install cargo-audit\`; CI audit remains backstop)" >&2
@@ -209,23 +212,30 @@ for block in re.split(r"\n\s*\n", text):
 ' 2>/dev/null || true
             }
             NEW_IDS="$(parse_advisories "$AUDIT_TEXT" | awk '$2=="high"||$2=="critical"{print $1}')"
-            if [ -n "$NEW_IDS" ]; then
+            if [ -z "$NEW_IDS" ]; then
+                echo "$GATE: no new high/critical advisories in this push"
+            elif ! git rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
+                echo "$GATE: warning: origin/develop unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
+            else
                 BASE_SEV=""
-                if git rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
-                    TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
-                    if git show "origin/develop:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
-                        BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null || true)"
-                        [ -n "$BASE_TEXT" ] && BASE_SEV="$(parse_advisories "$BASE_TEXT")"
-                    fi
-                    rm -f "$TMPBASE"
+                BASE_OK=0
+                TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
+                if git show "origin/develop:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
+                    BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null || true)"
+                    [ -n "$BASE_TEXT" ] && BASE_SEV="$(parse_advisories "$BASE_TEXT")" && BASE_OK=1
                 fi
-                while IFS= read -r aid; do
-                    [ -n "$aid" ] || continue
-                    if ! printf '%s\n' "$BASE_SEV" | grep -qE "^${aid}[[:space:]]"; then
-                        echo "$GATE: FAIL: new high/critical advisory introduced by this push: $aid" >&2
-                        FAIL=1
-                    fi
-                done <<< "$NEW_IDS"
+                rm -f "$TMPBASE"
+                if [ "$BASE_OK" != "1" ]; then
+                    echo "$GATE: warning: base lockfile audit unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
+                else
+                    while IFS= read -r aid; do
+                        [ -n "$aid" ] || continue
+                        if ! printf '%s\n' "$BASE_SEV" | grep -qE "^${aid}[[:space:]]"; then
+                            echo "$GATE: FAIL: new high/critical advisory introduced by this push: $aid" >&2
+                            FAIL=1
+                        fi
+                    done <<< "$NEW_IDS"
+                fi
             fi
         fi
     fi
