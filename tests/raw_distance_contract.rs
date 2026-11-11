@@ -17,11 +17,7 @@ fn exact_identifier_source_paths_exist() {
     ];
     for p in paths {
         let path = Path::new(p);
-        assert!(
-            path.exists(),
-            "Source file must exist: {}",
-            p
-        );
+        assert!(path.exists(), "Source file must exist: {}", p);
     }
 }
 
