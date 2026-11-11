@@ -47,10 +47,20 @@ from environments without the toolchain.
   scratch worktree → gate names exactly the added lines, ignores
   legacy warnings in the same file, exits 1.
 - PASS path: comment-only `.rs` addition on warm cache → exit 0.
-- Audit delta: HEAD vs `origin/develop` lockfiles both report exactly
-  `{RUSTSEC-2026-0194, RUSTSEC-2026-0195}` → no false block.
+- Audit delta: live report parses to `{0194, 0195: high}`,
+  `{0243-0436, 026-0173: unknown (unmaintained)}`,
+  `{026-0486: unknown (unsound)}`; base lockfile identical → no false
+  block. Unsound/unmaintained surface as warnings by design (CI audit
+  remains backstop).
 - Hook active via `bash scripts/install-hooks.sh` (copies
   `scripts/hooks/pre-push` to the common git dir shared by worktrees).
+- Codex review (PR #93) caught two vacuous-gate bugs in v1, fixed and
+  re-validated: (a) JSON advisory objects carry `cvss` but no
+  `severity` key — severity now comes from the report's `Severity:`
+  lines; (b) `rustfmt --check` emits no `@@` hunks — the gate now
+  diffs `rustfmt --emit stdout` (stdin mode, no filename header)
+  output against the file. Parser unit tests + FAIL/PASS e2e
+  re-run after each fix.
 
 ## 5. Adopting this in another Rust project
 

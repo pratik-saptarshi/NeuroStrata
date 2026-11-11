@@ -5,11 +5,16 @@
 # Philosophy (matches task-coverage-gate.sh and Task 15b): the gate NEVER
 # blocks on legacy backlog — .github/quality-baseline.md owns that. It
 # fails only when THIS push makes quality worse:
-#   1. `cargo fmt --check` reports diffs in touched .rs files.
-#   2. `cargo clippy` reports warnings in touched .rs files
-#      (hard compile errors fail regardless of location).
-#   3. `cargo audit` reports high/critical advisories NOT already
-#      present in the base branch lockfile.
+#   1. per-file rustfmt output differs on added lines (a real unified
+#      diff is generated via rustfmt --emit stdout piped through stdin —
+#      rustfmt --check's own format has no @@ headers and its file-arg
+#      mode prepends a filename header, so neither may be parsed naively).
+#   2. `cargo clippy` reports warnings/errors located on added lines
+#      (an unbuildable tree with zero diagnostics fails regardless).
+#   3. the human-readable `cargo audit` report shows high/critical
+#      advisories NOT already in the base lockfile (severity comes from
+#      the report's `Severity:` lines — JSON advisories carry `cvss`
+#      but no `severity` key, so JSON severity filtering is vacuous).
 #
 # Runs only when the push touches Rust sources or manifests; otherwise it
 # exits 0 silently. Bypass for urgent pushes (loud, logged):
@@ -81,7 +86,13 @@ for raw in sys.stdin:
 print("\n".join(sorted(out)))
 ' || true)"
 
-# ── 1. fmt: fail only when a rustfmt hunk overlaps added lines ───────────
+# ── 1. fmt: fail only when added lines are misformatted ──────────────────
+# rustfmt --check prints its OWN diff format ("Diff in <file>:<line>:" +
+# bare -/+ lines, no unified @@ headers), so it must NOT be parsed as
+# unified diff. Instead generate a real unified diff against rustfmt's
+# stdout and reuse the added-line attribution below. NOTE: the file is
+# piped via stdin — `rustfmt --emit stdout <file>` prepends a filename
+# header that would diff-dirty every file; stdin mode emits clean output.
 EDITION="$(grep -m1 '^edition[[:space:]]*=' Cargo.toml 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' || true)"
 [ -n "$EDITION" ] || EDITION="2021"
 if ! command -v rustfmt >/dev/null 2>&1; then
@@ -90,9 +101,14 @@ else
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         [ -f "$f" ] || continue
-        RUSTFMT_OUT="$(rustfmt --edition "$EDITION" --check "$f" 2>&1 || true)"
-        [ -n "$RUSTFMT_OUT" ] || continue
-        OVERLAP="$(printf '%s\n' "$RUSTFMT_OUT" | FILE="$f" ADDED="$ADDED_LINES" python3 -c '
+        FORMATTED="$(rustfmt --edition "$EDITION" --emit stdout < "$f" 2>/dev/null || true)"
+        if [ -z "$FORMATTED" ]; then
+            echo "$GATE: warning: rustfmt could not format $f (syntax?) — fmt NOT verified for this file (clippy/build remain backstop)" >&2
+            continue
+        fi
+        FMT_DIFF="$(diff -U0 "$f" <(printf '%s\n' "$FORMATTED") 2>/dev/null || true)"
+        [ -n "$FMT_DIFF" ] || continue
+        OVERLAP="$(printf '%s\n' "$FMT_DIFF" | FILE="$f" ADDED="$ADDED_LINES" python3 -c '
 import os, re, sys
 f = os.environ.get("FILE", "")
 added = set(x for x in os.environ.get("ADDED", "").split("\n") if x.startswith(f + ":"))
@@ -108,7 +124,7 @@ print("yes" if flag else "no")
 ' || true)"
         if [ "$OVERLAP" = "yes" ]; then
             echo "$GATE: FAIL: touched file needs formatting on added lines (run \`cargo fmt\`): $f" >&2
-            printf '%s\n' "$RUSTFMT_OUT" | head -n 15 >&2
+            printf '%s\n' "$FMT_DIFF" | head -n 15 >&2
             FAIL=1
         fi
     done <<< "$CHANGED_RS"
@@ -141,50 +157,47 @@ elif [ -n "$CLIPPY_DIAG" ]; then
 fi
 
 # ── 3. audit: fail only on NEW high/critical advisories vs base ──────────
+# Severity source: the human-readable `cargo audit` report (`Severity:
+# 7.5 (high)`). The JSON advisory objects carry `cvss` but NO `severity`
+# key, so filtering JSON on severity silently matches nothing and the
+# gate would never fire. IDs come from --json structure; the text report
+# above it is authoritative for severity.
 if [ -n "$CHANGED_MANIFEST" ]; then
     if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
         echo "$GATE: warning: cargo-audit not installed — audit NOT run (run \`cargo install cargo-audit\`; CI audit remains backstop)" >&2
     else
-        AUDIT_JSON="$(cargo audit --json 2>/dev/null || true)"
-        if [ -z "$AUDIT_JSON" ]; then
+        AUDIT_TEXT="$(cargo audit 2>/dev/null || true)"
+        if [ -z "$AUDIT_TEXT" ]; then
             echo "$GATE: warning: cargo audit produced no output (offline DB?) — audit NOT verified" >&2
         else
-            NEW_IDS="$(printf '%s' "$AUDIT_JSON" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-vulns = data.get("vulnerabilities", {}).get("list", []) if isinstance(data, dict) else []
-for v in vulns:
-    adv = v.get("advisory", {}) if isinstance(v, dict) else {}
-    sev = (adv.get("severity") or "").lower()
-    if sev in ("high", "critical"):
-        print(adv.get("id", ""))
-' 2>/dev/null || true)"
+            parse_advisories() {
+                printf '%s' "$1" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+for block in re.split(r"\n\s*\n", text):
+    m_id = re.search(r"^ID:\s*(\S+)", block, re.M)
+    if not m_id:
+        continue
+    m_sev = re.search(r"^Severity:\s*(?:[\d.]+\s*)?\((\w+)\)", block, re.M)
+    if not m_sev:
+        m_sev = re.search(r"^Severity:\s*(\w+)", block, re.M)
+    print(m_id.group(1), (m_sev.group(1).lower() if m_sev else "unknown"))
+' 2>/dev/null || true
+            }
+            NEW_IDS="$(parse_advisories "$AUDIT_TEXT" | awk '$2=="high"||$2=="critical"{print $1}')"
             if [ -n "$NEW_IDS" ]; then
-                BASE_IDS=""
+                BASE_SEV=""
                 if git rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
                     TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
                     if git show "origin/develop:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
-                        BASE_JSON="$(cargo audit --file "$TMPBASE" --json 2>/dev/null || true)"
-                        BASE_IDS="$(printf '%s' "$BASE_JSON" | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-vulns = data.get("vulnerabilities", {}).get("list", []) if isinstance(data, dict) else []
-for v in vulns:
-    adv = v.get("advisory", {}) if isinstance(v, dict) else {}
-    print(adv.get("id", ""))
-' 2>/dev/null || true)"
+                        BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null || true)"
+                        [ -n "$BASE_TEXT" ] && BASE_SEV="$(parse_advisories "$BASE_TEXT")"
                     fi
                     rm -f "$TMPBASE"
                 fi
                 while IFS= read -r aid; do
                     [ -n "$aid" ] || continue
-                    if ! printf '%s\n' "$BASE_IDS" | grep -qxF "$aid"; then
+                    if ! printf '%s\n' "$BASE_SEV" | grep -qE "^${aid}[[:space:]]"; then
                         echo "$GATE: FAIL: new high/critical advisory introduced by this push: $aid" >&2
                         FAIL=1
                     fi
