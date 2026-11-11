@@ -37,11 +37,22 @@ if [ "${RUST_QUALITY_SKIP:-0}" = "1" ]; then
     exit 0
 fi
 
-# ── Diff range: upstream tracking branch, else last commit ───────────────
-if git rev-parse --verify --quiet "@{u}" >/dev/null 2>&1; then
+# ── Diff range: exactly the commits this push introduces ─────────────────
+# @{u}..HEAD is exact for linear pushes, but after a rebase the remote
+# tip predates the rewritten base and the range balloons to include
+# upstream changes (e.g. a tree-wide reformat landing on develop),
+# which then false-block as "added" lines. Detect the rewrite (remote
+# tip no longer an ancestor of HEAD) and fall back to the merge-base
+# with the integration target, so the range is always the branch's own
+# delta. Last resort: the last commit only.
+if git rev-parse --verify --quiet "@{u}" >/dev/null 2>&1 \
+    && git merge-base --is-ancestor "@{u}" HEAD 2>/dev/null; then
     RANGE="@{u}..HEAD"
 else
-    RANGE="HEAD~1..HEAD"
+    RANGE="$(git merge-base HEAD origin/develop 2>/dev/null || true)..HEAD"
+    if [ "$RANGE" = "..HEAD" ]; then
+        RANGE="HEAD~1..HEAD"
+    fi
 fi
 
 CHANGED_RS="$(git diff --name-only "$RANGE" -- '*.rs' || true)"
