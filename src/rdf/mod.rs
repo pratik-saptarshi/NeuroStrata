@@ -8,8 +8,8 @@ pub mod provenance;
 pub mod reasoning;
 pub mod shacl;
 pub mod sparql;
-pub mod types_oxrdf;
 pub mod types;
+pub mod types_oxrdf;
 
 pub use canonical::*;
 pub use dataset_canonical::*;

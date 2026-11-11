@@ -8,7 +8,7 @@ use anyhow::Result;
 
 /// Re-export runtime types from laya_onnx.
 pub use crate::judgment::laya_onnx::{
-    LearningPaths, LocalTrainingRuntime, RuntimeState, ModelVersion,
+    LearningPaths, LocalTrainingRuntime, ModelVersion, RuntimeState,
 };
 
 /// Manages the local Laya training/runtime environment: provisioning a pinned
