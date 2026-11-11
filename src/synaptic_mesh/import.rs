@@ -46,7 +46,7 @@ use uuid::Uuid;
 use super::conflict::{self, ConflictKind};
 use super::manifest::Trust;
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, RdfBlock, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
 use super::storage::{remote_refs_present, run, run_ok, MeshStorage};
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
@@ -312,7 +312,6 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
     }
     out
 }
-
 
 /// The reusable innards: diff the committed content against the accepted
 /// cursor, validate every candidate, apply the survivors through the store
@@ -663,7 +662,10 @@ pub async fn changed_paths(
         // commit (rewritten or divergent history falls through to the
         // validated full-tree reconciliation; nothing is blindly applied).
         let approach = format!("{cursor}^{{commit}}");
-        if run_ok(mesh_root, &["cat-file", "-e", &approach]).await.is_ok() {
+        if run_ok(mesh_root, &["cat-file", "-e", &approach])
+            .await
+            .is_ok()
+        {
             if let Ok(out) = run_ok(
                 mesh_root,
                 &["diff", "--name-only", "-z", &format!("{cursor}..{head}")],
@@ -677,7 +679,6 @@ pub async fn changed_paths(
     Ok((tracked_paths(mesh_root).await?, true))
 }
 
-
 /// Committed content via the index. apply_changed always runs after a
 /// ff-merge (index == HEAD) or against a clean checkout, so the index never
 /// outlives what is committed here.
@@ -685,7 +686,6 @@ async fn tracked_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
     let out = run_ok(mesh_root, &["ls-files", "-z"]).await?;
     Ok(split_nul(&out.stdout))
 }
-
 
 fn split_nul(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
@@ -903,7 +903,9 @@ fn validate_parsed_record(
     // exactly as it arrived — no metadata mutation before verify_record_signature.
     let mut diagnostic = None;
     if let Some(ref rdf_block) = record.rdf {
-        if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
+        if let Err(violations) =
+            crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block)
+        {
             // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
             // applied. The violation is carried out-of-band for later attachment.
             tracing::warn!(
@@ -955,7 +957,6 @@ fn validate_parsed_record(
     }
     Ok((record, diagnostic))
 }
-
 
 /// The epoch gate (spec §"Deletion & erasure" / §"Import validation"): a
 /// record's `origin_mesh_epoch` is compared against the mesh manifest's
@@ -1230,17 +1231,13 @@ fn classify_merge(
         // pair is a candidate-state the gate cannot accept at all
         // (e.g. two live states a future vocabulary might introduce), and
         // the merge table must refuse before decorating the decision.
-        let any_direction_legal = local_state.can_transition_to(cand_state)
-            || cand_state.can_transition_to(local_state);
+        let any_direction_legal =
+            local_state.can_transition_to(cand_state) || cand_state.can_transition_to(local_state);
         if content_changed {
             return if any_direction_legal {
-                MergeDecision::ApplyCombination(
-                    "archive + edit; edited content stays archived",
-                )
+                MergeDecision::ApplyCombination("archive + edit; edited content stays archived")
             } else {
-                MergeDecision::Refuse(format!(
-                    "illegal transition {local_state} -> {cand_state}"
-                ))
+                MergeDecision::Refuse(format!("illegal transition {local_state} -> {cand_state}"))
             };
         }
         // Same content, one side archived and the other restored: the spec's
@@ -1359,7 +1356,6 @@ async fn head_commit_signature_state(root: &Path) -> &'static str {
         Err(_) => "unverifiable",
     }
 }
-
 
 /// Merge the 1.8.0 read-side conventions (`archived: true`,
 /// `superseded_by`) and the mesh terminal marker (`tombstoned: true`) onto a
@@ -1856,10 +1852,12 @@ async fn apply_effective(
     // matching concept_iri. Idempotent on replay.
     let current_update_id = record.update_id.to_string();
     let already_imported = match store.get(namespace, id).await {
-        Ok(found) => found
-            .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
-            .as_deref()
-            == Some(current_update_id.as_str()),
+        Ok(found) => {
+            found
+                .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
+                .as_deref()
+                == Some(current_update_id.as_str())
+        }
         Err(e) => {
             tracing::warn!("[neurostrata:mesh] store read failed for {id}: {e}");
             false
@@ -1870,7 +1868,10 @@ async fn apply_effective(
         if let Some(concept_val) = metadata.get("concept_iri").cloned() {
             let iris: Vec<String> = match &concept_val {
                 Value::String(s) => vec![s.clone()],
-                Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                Value::Array(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
                 _ => vec![],
             };
             let rid = crate::registry::registry_row_id(namespace);
@@ -1878,9 +1879,7 @@ async fn apply_effective(
                 Ok(Some((_, rp))) => crate::registry::registry_domain_entries(&rp.metadata),
                 Ok(None) => vec![],
                 Err(e) => {
-                    tracing::warn!(
-                        "[neurostrata:mesh] registry row {rid} unreadable: {e}"
-                    );
+                    tracing::warn!("[neurostrata:mesh] registry row {rid} unreadable: {e}");
                     vec![]
                 }
             };
@@ -1890,7 +1889,9 @@ async fn apply_effective(
                     .iter()
                     .filter_map(|e| {
                         if e.get("concept_iri").and_then(|v| v.as_str()) == Some(iri.as_str()) {
-                            e.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            e.get("slug")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
                         } else {
                             None
                         }
@@ -1907,7 +1908,8 @@ async fn apply_effective(
                         // ambiguous
                         tracing::warn!(
                             "[neurostrata:mesh] ambiguous concept_iri {} matches {} local domains",
-                            iri, n
+                            iri,
+                            n
                         );
                     }
                 }
@@ -1915,7 +1917,10 @@ async fn apply_effective(
             if !matched_slugs.is_empty() {
                 let mut existing: Vec<String> = match metadata.get("domain") {
                     Some(Value::String(s)) => vec![s.clone()],
-                    Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
                     _ => vec![],
                 };
                 for s in &matched_slugs {
@@ -1960,13 +1965,9 @@ async fn apply_effective(
     // Union the imported record's domain into the local registry (a cache).
     // A failure here is a warning, never a refusal: the row is already stored.
     if let Some(domain) = imported_domain {
-        if let Some(warning) = crate::registry::write_registry(
-            &store,
-            &emb,
-            namespace,
-            std::slice::from_ref(&domain),
-        )
-        .await
+        if let Some(warning) =
+            crate::registry::write_registry(&store, &emb, namespace, std::slice::from_ref(&domain))
+                .await
         {
             tracing::warn!(
                 "registry union failed for imported record {id} in {namespace}: {warning}"
@@ -2101,10 +2102,7 @@ fn local_origin(payload: &MemoryPayload) -> String {
     payload
         .metadata
         .get("mesh")
-        .and_then(|m| {
-            m.get("claimed_created_by")
-                .or_else(|| m.get("origin"))
-        })
+        .and_then(|m| m.get("claimed_created_by").or_else(|| m.get("origin")))
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
@@ -2218,11 +2216,18 @@ fn preserved_edit_record(
     // Curated metadata for RDF projection
     let eligibility = metadata.get("eligibility").and_then(|v| v.as_str());
     let source = metadata.get("source").and_then(|v| v.as_str());
-    let tags: Vec<String> = metadata.get("tags").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let tags: Vec<String> = metadata
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let concept_iri = metadata.get("concept_iri").and_then(|v| v.as_str());
-    let rdf_relationships: Vec<(String, String)> = rels.iter()
+    let rdf_relationships: Vec<(String, String)> = rels
+        .iter()
         .map(|r| (r.kind.clone(), r.target.to_string()))
         .collect();
     let state_str = "active";
@@ -2284,7 +2289,6 @@ fn preserved_edit_record(
     }
 }
 
-
 // --- git plumbing (fail-soft, non-interactive; via storage.rs's funnel) ---
 
 /// The checkout's dirty porcelain paths (`git status --porcelain`, run
@@ -2299,7 +2303,6 @@ async fn dirty_checkout_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
         .map(str::to_string)
         .collect())
 }
-
 
 /// Outcome of Ed25519 signature verification on a [`MeshRecord`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2572,8 +2575,6 @@ async fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
 
-
-
 /// Program Task 3 (c): classify procedure rows written before stamping
 /// existed, discriminating on mesh provenance. An unstamped procedure
 /// with no import provenance is local authorship → stamped `local`. An
@@ -2677,7 +2678,6 @@ pub async fn backfill_imported_procedure_trust(
     (stamped_local, stamped_untrusted)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2733,7 +2733,8 @@ mod tests {
             "import-tests",
             &["probe".to_string()],
             None,
-        ).await
+        )
+        .await
         .unwrap();
         (base, mesh)
     }
@@ -2754,7 +2755,8 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("epoch migration", "node-import-test").await
+        mesh.commit_all("epoch migration", "node-import-test")
+            .await
             .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
@@ -2775,7 +2777,8 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("signer allowlist", "node-import-test").await
+        mesh.commit_all("signer allowlist", "node-import-test")
+            .await
             .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
@@ -2901,14 +2904,15 @@ mod tests {
         // `/bundles/*.bundle.zst` rule git-ignores it (local-only), so
         // the fixture commits the bootstrap files, then force-tracks
         // the bundle — the legitimate transport route.
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store("bundle-only").await;
 
-        let report =
-            apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
-                .await
-                .expect("full-tree replay applies the bundle record");
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("full-tree replay applies the bundle record");
 
         assert_eq!(report.applied, 1, "report: {report:?}");
         assert!(
@@ -3000,7 +3004,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "newer revision")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("ignored-stale-bundle").await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
@@ -3146,7 +3151,8 @@ mod tests {
             "memories",
             &id,
             &serde_json::to_string(local).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store(tag).await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served, store.clone(), emb())
@@ -3159,7 +3165,9 @@ mod tests {
             &[candidate],
         )
         .expect("bundle writes");
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/rev.bundle.zst");
         if full_tree {
             std::fs::remove_file(
@@ -3170,7 +3178,8 @@ mod tests {
             )
             .unwrap();
             mesh.commit_all("withdraw json carrier", "node-peer-1")
-                .await.unwrap();
+                .await
+                .unwrap();
             std::fs::remove_file(cursor_file(mesh.root())).unwrap();
         }
         let second = apply_changed(&mesh, &served, store.clone(), emb())
@@ -3479,13 +3488,8 @@ mod tests {
             v7_update_id(REV_OLD_MILLIS, 0x18),
         ))
         .unwrap();
-        let (report, store) = tracked_bundle_second_pass(
-            "tracked-stale-cross-state",
-            &local,
-            candidate,
-            false,
-        )
-        .await;
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-stale-cross-state", &local, candidate, false).await;
         assert!(
             !report
                 .ignored
@@ -3585,7 +3589,9 @@ mod tests {
             &[candidate],
         )
         .expect("bundle writes");
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/priv.bundle.zst");
 
         let report = apply_changed(&mesh, &served, store.clone(), emb())
@@ -3673,7 +3679,9 @@ mod tests {
             &[record],
         )
         .expect("bundle writes");
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -3701,7 +3709,8 @@ mod tests {
             "memories",
             id,
             &serde_json::to_string(value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -4376,7 +4385,8 @@ mod tests {
             "memories",
             &id,
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -4385,10 +4395,7 @@ mod tests {
     }
 
     /// The stored `metadata.mesh` provenance object of an applied row.
-    async fn stored_mesh_provenance(
-        store: &std::sync::Arc<dyn VectorStore>,
-        id: &Uuid,
-    ) -> Value {
+    async fn stored_mesh_provenance(store: &std::sync::Arc<dyn VectorStore>, id: &Uuid) -> Value {
         let (_, payload) = store
             .get("probe", &id.to_string())
             .await
@@ -4428,10 +4435,7 @@ mod tests {
         // so the RDF payload still verifies; the canonical-JSON payload
         // covers `metadata`, so the JSON branch fails.
         if let Some(obj) = record.metadata.as_object_mut() {
-            obj.insert(
-                "unprojected_note".to_string(),
-                json!("added after signing"),
-            );
+            obj.insert("unprojected_note".to_string(), json!("added after signing"));
         }
         let (report, store) =
             run_bundle_route_with_signers("rdf-only-tampered", record, None, signers).await;
@@ -4605,8 +4609,7 @@ mod tests {
         sign_record_legacy_rdf(&mut record, &key_path);
         let signer_did = record.signer_did.clone().expect("signed record has a DID");
         let signers = vec![signer_entry_for(&record)];
-        let (report, store) =
-            run_json_route_with_signers("rdf-only-json", record, signers).await;
+        let (report, store) = run_json_route_with_signers("rdf-only-json", record, signers).await;
         assert_eq!(report.applied, 1, "report: {report:?}");
         assert!(
             report.applied_ids.contains(&id.to_string()),
@@ -4706,13 +4709,9 @@ mod tests {
             .clone()
             .expect("signed record has a DID");
         let rdf_signers = vec![signer_entry_for(&rdf_record)];
-        let (rdf_report, rdf_store) = run_bundle_route_with_signers(
-            "rdf-only-attribution",
-            rdf_record,
-            None,
-            rdf_signers,
-        )
-        .await;
+        let (rdf_report, rdf_store) =
+            run_bundle_route_with_signers("rdf-only-attribution", rdf_record, None, rdf_signers)
+                .await;
         assert_eq!(rdf_report.applied, 1, "report: {rdf_report:?}");
         assert_eq!(rdf_report.rdf_only_verified, 1, "report: {rdf_report:?}");
         assert_eq!(rdf_report.verified_signed, 0, "report: {rdf_report:?}");
@@ -4744,13 +4743,9 @@ mod tests {
             .clone()
             .expect("signed record has a DID");
         let full_signers = vec![signer_entry_for(&full_record)];
-        let (full_report, full_store) = run_bundle_route_with_signers(
-            "full-attribution",
-            full_record,
-            None,
-            full_signers,
-        )
-        .await;
+        let (full_report, full_store) =
+            run_bundle_route_with_signers("full-attribution", full_record, None, full_signers)
+                .await;
         assert_eq!(full_report.applied, 1, "report: {full_report:?}");
         assert_eq!(full_report.verified_signed, 1, "report: {full_report:?}");
         assert_eq!(full_report.rdf_only_verified, 0, "report: {full_report:?}");
@@ -4795,8 +4790,7 @@ mod tests {
         candidate.lifecycle.archived_at = Some(chrono::Utc::now());
         let key_dir = scratch("combo-local-active-key");
         let key_path = key_dir.join("signing.key");
-        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path)
-            .expect("record signs");
+        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path).expect("record signs");
         let signers = vec![signer_entry_for(&candidate)];
 
         let (_base, mesh) = mesh_with_commit("combo-local-active").await;
@@ -4811,7 +4805,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "local active content")).unwrap(),
-        ).await;
+        )
+        .await;
         let first = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 1 applies");
@@ -4831,7 +4826,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 2 applies");
@@ -4907,7 +4903,8 @@ mod tests {
                 "local archived content",
             ))
             .unwrap(),
-        ).await;
+        )
+        .await;
         let first = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 1 applies");
@@ -4928,7 +4925,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 2 applies");
@@ -5029,7 +5027,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("happy").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5085,7 +5084,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "deterministic dedup")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("reapply").await;
         let served = ["probe".to_string()];
 
@@ -5158,7 +5158,8 @@ mod tests {
                 "memories",
                 &exec_id.to_string(),
                 &serde_json::to_string(&simple_rule(exec_id, "executable payload")).unwrap(),
-            ).await;
+            )
+            .await;
             let exec_path = mesh
                 .root()
                 .join("probe")
@@ -5220,7 +5221,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&future).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("schema").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5268,7 +5270,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("epoch-older").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5303,7 +5306,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("epoch-equal").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5334,7 +5338,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("epoch-future").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5397,7 +5402,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("oversized").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5432,7 +5438,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&other).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("foreign").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5467,7 +5474,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "the mesh's version")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("private").await;
         store.init("probe").await.unwrap();
         store
@@ -5532,7 +5540,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("archived").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5642,7 +5651,8 @@ mod tests {
             "memories",
             &a.to_string(),
             &serde_json::to_string(&simple_rule(a, "first commit")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("cursor").await;
         let served = ["probe".to_string()];
 
@@ -5657,7 +5667,8 @@ mod tests {
             "memories",
             &b.to_string(),
             &serde_json::to_string(&simple_rule(b, "second commit")).unwrap(),
-        ).await;
+        )
+        .await;
 
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
@@ -5710,7 +5721,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "the committed content")).unwrap(),
-        ).await;
+        )
+        .await;
         // Dirty BOTH ways: a modified tracked record (uncommitted content is
         // exactly what a full-tree pass would wrongly read off disk) and an
         // untracked extra file.
@@ -5751,7 +5763,9 @@ mod tests {
         );
 
         // Committed (clean again): the same pass applies normally.
-        mesh.commit_all("clean local edits", "node-peer-1").await.unwrap();
+        mesh.commit_all("clean local edits", "node-peer-1")
+            .await
+            .unwrap();
         let report = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
             .await
             .expect("clean checkout applies");
@@ -5776,7 +5790,8 @@ mod tests {
             "memories",
             &a.to_string(),
             &serde_json::to_string(&simple_rule(a, "first commit")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("dirty-diff").await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
@@ -5793,7 +5808,8 @@ mod tests {
             "memories",
             &b.to_string(),
             &serde_json::to_string(&simple_rule(b, "second commit")).unwrap(),
-        ).await;
+        )
+        .await;
         let junk_name = format!("{}.txt", Uuid::new_v4());
         let junk_rel = format!("probe/memories/{junk_name}");
         std::fs::write(mesh.root().join(&junk_rel), "untracked junk").unwrap();
@@ -6124,7 +6140,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "original")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("tombstone-e2e").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -6140,7 +6157,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "tombstoned", None, "original")).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6155,7 +6173,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "zombie")).unwrap(),
-        ).await;
+        )
+        .await;
         let third = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6191,7 +6210,8 @@ mod tests {
                 "original",
             ))
             .unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("supersede-edit-e2e").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -6209,7 +6229,8 @@ mod tests {
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "edited content"))
                 .unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6618,7 +6639,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "original")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("conflict-nodrop").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -6636,7 +6658,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "their edit")).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6711,7 +6734,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
 
         let store = fresh_store("topology").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -6755,7 +6779,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
 
         let store = fresh_store("domainunion").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -6789,7 +6814,10 @@ mod tests {
     /// Rewrite the on-disk manifest's imported-procedures policy, commit,
     /// and reopen so the cached manifest reflects it (mirrors
     /// `reopen_with_epoch`).
-    async fn reopen_with_policy(mesh: &MeshStorage, trust: super::super::manifest::Trust) -> MeshStorage {
+    async fn reopen_with_policy(
+        mesh: &MeshStorage,
+        trust: super::super::manifest::Trust,
+    ) -> MeshStorage {
         let mut manifest = mesh.manifest().clone();
         manifest.policy.imported_procedures_trust = trust;
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -6798,7 +6826,9 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("policy change", "node-import-test").await.unwrap();
+        mesh.commit_all("policy change", "node-import-test")
+            .await
+            .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
 
@@ -6863,7 +6893,8 @@ mod tests {
             "procedures",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("forged").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -6907,7 +6938,8 @@ mod tests {
             "procedures",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("pol-trusted").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -6937,7 +6969,8 @@ mod tests {
             "procedures",
             &id2.to_string(),
             &serde_json::to_string(&value2).unwrap(),
-        ).await;
+        )
+        .await;
         let store2 = fresh_store("pol-none").await;
         let report2 = apply_changed(&mesh2, &["probe".to_string()], store2.clone(), emb())
             .await
@@ -6971,7 +7004,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("secret").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -6983,7 +7017,11 @@ mod tests {
             "the refusal names the scan: {:?}",
             report.ignored
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// Program Task 3 (fix round, M-1): the scanner builds its location
@@ -7001,10 +7039,7 @@ mod tests {
         let mut metadata = serde_json::Map::new();
         metadata.insert("eligibility".to_string(), json!("shareable"));
         metadata.insert("trust".to_string(), json!("untrusted"));
-        metadata.insert(
-            evil_key.clone(),
-            json!({ "nested": secret_value.clone() }),
-        );
+        metadata.insert(evil_key.clone(), json!({ "nested": secret_value.clone() }));
         value["metadata"] = Value::Object(metadata);
         commit_record_json(
             &mesh,
@@ -7012,7 +7047,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("secret-key").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -7036,7 +7072,11 @@ mod tests {
             !entry.contains(&secret_value),
             "the report must not echo the secret value: {entry}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// J3 (provenance leg): the row keeps the sender's claimed author for
@@ -7053,7 +7093,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "always use podman")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("createdby").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -7076,7 +7117,12 @@ mod tests {
         );
     }
 
-    async fn seed_row(store: &std::sync::Arc<dyn VectorStore>, id: &str, memory_type: &str, metadata: Value) {
+    async fn seed_row(
+        store: &std::sync::Arc<dyn VectorStore>,
+        id: &str,
+        memory_type: &str,
+        metadata: Value,
+    ) {
         store
             .upsert(
                 "probe",
@@ -7097,11 +7143,7 @@ mod tests {
     }
 
     async fn trust_stamp_of(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
-        let (_, payload) = store
-            .get("probe", id)
-            .await
-            .unwrap()
-            .expect("row present");
+        let (_, payload) = store.get("probe", id).await.unwrap().expect("row present");
         payload
             .metadata
             .get("trust")
@@ -7117,7 +7159,13 @@ mod tests {
     async fn backfill_stamps_by_provenance() {
         let store = fresh_store("backfill").await;
         store.init("probe").await.unwrap();
-        seed_row(&store, "proc-local", "procedure", json!({"trigger": "session-start"})).await;
+        seed_row(
+            &store,
+            "proc-local",
+            "procedure",
+            json!({"trigger": "session-start"}),
+        )
+        .await;
         seed_row(
             &store,
             "proc-imported",
@@ -7128,13 +7176,22 @@ mod tests {
             }),
         )
         .await;
-        seed_row(&store, "proc-promoted", "procedure", json!({"trust": "promoted"})).await;
+        seed_row(
+            &store,
+            "proc-promoted",
+            "procedure",
+            json!({"trust": "promoted"}),
+        )
+        .await;
         seed_row(&store, "rule-plain", "rule", json!({})).await;
 
         let (local, imported) = backfill_imported_procedure_trust(&store).await;
         assert_eq!((local, imported), (1, 1), "one of each class stamped");
         assert_eq!(trust_stamp_of(&store, "proc-local").await, json!("local"));
-        assert_eq!(trust_stamp_of(&store, "proc-imported").await, json!("untrusted"));
+        assert_eq!(
+            trust_stamp_of(&store, "proc-imported").await,
+            json!("untrusted")
+        );
         assert_eq!(
             trust_stamp_of(&store, "proc-promoted").await,
             json!("promoted"),
@@ -7147,6 +7204,10 @@ mod tests {
         );
 
         let (local2, imported2) = backfill_imported_procedure_trust(&store).await;
-        assert_eq!((local2, imported2), (0, 0), "idempotent: nothing left to classify");
+        assert_eq!(
+            (local2, imported2),
+            (0, 0),
+            "idempotent: nothing left to classify"
+        );
     }
 }

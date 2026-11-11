@@ -1,9 +1,9 @@
 use crate::domain;
-use crate::registry;
 use crate::rdf::shacl::ShaclViolation;
+use crate::registry;
+use crate::traits::MemoryPayload;
 use oxrdf::NamedOrBlankNode;
 use oxrdf::Term;
-use crate::traits::MemoryPayload;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -18,7 +18,6 @@ pub struct ClosureResult {
     pub results: Vec<String>,
     pub evidence: Vec<crate::traits::SearchEvidence>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainEntry {
@@ -203,7 +202,8 @@ impl OntologyIndex {
             return;
         }
         for alias in &entry.aliases {
-            self.alias_map.insert(alias.to_lowercase(), entry.slug.clone());
+            self.alias_map
+                .insert(alias.to_lowercase(), entry.slug.clone());
             self.add_alt_label(&entry.slug, alias);
         }
         self.alias_map
@@ -271,10 +271,7 @@ impl OntologyIndex {
                 }
             }
         }
-        if let Some(arr) = vocab
-            .get("equivalent_properties")
-            .and_then(Value::as_array)
-        {
+        if let Some(arr) = vocab.get("equivalent_properties").and_then(Value::as_array) {
             for pair in arr {
                 if let Some((a, b)) = vocabulary_pair(pair) {
                     self.add_equivalent_property(a, b);
@@ -288,20 +285,14 @@ impl OntologyIndex {
                 }
             }
         }
-        if let Some(arr) = vocab
-            .get("transitive_properties")
-            .and_then(Value::as_array)
-        {
+        if let Some(arr) = vocab.get("transitive_properties").and_then(Value::as_array) {
             for p in arr {
                 if let Some(s) = p.as_str() {
                     self.add_transitive_property(s);
                 }
             }
         }
-        if let Some(arr) = vocab
-            .get("symmetric_properties")
-            .and_then(Value::as_array)
-        {
+        if let Some(arr) = vocab.get("symmetric_properties").and_then(Value::as_array) {
             for p in arr {
                 if let Some(s) = p.as_str() {
                     self.add_symmetric_property(s);
@@ -582,12 +573,16 @@ impl OntologyIndex {
         let mut out = BTreeSet::new();
         if let Some(slug) = self.canonical_slug(symbol) {
             if let Some(alt) = self.alt_labels.get(&slug) {
-                for a in alt { out.insert(a.clone()); }
+                for a in alt {
+                    out.insert(a.clone());
+                }
             }
         }
         // Direct lookup for symbols not yet registered as domain slugs
         if let Some(alt) = self.alt_labels.get(symbol) {
-            for a in alt { out.insert(a.clone()); }
+            for a in alt {
+                out.insert(a.clone());
+            }
         }
         out
     }
@@ -675,7 +670,12 @@ impl OntologyIndex {
         result
     }
 
-    pub fn closure_governs(&self, root: &str, edges: &[String], budget: &QueryBudget) -> ClosureResult {
+    pub fn closure_governs(
+        &self,
+        root: &str,
+        edges: &[String],
+        budget: &QueryBudget,
+    ) -> ClosureResult {
         let mut result = ClosureResult::default();
         let mut visited: BTreeSet<String> = BTreeSet::new();
         let mut frontier: VecDeque<String> = VecDeque::new();
@@ -727,325 +727,334 @@ impl OntologyIndex {
         result
     }
 
-pub fn load_shacl_shapes(&mut self, ttl: &str) -> anyhow::Result<usize> {
-    let mut total = 0usize;
-    let parser = oxttl::TurtleParser::new();
-    let mut cur_shape: Option<ShaclShapeDef> = None;
-    // Turtle `sh:in ( "a" "b" )` collections expand into rdf:first/rdf:rest
-    // triples on list blank nodes; record them so sh:in can resolve values.
-    let mut list_first: BTreeMap<String, String> = BTreeMap::new();
-    let mut list_rest: BTreeMap<String, String> = BTreeMap::new();
-    // sh:in triples whose object blank node was not yet attached to any
-    // rdf:first/rdf:rest chain, deferred until the owning shape finalizes.
-    let mut deferred_in_lists: Vec<(String, String, String)> = Vec::new();
-    // oxttl emits inner `[ sh:path ... ; sh:in ... ]` triples BEFORE the
-    // enclosing `sh:property` push, so blank-node property constraint data is
-    // accumulated and applied when the push finally arrives.
-    let mut pending_props: BTreeMap<String, PendingShapeProp> = BTreeMap::new();
+    pub fn load_shacl_shapes(&mut self, ttl: &str) -> anyhow::Result<usize> {
+        let mut total = 0usize;
+        let parser = oxttl::TurtleParser::new();
+        let mut cur_shape: Option<ShaclShapeDef> = None;
+        // Turtle `sh:in ( "a" "b" )` collections expand into rdf:first/rdf:rest
+        // triples on list blank nodes; record them so sh:in can resolve values.
+        let mut list_first: BTreeMap<String, String> = BTreeMap::new();
+        let mut list_rest: BTreeMap<String, String> = BTreeMap::new();
+        // sh:in triples whose object blank node was not yet attached to any
+        // rdf:first/rdf:rest chain, deferred until the owning shape finalizes.
+        let mut deferred_in_lists: Vec<(String, String, String)> = Vec::new();
+        // oxttl emits inner `[ sh:path ... ; sh:in ... ]` triples BEFORE the
+        // enclosing `sh:property` push, so blank-node property constraint data is
+        // accumulated and applied when the push finally arrives.
+        let mut pending_props: BTreeMap<String, PendingShapeProp> = BTreeMap::new();
 
-    /// Extract list values from a `sh:in` object string: quoted string
-    /// literals (honoring backslash escapes) and <IRI> tokens.
-    fn parse_shacl_in_values(obj: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let chars: Vec<char> = obj.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i].is_whitespace() {
-                i += 1;
-            } else if chars[i] == '"' {
-                i += 1;
-                let mut val = String::new();
-                while i < chars.len() {
-                    if chars[i] == '\\' && i + 1 < chars.len() {
-                        val.push(chars[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    if chars[i] == '"' {
-                        i += 1;
-                        break;
-                    }
-                    val.push(chars[i]);
+        /// Extract list values from a `sh:in` object string: quoted string
+        /// literals (honoring backslash escapes) and <IRI> tokens.
+        fn parse_shacl_in_values(obj: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let chars: Vec<char> = obj.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i].is_whitespace() {
                     i += 1;
-                }
-                out.push(val);
-            } else if chars[i] == '<' {
-                i += 1;
-                let mut val = String::new();
-                while i < chars.len() && chars[i] != '>' {
-                    val.push(chars[i]);
+                } else if chars[i] == '"' {
                     i += 1;
-                }
-                i += 1;
-                out.push(val);
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// Walk an RDF list (rdf:first / rdf:rest chain) collecting value tokens.
-    fn resolve_sh_in_list(
-        head: &str,
-        first_map: &BTreeMap<String, String>,
-        rest_map: &BTreeMap<String, String>,
-    ) -> Vec<String> {
-        let mut values = Vec::new();
-        let mut cur = head.to_string();
-        let mut hops = 0usize;
-        while !cur.is_empty() && hops < 10_000 {
-            match first_map.get(&cur) {
-                Some(v) => values.push(v.clone()),
-                None => break,
-            }
-            match rest_map.get(&cur) {
-                Some(next) if !next.is_empty() => cur = next.clone(),
-                _ => break,
-            }
-            hops += 1;
-        }
-        values
-    }
-
-    /// Drain deferred sh:in blank-node lists whose rdf:first/rdf:rest triples
-    /// are now known, filling the matching (empty) in_values entry.
-    fn resolve_deferred_in_lists(
-        shape: &mut ShaclShapeDef,
-        deferred: &mut Vec<(String, String, String)>,
-        first_map: &BTreeMap<String, String>,
-        rest_map: &BTreeMap<String, String>,
-    ) {
-        let mut i = 0;
-        while i < deferred.len() {
-            let (shape_iri, path, head) = deferred[i].clone();
-            if shape_iri != shape.shape_iri {
-                i += 1;
-                continue;
-            }
-            let values = resolve_sh_in_list(&head, first_map, rest_map);
-            if values.is_empty() {
-                i += 1;
-                continue;
-            }
-            shape
-                .in_values
-                .entry(path)
-                .and_modify(|existing| {
-                    if existing.is_empty() {
-                        *existing = values.clone();
-                    }
-                })
-                .or_insert_with(|| values.clone());
-            deferred.remove(i);
-        }
-    }
-
-    for q in parser.for_reader(ttl.as_bytes()) {
-        let q = q?;
-        let s = match q.subject {
-            NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
-            _ => q.subject.to_string(),
-        };
-        let p = q.predicate.as_str().to_string();
-        let o = match &q.object {
-            Term::NamedNode(nn) => nn.as_str().to_string(),
-            Term::Literal(lit) => lit.value().to_string(),
-            _ => q.object.to_string(),
-        };
-
-        // RDF list collection tracking (rdf:first / rdf:rest chain nodes)
-        if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#first" {
-            list_first.entry(s.clone()).or_insert_with(|| o.clone());
-        } else if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest" {
-            match &q.object {
-                Term::BlankNode(bn) => {
-                    list_rest.insert(s.clone(), format!("_:{}", bn.as_str()));
-                }
-                _ => {
-                    list_rest.insert(s.clone(), String::new());
-                }
-            }
-        }
-
-        // sh:NodeShape declaration
-        if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-            && o == "http://www.w3.org/ns/shacl#NodeShape" {
-            if let Some(mut sh) = cur_shape.take() {
-                resolve_deferred_in_lists(&mut sh, &mut deferred_in_lists, &list_first, &list_rest);
-                self.shacl_shapes.push(sh);
-                total += 1;
-            }
-            cur_shape = Some(ShaclShapeDef {
-                shape_iri: s.clone(),
-                ..Default::default()
-            });
-        }
-
-        // sh:targetClass
-        if p == "http://www.w3.org/ns/shacl#targetClass" {
-            if let Some(sh) = cur_shape.as_mut() {
-                sh.target_class = Some(o.clone());
-            }
-        }
-
-        // sh:message
-        if p == "http://www.w3.org/ns/shacl#message" {
-            if let Some(sh) = cur_shape.as_mut() {
-                sh.messages.insert(o.clone(), o.clone());
-            }
-        }
-
-        // sh:property
-        if p == "http://www.w3.org/ns/shacl#property" {
-            if let Some(sh) = cur_shape.as_mut() {
-                sh.property_constraints.push((o.clone(), None));
-                let shape_iri = sh.shape_iri.clone();
-                // Apply accumulated inner `[ ... ]` data that oxttl emitted
-                // before this push (subject blank node = the push object).
-                if let Some(pend) = pending_props.remove(&o) {
-                    let path_key = pend.path.clone().unwrap_or_else(|| o.clone());
-                    if let Some(last) = sh.property_constraints.last_mut() {
-                        last.0 = path_key.clone();
-                    }
-                    let mut values: Vec<String> = pend.in_tokens;
-                    for head in &pend.in_lists {
-                        let resolved = resolve_sh_in_list(head, &list_first, &list_rest);
-                        if resolved.is_empty() {
-                            deferred_in_lists.push((
-                                shape_iri.clone(),
-                                path_key.clone(),
-                                head.clone(),
-                            ));
-                        } else {
-                            values.extend(resolved);
+                    let mut val = String::new();
+                    while i < chars.len() {
+                        if chars[i] == '\\' && i + 1 < chars.len() {
+                            val.push(chars[i + 1]);
+                            i += 2;
+                            continue;
                         }
+                        if chars[i] == '"' {
+                            i += 1;
+                            break;
+                        }
+                        val.push(chars[i]);
+                        i += 1;
                     }
-                    if !values.is_empty() {
-                        sh.in_values.insert(path_key, values);
+                    out.push(val);
+                } else if chars[i] == '<' {
+                    i += 1;
+                    let mut val = String::new();
+                    while i < chars.len() && chars[i] != '>' {
+                        val.push(chars[i]);
+                        i += 1;
                     }
+                    i += 1;
+                    out.push(val);
+                } else {
+                    i += 1;
                 }
             }
+            out
         }
 
-        // sh:path
-        if p == "http://www.w3.org/ns/shacl#path" {
-            if s.starts_with("_:") && cur_shape.is_some() {
-                // Inner constraint blank node: record the declared path so it
-                // can key the constraint once sh:property pushes it.
-                pending_props.entry(s.clone()).or_default().path = Some(o.clone());
-            } else if let Some(last) = cur_shape.as_mut().and_then(|sh| sh.property_constraints.last_mut()) {
-                last.0 = o.clone();
-            }
-        }
-
-        // sh:minCount
-        if p == "http://www.w3.org/ns/shacl#minCount" {
-            let val: u32 = o.parse().unwrap_or(0);
-            if let Some(shape_ref) = cur_shape.as_mut() {
-                if let Some(last) = shape_ref.property_constraints.last_mut() {
-                    shape_ref.min_counts.insert(last.0.clone(), val);
+        /// Walk an RDF list (rdf:first / rdf:rest chain) collecting value tokens.
+        fn resolve_sh_in_list(
+            head: &str,
+            first_map: &BTreeMap<String, String>,
+            rest_map: &BTreeMap<String, String>,
+        ) -> Vec<String> {
+            let mut values = Vec::new();
+            let mut cur = head.to_string();
+            let mut hops = 0usize;
+            while !cur.is_empty() && hops < 10_000 {
+                match first_map.get(&cur) {
+                    Some(v) => values.push(v.clone()),
+                    None => break,
                 }
-            }
-        }
-
-        // sh:maxCount
-        if p == "http://www.w3.org/ns/shacl#maxCount" {
-            let val: u32 = o.parse().unwrap_or(u32::MAX);
-            if let Some(shape_ref) = cur_shape.as_mut() {
-                if let Some(last) = shape_ref.property_constraints.last_mut() {
-                    shape_ref.max_counts.insert(last.0.clone(), val);
+                match rest_map.get(&cur) {
+                    Some(next) if !next.is_empty() => cur = next.clone(),
+                    _ => break,
                 }
+                hops += 1;
             }
+            values
         }
 
-        // sh:datatype
-        if p == "http://www.w3.org/ns/shacl#datatype" {
-            if let Some(shape_ref) = cur_shape.as_mut() {
-                if let Some(last) = shape_ref.property_constraints.last_mut() {
-                    shape_ref.datatypes.insert(last.0.clone(), o.clone());
+        /// Drain deferred sh:in blank-node lists whose rdf:first/rdf:rest triples
+        /// are now known, filling the matching (empty) in_values entry.
+        fn resolve_deferred_in_lists(
+            shape: &mut ShaclShapeDef,
+            deferred: &mut Vec<(String, String, String)>,
+            first_map: &BTreeMap<String, String>,
+            rest_map: &BTreeMap<String, String>,
+        ) {
+            let mut i = 0;
+            while i < deferred.len() {
+                let (shape_iri, path, head) = deferred[i].clone();
+                if shape_iri != shape.shape_iri {
+                    i += 1;
+                    continue;
                 }
-            }
-        }
-
-        // sh:nodeKind
-        if p == "http://www.w3.org/ns/shacl#nodeKind" {
-            if let Some(shape_ref) = cur_shape.as_mut() {
-                if let Some(last) = shape_ref.property_constraints.last_mut() {
-                    shape_ref.node_kinds.insert(last.0.clone(), o.clone());
+                let values = resolve_sh_in_list(&head, first_map, rest_map);
+                if values.is_empty() {
+                    i += 1;
+                    continue;
                 }
+                shape
+                    .in_values
+                    .entry(path)
+                    .and_modify(|existing| {
+                        if existing.is_empty() {
+                            *existing = values.clone();
+                        }
+                    })
+                    .or_insert_with(|| values.clone());
+                deferred.remove(i);
             }
         }
 
-        // sh:in
-        if p == "http://www.w3.org/ns/shacl#in" {
-            if s.starts_with("_:") && cur_shape.is_some() {
-                // Inner constraint blank node: buffer the list reference or
-                // token values; resolved/applied when sh:property pushes.
-                let pend = pending_props.entry(s.clone()).or_default();
+        for q in parser.for_reader(ttl.as_bytes()) {
+            let q = q?;
+            let s = match q.subject {
+                NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
+                _ => q.subject.to_string(),
+            };
+            let p = q.predicate.as_str().to_string();
+            let o = match &q.object {
+                Term::NamedNode(nn) => nn.as_str().to_string(),
+                Term::Literal(lit) => lit.value().to_string(),
+                _ => q.object.to_string(),
+            };
+
+            // RDF list collection tracking (rdf:first / rdf:rest chain nodes)
+            if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#first" {
+                list_first.entry(s.clone()).or_insert_with(|| o.clone());
+            } else if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest" {
                 match &q.object {
                     Term::BlankNode(bn) => {
-                        let head = format!("_:{}", bn.as_str());
-                        pend.in_lists.push(head);
+                        list_rest.insert(s.clone(), format!("_:{}", bn.as_str()));
                     }
                     _ => {
-                        let toks = parse_shacl_in_values(&o);
-                        pend.in_tokens.extend(toks);
+                        list_rest.insert(s.clone(), String::new());
                     }
                 }
-            } else {
-                let values: Vec<String>;
-                let mut deferred_head: Option<String> = None;
-                match &q.object {
-                    Term::BlankNode(bn) => {
-                        let head = format!("_:{}", bn.as_str());
-                        let resolved = resolve_sh_in_list(&head, &list_first, &list_rest);
-                        if resolved.is_empty() {
-                            values = Vec::new();
-                            deferred_head = Some(head);
-                        } else {
-                            values = resolved;
+            }
+
+            // sh:NodeShape declaration
+            if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                && o == "http://www.w3.org/ns/shacl#NodeShape"
+            {
+                if let Some(mut sh) = cur_shape.take() {
+                    resolve_deferred_in_lists(
+                        &mut sh,
+                        &mut deferred_in_lists,
+                        &list_first,
+                        &list_rest,
+                    );
+                    self.shacl_shapes.push(sh);
+                    total += 1;
+                }
+                cur_shape = Some(ShaclShapeDef {
+                    shape_iri: s.clone(),
+                    ..Default::default()
+                });
+            }
+
+            // sh:targetClass
+            if p == "http://www.w3.org/ns/shacl#targetClass" {
+                if let Some(sh) = cur_shape.as_mut() {
+                    sh.target_class = Some(o.clone());
+                }
+            }
+
+            // sh:message
+            if p == "http://www.w3.org/ns/shacl#message" {
+                if let Some(sh) = cur_shape.as_mut() {
+                    sh.messages.insert(o.clone(), o.clone());
+                }
+            }
+
+            // sh:property
+            if p == "http://www.w3.org/ns/shacl#property" {
+                if let Some(sh) = cur_shape.as_mut() {
+                    sh.property_constraints.push((o.clone(), None));
+                    let shape_iri = sh.shape_iri.clone();
+                    // Apply accumulated inner `[ ... ]` data that oxttl emitted
+                    // before this push (subject blank node = the push object).
+                    if let Some(pend) = pending_props.remove(&o) {
+                        let path_key = pend.path.clone().unwrap_or_else(|| o.clone());
+                        if let Some(last) = sh.property_constraints.last_mut() {
+                            last.0 = path_key.clone();
+                        }
+                        let mut values: Vec<String> = pend.in_tokens;
+                        for head in &pend.in_lists {
+                            let resolved = resolve_sh_in_list(head, &list_first, &list_rest);
+                            if resolved.is_empty() {
+                                deferred_in_lists.push((
+                                    shape_iri.clone(),
+                                    path_key.clone(),
+                                    head.clone(),
+                                ));
+                            } else {
+                                values.extend(resolved);
+                            }
+                        }
+                        if !values.is_empty() {
+                            sh.in_values.insert(path_key, values);
                         }
                     }
-                    _ => values = parse_shacl_in_values(&o),
                 }
+            }
+
+            // sh:path
+            if p == "http://www.w3.org/ns/shacl#path" {
+                if s.starts_with("_:") && cur_shape.is_some() {
+                    // Inner constraint blank node: record the declared path so it
+                    // can key the constraint once sh:property pushes it.
+                    pending_props.entry(s.clone()).or_default().path = Some(o.clone());
+                } else if let Some(last) = cur_shape
+                    .as_mut()
+                    .and_then(|sh| sh.property_constraints.last_mut())
+                {
+                    last.0 = o.clone();
+                }
+            }
+
+            // sh:minCount
+            if p == "http://www.w3.org/ns/shacl#minCount" {
+                let val: u32 = o.parse().unwrap_or(0);
                 if let Some(shape_ref) = cur_shape.as_mut() {
                     if let Some(last) = shape_ref.property_constraints.last_mut() {
-                        shape_ref.in_values.insert(last.0.clone(), values);
+                        shape_ref.min_counts.insert(last.0.clone(), val);
                     }
-                    if let Some(head) = deferred_head {
-                        deferred_in_lists.push((
-                            shape_ref.shape_iri.clone(),
-                            shape_ref
-                                .property_constraints
-                                .last()
-                                .map(|c| c.0.clone())
-                                .unwrap_or_default(),
-                            head,
-                        ));
+                }
+            }
+
+            // sh:maxCount
+            if p == "http://www.w3.org/ns/shacl#maxCount" {
+                let val: u32 = o.parse().unwrap_or(u32::MAX);
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.max_counts.insert(last.0.clone(), val);
+                    }
+                }
+            }
+
+            // sh:datatype
+            if p == "http://www.w3.org/ns/shacl#datatype" {
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.datatypes.insert(last.0.clone(), o.clone());
+                    }
+                }
+            }
+
+            // sh:nodeKind
+            if p == "http://www.w3.org/ns/shacl#nodeKind" {
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.node_kinds.insert(last.0.clone(), o.clone());
+                    }
+                }
+            }
+
+            // sh:in
+            if p == "http://www.w3.org/ns/shacl#in" {
+                if s.starts_with("_:") && cur_shape.is_some() {
+                    // Inner constraint blank node: buffer the list reference or
+                    // token values; resolved/applied when sh:property pushes.
+                    let pend = pending_props.entry(s.clone()).or_default();
+                    match &q.object {
+                        Term::BlankNode(bn) => {
+                            let head = format!("_:{}", bn.as_str());
+                            pend.in_lists.push(head);
+                        }
+                        _ => {
+                            let toks = parse_shacl_in_values(&o);
+                            pend.in_tokens.extend(toks);
+                        }
+                    }
+                } else {
+                    let values: Vec<String>;
+                    let mut deferred_head: Option<String> = None;
+                    match &q.object {
+                        Term::BlankNode(bn) => {
+                            let head = format!("_:{}", bn.as_str());
+                            let resolved = resolve_sh_in_list(&head, &list_first, &list_rest);
+                            if resolved.is_empty() {
+                                values = Vec::new();
+                                deferred_head = Some(head);
+                            } else {
+                                values = resolved;
+                            }
+                        }
+                        _ => values = parse_shacl_in_values(&o),
+                    }
+                    if let Some(shape_ref) = cur_shape.as_mut() {
+                        if let Some(last) = shape_ref.property_constraints.last_mut() {
+                            shape_ref.in_values.insert(last.0.clone(), values);
+                        }
+                        if let Some(head) = deferred_head {
+                            deferred_in_lists.push((
+                                shape_ref.shape_iri.clone(),
+                                shape_ref
+                                    .property_constraints
+                                    .last()
+                                    .map(|c| c.0.clone())
+                                    .unwrap_or_default(),
+                                head,
+                            ));
+                        }
                     }
                 }
             }
         }
+
+        if let Some(mut sh) = cur_shape.take() {
+            resolve_deferred_in_lists(&mut sh, &mut deferred_in_lists, &list_first, &list_rest);
+            self.shacl_shapes.push(sh);
+            total += 1;
+        }
+
+        Ok(total)
     }
 
-    if let Some(mut sh) = cur_shape.take() {
-        resolve_deferred_in_lists(&mut sh, &mut deferred_in_lists, &list_first, &list_rest);
-        self.shacl_shapes.push(sh);
-        total += 1;
+    /// Drop loaded SHACL shapes (used when a registry row stops shipping shapes).
+    pub fn clear_shacl_shapes(&mut self) {
+        self.shacl_shapes.clear();
     }
 
-    Ok(total)
-}
-
-/// Drop loaded SHACL shapes (used when a registry row stops shipping shapes).
-pub fn clear_shacl_shapes(&mut self) {
-    self.shacl_shapes.clear();
-}
-
-/// Validate a memory payload against loaded SHACL shapes.
-/// Returns violations extracted from matching shapes; falls back to
-/// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
+    /// Validate a memory payload against loaded SHACL shapes.
+    /// Returns violations extracted from matching shapes; falls back to
+    /// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
     pub fn shacl_validate(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
         if self.shacl_shapes.is_empty() {
             return crate::rdf::shacl::validate_memory(payload);
@@ -1059,7 +1068,8 @@ pub fn clear_shacl_shapes(&mut self) {
             // Match shape to memory_type via targetClass (ns:Rule, ns:Procedure, ns:Task, etc.)
             let shape_match = shape.target_class.as_deref().map_or(false, |tc| {
                 memory_type == tc.split('/').last().unwrap_or(&tc)
-                    || memory_type.to_lowercase() == tc.split('/').last().unwrap_or(&tc).to_lowercase()
+                    || memory_type.to_lowercase()
+                        == tc.split('/').last().unwrap_or(&tc).to_lowercase()
             });
 
             if !shape_match && shape.target_class.is_some() {
@@ -1067,7 +1077,12 @@ pub fn clear_shacl_shapes(&mut self) {
             }
 
             // Evaluate Memory target shapes (Memory) and matching type shapes
-            if shape.target_class.as_deref().map_or(false, |tc| tc.ends_with("Memory")) || shape_match {
+            if shape
+                .target_class
+                .as_deref()
+                .map_or(false, |tc| tc.ends_with("Memory"))
+                || shape_match
+            {
                 for (path, _) in &shape.property_constraints {
                     let path_violations = self.validate_path(payload, path, shape);
                     violations.extend(path_violations);
@@ -1078,7 +1093,12 @@ pub fn clear_shacl_shapes(&mut self) {
         violations
     }
 
-    fn validate_path(&self, payload: &MemoryPayload, path: &str, shape: &ShaclShapeDef) -> Vec<ShaclViolation> {
+    fn validate_path(
+        &self,
+        payload: &MemoryPayload,
+        path: &str,
+        shape: &ShaclShapeDef,
+    ) -> Vec<ShaclViolation> {
         let mut out = Vec::new();
         let value = match payload.metadata.get(path.trim_start_matches("ns:")) {
             Some(v) => v.clone(),
@@ -1135,7 +1155,9 @@ pub fn clear_shacl_shapes(&mut self) {
                         });
                     }
                 }
-                serde_json::Value::Object(_) if dt.contains("BlankNodeOrIRI") || dt.contains("BlankNode") => {
+                serde_json::Value::Object(_)
+                    if dt.contains("BlankNodeOrIRI") || dt.contains("BlankNode") =>
+                {
                     // ok
                 }
                 serde_json::Value::Null => {
@@ -1167,7 +1189,10 @@ pub fn clear_shacl_shapes(&mut self) {
                         if !allowed.iter().any(|a| a == item_s) {
                             out.push(ShaclViolation {
                                 field: path.to_string(),
-                                why: format!("{} value '{}' not in allowed values {:?}", path, item_s, allowed),
+                                why: format!(
+                                    "{} value '{}' not in allowed values {:?}",
+                                    path, item_s, allowed
+                                ),
                             });
                         }
                     }
@@ -1196,8 +1221,16 @@ mod tests {
         idx.add_sub_class("auth/mtls", "auth/tls");
 
         let subs = idx.subclasses_of("auth");
-        assert!(subs.contains("auth/tls"), "direct child missing: {:?}", subs);
-        assert!(subs.contains("auth/mtls"), "transitive child missing: {:?}", subs);
+        assert!(
+            subs.contains("auth/tls"),
+            "direct child missing: {:?}",
+            subs
+        );
+        assert!(
+            subs.contains("auth/mtls"),
+            "transitive child missing: {:?}",
+            subs
+        );
         assert!(
             !subs.contains("auth") && !subs.contains("security"),
             "subclasses_of must not return the class itself or its ancestors: {:?}",
@@ -1205,8 +1238,16 @@ mod tests {
         );
 
         let supers = idx.superclasses_of("auth/mtls");
-        assert!(supers.contains("auth/tls"), "direct parent missing: {:?}", supers);
-        assert!(supers.contains("auth"), "transitive ancestor missing: {:?}", supers);
+        assert!(
+            supers.contains("auth/tls"),
+            "direct parent missing: {:?}",
+            supers
+        );
+        assert!(
+            supers.contains("auth"),
+            "transitive ancestor missing: {:?}",
+            supers
+        );
         assert!(
             !supers.contains("auth/mtls"),
             "superclasses_of must not return the class itself: {:?}",
@@ -1239,7 +1280,6 @@ mod tests {
         );
     }
 }
-
 
 /// Extract an `(a, b)` pair from a vocabulary entry that is either a
 /// two-element `[a, b]` array or an object with `"child"`/`"parent"` (and

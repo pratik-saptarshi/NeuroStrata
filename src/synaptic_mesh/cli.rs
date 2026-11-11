@@ -103,14 +103,15 @@ pub async fn handle_synaptic_mesh_command(
             namespace,
             remote,
         } => render(
-            store.init_mesh(
-                &ctx.base_root,
-                &ctx.node_id,
-                name,
-                namespace,
-                remote.as_deref(),
-            )
-            .await,
+            store
+                .init_mesh(
+                    &ctx.base_root,
+                    &ctx.node_id,
+                    name,
+                    namespace,
+                    remote.as_deref(),
+                )
+                .await,
             |mesh_id| format!("mesh created: {mesh_id} — joined this project"),
         ),
         // `open_mesh` owns the whole adoption: it opens the repo AND writes
@@ -133,7 +134,9 @@ pub async fn handle_synaptic_mesh_command(
         SynapticMeshCommands::SyncEnqueue => super::mesh_service::sync_enqueue_line(store).await,
         // Recovery is print-only: it reads the checkout, names each paused
         // state, and hands back the manual fix.
-        SynapticMeshCommands::Recover => super::mesh_service::recover_report(&ctx.project_root).await,
+        SynapticMeshCommands::Recover => {
+            super::mesh_service::recover_report(&ctx.project_root).await
+        }
     }
 }
 
@@ -323,7 +326,8 @@ mod tests {
             ..Default::default()
         };
         let reply =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store).await;
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store)
+                .await;
         assert_eq!(
             reply, "mesh sync-enqueued: pulled mesh x; pushed mesh x",
             "one line, pull result first: {reply}"
@@ -340,7 +344,8 @@ mod tests {
         // Mock pulls fail with the storage-layer no-mesh error by default.
         let mut store = MockMesh::default();
         let reply =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store).await;
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store)
+                .await;
         assert!(
             reply.contains("no mesh joined") && reply.contains("nothing to do"),
             "hook sees a quiet success, not an error: {reply}"
@@ -361,7 +366,8 @@ mod tests {
             ..Default::default()
         };
         let reply =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store).await;
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store)
+                .await;
         assert!(
             reply.starts_with("mesh sync-enqueue failed (non-blocking"),
             "fatal shape for a hook: {reply}"
@@ -444,7 +450,8 @@ mod tests {
     #[tokio::test]
     async fn leave_removes_pointer_at_the_context_project_root() {
         let mut store = MockMesh::default();
-        let reply = handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &ctx(), &mut store).await;
+        let reply =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &ctx(), &mut store).await;
         assert_eq!(
             store.pointer_removed.as_deref(),
             Some(Path::new("/proj")),
@@ -470,7 +477,8 @@ mod tests {
             },
             &ctx(),
             &mut store,
-        ).await;
+        )
+        .await;
         assert_eq!(
             store.calls,
             vec!["open_mesh:/tmp/mesh".to_string()],
@@ -538,7 +546,8 @@ mod tests {
             },
             &ctx(),
             &mut store,
-        ).await;
+        )
+        .await;
         assert!(reply.contains("disk full"), "reply: {reply}");
     }
 
@@ -561,8 +570,10 @@ mod tests {
             },
             &explicit,
             &mut store,
-        ).await;
-        let _ = handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &explicit, &mut store).await;
+        )
+        .await;
+        let _ =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::Leave, &explicit, &mut store).await;
 
         let (base, node, _, _, _) = &store.init_calls[0];
         assert_eq!(
