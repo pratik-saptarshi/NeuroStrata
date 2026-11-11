@@ -1,24 +1,83 @@
 //! Federation (in-house approximation): query a remote daemon instance over HTTP.
 //! `remote_list` is also exercised in production by
 //! `MeshService::status_report`, which probes the configured HTTP peer.
-pub async fn remote_list(base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
-    let url = format!("{}/list?namespace={}", base_url.trim_end_matches('/'), namespace);
-    let client = reqwest::Client::new();
+fn federation_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        // Federation peers are direct HTTP addresses (often loopback).
+        // An operator `HTTP(S)_PROXY` must never capture this probe: a
+        // proxy refusal would read as "peer unreachable" and a proxy
+        // success would leak the bearer token to a middlebox.
+        .no_proxy()
+        // Separate from the overall bound on purpose. A port with nothing
+        // behind it hangs rather than refusing on some platforms, so an
+        // unbounded connect would hang the status probe instead of
+        // reporting the peer unreachable (fail-soft rule).
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Backoff between connect retries: 100ms doubling per attempt, capped
+/// at 1s so the status probe stays fail-soft instead of stalling on it.
+fn federation_connect_backoff(failed_attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        100u64
+            .saturating_mul(1u64 << failed_attempt.min(3))
+            .min(1000),
+    )
+}
+
+pub async fn remote_list(
+    base_url: &str,
+    namespace: &str,
+    token: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!(
+        "{}/list?namespace={}",
+        base_url.trim_end_matches('/'),
+        namespace
+    );
+    let client = federation_client();
     // An empty (unset) token must not send a bare `Authorization: Bearer` header.
-    let token = token.trim();
-    let mut req = client.get(&url);
-    if !token.is_empty() {
-        req = req.bearer_auth(token);
+    let token = token.trim().to_string();
+    // Production path: retry connect failures (peer still starting, one
+    // dropped SYN) with backoff. HTTP status and body errors are the
+    // peer's answer, never retried — only a transport that never reached
+    // the peer is worth a second dial.
+    let mut last_err = String::new();
+    for attempt in 0..3u32 {
+        let mut req = client.get(&url);
+        if !token.is_empty() {
+            req = req.bearer_auth(&token);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "federation endpoint returned HTTP {}",
+                        resp.status()
+                    ));
+                }
+                let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                return v
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "remote_list expected JSON array from {base_url}, got non-array"
+                        )
+                    })
+                    .map_err(|e| format!("{:#}", e));
+            }
+            Err(e) if e.is_connect() && attempt < 2 => {
+                last_err = e.to_string();
+                tokio::time::sleep(federation_connect_backoff(attempt)).await;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("federation endpoint returned HTTP {}", resp.status()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    v.as_array()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("remote_list expected JSON array from {base_url}, got non-array"))
-        .map_err(|e| format!("{:#}", e))
+    Err(last_err)
 }
 
 #[cfg(test)]
@@ -28,7 +87,11 @@ mod tests {
 
     #[test]
     fn url_format() {
-        let u = format!("{}/list?namespace={}", "http://x".trim_end_matches('/'), "ns");
+        let u = format!(
+            "{}/list?namespace={}",
+            "http://x".trim_end_matches('/'),
+            "ns"
+        );
         assert_eq!(u, "http://x/list?namespace=ns");
     }
 
@@ -84,8 +147,7 @@ mod tests {
                 "an empty token must omit the Authorization header, got: {request}"
             );
         });
-        let result =
-            remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "   ").await;
+        let result = remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "   ").await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.unwrap()[0]["id"], "m1");
         task.await.unwrap();
@@ -109,8 +171,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.shutdown().await.ok();
         });
-        let result =
-            remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "t").await;
+        let result = remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "t").await;
         let err = result.expect_err("a 404 cannot be a JSON decode path");
         assert!(err.contains("HTTP 404"), "got: {err}");
         task.await.unwrap();
