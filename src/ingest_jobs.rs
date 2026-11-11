@@ -276,8 +276,13 @@ impl IngestJobs {
                 return false;
             }
         };
-        let receivers: Vec<watch::Receiver<IngestProgress>> =
-            self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+        let receivers: Vec<watch::Receiver<IngestProgress>> = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
 
         let all_finished = async move {
             for mut rx in receivers {

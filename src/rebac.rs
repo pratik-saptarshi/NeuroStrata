@@ -50,7 +50,10 @@ pub fn check(predicate: &str, user: &str, resource: &str) -> bool {
 }
 
 /// §5.3 — principal resolution; admin honors client claim, others ignored.
-pub fn resolve_principal(authenticated_principal: &str, client_requested_principal: Option<&str>) -> String {
+pub fn resolve_principal(
+    authenticated_principal: &str,
+    client_requested_principal: Option<&str>,
+) -> String {
     if authenticated_principal == "admin" {
         client_requested_principal
             .filter(|s| !s.trim().is_empty())
@@ -146,7 +149,9 @@ pub fn validate_visible_to(vt: &Value) -> Vec<String> {
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
             if !p_ok {
-                errs.push(format!("visible_to[{idx}].principal must be a non-empty string"));
+                errs.push(format!(
+                    "visible_to[{idx}].principal must be a non-empty string"
+                ));
             }
             if let Some(role) = obj.get("role").and_then(|v| v.as_str()) {
                 if !matches!(role, "viewer" | "editor" | "owner") {
@@ -174,17 +179,29 @@ pub fn extract_resource_owner(user_id: &str, metadata: &Value) -> String {
             return s.to_string();
         }
     }
-    if let Some(s) = metadata.get("mesh").and_then(|v| v.get("created_by")).and_then(|v| v.as_str()) {
+    if let Some(s) = metadata
+        .get("mesh")
+        .and_then(|v| v.get("created_by"))
+        .and_then(|v| v.as_str())
+    {
         if !s.is_empty() {
             return s.to_string();
         }
     }
-    if let Some(s) = metadata.get("lifecycle").and_then(|v| v.get("created_by")).and_then(|v| v.as_str()) {
+    if let Some(s) = metadata
+        .get("lifecycle")
+        .and_then(|v| v.get("created_by"))
+        .and_then(|v| v.as_str())
+    {
         if !s.is_empty() {
             return s.to_string();
         }
     }
-    if let Some(s) = metadata.get("mesh").and_then(|v| v.get("verified_signer_did")).and_then(|v| v.as_str()) {
+    if let Some(s) = metadata
+        .get("mesh")
+        .and_then(|v| v.get("verified_signer_did"))
+        .and_then(|v| v.as_str())
+    {
         if !s.is_empty() {
             return s.to_string();
         }
@@ -275,7 +292,12 @@ mod tests {
 
     #[test]
     fn allowed_restricted_acl_stranger_denied() {
-        assert!(!allowed("bob", "alice", "viewer", &["alice".into(), "charlie".into()]));
+        assert!(!allowed(
+            "bob",
+            "alice",
+            "viewer",
+            &["alice".into(), "charlie".into()]
+        ));
     }
 
     // §5.2 check — exact match, no substring spoofing.
@@ -340,7 +362,10 @@ mod tests {
     #[test]
     fn extract_visible_to_empty_and_array() {
         assert!(extract_visible_to(&serde_json::json!({})).is_empty());
-        assert_eq!(extract_visible_to(&serde_json::json!({"visible_to":["a","b"]})), vec!["a","b"]);
+        assert_eq!(
+            extract_visible_to(&serde_json::json!({"visible_to":["a","b"]})),
+            vec!["a", "b"]
+        );
     }
 
     // §5.6 role-aware ACLs — {principal, role} objects honor their role.
@@ -364,8 +389,14 @@ mod tests {
             "user_id": "alice",
             "visible_to": [{ "principal": "bob", "role": "editor" }]
         });
-        assert!(can_write_memory("bob", "alice", &meta), "editor entry grants editor");
-        assert!(can_read_memory("bob", "alice", &meta), "editor entry grants viewer");
+        assert!(
+            can_write_memory("bob", "alice", &meta),
+            "editor entry grants editor"
+        );
+        assert!(
+            can_read_memory("bob", "alice", &meta),
+            "editor entry grants viewer"
+        );
         assert!(
             !allowed_with_roles("bob", "alice", "owner", &extract_acl_with_roles(&meta)),
             "editor entry must NOT grant owner"
@@ -377,9 +408,24 @@ mod tests {
         let meta = serde_json::json!({
             "visible_to": [{ "principal": "*", "role": "editor" }]
         });
-        assert!(allowed_with_roles("stranger", "alice", "editor", &extract_acl_with_roles(&meta)));
-        assert!(allowed_with_roles("stranger", "alice", "viewer", &extract_acl_with_roles(&meta)));
-        assert!(!allowed_with_roles("stranger", "alice", "owner", &extract_acl_with_roles(&meta)));
+        assert!(allowed_with_roles(
+            "stranger",
+            "alice",
+            "editor",
+            &extract_acl_with_roles(&meta)
+        ));
+        assert!(allowed_with_roles(
+            "stranger",
+            "alice",
+            "viewer",
+            &extract_acl_with_roles(&meta)
+        ));
+        assert!(!allowed_with_roles(
+            "stranger",
+            "alice",
+            "owner",
+            &extract_acl_with_roles(&meta)
+        ));
     }
 
     #[test]
@@ -387,8 +433,14 @@ mod tests {
         assert!(!is_restricted(&serde_json::json!({"visible_to":[]})));
         assert!(is_restricted(&serde_json::json!({"visible_to":["alice"]})));
         assert!(!is_restricted(&serde_json::json!({"visible_to":["*"]})));
-        assert!(can_publish_to_mesh(&serde_json::json!({"visible_to":["alice"]}), &["alice".into()]));
-        assert!(can_publish_to_mesh(&serde_json::json!({"visible_to":["*"]}), &[]));
+        assert!(can_publish_to_mesh(
+            &serde_json::json!({"visible_to":["alice"]}),
+            &["alice".into()]
+        ));
+        assert!(can_publish_to_mesh(
+            &serde_json::json!({"visible_to":["*"]}),
+            &[]
+        ));
     }
 
     // §5.6 fail-closed — a non-empty visible_to array whose every element is
@@ -402,7 +454,12 @@ mod tests {
             extract_acl_with_roles(&meta),
             vec![("__invalid_acl__".to_string(), "viewer".to_string())]
         );
-        assert!(!allowed("bob", "alice", "viewer", &extract_visible_to(&meta)));
+        assert!(!allowed(
+            "bob",
+            "alice",
+            "viewer",
+            &extract_visible_to(&meta)
+        ));
         assert!(!can_read_memory("bob", "alice", &meta));
         // Malformed elements paired with a valid one still parse the valid one.
         let mixed = serde_json::json!({"user_id":"alice","visible_to":[42,"bob"]});
