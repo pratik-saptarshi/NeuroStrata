@@ -97,7 +97,7 @@ tree-sitter-java = "0.23.5"
 regex = "1.13"
 tempfile = "3.14"
 cxx = "=1.0.195"
-lbug = "0.20.4"
+lbug = "0.22.1"
 arc-swap = "1"
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "blocking"] }
