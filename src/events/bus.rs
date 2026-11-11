@@ -7,7 +7,6 @@
 //! order, each under a 250ms timeout, each panic caught at the dispatcher join
 //! point. Nothing a subscriber does can reach back into the caller's write.
 
-use std::path::PathBuf;
 use super::outbox::{EventClass, EventOutbox, OutboxError};
 use super::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
@@ -21,6 +20,7 @@ use futures::FutureExt;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
@@ -339,9 +339,7 @@ impl ThalamicBus {
     pub fn attach_event_outbox(&self, dir: impl Into<PathBuf>) {
         let dir = dir.into();
         if self.outbox().is_some() {
-            self.metrics
-                .outbox_attached
-                .store(true, Ordering::Relaxed);
+            self.metrics.outbox_attached.store(true, Ordering::Relaxed);
             self.metrics
                 .outbox_attach_failed
                 .store(false, Ordering::Relaxed);
@@ -353,9 +351,7 @@ impl ThalamicBus {
         let outbox = match EventOutbox::open(&dir) {
             Ok(outbox) => Arc::new(outbox),
             Err(err) => {
-                self.metrics
-                    .outbox_attached
-                    .store(false, Ordering::Relaxed);
+                self.metrics.outbox_attached.store(false, Ordering::Relaxed);
                 self.metrics
                     .outbox_attach_failed
                     .store(true, Ordering::Relaxed);
@@ -369,9 +365,7 @@ impl ThalamicBus {
         {
             let mut slot = self.outbox.lock().expect("outbox slot lock poisoned");
             if slot.is_some() {
-                self.metrics
-                    .outbox_attached
-                    .store(true, Ordering::Relaxed);
+                self.metrics.outbox_attached.store(true, Ordering::Relaxed);
                 self.metrics
                     .outbox_attach_failed
                     .store(false, Ordering::Relaxed);
@@ -382,9 +376,7 @@ impl ThalamicBus {
             }
             *slot = Some(outbox.clone());
         }
-        self.metrics
-            .outbox_attached
-            .store(true, Ordering::Relaxed);
+        self.metrics.outbox_attached.store(true, Ordering::Relaxed);
         self.metrics
             .outbox_attach_failed
             .store(false, Ordering::Relaxed);
@@ -445,10 +437,7 @@ impl ThalamicBus {
     /// succeeded, so the queued pulse can tell the dispatcher which class
     /// subscribers the delivery workers now own; a class absent from the
     /// list retains ordinary queue delivery as its fallback.
-    fn append_qualified(
-        &self,
-        event: &ThalamicPulse,
-    ) -> (Vec<EventClass>, Option<OutboxError>) {
+    fn append_qualified(&self, event: &ThalamicPulse) -> (Vec<EventClass>, Option<OutboxError>) {
         let classes = self.qualified_classes(event);
         if classes.is_empty() {
             return (Vec::new(), None);
@@ -620,15 +609,9 @@ impl ThalamicBus {
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
             subscriber_timeouts: self.metrics.subscriber_timeouts.load(Ordering::Relaxed),
             recursion_blocks: self.metrics.recursion_blocks.load(Ordering::Relaxed),
-            outbox_append_failures: self
-                .metrics
-                .outbox_append_failures
-                .load(Ordering::Relaxed),
+            outbox_append_failures: self.metrics.outbox_append_failures.load(Ordering::Relaxed),
             outbox_attached: self.metrics.outbox_attached.load(Ordering::Relaxed),
-            outbox_attach_failed: self
-                .metrics
-                .outbox_attach_failed
-                .load(Ordering::Relaxed),
+            outbox_attach_failed: self.metrics.outbox_attach_failed.load(Ordering::Relaxed),
             subscriber_failures: self.metrics.subscriber_failures.load(Ordering::Relaxed),
         }
     }
@@ -743,16 +726,11 @@ async fn dispatch(
         // failed append leaves no outbox entry, so the subscriber keeps
         // this ordinary queue delivery as the event's fallback. Every
         // other subscriber still sees the pulse here, exactly as before.
-        let durable = outbox
-            .lock()
-            .expect("outbox slot lock poisoned")
-            .is_some();
+        let durable = outbox.lock().expect("outbox slot lock poisoned").is_some();
         for sub in registered.iter() {
             if durable {
                 if let Some(class) = EventClass::class_of_subscriber(sub.name()) {
-                    if class.interested_in(&event)
-                        && appended_classes.contains(&class)
-                    {
+                    if class.interested_in(&event) && appended_classes.contains(&class) {
                         continue;
                     }
                 }
@@ -837,8 +815,7 @@ async fn delivery_worker(
             // poll is a backstop — a missed wakeup delays a delivery by
             // at most the poll interval, and can never lose one, because
             // the entry is durable and the loop re-reads `pending`.
-            let _ =
-                tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
             continue;
         };
         let targets: Vec<Arc<dyn MemorySubscriber>> = subs
@@ -853,8 +830,7 @@ async fn delivery_worker(
             // mesh is not wired, say, though a previous run appended
             // entries for it). The entries stay unacknowledged: wedging
             // is honest and visible, dropping them would be loss.
-            let _ =
-                tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
             continue;
         }
         if deliver_entry(&entry, &targets, &store, &metrics, &bp_tx).await {
@@ -912,10 +888,7 @@ async fn deliver_entry(
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    subscriber = sub.name(),
-                    "outbox delivery failed: {err:#}"
-                );
+                tracing::warn!(subscriber = sub.name(), "outbox delivery failed: {err:#}");
                 all_ok = false;
             }
             Err(payload) => {
@@ -1385,11 +1358,11 @@ mod tests {
         }
     }
 
-impl crate::traits::AsAny for RecordingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    impl crate::traits::AsAny for RecordingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
-}
 
     /// Calls `ctx.store.get` once per pulse and records the outcome: the
     /// observable difference between an attached store and the stand-in.
@@ -1708,9 +1681,7 @@ impl crate::traits::AsAny for RecordingStore {
                 "guard_event_log" => {
                     matches!(event, ThalamicPulse::GuardedActionFired { .. })
                 }
-                "mesh_outbox" => {
-                    !matches!(event, ThalamicPulse::GuardedActionFired { .. })
-                }
+                "mesh_outbox" => !matches!(event, ThalamicPulse::GuardedActionFired { .. }),
                 _ => true,
             };
             if !interested {
@@ -1838,7 +1809,10 @@ impl crate::traits::AsAny for RecordingStore {
             )
             .expect("a throwaway store opens"),
         );
-        store.init("audit-ns").await.expect("the namespace table exists");
+        store
+            .init("audit-ns")
+            .await
+            .expect("the namespace table exists");
 
         let bus = ThalamicBus::new(2);
         bus.attach_store(store.clone());
@@ -1853,7 +1827,10 @@ impl crate::traits::AsAny for RecordingStore {
 
         bus.emit(created("c0", "audit-ns"), &RecursionToken::root());
         for i in 1..=5 {
-            bus.emit(guarded(&format!("t{i}"), "audit-ns"), &RecursionToken::root());
+            bus.emit(
+                guarded(&format!("t{i}"), "audit-ns"),
+                &RecursionToken::root(),
+            );
         }
 
         // The queue could only hold two of the five audit pulses and
@@ -2206,7 +2183,10 @@ impl crate::traits::AsAny for RecordingStore {
 
         let _ = std::fs::remove_file(dir.join("event-outbox.jsonl"));
         std::fs::create_dir_all(dir.join("event-outbox.jsonl")).unwrap();
-        bus.emit(guarded("fallback-trace", "audit-ns"), &RecursionToken::root());
+        bus.emit(
+            guarded("fallback-trace", "audit-ns"),
+            &RecursionToken::root(),
+        );
         assert_eq!(
             bus.metrics().outbox_append_failures,
             1,
@@ -2478,8 +2458,7 @@ impl crate::traits::AsAny for RecordingStore {
             items: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
         });
-        let subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>> = Arc::new(Mutex::new(Vec::new()));
         poison(&subs);
         let metrics = Arc::new(AtomicMetrics::default());
         let (bp_tx, _) = watch::channel(BackpressureEvent::Idle);

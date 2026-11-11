@@ -340,28 +340,38 @@ impl ContextPlan {
     }
 }
 
-
 impl AsRef<ContextRequest> for ContextRequest {
-    fn as_ref(&self) -> &Self { self }
+    fn as_ref(&self) -> &Self {
+        self
+    }
 }
 impl AsRef<ContextPlan> for ContextPlan {
-    fn as_ref(&self) -> &Self { self }
+    fn as_ref(&self) -> &Self {
+        self
+    }
 }
-
-
 
 impl EgressPolicy {
     pub fn allow() -> Self {
-        Self { allowed: true, reason: None }
+        Self {
+            allowed: true,
+            reason: None,
+        }
     }
     pub fn deny(reason: impl Into<String>) -> Self {
-        Self { allowed: false, reason: Some(reason.into()) }
+        Self {
+            allowed: false,
+            reason: Some(reason.into()),
+        }
     }
     pub fn enforce(&self) -> Result<(), String> {
         if self.allowed {
             Ok(())
         } else {
-            Err(self.reason.clone().unwrap_or_else(|| "egress denied".into()))
+            Err(self
+                .reason
+                .clone()
+                .unwrap_or_else(|| "egress denied".into()))
         }
     }
 }

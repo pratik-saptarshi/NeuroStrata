@@ -339,8 +339,7 @@ enum ModelClass {
 fn model_class(model_name: &str) -> ModelClass {
     if model_name.starts_with("BGESmall") || model_name.starts_with("BGEBase") {
         ModelClass::Small
-    } else if model_name.starts_with("NomicEmbed")
-        || model_name.starts_with("MultilingualE5Large")
+    } else if model_name.starts_with("NomicEmbed") || model_name.starts_with("MultilingualE5Large")
     {
         ModelClass::Large
     } else {
@@ -618,10 +617,7 @@ fn collect_artifact_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Res
             let rel = path
                 .strip_prefix(root)
                 .map_err(|_| {
-                    anyhow::anyhow!(
-                        "model cache walk escaped its root at {}",
-                        path.display()
-                    )
+                    anyhow::anyhow!("model cache walk escaped its root at {}", path.display())
                 })?
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -694,7 +690,10 @@ fn enforce_artifact_pin(
 /// `models--<org>--<repo>/snapshots/<revision>`, the revision named by
 /// `refs/main`. None when the model has not been downloaded yet.
 fn model_snapshot_dir(cache_root: &Path, model: &EmbeddingModel) -> Option<PathBuf> {
-    let code = TextEmbedding::get_model_info(model).ok()?.model_code.clone();
+    let code = TextEmbedding::get_model_info(model)
+        .ok()?
+        .model_code
+        .clone();
     let repo_dir = cache_root.join(format!("models--{}", code.replace('/', "--")));
     let snapshots = repo_dir.join("snapshots");
     if let Ok(revision) = fs::read_to_string(repo_dir.join("refs").join("main")) {
@@ -854,11 +853,7 @@ impl<T> IdleSession<T> {
         self.with_session_at(Instant::now(), f)
     }
 
-    fn with_session_at<R>(
-        &self,
-        now: Instant,
-        f: impl FnOnce(&mut T) -> Result<R>,
-    ) -> Result<R> {
+    fn with_session_at<R>(&self, now: Instant, f: impl FnOnce(&mut T) -> Result<R>) -> Result<R> {
         let mut state = self
             .state
             .lock()
@@ -914,19 +909,19 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
     let config_path = config_dir.join("embedders.json");
 
     // Default list if file doesn't exist or is empty
-    let default_models = vec![
-        AcceptableEmbedder {
-            model_name: "NomicEmbedTextV15".to_string(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
-            model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
-            generated_by: None,
-            artifact_pin: None,
-        },
-    ];
+    let default_models = vec![AcceptableEmbedder {
+        model_name: "NomicEmbedTextV15".to_string(),
+        dimensions: 768,
+        base_url: None,
+        api_key_env: None,
+        api_model: None,
+        // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
+        model_sha256: Some(
+            "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string(),
+        ),
+        generated_by: None,
+        artifact_pin: None,
+    }];
 
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
@@ -975,7 +970,6 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
     Ok(default_models)
 }
 
-
 /// The model this process is configured to use: the one NEUROSTRATA_MODEL names
 /// when it is acceptable, otherwise the first acceptable entry.
 
@@ -987,10 +981,13 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
 
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 
-
 /// Verify a model file's SHA-256 checksum against a pinned value.
 /// Returns `Err` on mismatch or when no model file can be found (fail-closed).
-pub fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
+pub fn verify_model_checksum(
+    cache_dir: &PathBuf,
+    model_name: &str,
+    pinned_sha: &str,
+) -> Result<()> {
     // Collect candidate model files. Check the flat cache layout first, then
     // walk the fastembed/HuggingFace snapshot layout (models--X/snapshots/*/onnx/model.onnx).
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -1085,7 +1082,10 @@ fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_d
             }
         }
         Err(e) => {
-            tracing::warn!("collect_onnx_files: read_dir({}) failed: {e}", dir.display());
+            tracing::warn!(
+                "collect_onnx_files: read_dir({}) failed: {e}",
+                dir.display()
+            );
         }
     }
 }
@@ -1386,9 +1386,7 @@ impl RemoteEmbedder {
                         continue;
                     }
                     if let Some(s) = e.downcast_ref::<StatusError>() {
-                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
-                            || s.0.is_server_error()
-                        {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS || s.0.is_server_error() {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -1439,7 +1437,6 @@ impl RemoteEmbedder {
             }));
         }
 
-
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -1464,9 +1461,9 @@ impl RemoteEmbedder {
         }
         let mut embedding = Vec::with_capacity(arr.len());
         for v in arr {
-            let val = v
-                .as_f64()
-                .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+            let val = v.as_f64().ok_or_else(|| {
+                anyhow!("remote embedding contained non-finite or non-numeric value")
+            })?;
             if !val.is_finite() {
                 anyhow::bail!("remote embedding contained non-finite or non-numeric value");
             }
@@ -1669,11 +1666,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let req = read_http_request(&mut sock).await;
-            assert!(
-                req.contains("POST /embeddings"),
-                "request: {}",
-                req
-            );
+            assert!(req.contains("POST /embeddings"), "request: {}", req);
             assert!(
                 req.to_ascii_lowercase()
                     .contains("authorization: bearer test-key"),
@@ -1718,8 +1711,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut sock, _) = listener.accept().await.expect("accept");
                 let _ = read_http_request(&mut sock).await;
-                let body =
-                    format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
+                let body = format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1788,7 +1780,10 @@ mod tests {
         let v = embedder.embed("retry me").await.unwrap();
         assert_eq!(v, vec![1.0f32, 2.0, 3.0, 4.0]);
         let handled = server.await.unwrap();
-        assert_eq!(handled, 2, "server must see both the failed and the retried attempt");
+        assert_eq!(
+            handled, 2,
+            "server must see both the failed and the retried attempt"
+        );
     }
 
     #[test]
@@ -2129,17 +2124,41 @@ mod tests {
         )] = &[
             // No profile: today's behavior at every file state.
             (None, Absent, None, "NomicEmbedTextV15", AutoGeneratedFile),
-            (None, AutoGenerated, None, "NomicEmbedTextV15", AutoGeneratedFile),
+            (
+                None,
+                AutoGenerated,
+                None,
+                "NomicEmbedTextV15",
+                AutoGeneratedFile,
+            ),
             (None, UserEdited, None, "BGEBaseENV15", UserEditedFile),
             // The case v1 got wrong: auto-generated file + profile=low
             // resolves the small model, directly, even though
             // BGESmallENV15Q is not an entry in the default list.
             (None, Absent, Some("low"), "BGESmallENV15Q", Profile),
             (None, AutoGenerated, Some("low"), "BGESmallENV15Q", Profile),
-            (None, AutoGenerated, Some("standard"), "NomicEmbedTextV15", Profile),
+            (
+                None,
+                AutoGenerated,
+                Some("standard"),
+                "NomicEmbedTextV15",
+                Profile,
+            ),
             // A user-edited file is an explicit choice and beats the profile.
-            (None, UserEdited, Some("low"), "BGEBaseENV15", UserEditedFile),
-            (None, UserEdited, Some("standard"), "BGEBaseENV15", UserEditedFile),
+            (
+                None,
+                UserEdited,
+                Some("low"),
+                "BGEBaseENV15",
+                UserEditedFile,
+            ),
+            (
+                None,
+                UserEdited,
+                Some("standard"),
+                "BGEBaseENV15",
+                UserEditedFile,
+            ),
             // The env var beats every layer below it, case-insensitively.
             (
                 Some("nomicembedtextv15"),
@@ -2148,7 +2167,13 @@ mod tests {
                 "NomicEmbedTextV15",
                 Environment,
             ),
-            (Some("BGEBaseENV15"), Absent, Some("low"), "BGEBaseENV15", Environment),
+            (
+                Some("BGEBaseENV15"),
+                Absent,
+                Some("low"),
+                "BGEBaseENV15",
+                Environment,
+            ),
             (
                 Some("NomicEmbedTextV15"),
                 UserEdited,
@@ -2701,11 +2726,8 @@ mod tests {
     /// fastembed snapshot carries, with stand-in bytes. The pin machinery
     /// operates on file bytes, so no model download is needed.
     fn synthetic_model_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "neurostrata-t9-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("neurostrata-t9-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, bytes) in [
@@ -2716,10 +2738,7 @@ mod tests {
                 "tokenizer_config.json",
                 &b"{\"tokenizer_class\":\"BertTokenizer\"}"[..],
             ),
-            (
-                "special_tokens_map.json",
-                &b"{\"unk_token\":\"[UNK]\"}"[..],
-            ),
+            ("special_tokens_map.json", &b"{\"unk_token\":\"[UNK]\"}"[..]),
         ] {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
@@ -2775,7 +2794,10 @@ mod tests {
         let err = resolve_embedding_model("DefinitelyNotAModel")
             .expect_err("an unknown model name must refuse, not fall back")
             .to_string();
-        assert!(err.contains("DefinitelyNotAModel"), "names the request: {err}");
+        assert!(
+            err.contains("DefinitelyNotAModel"),
+            "names the request: {err}"
+        );
         assert!(
             err.contains("NomicEmbedTextV15"),
             "names the acceptable list: {err}"
@@ -2865,8 +2887,7 @@ mod tests {
     #[test]
     fn unpinned_model_loads_and_records_hash() {
         let dir = synthetic_model_dir("unpinned");
-        enforce_artifact_pin(&dir, None, "SyntheticModel")
-            .expect("an unpinned model loads");
+        enforce_artifact_pin(&dir, None, "SyntheticModel").expect("an unpinned model loads");
         let candidate = dir.join("PIN-CANDIDATE");
         assert!(candidate.exists(), "the adoption record is written");
         let recorded = std::fs::read_to_string(&candidate).unwrap();
@@ -2880,10 +2901,9 @@ mod tests {
     fn embedders_json_pin_field_is_optional() {
         // Zero-change pin: existing embedders.json files (no artifact_pin)
         // parse unchanged, and a present pin round-trips.
-        let without: Vec<AcceptableEmbedder> = serde_json::from_str(
-            r#"[{"model_name":"NomicEmbedTextV15","dimensions":768}]"#,
-        )
-        .unwrap();
+        let without: Vec<AcceptableEmbedder> =
+            serde_json::from_str(r#"[{"model_name":"NomicEmbedTextV15","dimensions":768}]"#)
+                .unwrap();
         assert!(without[0].artifact_pin.is_none());
         let with: Vec<AcceptableEmbedder> = serde_json::from_str(
             r#"[{"model_name":"NomicEmbedTextV15","dimensions":768,"artifact_pin":"abc123"}]"#,

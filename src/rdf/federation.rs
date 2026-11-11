@@ -116,7 +116,11 @@ fn collect_service_endpoints(
     out: &mut Vec<(String, bool)>,
 ) -> Result<(), FederationError> {
     match pattern {
-        GraphPattern::Service { name, inner, silent } => {
+        GraphPattern::Service {
+            name,
+            inner,
+            silent,
+        } => {
             // Check nested SERVICE inside inner.
             if contains_service(inner) {
                 return Err(FederationError::NestedServiceDenied);
@@ -203,7 +207,10 @@ pub async fn project_federated_sparql_dataset_async(
     let search_results = match store.list_memories(namespace, None, None).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("federation dataset load failed for namespace '{}': {e}", namespace);
+            tracing::warn!(
+                "federation dataset load failed for namespace '{}': {e}",
+                namespace
+            );
             return (dataset, false);
         }
     };
@@ -261,7 +268,11 @@ pub async fn project_federated_sparql_dataset_async(
         }
 
         // Archived
-        if meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if meta
+            .get("archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -367,9 +378,7 @@ pub async fn handle_remote_sparql_request(
             if let Ok(expected) = std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN") {
                 let expected = expected.trim();
                 if !expected.is_empty() && token != expected {
-                    return Err(FederationError::Denied(
-                        "invalid Bearer token".into(),
-                    ));
+                    return Err(FederationError::Denied("invalid Bearer token".into()));
                 }
             }
         }
@@ -451,7 +460,8 @@ pub async fn handle_remote_sparql_request(
             body = serde_json::json!({
                 "head": { "vars": var_names },
                 "results": { "bindings": bindings }
-            }).to_string();
+            })
+            .to_string();
         }
         spareval::QueryResults::Boolean(b) => {
             body = format!(r#"{{"head":{{"vars":[]}},"boolean":{}}}"#, b);
@@ -543,11 +553,10 @@ impl HttpServiceHandler {
         base_iri: Option<&oxiri::Iri<String>>,
     ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
         let endpoint_str = service_name.as_str();
-        let peer = self
-            .config
-            .service_peers
-            .iter()
-            .find(|p| p.endpoint_url.trim_end_matches('/') == endpoint_str.trim_end_matches('/'));
+        let peer =
+            self.config.service_peers.iter().find(|p| {
+                p.endpoint_url.trim_end_matches('/') == endpoint_str.trim_end_matches('/')
+            });
         let peer = match peer {
             Some(p) => p,
             None => {
@@ -599,7 +608,8 @@ impl HttpServiceHandler {
         let body_bytes = resp
             .bytes()
             .map_err(|e| FederationError::Network(format!("{}", e)))?;
-        let parser = sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
+        let parser =
+            sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
         let output = parser
             .for_slice(&body_bytes)
             .map_err(|e| FederationError::Parse(format!("{}", e)))?;
@@ -607,8 +617,9 @@ impl HttpServiceHandler {
             sparesults::SliceQueryResultsParserOutput::Solutions(sol_parser) => {
                 let variables: std::sync::Arc<[oxrdf::Variable]> =
                     sol_parser.variables().to_vec().into();
-                let mut collected: Vec<Result<sparesults::QuerySolution, spareval::QueryEvaluationError>> =
-                    Vec::new();
+                let mut collected: Vec<
+                    Result<sparesults::QuerySolution, spareval::QueryEvaluationError>,
+                > = Vec::new();
                 for item in sol_parser {
                     match item {
                         Ok(sol) => collected.push(Ok(sol)),
@@ -624,7 +635,10 @@ impl HttpServiceHandler {
             }
             sparesults::SliceQueryResultsParserOutput::Boolean(_) => {
                 let variables: std::sync::Arc<[oxrdf::Variable]> = std::sync::Arc::new([]);
-                Ok(spareval::QuerySolutionIter::new(variables, std::iter::empty()))
+                Ok(spareval::QuerySolutionIter::new(
+                    variables,
+                    std::iter::empty(),
+                ))
             }
         }
     }
@@ -652,9 +666,7 @@ mod tests {
     #[test]
     fn inspect_service_clauses_nested_rejected() {
         let query = SparqlParser::new()
-            .parse_query(
-                "SELECT * WHERE { SERVICE <http://a/> { SERVICE <http://b/> {} } }",
-            )
+            .parse_query("SELECT * WHERE { SERVICE <http://a/> { SERVICE <http://b/> {} } }")
             .unwrap();
         let res = inspect_service_clauses(&query);
         assert!(matches!(res, Err(FederationError::NestedServiceDenied)));
@@ -665,8 +677,12 @@ mod tests {
         assert!(contains_custom_neurostrata_function(
             "SELECT * WHERE { ?s <urn:neurostrata:ns#salience> ?v }"
         ));
-        assert!(contains_custom_neurostrata_function("SELECT * WHERE { ?s ns:salience ?v }"));
-        assert!(!contains_custom_neurostrata_function("SELECT * WHERE { ?s ?p ?o }"));
+        assert!(contains_custom_neurostrata_function(
+            "SELECT * WHERE { ?s ns:salience ?v }"
+        ));
+        assert!(!contains_custom_neurostrata_function(
+            "SELECT * WHERE { ?s ?p ?o }"
+        ));
     }
 
     // T1 oracle 7 — A2: a shareable row whose visible_to carries the
@@ -675,12 +691,9 @@ mod tests {
     #[tokio::test]
     async fn federation_dataset_projects_object_wildcard_shareable_row() {
         use crate::traits::VectorStore;
-        let dir = std::env::temp_dir().join(format!(
-            "ns-federation-a2-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
-            .expect("open temp database");
+        let dir = std::env::temp_dir().join(format!("ns-federation-a2-{}", uuid::Uuid::new_v4()));
+        let store =
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
         for (id, metadata) in [
             (
@@ -714,10 +727,7 @@ mod tests {
         }
         let (dataset, _truncated) =
             project_federated_sparql_dataset_async("probe", &store, 250_000).await;
-        let subjects: Vec<String> = dataset
-            .iter()
-            .map(|q| q.subject.to_string())
-            .collect();
+        let subjects: Vec<String> = dataset.iter().map(|q| q.subject.to_string()).collect();
         assert!(
             subjects.iter().any(|s| s.contains("wildcard-shareable")),
             "object-wildcard shareable row must be projected, subjects: {subjects:?}"

@@ -25,10 +25,10 @@ use super::outbox::{
     is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED,
 };
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, RdfBlock, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
-use crate::rdf::build_mesh_canonical_nquads;
 use super::storage::MeshStorage;
+use crate::rdf::build_mesh_canonical_nquads;
 
 /// What one drain did. Fielded so the daemon's loop can log it and the tests
 /// can assert on it without parsing a sentence.
@@ -185,7 +185,6 @@ pub async fn drain_once(
 
     Ok(report)
 }
-
 
 /// Fixed probe payload for the signing-key gate in [`apply_one`]: the
 /// gate signs exactly this with the gated keypair through
@@ -362,7 +361,10 @@ fn apply_one(
     // mesh files bounded and reviewable.
     let serialized = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
     if serialized.len() > 1_048_576 {
-        return Err(format!("mesh record exceeds 1 MiB size cap ({} bytes)", serialized.len()));
+        return Err(format!(
+            "mesh record exceeds 1 MiB size cap ({} bytes)",
+            serialized.len()
+        ));
     }
     write_record(&path, &record)?;
 
@@ -371,9 +373,10 @@ fn apply_one(
     // serialization next to the record file. Fail-soft.
     if let Some(ref rdf_block) = record.rdf {
         if std::env::var("NEUROSTRATA_MESH_RDF_PATCH").is_ok() {
-            if let Ok(stream) =
-                crate::streaming::Stream::from_nquads(&rdf_block.quads, crate::streaming::PatchOp::Add)
-            {
+            if let Ok(stream) = crate::streaming::Stream::from_nquads(
+                &rdf_block.quads,
+                crate::streaming::PatchOp::Add,
+            ) {
                 if !stream.is_empty() {
                     let patch_path = path.with_extension("rdfpatch");
                     match std::fs::write(&patch_path, stream.to_patch()) {
@@ -450,8 +453,15 @@ fn build_record(
     // Extract curated metadata
     let eligibility = entry.metadata.get("eligibility").and_then(|v| v.as_str());
     let source = entry.metadata.get("source").and_then(|v| v.as_str());
-    let tags: Vec<String> = entry.metadata.get("tags").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let tags: Vec<String> = entry
+        .metadata
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let concept_iri = entry.metadata.get("concept_iri").and_then(|v| v.as_str());
 
@@ -459,17 +469,27 @@ fn build_record(
     // further borrow; the def is dropped at the end of its if-block).
     let (trigger, initial_fires, valid_to, rehearsal_script) = if entry.memory_type == "procedure" {
         let def = procedure_definition(entry);
-        let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+        let trig = def
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
-        let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
-        let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+        let vt = def
+            .get("valid_to")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let rs = def
+            .get("rehearsal_script")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         (trig, fires, vt, rs)
     } else {
         (None, None, None, None)
     };
 
     // Build relationships vec for RDF
-    let rdf_relationships: Vec<(String, String)> = relationships.iter()
+    let rdf_relationships: Vec<(String, String)> = relationships
+        .iter()
         .map(|r| (r.kind.clone(), r.target.to_string()))
         .collect();
 
@@ -552,7 +572,6 @@ fn build_record(
     }
 }
 
-
 /// Sign a [`MeshRecord`] in place using the Ed25519 keypair at `key_path`.
 ///
 /// Test-only since the seal moved: [`apply_one`] signs with the keypair
@@ -625,8 +644,16 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
     let state_str = format!("{:?}", record.lifecycle.state).to_lowercase();
     let created_at_str = record.lifecycle.created_at.to_rfc3339();
     let created_by = &record.lifecycle.created_by;
-    let superseded_by_str = record.lifecycle.superseded_by.as_ref().map(|u| u.to_string());
-    let archived_at_str = record.lifecycle.archived_at.as_ref().map(|dt| dt.to_rfc3339());
+    let superseded_by_str = record
+        .lifecycle
+        .superseded_by
+        .as_ref()
+        .map(|u| u.to_string());
+    let archived_at_str = record
+        .lifecycle
+        .archived_at
+        .as_ref()
+        .map(|dt| dt.to_rfc3339());
     // Tombstone the update stamp for an archive: the archive op IS the
     // tombstoning event (the update timestamp), and an already-present
     // tombstone wins.
@@ -646,35 +673,73 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
     };
     let eligibility = record.metadata.get("eligibility").and_then(|v| v.as_str());
     let source = record.metadata.get("source").and_then(|v| v.as_str());
-    let tags: Vec<String> = record.metadata.get("tags").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let tags: Vec<String> = record
+        .metadata
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let concept_iri = record.metadata.get("concept_iri").and_then(|v| v.as_str());
-    let rdf_relationships: Vec<(String, String)> = record.relationships.iter()
+    let rdf_relationships: Vec<(String, String)> = record
+        .relationships
+        .iter()
         .map(|r| (r.kind.clone(), r.target.to_string()))
         .collect();
     let update_id_str = record.update_id.to_string();
     let epoch = record.origin_mesh_epoch;
     let trust_val = format!("{:?}", record.trust).to_lowercase();
     // Procedure fields: read from content definition if procedure
-    let (trigger, initial_fires, valid_to, rehearsal_script) = if record.memory_type == "procedure" {
+    let (trigger, initial_fires, valid_to, rehearsal_script) = if record.memory_type == "procedure"
+    {
         if let Some(def) = record.content.as_object() {
-            let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+            let trig = def
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
-            let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
-            let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+            let vt = def
+                .get("valid_to")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let rs = def
+                .get("rehearsal_script")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             (trig, fires, vt, rs)
-        } else { (None, None, None, None) }
-    } else { (None, None, None, None) };
+        } else {
+            (None, None, None, None)
+        }
+    } else {
+        (None, None, None, None)
+    };
 
     let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-        &id_str, namespace, memory_type, &state_str,
-        &created_at_str, created_by,
+        &id_str,
+        namespace,
+        memory_type,
+        &state_str,
+        &created_at_str,
+        created_by,
         superseded_by_str.as_deref(),
-        archived_at_str.as_deref(), tombstoned_at_str.as_deref(),
-        &content_str, eligibility, source, &tags, concept_iri,
-        &rdf_relationships, &update_id_str, epoch, &trust_val,
-        trigger.as_deref(), initial_fires, valid_to.as_deref(), rehearsal_script.as_deref(),
+        archived_at_str.as_deref(),
+        tombstoned_at_str.as_deref(),
+        &content_str,
+        eligibility,
+        source,
+        &tags,
+        concept_iri,
+        &rdf_relationships,
+        &update_id_str,
+        epoch,
+        &trust_val,
+        trigger.as_deref(),
+        initial_fires,
+        valid_to.as_deref(),
+        rehearsal_script.as_deref(),
     );
     Some(RdfBlock {
         // The rebuilt block retains the existing block's schema/format
@@ -737,7 +802,10 @@ fn trust_from(metadata: &Value) -> Trust {
 
 fn created_at(entry: &OutboxEntry) -> DateTime<Utc> {
     DateTime::from_timestamp(entry.ts, 0).unwrap_or_else(|| {
-        tracing::warn!("invalid outbox entry timestamp {}; falling back to Utc::now()", entry.ts);
+        tracing::warn!(
+            "invalid outbox entry timestamp {}; falling back to Utc::now()",
+            entry.ts
+        );
         Utc::now()
     })
 }
@@ -948,9 +1016,7 @@ mod tests {
 
     impl BundleEnvGuard {
         fn new() -> Self {
-            let lock = BUNDLE_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let lock = BUNDLE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let prior = std::env::var_os("NEUROSTRATA_MESH_BUNDLE_ZSTD");
             std::env::set_var("NEUROSTRATA_MESH_BUNDLE_ZSTD", "1");
             Self { _lock: lock, prior }
@@ -960,9 +1026,7 @@ mod tests {
     impl Drop for BundleEnvGuard {
         fn drop(&mut self) {
             match &self.prior {
-                Some(value) => {
-                    std::env::set_var("NEUROSTRATA_MESH_BUNDLE_ZSTD", value)
-                }
+                Some(value) => std::env::set_var("NEUROSTRATA_MESH_BUNDLE_ZSTD", value),
                 None => std::env::remove_var("NEUROSTRATA_MESH_BUNDLE_ZSTD"),
             }
         }
@@ -1000,7 +1064,9 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("epoch migration", "node-fixture").await.unwrap();
+        mesh.commit_all("epoch migration", "node-fixture")
+            .await
+            .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
 
@@ -1037,7 +1103,6 @@ mod tests {
         assert_eq!(record.origin_mesh_epoch, 1);
         assert_eq!(record.trust, Trust::Trusted);
     }
-
 
     #[tokio::test]
     async fn a_second_drain_is_a_no_op() {
@@ -1106,7 +1171,6 @@ mod tests {
         assert_eq!(git_count(mesh.root()), 1, "no duplicate commit");
     }
 
-
     #[tokio::test]
     async fn a_batch_produces_one_git_commit() {
         let (mesh, outbox) = fixture("batch", None).await;
@@ -1128,7 +1192,6 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("synaptic-mesh: 3 record(s)"));
     }
-
 
     #[tokio::test]
     async fn a_foreign_origin_row_is_skipped_never_re_exported() {
@@ -1220,13 +1283,13 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn an_unreachable_remote_does_not_stop_the_drain() {
         let (mesh, outbox) = fixture(
             "unreachable",
             Some("https://unreachable.invalid/team/mesh.git"),
-        ).await;
+        )
+        .await;
         let id = Uuid::new_v4();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
@@ -1242,7 +1305,6 @@ mod tests {
             .join(format!("{id}.json"));
         assert!(path.exists());
     }
-
 
     #[tokio::test]
     async fn eligibility_absenting_or_private_is_not_published_shareable_is() {
@@ -1281,7 +1343,6 @@ mod tests {
         assert!(!dir.join(format!("{absent_id}.json")).exists());
     }
 
-
     #[tokio::test]
     async fn a_superseded_entry_records_the_lifecycle_and_successor() {
         let (mesh, outbox) = fixture("superseded", None).await;
@@ -1313,7 +1374,6 @@ mod tests {
         assert_eq!(record.lifecycle.superseded_by, Some(new_id));
     }
 
-
     #[tokio::test]
     async fn an_archived_entry_records_the_lifecycle_and_tombstone() {
         let (mesh, outbox) = fixture("archived", None).await;
@@ -1343,7 +1403,6 @@ mod tests {
         assert_eq!(record.lifecycle.state, LifecycleState::Archived);
         assert!(record.lifecycle.archived_at.is_some());
     }
-
 
     #[tokio::test]
     async fn a_file_rename_fault_keeps_the_entry_pending_until_the_fault_clears() {
@@ -1531,7 +1590,6 @@ mod tests {
         );
     }
 
-
     /// A mixed batch drains the current-epoch entry (committing it) while the
     /// stale entry is quarantined and LEFT PENDING — the commit step must
     /// never consume a quarantined entry.
@@ -1562,7 +1620,6 @@ mod tests {
             "the quarantined entry is the one left pending"
         );
     }
-
 
     /// The mesh's PUBLISH path reduces a record's metadata to the curated
     /// envelope — `eligibility`, `source`, `tags` (`projected_metadata`,
@@ -1674,7 +1731,11 @@ mod tests {
         assert_eq!(roundtrip[0], record);
 
         let loaded = &roundtrip[0];
-        assert!(loaded.patch.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
+        assert!(loaded
+            .patch
+            .as_ref()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false));
     }
 
     // ---- issue #46: sign AFTER preservation + RDF rebuild -----------------
@@ -2208,7 +2269,10 @@ mod tests {
             crate::did::verify(&json_payload, &pubkey, &sig),
             "the signature must verify over the canonical-JSON (full-record) payload"
         );
-        let rdf_block = record.rdf.as_ref().expect("the record carries an RDF block");
+        let rdf_block = record
+            .rdf
+            .as_ref()
+            .expect("the record carries an RDF block");
         let rdf_payload = crate::did::signing_payload(
             &rdf_block.quads,
             &record.update_id.to_string(),
@@ -2261,8 +2325,7 @@ mod tests {
         assert_eq!(bundles.len(), 1, "exactly one bundle file: {bundles:?}");
 
         // Its decoded contents are exactly the 2 committed records.
-        let records =
-            crate::synaptic_mesh::import::read_compressed_bundle(&bundles[0]).unwrap();
+        let records = crate::synaptic_mesh::import::read_compressed_bundle(&bundles[0]).unwrap();
         assert_eq!(records.len(), 2, "the bundle holds exactly 2 records");
         let mut got: Vec<Uuid> = records.iter().map(|r| r.id).collect();
         got.sort();
