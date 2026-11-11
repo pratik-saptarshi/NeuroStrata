@@ -1925,9 +1925,9 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lbug"
-version = "0.20.4"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa792a6ec0595098bf41f2f6d243bb705a0d4c01bb94f44e63cc49988796b0e8"
+checksum = "0dd89790069b850c2ae89d3cc8962b4cdffa2cafface814c4cae5c7e6f666e0b"
 dependencies = [
  "cmake",
  "cxx",
