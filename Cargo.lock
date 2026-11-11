@@ -2257,7 +2257,7 @@ dependencies = [
  "ndarray",
  "openssl",
  "ort",
- "oxiri 0.3.1",
+ "oxiri",
  "oxrdf",
  "oxttl",
  "petgraph",
@@ -2518,7 +2518,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "oxhttp",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
@@ -2547,22 +2547,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
 
 [[package]]
-name = "oxiri"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b6bd0ef560f078e41ce2ebf370cce217e7fb2c3695ffa87541151c9de94e83a"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "oxjsonld"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1554d73123a75723a4e0a4d400a3fb19ca09673563a2557090267729622fcb2"
 dependencies = [
  "json-event-parser",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "ryu-js",
  "thiserror 2.0.18",
@@ -2576,7 +2567,7 @@ checksum = "08037a3c3cf580d065caec6a864cf97f51be219862d95c691a48c7543406d675"
 dependencies = [
  "hex",
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxsdatatypes",
  "rand 0.9.4",
  "sha2",
@@ -2603,7 +2594,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b69a81d41e2ee7d0d296980e6e44d3d2282f558cd82a8b3b4988c2eb06a6e07d"
 dependencies = [
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "quick-xml",
  "thiserror 2.0.18",
@@ -2626,7 +2617,7 @@ checksum = "c2f5a5c0e82734bb66c9e2a82839bafca5cc129531c51b92f428a4f43405793d"
 dependencies = [
  "memchr",
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "thiserror 2.0.18",
 ]
@@ -3257,7 +3248,7 @@ checksum = "71ad494fd6cb6e53320b6c06e760ab403465331b1f790d40bb280afae7427587"
 dependencies = [
  "getrandom 0.3.4",
  "indexmap",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "proptest",
  "reqwest 0.12.28",
@@ -3279,7 +3270,7 @@ dependencies = [
  "once_cell",
  "oxigraph",
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxjsonld",
  "oxrdf",
  "oxrdfio",
@@ -3773,7 +3764,7 @@ dependencies = [
  "hex",
  "json-event-parser",
  "md-5",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "oxsdatatypes",
  "rand 0.9.4",
@@ -3794,7 +3785,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43d5fd4ba16eea5586aa54227ca2c0a394794a0f82e39c6c98a57cc6877f0230"
 dependencies = [
  "oxilangtag",
- "oxiri 0.2.11",
+ "oxiri",
  "oxrdf",
  "peg",
  "rand 0.9.4",
