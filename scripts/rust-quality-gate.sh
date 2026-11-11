@@ -112,19 +112,27 @@ else
 import os, re, sys
 f = os.environ.get("FILE", "")
 added = set(x for x in os.environ.get("ADDED", "").split("\n") if x.startswith(f + ":"))
-flag = False
+out, cur, hit = [], [], False
+def flush():
+    global out, cur, hit
+    if hit:
+        out.extend(cur)
+    cur, hit = [], False
 for raw in sys.stdin:
     line = raw.rstrip("\n")
     m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", line)
     if m:
+        flush()
         s, c = int(m.group(1)), int(m.group(2) or 1)
-        if any(f"{f}:{n}" in added for n in range(s, s + c)):
-            flag = True
-print("yes" if flag else "no")
+        hit = any(f"{f}:{n}" in added for n in range(s, s + c))
+    cur.append(line)
+flush()
+print("MATCH" if out else "no")
+print("\n".join(out))
 ' || true)"
-        if [ "$OVERLAP" = "yes" ]; then
+        if [ "$(printf '%s\n' "$OVERLAP" | head -n 1)" = "MATCH" ]; then
             echo "$GATE: FAIL: touched file needs formatting on added lines (run \`cargo fmt\`): $f" >&2
-            printf '%s\n' "$FMT_DIFF" | head -n 15 >&2
+            printf '%s\n' "$OVERLAP" | tail -n +2 | head -n 20 >&2
             FAIL=1
         fi
     done <<< "$CHANGED_RS"
