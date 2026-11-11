@@ -27,6 +27,11 @@ Bypass (urgent pushes only, loud and logged):
 toolchains (`cargo`, `rustfmt`, `cargo-audit`) warn-and-pass with an
 install hint rather than blocking — a hook must never brick pushes
 from environments without the toolchain.
+Range semantics: the gate diffs exactly the commits the push
+introduces — `@{u}..HEAD` for linear pushes; after a rebase (remote
+tip no longer an ancestor) it falls back to the merge-base with
+`origin/develop`, so an upstream tree-wide change can never inflate
+the range into false blocks. Last resort: `HEAD~1..HEAD`.
 
 ## 3. Severity policy (audit)
 
