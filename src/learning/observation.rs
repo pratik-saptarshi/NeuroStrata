@@ -1,6 +1,6 @@
-use crate::traits::MemoryPayload;
 use crate::judgment::policy::DedupDecision;
-use serde::{Serialize, Deserialize};
+use crate::traits::MemoryPayload;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningContext {
@@ -73,7 +73,7 @@ pub enum LearningOutcomeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::learning::blob_store::BlobStore;
     use crate::traits::MemoryPayload;
 

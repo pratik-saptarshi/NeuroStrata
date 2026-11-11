@@ -17,10 +17,9 @@ connect-src 'self' http://127.0.0.1:34343";
 
 fn read_json(rel: &str) -> Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
 fn csp() -> String {
@@ -44,7 +43,9 @@ fn open_url_patterns() -> Vec<String> {
     let perms = cap["permissions"].as_array().expect("permissions array");
     let mut urls = Vec::new();
     for perm in perms {
-        let Some(obj) = perm.as_object() else { continue };
+        let Some(obj) = perm.as_object() else {
+            continue;
+        };
         if obj.get("identifier").and_then(Value::as_str) != Some("shell:allow-open") {
             continue;
         }

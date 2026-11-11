@@ -41,7 +41,9 @@ pub enum TwinWarning {
         min: f64,
         max: f64,
     },
-    UnknownVariable { name: String },
+    UnknownVariable {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,10 +88,7 @@ impl TwinSchema {
                 let min = bounds_obj.get("min")?.as_f64()?;
                 let max = bounds_obj.get("max")?.as_f64()?;
                 let unit = bounds_obj.get("unit")?.as_str()?.to_string();
-                Some((
-                    k.clone(),
-                    TwinVarBounds { min, max, unit },
-                ))
+                Some((k.clone(), TwinVarBounds { min, max, unit }))
             })
             .collect();
         Some(TwinSchema { variables })
@@ -98,13 +97,23 @@ impl TwinSchema {
 
 pub fn sanitize_var_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
 pub fn get_state(payload: &crate::traits::MemoryPayload) -> BTreeMap<String, f64> {
     let mut result = BTreeMap::new();
-    if let Some(vars) = payload.metadata.get("twin").and_then(|t| t.get("variables")) {
+    if let Some(vars) = payload
+        .metadata
+        .get("twin")
+        .and_then(|t| t.get("variables"))
+    {
         if let Some(obj) = vars.as_object() {
             for (k, v) in obj {
                 if let Some(val) = v.as_f64() {
@@ -156,7 +165,8 @@ pub fn set_state(
         .ok_or_else(|| TwinError::InvalidPayload("twin is not an object".to_string()))?;
 
     if merge {
-        if !twin.contains_key("variables") || twin.get("variables").map_or(true, |v| !v.is_object()) {
+        if !twin.contains_key("variables") || twin.get("variables").map_or(true, |v| !v.is_object())
+        {
             twin.insert("variables".to_string(), serde_json::json!({}));
         }
         let vars_obj = twin
@@ -175,16 +185,19 @@ pub fn set_state(
         twin.insert("variables".to_string(), serde_json::Value::Object(new_vars));
     }
 
-    let current_version = twin
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    twin.insert("version".to_string(), serde_json::json!(current_version + 1));
+    let current_version = twin.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    twin.insert(
+        "version".to_string(),
+        serde_json::json!(current_version + 1),
+    );
 
     Ok(())
 }
 
-pub fn diff(old: &crate::traits::MemoryPayload, new: &crate::traits::MemoryPayload) -> Vec<TwinDelta> {
+pub fn diff(
+    old: &crate::traits::MemoryPayload,
+    new: &crate::traits::MemoryPayload,
+) -> Vec<TwinDelta> {
     let old_state = get_state(old);
     let new_state = get_state(new);
     let mut all_keys: Vec<&String> = old_state.keys().chain(new_state.keys()).collect();
@@ -224,7 +237,10 @@ pub fn diff(old: &crate::traits::MemoryPayload, new: &crate::traits::MemoryPaylo
     result
 }
 
-pub fn validate_state(vars: &BTreeMap<String, f64>, schema: Option<&TwinSchema>) -> Vec<TwinWarning> {
+pub fn validate_state(
+    vars: &BTreeMap<String, f64>,
+    schema: Option<&TwinSchema>,
+) -> Vec<TwinWarning> {
     let mut warnings = Vec::new();
     if let Some(s) = schema {
         for (name, val) in vars {
@@ -245,10 +261,9 @@ pub fn validate_state(vars: &BTreeMap<String, f64>, schema: Option<&TwinSchema>)
     warnings
 }
 
-pub fn list_twins_from_rows(
-    rows: &[(String, crate::traits::MemoryPayload)],
-) -> Vec<TwinSummary> {
-    let mut best: BTreeMap<String, (String, u64, usize, i64, Option<String>, Option<String>)> = BTreeMap::new();
+pub fn list_twins_from_rows(rows: &[(String, crate::traits::MemoryPayload)]) -> Vec<TwinSummary> {
+    let mut best: BTreeMap<String, (String, u64, usize, i64, Option<String>, Option<String>)> =
+        BTreeMap::new();
     let now = chrono::Utc::now().timestamp();
     for (id, payload) in rows {
         let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
@@ -306,22 +321,31 @@ pub fn list_twins_from_rows(
             schema_id.clone(),
         ));
         if version > entry.1 {
-            *entry = (id.clone(), version, variable_count, last_updated, source, schema_id);
-        }
-    }
-    let mut summaries: Vec<TwinSummary> = best
-        .into_iter()
-        .map(|(twin_id, (id, twin_version, variable_count, last_updated, source, schema_id))| {
-            TwinSummary {
-                id,
-                twin_id: twin_id.clone(),
-                twin_version,
+            *entry = (
+                id.clone(),
+                version,
                 variable_count,
                 last_updated,
                 source,
                 schema_id,
-            }
-        })
+            );
+        }
+    }
+    let mut summaries: Vec<TwinSummary> = best
+        .into_iter()
+        .map(
+            |(twin_id, (id, twin_version, variable_count, last_updated, source, schema_id))| {
+                TwinSummary {
+                    id,
+                    twin_id: twin_id.clone(),
+                    twin_version,
+                    variable_count,
+                    last_updated,
+                    source,
+                    schema_id,
+                }
+            },
+        )
         .collect();
     summaries.sort_by(|a, b| a.twin_id.cmp(&b.twin_id));
     summaries
@@ -368,8 +392,7 @@ pub fn require_twin_state_from_rows(
     rows: &[(String, crate::traits::MemoryPayload)],
     twin_id: &str,
 ) -> Result<BTreeMap<String, f64>, TwinError> {
-    get_twin_state_from_rows(rows, twin_id)
-        .ok_or_else(|| TwinError::NotFound(twin_id.to_string()))
+    get_twin_state_from_rows(rows, twin_id).ok_or_else(|| TwinError::NotFound(twin_id.to_string()))
 }
 
 pub fn twin_history_from_rows(
@@ -469,14 +492,15 @@ pub async fn list_twins(
 ) -> Vec<TwinSummary> {
     match store.list(namespace, None, None).await {
         Ok(results) => {
-            let rows: Vec<(String, crate::traits::MemoryPayload)> = results
-                .into_iter()
-                .map(|r| (r.id, r.payload))
-                .collect();
+            let rows: Vec<(String, crate::traits::MemoryPayload)> =
+                results.into_iter().map(|r| (r.id, r.payload)).collect();
             list_twins_from_rows(&rows)
         }
         Err(e) => {
-            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            tracing::warn!(
+                "digital_twin store.list error in namespace '{}': {e}",
+                namespace
+            );
             Vec::new()
         }
     }
@@ -489,10 +513,8 @@ pub async fn get_twin_state(
 ) -> Option<BTreeMap<String, f64>> {
     match store.list(namespace, None, None).await {
         Ok(results) => {
-            let rows: Vec<(String, crate::traits::MemoryPayload)> = results
-                .into_iter()
-                .map(|r| (r.id, r.payload))
-                .collect();
+            let rows: Vec<(String, crate::traits::MemoryPayload)> =
+                results.into_iter().map(|r| (r.id, r.payload)).collect();
             let state = get_twin_state_from_rows(&rows, twin_id);
             if state.is_none() {
                 tracing::debug!(
@@ -504,7 +526,10 @@ pub async fn get_twin_state(
             state
         }
         Err(e) => {
-            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            tracing::warn!(
+                "digital_twin store.list error in namespace '{}': {e}",
+                namespace
+            );
             None
         }
     }
@@ -518,14 +543,15 @@ pub async fn twin_history(
 ) -> Vec<(u64, i64, BTreeMap<String, f64>)> {
     match store.list(namespace, None, None).await {
         Ok(results) => {
-            let rows: Vec<(String, crate::traits::MemoryPayload)> = results
-                .into_iter()
-                .map(|r| (r.id, r.payload))
-                .collect();
+            let rows: Vec<(String, crate::traits::MemoryPayload)> =
+                results.into_iter().map(|r| (r.id, r.payload)).collect();
             twin_history_from_rows(&rows, twin_id, limit)
         }
         Err(e) => {
-            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            tracing::warn!(
+                "digital_twin store.list error in namespace '{}': {e}",
+                namespace
+            );
             Vec::new()
         }
     }
@@ -540,14 +566,15 @@ pub async fn twin_diff(
 ) -> Result<Vec<TwinDelta>, TwinError> {
     match store.list(namespace, None, None).await {
         Ok(results) => {
-            let rows: Vec<(String, crate::traits::MemoryPayload)> = results
-                .into_iter()
-                .map(|r| (r.id, r.payload))
-                .collect();
+            let rows: Vec<(String, crate::traits::MemoryPayload)> =
+                results.into_iter().map(|r| (r.id, r.payload)).collect();
             twin_diff_from_rows(&rows, twin_id, from_version, to_version)
         }
         Err(e) => {
-            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            tracing::warn!(
+                "digital_twin store.list error in namespace '{}': {e}",
+                namespace
+            );
             Err(TwinError::NotFound(format!(
                 "store error for twin {}",
                 twin_id
@@ -596,7 +623,14 @@ mod tests {
         let state = get_state(&p);
         assert!(!state.contains_key("x"));
         assert_eq!(state.get("y"), Some(&2.5));
-        let version = p.metadata.get("twin").unwrap().get("version").unwrap().as_u64().unwrap();
+        let version = p
+            .metadata
+            .get("twin")
+            .unwrap()
+            .get("version")
+            .unwrap()
+            .as_u64()
+            .unwrap();
         assert_eq!(version, 1);
 
         vars.clear();
@@ -633,7 +667,9 @@ mod tests {
     fn require_twin_state_from_rows_maps_miss_to_not_found() {
         let rows = vec![(
             "id1".into(),
-            make_payload(json!({ "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } } })),
+            make_payload(
+                json!({ "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } } }),
+            ),
         )];
         let state = require_twin_state_from_rows(&rows, "t1").unwrap();
         assert_eq!(state.get("a"), Some(&1.0));
@@ -659,7 +695,14 @@ mod tests {
         let schema = TwinSchema {
             variables: {
                 let mut m = BTreeMap::new();
-                m.insert("t".into(), TwinVarBounds { min: 0.0, max: 10.0, unit: "c".into() });
+                m.insert(
+                    "t".into(),
+                    TwinVarBounds {
+                        min: 0.0,
+                        max: 10.0,
+                        unit: "c".into(),
+                    },
+                );
                 m
             },
         };
@@ -675,18 +718,27 @@ mod tests {
     #[test]
     fn list_twins_from_rows_groups_and_picks_latest() {
         let rows = vec![
-            ("id1".into(), make_payload(json!({
-                "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } },
-                "valid_from": 100
-            }))),
-            ("id2".into(), make_payload(json!({
-                "twin": { "id": "t1", "version": 2, "variables": { "a": 2.0 } },
-                "valid_from": 200
-            }))),
-            ("id3".into(), make_payload(json!({
-                "twin": { "id": "t2", "version": 1, "variables": { "b": 1.0 } },
-                "valid_from": 150
-            }))),
+            (
+                "id1".into(),
+                make_payload(json!({
+                    "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } },
+                    "valid_from": 100
+                })),
+            ),
+            (
+                "id2".into(),
+                make_payload(json!({
+                    "twin": { "id": "t1", "version": 2, "variables": { "a": 2.0 } },
+                    "valid_from": 200
+                })),
+            ),
+            (
+                "id3".into(),
+                make_payload(json!({
+                    "twin": { "id": "t2", "version": 1, "variables": { "b": 1.0 } },
+                    "valid_from": 150
+                })),
+            ),
         ];
         let summaries = list_twins_from_rows(&rows);
         assert_eq!(summaries.len(), 2);
@@ -698,8 +750,14 @@ mod tests {
     #[test]
     fn twin_history_from_rows_sorted_and_truncated() {
         let rows = vec![
-            ("id1".into(), make_payload(json!({ "twin": { "id": "t1", "version": 2 }, "valid_from": 200 }))),
-            ("id2".into(), make_payload(json!({ "twin": { "id": "t1", "version": 1 }, "valid_from": 100 }))),
+            (
+                "id1".into(),
+                make_payload(json!({ "twin": { "id": "t1", "version": 2 }, "valid_from": 200 })),
+            ),
+            (
+                "id2".into(),
+                make_payload(json!({ "twin": { "id": "t1", "version": 1 }, "valid_from": 100 })),
+            ),
         ];
         let hist = twin_history_from_rows(&rows, "t1", 0);
         assert_eq!(hist.len(), 2);
@@ -710,8 +768,18 @@ mod tests {
     #[test]
     fn twin_diff_from_rows_success_and_missing_version() {
         let rows = vec![
-            ("id1".into(), make_payload(json!({ "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } }, "valid_from": 100 }))),
-            ("id2".into(), make_payload(json!({ "twin": { "id": "t1", "version": 2, "variables": { "a": 2.0 } }, "valid_from": 200 }))),
+            (
+                "id1".into(),
+                make_payload(
+                    json!({ "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } }, "valid_from": 100 }),
+                ),
+            ),
+            (
+                "id2".into(),
+                make_payload(
+                    json!({ "twin": { "id": "t1", "version": 2, "variables": { "a": 2.0 } }, "valid_from": 200 }),
+                ),
+            ),
         ];
         let d = twin_diff_from_rows(&rows, "t1", 1, 2).unwrap();
         assert_eq!(d.len(), 1);
@@ -724,14 +792,20 @@ mod tests {
     fn list_twins_from_rows_future_and_expired_valid_to() {
         let now = chrono::Utc::now().timestamp();
         let rows = vec![
-            ("id1".into(), make_payload(json!({
-                "twin": { "id": "tfuture", "version": 1, "variables": { "a": 1.0 } },
-                "valid_to": now + 3600
-            }))),
-            ("id2".into(), make_payload(json!({
-                "twin": { "id": "texpired", "version": 1, "variables": { "b": 1.0 } },
-                "valid_to": now - 60
-            }))),
+            (
+                "id1".into(),
+                make_payload(json!({
+                    "twin": { "id": "tfuture", "version": 1, "variables": { "a": 1.0 } },
+                    "valid_to": now + 3600
+                })),
+            ),
+            (
+                "id2".into(),
+                make_payload(json!({
+                    "twin": { "id": "texpired", "version": 1, "variables": { "b": 1.0 } },
+                    "valid_to": now - 60
+                })),
+            ),
         ];
         let summaries = list_twins_from_rows(&rows);
         assert_eq!(summaries.len(), 1);
