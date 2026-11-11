@@ -17,7 +17,11 @@ pub struct GuardValidator {
 }
 
 impl GuardValidator {
-    pub async fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
+    pub async fn new(
+        store: Arc<dyn VectorStore>,
+        embedder: Arc<dyn Embedder>,
+        namespace: &str,
+    ) -> Self {
         let semantic = SemanticEvaluator::new(store, embedder, namespace);
         let sandbox = SandboxEvaluator::new().await;
 
@@ -130,12 +134,18 @@ impl GuardValidator {
                     };
 
                     match &mut verdict {
-                        ValidateVerdict::SandboxReject { constraints: ref mut c, .. } => {
+                        ValidateVerdict::SandboxReject {
+                            constraints: ref mut c,
+                            ..
+                        } => {
                             if c.is_empty() {
                                 *c = constraints;
                             }
                         }
-                        ValidateVerdict::DeterministicReject { constraints: ref mut c, .. } => {
+                        ValidateVerdict::DeterministicReject {
+                            constraints: ref mut c,
+                            ..
+                        } => {
                             if c.is_empty() {
                                 *c = constraints;
                             }

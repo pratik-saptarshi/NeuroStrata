@@ -44,12 +44,7 @@ pub enum SymbolMatchGrade {
 /// Degenerate weights (`w_sum <= 0.0`) carry no signal of their own, so the
 /// vector distance (clamped to range) is passed through as the score rather
 /// than collapsing into a false "perfect" `0.0`.
-pub fn combine(
-    d_vec: f32,
-    d_graph: f32,
-    d_sym: f32,
-    weights: (f32, f32, f32),
-) -> f32 {
+pub fn combine(d_vec: f32, d_graph: f32, d_sym: f32, weights: (f32, f32, f32)) -> f32 {
     let (w_vec, w_graph, w_sym) = weights;
     let w_sum = w_vec + w_graph + w_sym;
     if w_sum <= 0.0 {

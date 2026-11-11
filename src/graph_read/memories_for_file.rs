@@ -85,11 +85,7 @@ pub struct MemoryHit {
 pub fn memory_type_priority(memory_type: &str, metadata: &Value) -> u8 {
     match memory_type {
         "rule" => {
-            if metadata
-                .get("enforcement")
-                .and_then(|v| v.as_str())
-                == Some("ENFORCED")
-            {
+            if metadata.get("enforcement").and_then(|v| v.as_str()) == Some("ENFORCED") {
                 0
             } else {
                 1
