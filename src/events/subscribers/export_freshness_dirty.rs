@@ -208,9 +208,7 @@ pub async fn clear_export_freshness_for_namespace(
                     .upsert(namespace, &flag_id(namespace), vector, payload)
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to clear freshness flag for {namespace}: {e}"
-                        )
+                        anyhow::anyhow!("Failed to clear freshness flag for {namespace}: {e}")
                     })?;
             }
             Ok(())
