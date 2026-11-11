@@ -56,6 +56,19 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
+# ── Pushed refs (best-effort) ────────────────────────────────────────────
+# git invokes pre-push as: pre-push <remote-name> <remote-url> with one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per updated
+# ref on stdin. Capture them for guards that need the exact push range
+# (e.g. the Rust gate validates pushed refs, not just the checkout).
+# /dev/null or empty stdin yields empty immediately; a TTY is never read
+# (it would hang waiting for input).
+HOOK_PUSH_REFS=""
+if [ ! -t 0 ]; then
+    HOOK_PUSH_REFS="$(cat 2>/dev/null || true)"
+fi
+export HOOK_PUSH_REFS
+
 # ── Project guards (run before the task gate, independently of it) ───────
 # These run BEFORE Guard 2 below on purpose: Guard 2 exits 0 early when
 # the neurostrata-mcp binary is missing or NEUROSTRATA_SKIP_GATE=1, and

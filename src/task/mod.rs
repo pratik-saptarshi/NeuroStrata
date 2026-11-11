@@ -2520,6 +2520,19 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
+# ── Pushed refs (best-effort) ────────────────────────────────────────────
+# git invokes pre-push as: pre-push <remote-name> <remote-url> with one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per updated
+# ref on stdin. Capture them for guards that need the exact push range
+# (e.g. the Rust gate validates pushed refs, not just the checkout).
+# /dev/null or empty stdin yields empty immediately; a TTY is never read
+# (it would hang waiting for input).
+HOOK_PUSH_REFS=""
+if [ ! -t 0 ]; then
+    HOOK_PUSH_REFS="$(cat 2>/dev/null || true)"
+fi
+export HOOK_PUSH_REFS
+
 # ── Project guards (run before the task gate, independently of it) ───────
 # These run BEFORE the task gate below on purpose: the gate exits 0 early
 # when the neurostrata-mcp binary is missing or NEUROSTRATA_SKIP_GATE=1,
@@ -2571,7 +2584,7 @@ if [ $code -eq 2 ]; then
 fi
 
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: 258f2499befde2c5315e80c13cb2d13a048e220a412497ab32b5378687450e84
+# neurostrata-hook-sha256: 9c009dc761e874b364a7a6b0fbac48205766dd3c54e041655342f1e4c69881b4
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -4478,6 +4491,138 @@ mod tests {
         assert!(
             fork.status.success(),
             "the scaffolded hook must let a fork push through a passing gate"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex round 4: the gate validates pushed refs, not just the
+    /// checkout. The hook must therefore deliver stdin ref lines to
+    /// guards via HOOK_PUSH_REFS (a foreign branch or tag push must
+    /// reach the gate for its "not locally verified" warning), while a
+    /// push of the checked-out branch flows through quietly.
+    #[test]
+    fn scaffolded_pre_push_hook_exports_pushed_refs_to_guards() {
+        use std::os::unix::fs::PermissionsExt;
+        if which_bash().is_none() || which_git().is_none() {
+            return; // nothing to smoke-test with
+        }
+        let root = std::env::temp_dir().join(format!("ns-hookrefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "user.email", "t@t.t"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("f.txt"), "x\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-qm", "t"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let set_exec = |p: &std::path::Path| {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).unwrap();
+        };
+        let hook = root.join("scripts").join("hooks").join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        set_exec(&hook);
+        let stub = root.join("bin").join("neurostrata-mcp");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        set_exec(&stub);
+        // stub the project gates the scaffold wires by default; the rust
+        // gate stub echoes what the hook delivered so the test can assert
+        // on the plumbing without running the real gate
+        for g in ["task-coverage-gate.sh"] {
+            let p = root.join("scripts").join(g);
+            std::fs::write(&p, "#!/bin/bash\nexit 0\n").unwrap();
+            set_exec(&p);
+        }
+        let p = root.join("scripts").join("rust-quality-gate.sh");
+        std::fs::write(&p, "#!/bin/bash\necho \"REFS=$HOOK_PUSH_REFS\"\nexit 0\n").unwrap();
+        set_exec(&p);
+        let path = format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let run_with_stdin = |input: &str| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("bash")
+                .arg("scripts/hooks/pre-push")
+                .arg("origin")
+                .arg("https://github.com/pratik-saptarshi/NeuroStrata.git")
+                .current_dir(&root)
+                .env("PATH", &path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // pushing the checked-out branch: quiet, passing
+        let cur = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let own = run_with_stdin(&format!("refs/heads/{branch} {head_sha} refs/heads/{branch} {sha}\n"));
+        assert!(own.status.success(), "own-branch push must pass");
+        assert!(
+            String::from_utf8_lossy(&own.stdout).contains(&format!("refs/heads/{branch}")),
+            "own-branch ref line must reach guards via HOOK_PUSH_REFS"
+        );
+
+        // pushing another branch and a tag: the refs must reach the
+        // gate (which warns that they are not locally verified)
+        let foreign = run_with_stdin(&format!(
+            "refs/heads/other {head_sha} refs/heads/other {sha}\nrefs/tags/v9 {head_sha} refs/tags/v9 {sha}\n"
+        ));
+        assert!(foreign.status.success(), "foreign refs warn, not block");
+        let out = String::from_utf8_lossy(&foreign.stdout).to_string();
+        assert!(
+            out.contains("refs/heads/other") && out.contains("refs/tags/v9"),
+            "pushed ref lines must reach guards via HOOK_PUSH_REFS: {}",
+            out
         );
         let _ = std::fs::remove_dir_all(&root);
     }

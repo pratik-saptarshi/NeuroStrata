@@ -37,28 +37,56 @@ if [ "${RUST_QUALITY_SKIP:-0}" = "1" ]; then
     exit 0
 fi
 
-# ── Diff range: exactly the commits this push introduces ─────────────────
-# @{u}..HEAD is exact for linear pushes, but after a rebase the remote
-# tip predates the rewritten base and the range balloons to include
-# upstream changes (e.g. a tree-wide reformat landing on develop),
-# which then false-block as "added" lines. Detect the rewrite (remote
-# tip no longer an ancestor of HEAD) and fall back to the merge-base
-# with the integration target, so the range is always the branch's own
-# delta. A branch with no upstream takes the same merge-base path, so
-# first pushes check every commit, not just HEAD~1. Last resort
+# ── Change base: what is this push relative to? ─────────────────────────
+# The hook exports HOOK_PUSH_REFS (one "<local ref> <local sha>
+# <remote ref> <remote sha>" line per updated ref). Prefer the exact
+# pushed range when pushing the checked-out branch; warn loudly about
+# any other pushed ref (other branches, tags), which is NOT locally
+# verified — CI remains the backstop for those. Otherwise fall back to
+# the merge-base with the integration target, so the range is always
+# the branch's own delta: after a rebase the remote tip predates the
+# rewritten base and @{u}..HEAD would balloon to include upstream
+# changes (e.g. a tree-wide reformat), false-blocking as "added" lines.
+# A branch with no upstream takes the same merge-base path, so first
+# pushes check every commit, not just HEAD~1. Last resort
 # (no origin/develop available, e.g. offline): the last commit only.
-if git rev-parse --verify --quiet "@{u}" >/dev/null 2>&1 \
-    && git merge-base --is-ancestor "@{u}" HEAD 2>/dev/null; then
-    RANGE="@{u}..HEAD"
-else
-    RANGE="$(git merge-base HEAD origin/develop 2>/dev/null || true)..HEAD"
-    if [ "$RANGE" = "..HEAD" ]; then
-        RANGE="HEAD~1..HEAD"
+BASE=""
+CURBRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
+if [ -n "${HOOK_PUSH_REFS:-}" ]; then
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        lref="${line%% *}"; rest="${line#* }"
+        lsha="${rest%% *}"; rest="${rest#* }"
+        rref="${rest%% *}"; rsha="${rest##* }"
+        [ -n "$lref" ] || continue
+        case "$lsha" in
+            0000000000000000000000000000000000000000) continue ;; # branch deletion: nothing to check
+        esac
+        if [ "$lref" = "refs/heads/$CURBRANCH" ] && [ "$lsha" = "$HEAD_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            BASE="$rsha"
+        else
+            echo "$GATE: note: pushed ref $lref is not the checked-out HEAD — not locally verified (CI remains backstop)" >&2
+        fi
+    done <<< "$HOOK_PUSH_REFS"
+fi
+if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+    BASE=""
+    if git rev-parse --verify --quiet "@{u}" >/dev/null 2>&1 \
+        && git merge-base --is-ancestor "@{u}" HEAD 2>/dev/null; then
+        BASE="@{u}"
+    else
+        BASE="$(git merge-base HEAD origin/develop 2>/dev/null || true)"
+        [ -n "$BASE" ] || BASE="HEAD~1"
     fi
 fi
 
-CHANGED_RS="$(git diff --name-only "$RANGE" -- '*.rs' || true)"
-CHANGED_MANIFEST="$(git diff --name-only "$RANGE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' || true)"
+# The gate checks the WORKING TREE as it stands (not just committed
+# HEAD): rustfmt/clippy/audit all inspect worktree files, so attribution
+# must use worktree numbering too — otherwise uncommitted edits could
+# hide findings in the code actually being pushed (or vice versa).
+CHANGED_RS="$(git diff --name-only "$BASE" -- '*.rs' || true)"
+CHANGED_MANIFEST="$(git diff --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' || true)"
 
 if [ -z "$CHANGED_RS" ] && [ -z "$CHANGED_MANIFEST" ]; then
     echo "$GATE: no Rust sources or manifests changed — nothing to check"
@@ -73,17 +101,22 @@ fi
 FAIL=0
 
 # Added-line set for every touched .rs file (format "path:lineno",
-# new-file numbering). Both the fmt and clippy attributions below match
-# findings against this set, so legacy findings in touched files never
-# block the push — only lines this push adds. Mirrors
-# task-coverage-gate.sh (+-line inspection).
-ADDED_LINES="$(git diff -U0 "$RANGE" -- '*.rs' | python3 -c '
+# worktree numbering — the same files rustfmt/clippy inspect). Both the
+# fmt and clippy attributions below match findings against this set, so
+# legacy findings in touched files never block the push — only lines
+# this push adds. Mirrors task-coverage-gate.sh (+-line inspection).
+# Kept in a temp file, not the environment: large diffs exceed the
+# per-string environment limit and python would fail to start — and the
+# `|| true` guard would then pass everything silently.
+ADDED_FILE="$(mktemp -t rustgate-added.XXXXXX)"
+trap 'rm -f "$ADDED_FILE"' EXIT
+git diff -U0 "$BASE" -- '*.rs' | python3 -c '
 import re, sys
 cur, new_line, out = None, 0, set()
 for raw in sys.stdin:
     line = raw.rstrip("\n")
     if line.startswith("+++ b/"):
-        cur = line[6:]
+        cur, new_line = line[6:], 0
         continue
     m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
     if m:
@@ -97,7 +130,7 @@ for raw in sys.stdin:
     elif line.startswith(" "):
         new_line += 1
 print("\n".join(sorted(out)))
-' || true)"
+' > "$ADDED_FILE" 2>/dev/null || true
 
 # ── 1. fmt: fail only when added lines are misformatted ──────────────────
 # rustfmt --check prints its OWN diff format ("Diff in <file>:<line>:" +
@@ -121,10 +154,18 @@ else
         fi
         FMT_DIFF="$(diff -U0 "$f" <(printf '%s\n' "$FORMATTED") 2>/dev/null || true)"
         [ -n "$FMT_DIFF" ] || continue
-        OVERLAP="$(printf '%s\n' "$FMT_DIFF" | FILE="$f" ADDED="$ADDED_LINES" python3 -c '
+        OVERLAP="$(printf '%s\n' "$FMT_DIFF" | FILE="$f" ADDED_FILE="$ADDED_FILE" python3 -c '
 import os, re, sys
 f = os.environ.get("FILE", "")
-added = set(x for x in os.environ.get("ADDED", "").split("\n") if x.startswith(f + ":"))
+added = set()
+try:
+    with open(os.environ.get("ADDED_FILE", "")) as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if ln.startswith(f + ":"):
+                added.add(ln)
+except OSError:
+    pass
 out, cur, hit = [], [], False
 def flush():
     global out, cur, hit
@@ -155,7 +196,7 @@ fi
 # A broken build (no parseable diagnostics) fails regardless — quality
 # cannot be verified. Deny-level lints elsewhere in the tree are backlog
 # (same rule as warnings): only added lines gate the push.
-# (ADDED_LINES computed once above and reused here.)
+# (ADDED_FILE computed once above and reused here.)
 # --workspace: the root package alone would skip workspace members
 # (e.g. crates/neurostrata-wasm, which ships without its own lockfile
 # and is covered by the root lockfile for audit). --all-targets: the
@@ -177,7 +218,7 @@ elif [ -n "$CLIPPY_DIAG" ]; then
         dpath="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs' || true)"
         dline="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs:[0-9]+' | grep -oE '[0-9]+$' || true)"
         if [ -n "$dpath" ] && [ -n "$dline" ] \
-            && printf '%s\n' "$ADDED_LINES" | grep -qxF "$dpath:$dline"; then
+            && grep -qxF "$dpath:$dline" "$ADDED_FILE" 2>/dev/null; then
             echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2
             FAIL=1
         fi
