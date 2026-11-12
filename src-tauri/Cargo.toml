@@ -16,7 +16,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tauri-plugin-dialog = "2.7.3"
 tauri-plugin-store = "2.4.5"
-dirs = "6.0.0"
+dirs = "7.0.0"
 reqwest = { version = "0.12.28", features = ["blocking", "json"] }
 
 [features]
