@@ -243,8 +243,16 @@ if [ -n "$CHANGED_MANIFEST" ]; then
     if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
         echo "$GATE: warning: cargo-audit not installed — audit NOT run (run \`cargo install cargo-audit\`; CI audit remains backstop)" >&2
     else
-        AUDIT_TEXT="$(cargo audit 2>/dev/null || true)"
-        if [ -z "$AUDIT_TEXT" ]; then
+        # (no `set -e` in this script, so a failing substitution is safe
+        # to inspect via $? on the next line)
+        AUDIT_TEXT="$(cargo audit 2>/dev/null)"
+        AUDIT_RC=$?
+        if [ -z "$AUDIT_TEXT" ] && [ "$AUDIT_RC" -eq 0 ]; then
+            # Clean tree: cargo audit prints nothing on success. An empty
+            # report with exit 0 is a verified-clean result, not missing
+            # data — do not confuse it with the offline case below.
+            NEW_IDS=""
+        elif [ -z "$AUDIT_TEXT" ]; then
             echo "$GATE: warning: cargo audit produced no output (offline DB?) — audit NOT verified" >&2
         else
             parse_advisories() {
@@ -271,8 +279,20 @@ for block in re.split(r"\n\s*\n", text):
                 BASE_OK=0
                 TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
                 if git show "origin/develop:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
-                    BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null || true)"
-                    [ -n "$BASE_TEXT" ] && BASE_SEV="$(parse_advisories "$BASE_TEXT")" && BASE_OK=1
+                    # (no `set -e` in this script, so a failing substitution
+                    # is safe to inspect via $? on the next line)
+                    BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null)"
+                    BASE_RC=$?
+                    if [ "$BASE_RC" -eq 0 ]; then
+                        # Verified-clean baseline: cargo audit prints
+                        # nothing on success. An empty set here is
+                        # evidence of absence, not missing data — any
+                        # high/critical ID in the push is therefore new.
+                        BASE_OK=1
+                    elif [ -n "$BASE_TEXT" ]; then
+                        BASE_SEV="$(parse_advisories "$BASE_TEXT")"
+                        BASE_OK=1
+                    fi
                 fi
                 rm -f "$TMPBASE"
                 if [ "$BASE_OK" != "1" ]; then

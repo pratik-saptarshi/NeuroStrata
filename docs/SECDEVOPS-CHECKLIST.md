@@ -63,7 +63,10 @@ pushed branches/tags are reported, not verified. Last resort
   `{0243-0436, 026-0173: unknown (unmaintained)}`,
   `{026-0486: unknown (unsound)}`; base lockfile identical → no false
   block. Unsound/unmaintained surface as warnings by design (CI audit
-  remains backstop).
+  remains backstop). Exit codes distinguish verified-clean (exit 0,
+  possibly empty output) from unavailable (non-zero + empty): a clean
+  baseline counts as verified-empty, so a push introducing the *first*
+  high/critical advisory correctly blocks instead of warn-skipping.
 - Hook active via `bash scripts/install-hooks.sh` (copies
   `scripts/hooks/pre-push` to the common git dir shared by worktrees).
   The `SCAFFOLDED_PRE_PUSH_HOOK` const in `src/task/mod.rs` carries the
