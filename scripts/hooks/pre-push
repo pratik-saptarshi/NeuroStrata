@@ -56,6 +56,43 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
+# ── Pushed refs (best-effort) ────────────────────────────────────────────
+# git invokes pre-push as: pre-push <remote-name> <remote-url> with one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per updated
+# ref on stdin. Capture them for guards that need the exact push range
+# (e.g. the Rust gate validates pushed refs, not just the checkout).
+# /dev/null or empty stdin yields empty immediately; a TTY is never read
+# (it would hang waiting for input).
+HOOK_PUSH_REFS=""
+if [ ! -t 0 ]; then
+    HOOK_PUSH_REFS="$(cat 2>/dev/null || true)"
+fi
+export HOOK_PUSH_REFS
+
+# ── Project guards (run before the task gate, independently of it) ───────
+# These run BEFORE Guard 2 below on purpose: Guard 2 exits 0 early when
+# the neurostrata-mcp binary is missing or NEUROSTRATA_SKIP_GATE=1, and
+# project guards must not be bypassed by task-tool availability.
+# A guard that belongs here does NOT need a CI workflow to be real.
+PROJECT_GATES=(
+    # Rust quality gate: fmt/clippy deltas + audit delta on pushes that
+    # touch Rust sources or manifests. Never blocks on legacy backlog
+    # (the quality-baseline file owns that); see
+    # docs/SECDEVOPS-CHECKLIST.md. Bypass: RUST_QUALITY_SKIP=1.
+    ./scripts/rust-quality-gate.sh
+    # Task-coverage gate: blocks pushes when changed docs contain work-item
+    # language without a NeuroStrata task ID citation.
+    ./scripts/task-coverage-gate.sh
+    # ./scripts/rules-gate.sh
+)
+
+if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
+    for g in "${PROJECT_GATES[@]}"; do
+        [ -f "$g" ] || { echo "project guard $g missing — skipping" >&2; continue; }
+        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
+    done
+fi
+
 # ── Guard 2: NeuroStrata task gate ────────────────────────────────────
 # Scaffolded by neurostrata-bootstrap / task_setup.
 # The hook IS the gate. It runs on every push on ANY git host, so it is
@@ -90,23 +127,6 @@ fi
 # and it still does not block (0 and 2 pass, per the exit line below).
 if [ $code -eq 2 ]; then
     echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
-fi
-
-# ── project guards (add yours here) ────────────────────────────────────────
-# Add the path of each local guard; it runs before every push on every host.
-# A guard that belongs here does NOT need a CI workflow to be real.
-PROJECT_GATES=(
-    # Task-coverage gate: blocks pushes when changed docs contain work-item
-    # language without a NeuroStrata task ID citation.
-    ./scripts/task-coverage-gate.sh
-    # ./scripts/rules-gate.sh
-)
-
-if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
-    for g in "${PROJECT_GATES[@]}"; do
-        [ -f "$g" ] || { echo "task-coverage-gate: guard $g missing — skipping" >&2; continue; }
-        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
-    done
 fi
 
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
