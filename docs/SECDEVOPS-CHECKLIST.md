@@ -19,7 +19,7 @@ the gate never demands a tree-wide sweep.
 | `rustfmt` per-file unified diff | pre-push hook (`scripts/rust-quality-gate.sh`, wired in `scripts/hooks/pre-push` `PROJECT_GATES` **ahead of the task gate** so task-tool bypasses can't skip it; mirrored in the `SCAFFOLDED_PRE_PUSH_HOOK` const so hook hygiene preserves it) | unified hunks overlapping added lines only (per-file `rustfmt --emit stdout` via stdin — never parse `--check` output, which has no `@@` hunks; matching hunk printed, not `head`) | **block** (`cargo fmt` fixes) |
 | `cargo clippy --locked --workspace --all-targets` (short format) | same | diagnostics on added line numbers only (covers workspace members incl. test/example code; audit covers the wasm crate via the root lockfile) | **block** |
 | `cargo audit` (human-readable report) | same, manifest changes only | NEW `high`/`critical` IDs vs base lockfile; unresolved base → warn-and-skip (never compare against an empty baseline) | **block** |
-| Pushed refs | hook exports `HOOK_PUSH_REFS`; gate uses the matching line for its base | other branches/tags are *not* locally verified (loud note, CI backstop) | warn |
+| Pushed refs | hook exports `HOOK_PUSH_REFS`; gate uses the matching line for its base **only if linear from it** (stale remote tips after a rebase fall through to merge-base) | other branches/tags are *not* locally verified (loud note, CI backstop) | warn |
 | Attribution set | temp file (env has per-string limits) | — | — |
 | Working tree | gate checks the tree as it stands, including uncommitted edits | — | — |
 | `cargo deny` | CI report-only (no `deny.toml`; 358 license defaults unresolved) | advisories/bans deltas only | warn |
@@ -78,8 +78,11 @@ pushed branches/tags are reported, not verified. Last resort
   commit; (6) missing base lockfile warn-skips audit instead of
   false-blocking; (7) other pushed refs are reported, not verified;
   (8) uncommitted edits are checked via worktree diff; (9) attribution
-  set travels by temp file, not env. Each fixed, unit-tested, and
-  re-validated e2e (FAIL/PASS/audit/uncommitted/foreign-ref paths).
+  set travels by temp file, not env; (10) hook-supplied bases pass the
+  same ancestry check as upstream refs (a stale post-rebase tip falls
+  back to merge-base instead of inflating the range). Each fixed,
+  unit-tested, and re-validated e2e
+  (FAIL/PASS/audit/uncommitted/foreign-ref/no-upstream paths).
 - Codex review (PR #93) caught two vacuous-gate bugs in v1, fixed and
   re-validated: (a) JSON advisory objects carry `cvss` but no
   `severity` key — severity now comes from the report's `Severity:`

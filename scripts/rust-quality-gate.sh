@@ -64,7 +64,16 @@ if [ -n "${HOOK_PUSH_REFS:-}" ]; then
             0000000000000000000000000000000000000000) continue ;; # branch deletion: nothing to check
         esac
         if [ "$lref" = "refs/heads/$CURBRANCH" ] && [ "$lsha" = "$HEAD_SHA" ] && [ -n "$HEAD_SHA" ]; then
-            BASE="$rsha"
+            # Trust the pushed base only when history is linear from it:
+            # after a rebase the old remote tip still exists but is no
+            # longer an ancestor, and using it would attribute upstream
+            # changes to this push. Unknown SHAs fall through to the
+            # merge-base path below (fail-closed, never vacuous).
+            if [ "$rsha" != "0000000000000000000000000000000000000000" ] \
+                && git cat-file -e "$rsha^{commit}" 2>/dev/null \
+                && git merge-base --is-ancestor "$rsha" HEAD 2>/dev/null; then
+                BASE="$rsha"
+            fi
         else
             echo "$GATE: note: pushed ref $lref is not the checked-out HEAD — not locally verified (CI remains backstop)" >&2
         fi
