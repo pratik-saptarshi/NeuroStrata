@@ -4553,14 +4553,12 @@ mod tests {
         let stub = root.join("bin").join("neurostrata-mcp");
         std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
         set_exec(&stub);
-        // stub the project gates the scaffold wires by default; the rust
+        // stub the project gate the scaffold wires by default; the rust
         // gate stub echoes what the hook delivered so the test can assert
         // on the plumbing without running the real gate
-        for g in ["task-coverage-gate.sh"] {
-            let p = root.join("scripts").join(g);
-            std::fs::write(&p, "#!/bin/bash\nexit 0\n").unwrap();
-            set_exec(&p);
-        }
+        let p = root.join("scripts").join("task-coverage-gate.sh");
+        std::fs::write(&p, "#!/bin/bash\nexit 0\n").unwrap();
+        set_exec(&p);
         let p = root.join("scripts").join("rust-quality-gate.sh");
         std::fs::write(&p, "#!/bin/bash\necho \"REFS=$HOOK_PUSH_REFS\"\nexit 0\n").unwrap();
         set_exec(&p);
@@ -4605,7 +4603,9 @@ mod tests {
             .output()
             .unwrap();
         let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        let own = run_with_stdin(&format!("refs/heads/{branch} {head_sha} refs/heads/{branch} {sha}\n"));
+        let own = run_with_stdin(&format!(
+            "refs/heads/{branch} {head_sha} refs/heads/{branch} {sha}\n"
+        ));
         assert!(own.status.success(), "own-branch push must pass");
         assert!(
             String::from_utf8_lossy(&own.stdout).contains(&format!("refs/heads/{branch}")),
