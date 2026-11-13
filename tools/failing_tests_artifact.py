@@ -12,20 +12,28 @@ The output schema matches the Phase 0 failing-test inventory exactly:
 ``repo``, ``run_id``, ``branch``, ``job_name``, ``failing_tests``,
 ``log_source`` (always ``"artifact"`` for records produced here). The
 identity fields come from the GitHub Actions default environment
-(``GITHUB_REPOSITORY``, ``GITHUB_RUN_ID``, ``GITHUB_REF_NAME``); the job
-display name is passed explicitly because Actions exposes no context
-for it.
+(``GITHUB_REPOSITORY``, ``GITHUB_RUN_ID``, and ``GITHUB_HEAD_REF`` /
+``GITHUB_REF_NAME`` for the branch); the job display name is passed
+explicitly because Actions exposes no context for it.
 
 Extraction is deliberately narrow: only lines of the shape
-``test <name> ... FAILED`` from libtest output count. Compile errors and
+``test <name> ... FAILED`` from libtest output count, anchored to the
+whole line (after stripping a ``gh run view --log`` prefix, for local
+use against downloaded logs). Doctest result lines, whose names carry
+spaces (``test src/lib.rs - foo (line 3) ... FAILED``), count too.
+Anything merely containing the shape -- a ``FAILEDNESS`` line, an
+echoed example in some other output -- does not. Compile errors and
 mid-run crashes produce an empty ``failing_tests`` list, which is the
-truthful record for those shapes -- the inventory records them the same
-way.
+truthful record for those shapes -- the inventory records them the
+same way.
 
 This tool is a telemetry side-channel. It must never fail the job that
-invokes it: any error is reported on stderr and exits 0, leaving an
-artifact behind only when the parse succeeded. The workflow step that
-calls it is also marked continue-on-error.
+invokes it: runtime errors (unreadable log, unwritable output) are
+reported on stderr and exit 0, leaving an artifact behind only when
+the parse succeeded, and the workflow step that calls it is also
+marked continue-on-error. Argument errors are workflow programming
+errors and keep argparse's exit 2, so a typo'd invocation is visible
+in the step log instead of silently producing an empty artifact.
 
 Usage: ``python3 tools/failing_tests_artifact.py --log PATH --out PATH
 --job-name NAME``. Stdlib only; Python 3.11+.
@@ -40,10 +48,16 @@ import re
 import sys
 from pathlib import Path
 
-#: libtest result line: "test some::path::name ... FAILED". The name is
-#: a single token; harness output with a trailing "(...)" suffix or a
-#: "[ignore]"-style annotation does not occur in this suite's runs.
-FAILED_RE = re.compile(r"^test (\S+) \.\.\. FAILED$")
+#: libtest result line: "test some::path::name ... FAILED". Unit-test
+#: names are single tokens; doctest names contain spaces and a
+#: "(line N)" suffix, so the name group is ".+" under a full-line
+#: anchor rather than "\S+".
+FAILED_RE = re.compile(r"^test (.+) \.\.\. FAILED$")
+
+#: ``gh run view --log`` prefix: "<job>\t<step>\t<ISO timestamp> " ahead
+#: of the raw cargo output. Stripped so downloaded logs parse exactly
+#: like the raw tee'd output this tool reads in CI.
+GH_PREFIX_RE = re.compile(r"^[^\t]+\t[^\t]+\t\d{4}-\d{2}-\d{2}T[\d:.]+Z ")
 
 
 def extract_failing_tests(log_text: str) -> list[str]:
@@ -51,11 +65,7 @@ def extract_failing_tests(log_text: str) -> list[str]:
     seen: set[str] = set()
     names: list[str] = []
     for line in log_text.splitlines():
-        # CI logs may prefix the cargo output (gh log downloads do);
-        # search rather than match so both shapes parse identically.
-        m = FAILED_RE.search(line.strip()) or re.search(
-            r"test (\S+) \.\.\. FAILED", line
-        )
+        m = FAILED_RE.match(GH_PREFIX_RE.sub("", line).strip())
         if m and m.group(1) not in seen:
             seen.add(m.group(1))
             names.append(m.group(1))
@@ -83,7 +93,10 @@ def main(argv: list[str] | None = None) -> int:
     record = {
         "repo": os.environ.get("GITHUB_REPOSITORY", ""),
         "run_id": run_id,
-        "branch": os.environ.get("GITHUB_REF_NAME", ""),
+        # On pull_request runs GITHUB_REF_NAME is "<pr>/merge", which is
+        # useless for branch correlation; the head ref is the real branch.
+        "branch": os.environ.get("GITHUB_HEAD_REF")
+        or os.environ.get("GITHUB_REF_NAME", ""),
         "job_name": args.job_name,
         "failing_tests": extract_failing_tests(log_text),
         "log_source": "artifact",

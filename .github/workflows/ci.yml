@@ -171,6 +171,7 @@ jobs:
           name: failing-tests-test-matrix-${{ matrix.os }}
           path: ${{ runner.temp }}/failing-tests.json
           if-no-files-found: ignore
+          overwrite: true
 
   # The build job proves compilation; this proves behavior. Single test
   # thread because the suite's per-test temp databases exhaust the mmap
@@ -249,6 +250,7 @@ jobs:
           name: failing-tests-test
           path: ${{ runner.temp }}/failing-tests.json
           if-no-files-found: ignore
+          overwrite: true
 
   # Task 15a's scripted assertion for the release governance (J17),
   # grep-level by design: release.yml must not grant contents: write at

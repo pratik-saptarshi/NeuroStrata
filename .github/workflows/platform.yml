@@ -241,3 +241,4 @@ jobs:
           name: failing-tests-test-matrix-${{ matrix.os }}
           path: ${{ runner.temp }}/failing-tests.json
           if-no-files-found: ignore
+          overwrite: true
