@@ -1081,6 +1081,8 @@ pub(crate) async fn start_daemon_on(
     // already started runs on a blocking thread that abort cannot reach, and the
     // final checkpoint would then contend with it.
     let (stop_periodic, mut periodic_stopped) = tokio::sync::watch::channel(false);
+    // The memory time series stops on the same signal (see procmem).
+    let memory_sampler = crate::procmem::spawn_sampler(periodic_stopped.clone());
     let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;
         let mut failures: u32 = 0;
@@ -1173,6 +1175,7 @@ pub(crate) async fn start_daemon_on(
     if let Err(e) = periodic.await {
         tracing::warn!("periodic checkpoint task join error: {e}");
     }
+    let _ = memory_sampler.await;
 
     // The whole point of stopping gracefully: get everything on disk before exit.
     // A checkpoint needs every transaction to drain, and detached work such as
@@ -1654,7 +1657,10 @@ async fn handle_set_metadata(
     Json(req): Json<SetMetadataReq>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata).await
+    // The daemon is bearer-authenticated per user, so its caller is the local
+    // operator: the same admin default the CLI uses.
+    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata, "admin")
+        .await
     {
         Ok(crate::server::MetadataOutcome::Updated) => Ok("OK"),
         Ok(crate::server::MetadataOutcome::NotFound) => {
@@ -3517,8 +3523,10 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let sneaky = root.join("new").join("..").join("..").join("escape");
         let err = check_caller_path(&sneaky, &root, &[]).expect_err("a `..` remainder refuses");
+        // Windows resolves `new\..` lexically, so the escape is caught by
+        // the containment check instead of the unresolvable-remainder check.
         assert!(
-            err.contains("cannot be resolved"),
+            err.contains("cannot be resolved") || err.contains("outside the project root"),
             "the refusal says which check failed: {err}"
         );
     }
