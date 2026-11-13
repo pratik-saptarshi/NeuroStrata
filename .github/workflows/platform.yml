@@ -1,0 +1,238 @@
+name: Platform
+
+# Non-gating platform coverage: the macOS and Windows build/test legs
+# that used to run inside ci.yml on every pull request.
+#
+# Why split: in the 2026-11 CI census, macOS runners repeatedly failed
+# to provision at all -- jobs sat queued until they were cancelled
+# (~15 min, or hours in the Nov 11 backlog) and took otherwise-green PR
+# runs down with them, even though no macOS or Windows check is in the
+# required set. The legs still matter (they are the only coverage of
+# the MSVC/CMake and Clang/OpenSSL-3 build shapes), so they run here on
+# every push to develop and weekly, where a queue-starved runner costs
+# a late signal instead of a red PR.
+#
+# The required set is unchanged and stays in ci.yml +
+# dependency-review.yml: build (ubuntu-latest), test (ubuntu),
+# release governance, dependency-review.
+
+on:
+  push:
+    branches: [develop]
+  schedule:
+    # Weekly, Tuesday 06:17 UTC (off the top of the hour on purpose).
+    - cron: "17 6 * * 2"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The non-Ubuntu build legs, split out of ci.yml (see this file's
+        # header). One runner per way this build can differ:
+        #   windows - MSVC and the CMake/Ninja assumptions, plus the 4 GiB
+        #             static-library limit that decides debug vs release.
+        #             OpenSSL is vendored here too: lbug 0.20.4 hard-links it.
+        #   macos   - Clang and libc++ rather than GCC or MSVC, and the other
+        #             side of the OpenSSL target gate (Security.framework).
+        #             macos-15 is arm64, a standard runner, free on a public
+        #             repository. x64 macs were dropped 2026-09: ort rc.13
+        #             ships no prebuilt ONNX Runtime for x86_64-apple-darwin,
+        #             and every fastembed >= 5 pins that ort.
+        os: [windows-latest, macos-15]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      # lbug (LadybugDB) compiles a C++ core with CMake. Any 3.15+ works,
+      # including the CMake 4 the macOS image ships -- verified by building the
+      # whole tree against 4.3.1 with no policy override.
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      # The vendored OpenSSL build (needed by lbug's link directives) requires
+      # a Perl with Windows module support: the Git-bundled perl that wins PATH
+      # exits 2 during Configure. Strawberry Perl is preinstalled on the image;
+      # point openssl-src at it explicitly. NASM is also preinstalled but not
+      # always on PATH.
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+
+      # lbug's CMake requires OpenSSL 3.x, but the macos-15 image's
+      # default Homebrew OpenSSL is now 4.x, which the configure rejects
+      # outright ("Ladybug requires OpenSSL 3.x but found 4.1.0").
+      # Point CMake at the openssl@3 keg, as lbug's own error prescribes.
+      - name: Configure OpenSSL 3 for CMake (macOS)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          brew list --versions openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      # src/task/harness_plugins.rs embeds plugins/opencode/dist/index.js with
+      # include_str!, and the dist/ bundle is tracked in the repo, so the
+      # bundle is present on a fresh checkout and no plugin build is needed
+      # before the guard and the compile.
+
+      # Diagnostic only: fails in seconds, before cargo compiles, if
+      # any include_str! target is missing from the checkout. Passing
+      # here is not acceptance — a persisting local dist/ would also
+      # pass; only a fresh-checkout CI run proves the bundle is tracked.
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN=target/release/neurostrata-mcp.exe
+          else
+            BIN=target/release/neurostrata-mcp
+          fi
+          "$BIN" --version
+
+      # The binary reports CARGO_PKG_VERSION. If someone reintroduces a
+      # hardcoded string in the clap attribute, this catches it.
+      - name: Version matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN=target/release/neurostrata-mcp.exe
+          else
+            BIN=target/release/neurostrata-mcp
+          fi
+          expected="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          reported="$("$BIN" --version | tr -d '\r' | awk '{print $NF}')"
+          echo "Cargo.toml=$expected  binary=$reported"
+          if [ "$expected" != "$reported" ]; then
+            echo "::error::Binary reports '$reported' but Cargo.toml says '$expected'."
+            exit 1
+          fi
+
+  # The non-Ubuntu test legs, split out of ci.yml with the build legs.
+  # Single test thread because the suite's per-test temp databases
+  # exhaust the mmap budget when run in parallel (intermittent "Mmap
+  # for size ... failed"). Both legs are report-only: the first 3-OS
+  # run exposed pre-existing platform failures on them -- the exact
+  # failures, with their causes, are recorded in
+  # .github/quality-baseline.md. They are bugs with their own
+  # follow-ups, not backlog. Remove a leg's `report-only` flag when
+  # its recorded failures reach zero.
+  test-matrix:
+    name: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.report-only == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            report-only: true
+          - os: macos-15
+            report-only: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Version sync check
+        shell: bash
+        run: python3 tools/check_version_sync.py
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      # Same vendored-OpenSSL constraint as the build job: the test build
+      # compiles lbug too. (Same as the Configure step in the build job.)
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+
+      # lbug's CMake requires OpenSSL 3.x, but the macos-15 image's
+      # default Homebrew OpenSSL is now 4.x, which the configure rejects
+      # outright ("Ladybug requires OpenSSL 3.x but found 4.1.0").
+      # Point CMake at the openssl@3 keg, as lbug's own error prescribes.
+      - name: Configure OpenSSL 3 for CMake (macOS)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          brew list --versions openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      # CI telemetry (remediation programme, judge item 10): on failure,
+      # publish the failing-test list as a stable-format artifact (schema:
+      # tools/failing_tests_artifact.py), so failure censuses read
+      # artifacts instead of digging through raw job logs. Side-channel
+      # only: continue-on-error is deliberate here -- a broken telemetry
+      # step must never change the job's verdict.
+      - name: Write failing-test list (telemetry)
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          TELEM_JOB_NAME: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
+        run: |
+          python3 tools/failing_tests_artifact.py \
+            --log "$RUNNER_TEMP/test-output.log" \
+            --out "$RUNNER_TEMP/failing-tests.json" \
+            --job-name "$TELEM_JOB_NAME"
+
+      - name: Upload failing-test list (telemetry)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failing-tests-test-matrix-${{ matrix.os }}
+          path: ${{ runner.temp }}/failing-tests.json
+          if-no-files-found: ignore
+          overwrite: true

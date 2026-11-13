@@ -26,19 +26,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One runner per way this build can differ:
-        #   ubuntu  - the cheap gate for lockfile and compile breakage, and the
-        #             only target where OpenSSL is vendored.
-        #   windows - MSVC and the CMake/Ninja assumptions, plus the 4 GiB
-        #             static-library limit that decides debug vs release.
-        #             OpenSSL is vendored here too: lbug 0.20.4 hard-links it.
-        #   macos   - Clang and libc++ rather than GCC or MSVC, and the other
-        #             side of the OpenSSL target gate (Security.framework).
-        #             macos-15 is arm64, a standard runner, free on a public
-        #             repository. x64 macs were dropped 2026-09: ort rc.13
-        #             ships no prebuilt ONNX Runtime for x86_64-apple-darwin,
-        #             and every fastembed >= 5 pins that ort.
-        os: [ubuntu-latest, windows-latest, macos-15]
+        # Ubuntu is the only build leg left in the PR workflow: the cheap
+        # gate for lockfile and compile breakage, and the only target
+        # where OpenSSL is vendored. The windows and macos legs moved to
+        # platform.yml (push-to-develop + weekly, non-gating) -- see that
+        # file's header for why.
+        os: [ubuntu-latest]
 
     steps:
       - name: Checkout
@@ -60,18 +53,6 @@ jobs:
             echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
             exit 1
           }
-
-      # The vendored OpenSSL build (needed by lbug's link directives) requires
-      # a Perl with Windows module support: the Git-bundled perl that wins PATH
-      # exits 2 during Configure. Strawberry Perl is preinstalled on the image;
-      # point openssl-src at it explicitly. NASM is also preinstalled but not
-      # always on PATH.
-      - name: Configure vendored OpenSSL build (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: bash
-        run: |
-          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
-          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
 
       # src/task/harness_plugins.rs embeds plugins/opencode/dist/index.js with
       # include_str!, and the dist/ bundle is tracked in the repo, so the
@@ -122,15 +103,11 @@ jobs:
   # The build job proves compilation; this proves behavior. Single test
   # thread because the suite's per-test temp databases exhaust the mmap
   # budget when run in parallel (intermittent "Mmap for size ... failed").
-  # The matrix matches the build job's (J16): tests are behavior, not
-  # backlog. The suite had only ever run on Ubuntu before this matrix
-  # existed, and the first 3-OS run exposed pre-existing platform
-  # failures on the other two legs -- the exact failures, with their
-  # causes, are recorded in .github/quality-baseline.md. Those legs run
-  # and report but do not gate until the failures are fixed (they are
-  # bugs with their own follow-ups, not backlog); the Ubuntu leg is the
-  # hard gate it has always been. Remove a leg's `report-only` flag when
-  # its recorded failures reach zero.
+  # Only the Ubuntu leg remains here; the windows and macos legs (both
+  # report-only) moved to platform.yml with the build legs -- see that
+  # file's header. Their recorded pre-existing failures, with causes,
+  # are in .github/quality-baseline.md; they are bugs with their own
+  # follow-ups, not backlog.
   test-matrix:
     name: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
     runs-on: ${{ matrix.os }}
@@ -140,10 +117,6 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-          - os: windows-latest
-            report-only: true
-          - os: macos-15
-            report-only: true
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -166,18 +139,39 @@ jobs:
             exit 1
           }
 
-      # Same vendored-OpenSSL constraint as the build job: the test build
-      # compiles lbug too. (Same as the Configure step in the build job.)
-      - name: Configure vendored OpenSSL build (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: bash
-        run: |
-          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
-          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
-
       - name: Test
         shell: bash
-        run: cargo test --locked -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+
+      # CI telemetry (remediation programme, judge item 10): on failure,
+      # publish the failing-test list as a stable-format artifact (schema:
+      # tools/failing_tests_artifact.py), so failure censuses read
+      # artifacts instead of digging through raw job logs. Side-channel
+      # only: continue-on-error is deliberate here -- a broken telemetry
+      # step must never change the job's verdict.
+      - name: Write failing-test list (telemetry)
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          TELEM_JOB_NAME: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
+        run: |
+          python3 tools/failing_tests_artifact.py \
+            --log "$RUNNER_TEMP/test-output.log" \
+            --out "$RUNNER_TEMP/failing-tests.json" \
+            --job-name "$TELEM_JOB_NAME"
+
+      - name: Upload failing-test list (telemetry)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failing-tests-test-matrix-${{ matrix.os }}
+          path: ${{ runner.temp }}/failing-tests.json
+          if-no-files-found: ignore
+          overwrite: true
 
   # The build job proves compilation; this proves behavior. Single test
   # thread because the suite's per-test temp databases exhaust the mmap
@@ -217,14 +211,46 @@ jobs:
 
       - name: Test
         shell: bash
-        run: cargo test --locked -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       # The wasm crate is path-locked to the same workspace but builds its own
       # dep set (wasm-bindgen, tracing); run its unit tests explicitly so a
       # broken --locked resolution or a wasm-only test regression fails CI.
       - name: Test wasm crate
         shell: bash
-        run: cargo test -p neurostrata-wasm --locked -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test -p neurostrata-wasm --locked -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/test-output.log"
+
+      # CI telemetry (remediation programme, judge item 10): on failure,
+      # publish the failing-test list as a stable-format artifact (schema:
+      # tools/failing_tests_artifact.py), so failure censuses read
+      # artifacts instead of digging through raw job logs. Side-channel
+      # only: continue-on-error is deliberate here -- a broken telemetry
+      # step must never change the job's verdict.
+      - name: Write failing-test list (telemetry)
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          TELEM_JOB_NAME: test (ubuntu)
+        run: |
+          python3 tools/failing_tests_artifact.py \
+            --log "$RUNNER_TEMP/test-output.log" \
+            --out "$RUNNER_TEMP/failing-tests.json" \
+            --job-name "$TELEM_JOB_NAME"
+
+      - name: Upload failing-test list (telemetry)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failing-tests-test
+          path: ${{ runner.temp }}/failing-tests.json
+          if-no-files-found: ignore
+          overwrite: true
 
   # Task 15a's scripted assertion for the release governance (J17),
   # grep-level by design: release.yml must not grant contents: write at
