@@ -22,12 +22,6 @@ on:
   schedule:
     # Weekly, Tuesday 06:17 UTC (off the top of the hour on purpose).
     - cron: "17 6 * * 2"
-  # INTERIM -- evaluation only, removed before this workflow lands:
-  # workflow_dispatch cannot run a workflow that does not yet exist on
-  # the default branch, so this pull_request trigger is the pre-merge
-  # eval vehicle for the introducing PR. While platform.yml exists only
-  # on that PR's branch, the trigger can only fire for that PR.
-  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
