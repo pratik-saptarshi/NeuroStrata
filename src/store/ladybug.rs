@@ -973,8 +973,43 @@ async fn search_inner(
             // hydrated to real content) joins the result set. Empty-stub rows
             // carry no content and are never merged, so reasoning cannot
             // invent a result.
+            //
+            // Admission applies the same predicates the preceding passes
+            // apply, because `ReasoningAdapter::execute` returns a hydrated
+            // row for the query itself whenever the query equals a memory
+            // id, even with no ontology expansion — an unfiltered merge
+            // would hand back rows every preceding pass excluded: retired
+            // and mesh-conflicting rows, registry rows, archived rows and
+            // task / structural row classes (gated by the same escape
+            // hatches), and rows outside the requested domains.
             for inferred in inferred_results {
                 if inferred.payload.content.is_empty() {
+                    continue;
+                }
+                let metadata_val = &inferred.payload.metadata;
+                if is_retired_at(metadata_val, now) {
+                    continue;
+                }
+                if !include_archived && is_archived(metadata_val) {
+                    continue;
+                }
+                if is_mesh_conflicting(metadata_val) {
+                    continue;
+                }
+                if crate::registry::is_registry_row(metadata_val) {
+                    continue;
+                }
+                if !include_tasks && inferred.payload.memory_type == "task" {
+                    continue;
+                }
+                if STRUCTURAL_MEMORY_TYPES.contains(&inferred.payload.memory_type.as_str()) {
+                    continue;
+                }
+                if !domain_keys.is_empty()
+                    && !crate::domain::domain_keys(metadata_val)
+                        .iter()
+                        .any(|k| domain_keys.contains(k))
+                {
                     continue;
                 }
                 if results.iter().any(|existing| existing.id == inferred.id) {
@@ -1178,6 +1213,15 @@ pub struct LadybugStore {
     /// rebuilt from the database on the next query; mutations are no-ops until
     /// then because the database is the source of truth.
     lexical_loaded: Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
+    /// Bumped whenever the lexical view is invalidated by a pointer flip or
+    /// abort. A load that fetched documents before the bump must not install
+    /// them after it, or it would resurrect the superseded generation and
+    /// mark the namespace loaded.
+    lexical_epoch: std::sync::atomic::AtomicU64,
+    /// Serialises Tantivy snapshot installation with pointer-change refresh,
+    /// so a rebuild that fetched the pre-publish rows cannot replace the
+    /// post-publish namespace after the refresh has installed it.
+    lexical_refresh_lock: tokio::sync::Mutex<()>,
     /// In-memory ring-buffer & rolling aggregate time-series metrics store.
     pub metrics: Arc<crate::time_series::TimeSeriesStore>,
     /// Optional disk-backed Tantivy full-text index, opened lazily.
@@ -1242,6 +1286,12 @@ enum CachedStoreState {
     /// A fresh store whose pristine sidecar could not be written yet
     /// (the configured model did not resolve); retried on later calls.
     FreshUnrecorded,
+    /// A sidecar is present but unparseable (corrupt, unreadable, or a
+    /// version this build does not understand): a recorded identity
+    /// exists but cannot be verified, so identity-consulting opens
+    /// refuse. Distinct from `LockedUnknown`, which is absence — a
+    /// corrupt sidecar must never be attested over or cured silently.
+    Unparseable(String),
 }
 
 /// The first-write guard's restart-to-apply refusal.
@@ -1376,7 +1426,211 @@ impl Dirty {
 /// and silently drops every record it could not authenticate, which is exactly
 /// the outcome this code exists to make visible.
 fn verifying_config() -> SystemConfig {
-    SystemConfig::default().throw_on_wal_replay_failure(true)
+    with_buffer_pool(SystemConfig::default().throw_on_wal_replay_failure(true))
+}
+
+/// Smallest buffer pool the daemon will run with. Measured on a copy of a
+/// 705 MB store: 96 MB and up completed every query, 64 MB failed 8 of 12
+/// with "Unable to allocate memory! The buffer pool is full". The floor sits
+/// above the last size that worked because the largest query depends on the
+/// data, which grows.
+const MIN_BUFFER_POOL_MB: u64 = 128;
+
+/// The pool size in force, for the error message that tells a caller what to
+/// change. 0 means the engine sized it.
+static BUFFER_POOL_MB_IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What size, in MB, to give the buffer pool, and what to say about it.
+/// `configured` is `storage_hygiene.buffer_pool_mb`; `env` is
+/// `NEUROSTRATA_BUFFER_POOL_MB`, which wins when it parses. 0 means "let the
+/// engine decide". Anything else below the floor is raised to it.
+fn resolve_buffer_pool_mb(configured: u64, env: Option<&str>) -> (u64, Option<String>) {
+    let mut note = None;
+    let wanted = match env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                note = Some(format!(
+                    "NEUROSTRATA_BUFFER_POOL_MB={v:?} is not a number of megabytes; using {configured} from the config"
+                ));
+                configured
+            }
+        },
+        None => configured,
+    };
+    if wanted == 0 {
+        return (0, note);
+    }
+    if wanted < MIN_BUFFER_POOL_MB {
+        note = Some(format!(
+            "a buffer pool of {wanted} MB is below the {MIN_BUFFER_POOL_MB} MB floor (queries fail under it); using {MIN_BUFFER_POOL_MB} MB"
+        ));
+        return (MIN_BUFFER_POOL_MB, note);
+    }
+    (wanted, note)
+}
+
+/// Caps the engine's buffer pool per `storage_hygiene.buffer_pool_mb` and
+/// `NEUROSTRATA_BUFFER_POOL_MB`. Said once per process, so the log shows what
+/// the daemon is running with.
+fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    // `load`, not `from_default_path`: opening a store must not create a config
+    // file as a side effect. A missing file is the normal case and says nothing.
+    let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
+    let configured = match crate::config::Config::default_path() {
+        Ok(path) if !path.exists() => default_mb,
+        _ => match crate::config::Config::load() {
+            Ok(c) => c.storage_hygiene.buffer_pool_mb,
+            Err(e) => {
+                tracing::warn!("could not read the config for buffer_pool_mb, using {default_mb}: {e}");
+                default_mb
+            }
+        },
+    };
+    let env = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
+    let (mb, note) = resolve_buffer_pool_mb(configured, env.as_deref());
+    BUFFER_POOL_MB_IN_USE.store(mb, std::sync::atomic::Ordering::Relaxed);
+    SAID.call_once(|| {
+        if let Some(n) = &note {
+            eprintln!("WARNING: {n}");
+        }
+        if mb == 0 {
+            eprintln!("Buffer pool: sized by the engine (storage_hygiene.buffer_pool_mb = 0)");
+        } else {
+            eprintln!("Buffer pool: capped at {mb} MB");
+        }
+    });
+    if mb == 0 {
+        cfg
+    } else {
+        cfg.buffer_pool_size(buffer_pool_bytes(mb))
+    }
+}
+
+/// Convert MB to the engine's byte count without wrapping. An absurd configured
+/// value saturates; it must never wrap to 0 and silently disable the cap.
+fn buffer_pool_bytes(mb: u64) -> u64 {
+    mb.saturating_mul(1024 * 1024)
+}
+
+/// An engine error that says the buffer pool was too small, with what to do
+/// about it. Any other error passes through unchanged.
+fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
+    let text = e.to_string();
+    if !text.contains("buffer pool is full") {
+        return e;
+    }
+    let mb = BUFFER_POOL_MB_IN_USE.load(std::sync::atomic::Ordering::Relaxed);
+    anyhow::anyhow!(
+        "{text} -- the database engine's buffer pool ({mb} MB) is too small for this query. \
+         Raise storage_hygiene.buffer_pool_mb in ~/.config/neurostrata/config.json, or set \
+         NEUROSTRATA_BUFFER_POOL_MB; 0 lets the engine size it, at the cost of memory."
+    )
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+
+    #[test]
+    fn a_huge_value_saturates_instead_of_wrapping_to_zero() {
+        assert_eq!(buffer_pool_bytes(384), 384 * 1024 * 1024);
+        assert_eq!(buffer_pool_bytes(u64::MAX), u64::MAX);
+        assert_ne!(buffer_pool_bytes(u64::MAX), 0);
+    }
+
+    #[test]
+    fn the_config_value_is_used_when_the_environment_says_nothing() {
+        assert_eq!(resolve_buffer_pool_mb(384, None), (384, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some("  ")), (384, None));
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_config() {
+        assert_eq!(resolve_buffer_pool_mb(384, Some("512")), (512, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some(" 640 ")), (640, None));
+    }
+
+    #[test]
+    fn zero_hands_the_sizing_back_to_the_engine() {
+        assert_eq!(resolve_buffer_pool_mb(0, None), (0, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some("0")), (0, None));
+    }
+
+    #[test]
+    fn a_value_below_the_floor_is_raised_and_said_so() {
+        let (mb, note) = resolve_buffer_pool_mb(64, None);
+        assert_eq!(mb, MIN_BUFFER_POOL_MB);
+        assert!(note.unwrap().contains("floor"));
+        let (mb, _) = resolve_buffer_pool_mb(384, Some("96"));
+        assert_eq!(mb, MIN_BUFFER_POOL_MB);
+        assert_eq!(resolve_buffer_pool_mb(MIN_BUFFER_POOL_MB, None), (MIN_BUFFER_POOL_MB, None));
+    }
+
+    #[test]
+    fn an_environment_value_that_is_not_a_number_falls_back_to_the_config() {
+        let (mb, note) = resolve_buffer_pool_mb(384, Some("lots"));
+        assert_eq!(mb, 384);
+        assert!(note.unwrap().contains("NEUROSTRATA_BUFFER_POOL_MB"));
+    }
+
+    #[test]
+    fn the_default_is_above_the_floor() {
+        let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
+        assert!(default_mb >= MIN_BUFFER_POOL_MB, "{default_mb}");
+    }
+
+    #[test]
+    fn an_older_config_without_the_key_gets_the_default() {
+        let cfg: crate::storage::StorageHygieneConfig =
+            serde_json::from_str(r#"{"checkpoint_interval_secs": 5}"#).unwrap();
+        assert_eq!(cfg.checkpoint_interval_secs, 5);
+        assert_eq!(
+            cfg.buffer_pool_mb,
+            crate::storage::StorageHygieneConfig::default().buffer_pool_mb
+        );
+    }
+
+    #[test]
+    fn a_full_pool_error_names_the_setting_and_other_errors_pass_through() {
+        let full = anyhow::anyhow!(
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!"
+        );
+        let text = explain_engine_error(full).to_string();
+        assert!(text.contains("The buffer pool is full"), "{text}");
+        assert!(text.contains("storage_hygiene.buffer_pool_mb"), "{text}");
+        assert!(text.contains("NEUROSTRATA_BUFFER_POOL_MB"), "{text}");
+
+        let other = explain_engine_error(anyhow::anyhow!("Parser exception: nope")).to_string();
+        assert_eq!(other, "Parser exception: nope");
+    }
+
+    /// A pool far under the floor must fail with the explained error, not
+    /// silently return nothing. Needs a COPY of a database (never the live one):
+    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> cargo test --release \
+    ///   --bin neurostrata-mcp a_pool_too_small_for_the_data_fails_with_advice -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn a_pool_too_small_for_the_data_fails_with_advice() {
+        use crate::traits::VectorStore;
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let cfg = SystemConfig::default()
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let store = LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
+        let namespaces = store.list_namespaces().await.expect("namespaces");
+        let mut advised = 0;
+        for ns in &namespaces {
+            if let Err(e) = store.search(ns, vec![0.05; 768], 5, false, false).await {
+                let text = e.to_string();
+                if text.contains("storage_hygiene.buffer_pool_mb") {
+                    advised += 1;
+                }
+            }
+        }
+        assert!(advised > 0, "no search failed with the advice; the pool may be big enough here");
+    }
 }
 
 /// Recovery open, used only after verification has already failed. The engine
@@ -1388,9 +1642,11 @@ fn verifying_config() -> SystemConfig {
 /// This trades tamper-evidence for the writes, so it is never the normal path
 /// and never silent.
 fn unverified_config() -> SystemConfig {
-    SystemConfig::default()
-        .throw_on_wal_replay_failure(false)
-        .enable_checksums(false)
+    with_buffer_pool(
+        SystemConfig::default()
+            .throw_on_wal_replay_failure(false)
+            .enable_checksums(false),
+    )
 }
 
 /// Fail closed by default: an unauthenticated WAL is refused rather than
@@ -1523,19 +1779,26 @@ impl FirstWriteFlip {
     /// `LadybugStore::cached_store_state`: the cache is shared with the
     /// store, and a state the store already loaded is authoritative. A
     /// cold cache is classified from the sidecar file alone — a
-    /// parseable sidecar is `Recorded`; anything else cannot be a
+    /// parseable sidecar is `Recorded`; an absent one cannot be a
     /// pristine state this flip may move, so it reads as `LockedUnknown`
-    /// and the flip no-ops. (The store's own first classification, with
-    /// its fresh-store handling, has always run by upsert entry:
-    /// `guard_first_write` and `check_data_bearing_identity` load it.)
+    /// and the flip no-ops; a present-but-unparseable one reads as
+    /// `Unparseable`, which the flip likewise never rewrites. (The
+    /// store's own first classification, with its fresh-store handling,
+    /// has always run by upsert entry: `guard_first_write` and
+    /// `check_data_bearing_identity` load it.)
     fn cached_store_state(&self) -> CachedStoreState {
         let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = &*cache {
             return state.clone();
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
-            Some(recorded) => CachedStoreState::Recorded(recorded),
-            None => CachedStoreState::LockedUnknown,
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                CachedStoreState::Recorded(recorded)
+            }
+            crate::model_choice::StoreStateRead::Unparseable(reason) => {
+                CachedStoreState::Unparseable(reason)
+            }
+            crate::model_choice::StoreStateRead::Absent => CachedStoreState::LockedUnknown,
         };
         *cache = Some(state.clone());
         state
@@ -1624,17 +1887,25 @@ impl LockedUnknownStamp {
     /// This handle's view of the store-state sidecar, mirroring
     /// `FirstWriteFlip::cached_store_state`: the cache is shared
     /// with the store, and a state the store already loaded is
-    /// authoritative. (The stamp step's callers have always loaded
-    /// the cache by entry: `init` classifies the store to compute
-    /// the upgrade candidacy before the stamp step runs.)
+    /// authoritative. A present-but-unparseable sidecar classifies as
+    /// `Unparseable`, never `LockedUnknown`, so the stamp's
+    /// `LockedUnknown` gate can never attest over it. (The stamp
+    /// step's callers have always loaded the cache by entry: `init`
+    /// classifies the store to compute the upgrade candidacy before
+    /// the stamp step runs.)
     fn cached_store_state(&self) -> CachedStoreState {
         let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = &*cache {
             return state.clone();
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
-            Some(recorded) => CachedStoreState::Recorded(recorded),
-            None => CachedStoreState::LockedUnknown,
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                CachedStoreState::Recorded(recorded)
+            }
+            crate::model_choice::StoreStateRead::Unparseable(reason) => {
+                CachedStoreState::Unparseable(reason)
+            }
+            crate::model_choice::StoreStateRead::Absent => CachedStoreState::LockedUnknown,
         };
         *cache = Some(state.clone());
         state
@@ -1908,6 +2179,8 @@ impl LadybugStore {
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(Default::default())),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
+            lexical_epoch: std::sync::atomic::AtomicU64::new(0),
+            lexical_refresh_lock: tokio::sync::Mutex::new(()),
             metrics: Arc::new(
                 crate::time_series::TimeSeriesStore::new(
                     crate::time_series::SeriesConfig::default(),
@@ -2024,13 +2297,19 @@ impl LadybugStore {
             return state.clone();
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
-            Some(recorded) => CachedStoreState::Recorded(recorded),
-            None if !self.db_preexisting
-                && !crate::model_choice::store_state_path(&self.local_path).exists() =>
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                CachedStoreState::Recorded(recorded)
+            }
+            crate::model_choice::StoreStateRead::Unparseable(reason) => {
+                CachedStoreState::Unparseable(reason)
+            }
+            crate::model_choice::StoreStateRead::Absent
+                if !self.db_preexisting
+                    && !crate::model_choice::store_state_path(&self.local_path).exists() =>
             {
                 CachedStoreState::FreshUnrecorded
             }
-            None => {
+            crate::model_choice::StoreStateRead::Absent => {
                 // A pre-sidecar store opens
                 // exactly as it always has — no refusal can key on a
                 // descriptor that was never recorded — but the Phase B
@@ -2300,7 +2579,22 @@ impl LadybugStore {
     /// embed nothing. Pristine and pre-sidecar stores are likewise
     /// outside this check: pristine identity is the first-write
     /// guard's window, and a pre-sidecar store has no R to key on.
+    /// A present-but-unparseable sidecar is the one state that
+    /// refuses even unbound here: no R can be read from it, yet one
+    /// was recorded, so this check — the funnel every
+    /// identity-consulting entry point passes through — fails closed
+    /// instead of treating the store as unrecorded. Paths that never
+    /// call this check consult no recorded identity and are unaffected.
     fn check_data_bearing_identity(&self) -> Result<()> {
+        // A present-but-unparseable sidecar refuses regardless of the
+        // bound serving descriptor and regardless of has_data — both
+        // are unknowable — before any other identity reasoning.
+        if let CachedStoreState::Unparseable(reason) = self.cached_store_state() {
+            return Err(crate::model_choice::store_state_unparseable_error(
+                &self.local_path,
+                &reason,
+            ));
+        }
         if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
             if recorded.has_data {
                 if let Some(serving) = self.serving_descriptor() {
@@ -2509,7 +2803,8 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
-            })();
+            })()
+            .map_err(explain_engine_error);
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (turn, outcome)
         })
@@ -2554,7 +2849,8 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
-            })();
+            })()
+            .map_err(explain_engine_error);
             // Counted here rather than after the await: the await is what a
             // deadline drops, and the whole question is whether the work
             // outlives the caller that stopped waiting for it.
@@ -2751,6 +3047,507 @@ fn emit_write_shape_warning(namespace: &str, id: &str, warning: &WriteShapeWarni
     );
 }
 
+/// Edge-array metadata keys the namespace hygiene repair checks.
+const HYGIENE_EDGE_KEYS: [&str; 6] = ["governs", "related_to", "relates_to", "contained_by", "extracted_from", "depends_on"];
+
+/// The error a partially-completed repair returns. It carries the committed
+/// counts so the caller can report what landed while still refusing to mark
+/// the run complete.
+fn hygiene_partial_error(
+    namespace: &str,
+    shape: usize,
+    dangling: usize,
+    failed_chunks: usize,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "hygiene repair for '{namespace}' completed partially: {shape} shape and {dangling} dangling updates committed, {failed_chunks} chunk(s) failed; the run is not complete"
+    )
+}
+
+/// What `repair_namespace_hygiene` needs to know about one row. Content is
+/// reduced to "is it blank", the only thing the repair asks of it.
+struct HygieneRow {
+    id: String,
+    mtype: String,
+    loc: String,
+    /// The content as read, so a backfill can be conditional on it.
+    content: String,
+    content_empty: bool,
+    meta_str: String,
+}
+
+/// What the database said about an edge target that is not a known row id.
+#[derive(Clone, Copy, Default)]
+struct HygieneTarget {
+    /// A row with exactly this id exists (any namespace).
+    exact: bool,
+    /// The target resolves to a row in this namespace's active generation.
+    resolved: bool,
+}
+
+/// One statement the hygiene repair will run.
+#[derive(Clone)]
+enum HygieneWrite {
+    Edge(String),
+    Row {
+        id: String,
+        /// Sets the metadata only while it is still what the plan was made
+        /// from. The repair plans inside the write turn from rows it has just
+        /// read, so this always holds there; it stays as a guard on the
+        /// statement itself.
+        meta_q: String,
+        content_q: Option<String>,
+        shape: bool,
+        dangling: bool,
+    },
+}
+
+/// What the planner needs to know about the rest of the namespace. The
+/// candidate pass answers from data it prefetched; the write turn answers from
+/// keyed lookups made in that turn, so the answer is never older than the turn.
+trait HygieneView {
+    /// A live (not archived) row of this namespace has exactly this id.
+    fn is_known(&self, id: &str) -> bool;
+    /// What the database says about a target that is not a live row here.
+    fn target(&self, t: &str) -> HygieneTarget;
+    /// A long target that exactly one live row id of this namespace starts with.
+    fn unique_prefix(&self, t: &str) -> bool;
+    /// The relationship `from -[rel]-> to` is already stored.
+    fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool;
+}
+
+/// Answers from data read ahead of time, for the candidate pass.
+#[derive(Default)]
+struct PrefetchedView {
+    known_ids: std::collections::BTreeSet<String>,
+    targets: HashMap<String, HygieneTarget>,
+    existing: HashSet<(String, String, &'static str)>,
+}
+
+impl HygieneView for PrefetchedView {
+    fn is_known(&self, id: &str) -> bool {
+        self.known_ids.contains(id)
+    }
+    fn target(&self, t: &str) -> HygieneTarget {
+        self.targets.get(t).copied().unwrap_or_default()
+    }
+    fn unique_prefix(&self, t: &str) -> bool {
+        t.len() >= 7
+            && self
+                .known_ids
+                .range(t.to_string()..)
+                .take_while(|x| x.starts_with(t))
+                .take(2)
+                .count()
+                == 1
+    }
+    fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool {
+        self.existing.contains(&(from.to_string(), to.to_string(), rel))
+    }
+}
+
+/// Answers from keyed lookups made now, on the connection of the write turn.
+/// A read that fails is remembered in `failed`: the view can no longer vouch
+/// for what it says, so the caller must not write from the plan.
+struct LiveView<'a, 'db> {
+    conn: &'a Connection<'db>,
+    namespace: &'a str,
+    known: std::cell::RefCell<HashMap<String, bool>>,
+    targets: std::cell::RefCell<HashMap<String, HygieneTarget>>,
+    failed: std::cell::RefCell<Option<String>>,
+}
+
+impl<'a, 'db> LiveView<'a, 'db> {
+    fn new(conn: &'a Connection<'db>, namespace: &'a str) -> Self {
+        Self {
+            conn,
+            namespace,
+            known: Default::default(),
+            targets: Default::default(),
+            failed: Default::default(),
+        }
+    }
+    fn fail(&self, what: &str, e: impl std::fmt::Display) {
+        let mut failed = self.failed.borrow_mut();
+        if failed.is_none() {
+            *failed = Some(format!("{what}: {e}"));
+        }
+    }
+}
+
+impl HygieneView for LiveView<'_, '_> {
+    fn is_known(&self, id: &str) -> bool {
+        if let Some(known) = self.known.borrow().get(id) {
+            return *known;
+        }
+        let q = format!(
+            "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.metadata",
+            escape_ladybug_string(id),
+            escape_ladybug_string(self.namespace)
+        );
+        let live = match self.conn.query(&q) {
+            Ok(mut res) => match res.next() {
+                Some(row) => !hygiene_meta_archived(&format!("{}", row[0])),
+                None => false,
+            },
+            Err(e) => {
+                self.fail("reading a target row", e);
+                false
+            }
+        };
+        self.known.borrow_mut().insert(id.to_string(), live);
+        live
+    }
+
+    fn target(&self, t: &str) -> HygieneTarget {
+        if self.is_known(t) {
+            return HygieneTarget::default();
+        }
+        if let Some(info) = self.targets.borrow().get(t) {
+            return *info;
+        }
+        let exact = match exact_target_exists(self.conn, t) {
+            Ok(exact) => exact,
+            Err(e) => {
+                self.fail("looking up a target id", e);
+                false
+            }
+        };
+        let resolved = !exact
+            && match hygiene_target_resolves(self.conn, self.namespace, t) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    self.fail("resolving a target", e);
+                    false
+                }
+            };
+        let info = HygieneTarget { exact, resolved };
+        self.targets.borrow_mut().insert(t.to_string(), info);
+        info
+    }
+
+    fn unique_prefix(&self, t: &str) -> bool {
+        if t.len() < 7 {
+            return false;
+        }
+        let q = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' RETURN m.metadata",
+            escape_ladybug_string(self.namespace),
+            escape_ladybug_string(t)
+        );
+        match self.conn.query(&q) {
+            Ok(mut res) => {
+                let mut live = 0usize;
+                while let Some(row) = res.next() {
+                    if !hygiene_meta_archived(&format!("{}", row[0])) {
+                        live += 1;
+                        if live > 1 {
+                            break;
+                        }
+                    }
+                }
+                live == 1
+            }
+            Err(e) => {
+                self.fail("looking up ids by prefix", e);
+                false
+            }
+        }
+    }
+
+    fn edge_exists(&self, from: &str, to: &str, rel: &'static str) -> bool {
+        let q = format!(
+            "MATCH (a:Memory {{id: '{}'}})-[r:{rel}]->(b:Memory {{id: '{}'}}) RETURN a.id LIMIT 1",
+            escape_ladybug_string(from),
+            escape_ladybug_string(to)
+        );
+        match self.conn.query(&q) {
+            Ok(mut res) => res.next().is_some(),
+            Err(e) => {
+                self.fail("looking up an edge", e);
+                true
+            }
+        }
+    }
+}
+
+/// Whether row metadata marks the row archived.
+fn hygiene_meta_archived(meta_str: &str) -> bool {
+    serde_json::from_str::<Value>(meta_str)
+        .ok()
+        .and_then(|m| m.get("archived").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Plans the repair of one row from data already in memory, and appends the
+/// statements it needs to `out`. Nothing here touches the database.
+fn plan_hygiene_row(
+    row: &HygieneRow,
+    namespace: &str,
+    view: &dyn HygieneView,
+    out: &mut Vec<HygieneWrite>,
+) {
+    let (id, mtype, loc) = (&row.id, &row.mtype, &row.loc);
+    let safe = escape_ladybug_string(namespace);
+    let mut meta: Value = serde_json::from_str(&row.meta_str).unwrap_or(serde_json::json!({}));
+    if !meta.is_object() { meta = serde_json::json!({}); }
+    let mut shape_changed = false;
+    let mut dangling_changed = false;
+    // (a) rule source. A usable source is a non-empty string or object
+    // (`crate::traits::has_source`); "N/A" is a placeholder. Reading it as a
+    // string alone used to overwrite structured origins with the location.
+    if mtype == "rule" {
+        let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let usable = crate::traits::has_source(&meta) && src != "N/A";
+        if !usable {
+            let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("source".to_string(), Value::String(val));
+                shape_changed = true;
+            }
+        }
+    }
+    // (a2) procedure trigger repair
+    if mtype == "procedure" {
+        let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+        let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
+        if !is_valid {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("trigger".to_string(), Value::String("session-start".to_string()));
+                shape_changed = true;
+            }
+        }
+        if meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none() {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("remaining_fires".to_string(), Value::Number(serde_json::Number::from(5)));
+                shape_changed = true;
+            }
+        }
+    }
+    // (a3) task memory repair: backfill metadata.task defaults
+    if mtype == "task" {
+        let task_meta = meta.get("task").cloned();
+        let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
+        let mut task_changed = false;
+        if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
+            task_obj.insert("status".to_string(), Value::String("open".to_string()));
+            task_changed = true;
+        }
+        if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
+            task_obj.insert("priority".to_string(), Value::Number(serde_json::Number::from(2)));
+            task_changed = true;
+        }
+        if !task_obj.contains_key("task_type") {
+            task_obj.insert("task_type".to_string(), Value::String("task".to_string()));
+            task_changed = true;
+        }
+        if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("task".to_string(), Value::Object(task_obj));
+                shape_changed = true;
+            }
+        }
+    }
+    // (a4) blank content: backfill from title, then location, then "legacy"
+    let mut content_backfill: Option<String> = None;
+    let structural = matches!(mtype.as_str(), "file" | "directory" | "markdown" | "symbol" | "code_ast" | "doc_section" | "freshness_flag" | "guard_event");
+    let backfill_text = |meta: &Value| {
+        meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
+            .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
+            .unwrap_or_else(|| "legacy".to_string())
+    };
+    if row.content_empty && !structural {
+        content_backfill = Some(backfill_text(&meta));
+    }
+    if (row.content_empty && mtype == "fact") || (row.content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
+        content_backfill = Some(backfill_text(&meta));
+    }
+    // (b) dangling refs in edge arrays, and edges that should exist
+    let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+    let mut unresolvable = Vec::new();
+    let mut edges: Vec<String> = Vec::new();
+    for k in &HYGIENE_EDGE_KEYS {
+        let Some(arr) = meta.get(*k).and_then(|v| v.as_array()).cloned() else { continue };
+        let mut kept = Vec::new();
+        for item in &arr {
+            let Some(t) = item.as_str() else { kept.push(item.clone()); continue };
+            if t == "samples" || t == "total" {
+                unresolvable.push(t.to_string());
+                continue;
+            }
+            let known = view.is_known(t);
+            let info = view.target(t);
+            let exists = known || info.exact || info.resolved || view.unique_prefix(t);
+            if !exists {
+                unresolvable.push(t.to_string());
+                continue;
+            }
+            kept.push(item.clone());
+            if known || info.exact {
+                let rel_table = match *k {
+                    "governs" => "GOVERNS",
+                    "related_to" | "relates_to" => "RELATES_TO",
+                    "contained_by" => "CONTAINS",
+                    "extracted_from" => "EXTRACTED_FROM",
+                    "depends_on" => "DEPENDS_ON",
+                    _ => "RELATES_TO",
+                };
+                let (from_id, to_id) = if *k == "contained_by" { (t, id.as_str()) } else { (id.as_str(), t) };
+                if !view.edge_exists(from_id, to_id, rel_table) {
+                    let safe_self = escape_ladybug_string(id);
+                    edges.push(format!(
+                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = '{}', r.origin = 'local'",
+                        escape_ladybug_string(from_id), escape_ladybug_string(to_id), rel_table, safe, safe_self
+                    ));
+                }
+            }
+        }
+        if kept.len() != arr.len() {
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert(k.to_string(), Value::Array(kept));
+                dangling_changed = true;
+            }
+        }
+    }
+    if !unresolvable.is_empty() {
+        archived_refs.extend(unresolvable);
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("archived_refs".to_string(), Value::Array(archived_refs.iter().map(|s| Value::String(s.clone())).collect()));
+        }
+        dangling_changed = true;
+    }
+    out.extend(edges.into_iter().map(HygieneWrite::Edge));
+    if shape_changed || dangling_changed || content_backfill.is_some() {
+        let has_backfill = content_backfill.is_some();
+        out.push(HygieneWrite::Row {
+            id: id.clone(),
+            meta_q: format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' AND m.metadata = '{}' SET m.metadata = '{}' RETURN m.id",
+                safe, escape_ladybug_string(id), escape_ladybug_string(&row.meta_str), escape_ladybug_string(&meta.to_string())
+            ),
+            // Conditional on the blank content that was read: an edit made
+            // since then must not be overwritten by the placeholder.
+            content_q: content_backfill.map(|text| format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' AND m.content = '{}' SET m.content = '{}' RETURN m.id",
+                safe, escape_ladybug_string(id), escape_ladybug_string(&row.content), escape_ladybug_string(&text)
+            )),
+            shape: shape_changed || has_backfill,
+            dangling: dangling_changed,
+        });
+    }
+}
+
+/// Whether a declared target resolves to a row in `ns` the way a write would
+/// resolve it (active generation, suffix forms), not only by its literal id.
+/// The hygiene repair uses it in its candidate pass and again, from fresh data,
+/// in the write turn.
+fn hygiene_target_resolves(conn: &Connection, ns: &str, t: &str) -> Result<bool> {
+    let ns_prefix = format!("{}{}", ns, crate::parser::ingest::NAMESPACE_SEPARATOR);
+    let declared = if let Some(stripped) = t.strip_prefix(&ns_prefix) {
+        stripped
+    } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        t
+    } else {
+        return Ok(false);
+    };
+    match resolve_target_on_write(conn, ns, declared) {
+        crate::traits::TargetResolution::Resolved(_) => Ok(true),
+        crate::traits::TargetResolution::Failed(e) => Err(anyhow::anyhow!("resolving {t}: {e}")),
+        _ => Ok(false),
+    }
+}
+
+/// Repairs `ids` from what the database holds now, inside the caller's single
+/// write turn.
+///
+/// The turn holds the store's one lock (`with_conn` and `write_with_deadline`
+/// share it) and the database file lock keeps every other process out, so
+/// nothing can change between the reads and the writes here. Every input to the
+/// plan is read in the turn, from keyed lookups: the rows, which of their edge
+/// targets exist, which resolve, and which edges are already stored. That makes
+/// the repair correct without trusting any earlier read: a row that stopped
+/// needing repair is skipped, one edited or archived since is judged as it is
+/// now, and one that started needing repair is left for the next run. If any
+/// read fails the plan is discarded and nothing is written.
+fn hygiene_repair_chunk(conn: &Connection, namespace: &str, ids: &[String]) -> Result<(usize, usize)> {
+    let safe_ns = escape_ladybug_string(namespace);
+
+    // 1. The rows as they are now, one keyed read each. Archived rows are not
+    // repaired.
+    let mut rows: Vec<HygieneRow> = Vec::new();
+    for id in ids {
+        let mut res = conn.query(&format!(
+            "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{safe_ns}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata",
+            escape_ladybug_string(id)
+        ))?;
+        while let Some(row) = res.next() {
+            let meta_str = format!("{}", row[4]);
+            if hygiene_meta_archived(&meta_str) {
+                continue;
+            }
+            rows.push(HygieneRow {
+                id: format!("{}", row[0]),
+                mtype: format!("{}", row[1]),
+                loc: format!("{}", row[2]),
+                content: format!("{}", row[3]),
+                content_empty: format!("{}", row[3]).trim().is_empty(),
+                meta_str,
+            });
+        }
+    }
+
+    // 2. Plan from the live view.
+    let view = LiveView::new(conn, namespace);
+    let mut writes: Vec<HygieneWrite> = Vec::new();
+    for row in &rows {
+        plan_hygiene_row(row, namespace, &view, &mut writes);
+    }
+    if let Some(failure) = view.failed.borrow().clone() {
+        return Err(anyhow::anyhow!("hygiene repair could not read what it plans from; nothing was written: {failure}"));
+    }
+
+    // 3. Write it.
+    let (mut shape_n, mut dangling_n) = (0usize, 0usize);
+    for w in &writes {
+        match w {
+            HygieneWrite::Edge(q) => {
+                if let Err(e) = conn.query(q) {
+                    tracing::debug!("hygiene edge merge note: {e}");
+                }
+            }
+            HygieneWrite::Row { id, meta_q, content_q, shape, dangling } => {
+                if let Some(q) = content_q {
+                    match conn.query(q) {
+                        Err(e) => {
+                            tracing::warn!("hygiene repair: content write failed for {id}: {e}");
+                            continue;
+                        }
+                        Ok(mut res) => {
+                            if res.next().is_none() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                match conn.query(meta_q) {
+                    Err(e) => {
+                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
+                        continue;
+                    }
+                    Ok(mut res) => {
+                        if res.next().is_none() {
+                            continue;
+                        }
+                    }
+                }
+                shape_n += *shape as usize;
+                dangling_n += *dangling as usize;
+            }
+        }
+    }
+    Ok((shape_n, dangling_n))
+}
+
 /// Exact ID lookup for qualified target resolution.
 fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     let safe_id = escape_ladybug_string(id);
@@ -2808,24 +3605,140 @@ fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
 /// published. Read surfaces (`list`, `export_graph`) drop rows from a
 /// superseded generation against this set.
 fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections::HashSet<u64> {
+    match active_generations_checked(conn, namespace) {
+        Ok(gens) => gens,
+        Err(e) => {
+            tracing::warn!("active_generations_of query failed: {e}");
+            std::collections::HashSet::new()
+        }
+    }
+}
+
+/// Fallible active-generation read for destructive operations.
+///
+/// A read surface can degrade to "no generations" when the query fails; a
+/// delete cannot: an empty set would make every generation look superseded.
+/// `delete_generation`/`prune_generations` use this and propagate the error.
+fn active_generations_checked(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<std::collections::HashSet<u64>> {
     let query = format!(
         "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.active_generation",
         escape_ladybug_string(namespace)
     );
     let mut gens = std::collections::HashSet::new();
-    match conn.query(&query) {
-        Ok(rows) => {
-            for row in rows {
-                if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
-                    if g > 0 {
-                        gens.insert(g as u64);
-                    }
+    for row in conn.query(&query)? {
+        if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+            if g > 0 {
+                gens.insert(g as u64);
+            }
+        }
+    }
+    Ok(gens)
+}
+
+/// Each source's recorded previous generation (the rollback target).
+fn previous_generations_of(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<std::collections::HashSet<u64>> {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' RETURN g.previous_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut gens = std::collections::HashSet::new();
+    for row in conn.query(&query)? {
+        if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+            if g > 0 {
+                gens.insert(g as u64);
+            }
+        }
+    }
+    Ok(gens)
+}
+
+/// Published source pointers: `(source_key, active_generation,
+/// previous_generation)`. `previous_generation` is 0 for a store upgraded from
+/// before the column existed, or for a source that has published once.
+fn ingest_pointers_of(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Vec<(String, u64, u64)>> {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.source_key, g.active_generation, g.previous_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut out = Vec::new();
+    for row in conn.query(&query)? {
+        let source = format!("{}", row[0]);
+        let active = format!("{}", row[1]).parse::<i64>().unwrap_or(0).max(0) as u64;
+        let previous = format!("{}", row[2]).parse::<i64>().unwrap_or(0).max(0) as u64;
+        if active > 0 {
+            out.push((source, active, previous));
+        }
+    }
+    Ok(out)
+}
+
+/// The generations an ingest has allocated but not published or aborted.
+///
+/// One `StagingGeneration` row per in-flight ingest, so overlapping ingests of
+/// one source are both protected (a scalar on the pointer row would lose the
+/// older one). Publish/abort delete only their own generation's row. A staged
+/// generation is not superseded, so retention must never prune it: the ingest
+/// would publish a pointer onto deleted rows.
+fn staging_generations_of(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<std::collections::HashSet<u64>> {
+    staging_generations_at(conn, namespace, chrono::Utc::now().timestamp())
+}
+
+/// A staging marker older than this is treated as abandoned: the process died
+/// between `begin_generation` and publish/abort. Long enough for a real
+/// ingest, short enough that a crash does not make a generation unprunable
+/// forever.
+pub(crate) const STAGING_TTL_SECS: i64 = 24 * 60 * 60;
+
+fn staging_generations_at(
+    conn: &Connection,
+    namespace: &str,
+    now: i64,
+) -> Result<std::collections::HashSet<u64>> {
+    let query = format!(
+        "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' RETURN s.generation, s.base_generation, s.created_at",
+        escape_ladybug_string(namespace)
+    );
+    let mut gens = std::collections::HashSet::new();
+    for row in conn.query(&query)? {
+        let created_at = format!("{}", row[2]).parse::<i64>().unwrap_or(0);
+        if now.saturating_sub(created_at) > STAGING_TTL_SECS {
+            continue;
+        }
+        for index in [0usize, 1usize] {
+            if let Ok(g) = format!("{}", row[index]).parse::<i64>() {
+                if g > 0 {
+                    gens.insert(g as u64);
                 }
             }
         }
-        Err(e) => { tracing::warn!("active_generations_of query failed: {e}"); }
     }
-    gens
+    Ok(gens)
+}
+
+fn clear_abandoned_staging(
+    conn: &Connection,
+    namespace: &str,
+    now: i64,
+) -> Result<()> {
+    let cutoff = now.saturating_sub(STAGING_TTL_SECS);
+    let query = format!(
+        "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.created_at < {cutoff} DELETE s",
+        escape_ladybug_string(namespace)
+    );
+    conn.query(&query)?;
+    Ok(())
 }
 
 /// The active generation per source plus the namespace-wide active set and the
@@ -2880,7 +3793,9 @@ pub(crate) fn active_generations_by_source_of(
 /// - Unscoped rows (`split_scoped_id == None`) — normative `rule`/`fact`/
 ///   `decision`/`procedure` and legacy AST ids — are always kept.
 /// - Scoped rows are kept only against their owning source's active
-///   generation; `doc_section` rows fall back to the namespace's `docs`
+///   generation. The source is `metadata.source_key`, else the ingest
+///   identity's `worktree_id`; a source with no pointer falls back to the
+///   namespace set. `doc_section` rows fall back to the namespace's `docs`
 ///   pointer (or any active doc generation when no pointer exists).
 /// - Deduplication of equal `bare_id` across active generations (keep highest
 ///   `gen`) is the caller's job; this predicate is stateless per row.
@@ -2889,6 +3804,26 @@ pub(crate) fn is_active_scoped_row(
     namespace: &str,
     memory_type: &str,
     metadata: &Value,
+    by_source: &HashMap<String, i64>,
+    active_set: &std::collections::HashSet<i64>,
+    max_non_doc_gen: Option<i64>,
+) -> Option<String> {
+    is_active_scoped_row_with_source(
+        id,
+        namespace,
+        memory_type,
+        row_source_key(metadata),
+        by_source,
+        active_set,
+        max_non_doc_gen,
+    )
+}
+
+fn is_active_scoped_row_with_source(
+    id: &str,
+    namespace: &str,
+    memory_type: &str,
+    source_key: Option<&str>,
     by_source: &HashMap<String, i64>,
     active_set: &std::collections::HashSet<i64>,
     _max_non_doc_gen: Option<i64>,
@@ -2905,9 +3840,15 @@ pub(crate) fn is_active_scoped_row(
         // No generation table entries yet: nothing is superseded.
         return Some(id.to_string());
     }
-    let keep = if let Some(source_key) = metadata.get("source_key").and_then(|v| v.as_str()) {
-        // Explicit source pointer: the row must equal that source's active gen.
-        by_source.get(source_key).is_some_and(|&active| active == gen_i)
+    let keep = if let Some(source_key) = source_key {
+        // Explicit source pointer: the row must equal that source's active
+        // generation. A source with no pointer (a pre-source-split store
+        // whose single namespace pointer is keyed by the empty source) falls
+        // back to the namespace set, exactly as a row without a stamp does.
+        match by_source.get(source_key) {
+            Some(&active) => active == gen_i,
+            None => active_set.contains(&gen_i),
+        }
     } else if memory_type == "doc_section" {
         // `doc_section` rows without an explicit `source_key`: match the docs
         // pointer when present, otherwise any active doc generation.
@@ -2943,8 +3884,61 @@ impl ActiveGenerations {
     /// Same rule as `is_active_scoped_row`: false for a row of a superseded
     /// generation or another namespace.
     pub(crate) fn reaches(&self, id: &str, namespace: &str, memory_type: &str, metadata: &Value) -> bool {
-        is_active_scoped_row(id, namespace, memory_type, metadata, &self.by_source, &self.active_set, self.max_code_gen).is_some()
+        self.reaches_source(id, namespace, memory_type, row_source_key(metadata))
     }
+
+    /// The predicate with the row's source already resolved. Lexical documents
+    /// carry the source (from the ingest identity) instead of full metadata.
+    pub(crate) fn reaches_source(
+        &self,
+        id: &str,
+        namespace: &str,
+        memory_type: &str,
+        source_key: Option<&str>,
+    ) -> bool {
+        is_active_scoped_row_with_source(
+            id,
+            namespace,
+            memory_type,
+            source_key,
+            &self.by_source,
+            &self.active_set,
+            self.max_code_gen,
+        )
+        .is_some()
+    }
+
+    /// No pointer rows at all: `is_active_scoped_row` keeps every scoped row
+    /// (nothing can be superseded yet), so no query-level filter may run.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_source.is_empty() && self.active_set.is_empty()
+    }
+
+    /// The namespace's active generations as the `u64` values the Tantivy
+    /// generation field stores. Used as the query-level superset filter.
+    pub(crate) fn active_generations_u64(&self) -> HashSet<u64> {
+        self.active_set
+            .iter()
+            .filter(|&&generation| generation > 0)
+            .map(|&generation| generation as u64)
+            .collect()
+    }
+}
+
+/// The source a row belongs to, for the generation predicate: the explicit
+/// `source_key` when a writer set one, else the ingest identity's worktree
+/// (the same value `parser::ingest::source_key_for` stores in the pointer
+/// table), else `None` (the namespace-set fallback).
+pub(crate) fn row_source_key(metadata: &Value) -> Option<&str> {
+    metadata
+        .get("source_key")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            metadata
+                .get("source_identity")
+                .and_then(|v| v.get("worktree_id"))
+                .and_then(|v| v.as_str())
+        })
 }
 
 /// Normative memory types that the recall path reserves result slots for.
@@ -3413,6 +4407,249 @@ impl LadybugStore {
             })
     }
 
+    /// Delete every row of one superseded generation in `namespace`.
+    ///
+    /// # Rollback constraint
+    ///
+    /// The active generation of each source is the pointer's target, and the
+    /// generation immediately before it is the rollback target if a publish is
+    /// reversed. This API refuses the active generation outright (move the
+    /// pointer first) and [`Self::prune_generations`] always retains every
+    /// active generation plus the newest `keep` generations, so the default
+    /// keep of 2 leaves the rollback target intact. Deleting a *previous*
+    /// generation through this method is possible only by naming it
+    /// explicitly; callers that need rollback must not do that.
+    pub async fn delete_generation(&self, namespace: &str, generation: u64) -> Result<usize> {
+        // Explicit operator purge: the caller may intentionally remove a
+        // previous generation, so the rollback-target protection is off here.
+        self.delete_generation_inner(namespace, generation, false)
+            .await
+    }
+
+    /// Prune's delete: re-checks the rollback target inside the write turn.
+    /// A concurrent publish can make the caller's pointer snapshot stale
+    /// between selection and deletion.
+    async fn delete_generation_protected(
+        &self,
+        namespace: &str,
+        generation: u64,
+    ) -> Result<usize> {
+        self.delete_generation_inner(namespace, generation, true)
+            .await
+    }
+
+    async fn delete_generation_inner(
+        &self,
+        namespace: &str,
+        generation: u64,
+        protect_previous: bool,
+    ) -> Result<usize> {
+        if generation == 0 {
+            anyhow::bail!("generation 0 is not generation-scoped");
+        }
+        let namespace_owned = namespace.to_string();
+        self.write_with_deadline("pruning a superseded generation", move |conn| {
+            // Both checks run INSIDE the write turn. A publication or rollback
+            // (`publish_generation`) takes the same writer lock, so it cannot
+            // move the pointer between the check and the delete. The checked
+            // read propagates a query failure instead of treating it as "no
+            // active generations", which would make every generation look
+            // superseded.
+            let active = active_generations_checked(conn, &namespace_owned)?;
+            if active.contains(&generation) {
+                anyhow::bail!(
+                    "refusing to delete generation {generation} of '{namespace_owned}': it is active for a source; move the pointer first (it is the rollback target)"
+                );
+            }
+            let staging = staging_generations_of(conn, &namespace_owned)?;
+            if staging.contains(&generation) {
+                anyhow::bail!(
+                    "refusing to delete generation {generation} of '{namespace_owned}': an ingest is still staging it; publish or abort it first"
+                );
+            }
+            if protect_previous {
+                let previous = previous_generations_of(conn, &namespace_owned)?;
+                if previous.contains(&generation) {
+                    anyhow::bail!(
+                        "refusing to prune generation {generation} of '{namespace_owned}': it is a source's rollback target; use the explicit delete API to purge it"
+                    );
+                }
+            }
+            let safe_ns = escape_ladybug_string(&namespace_owned);
+            let prefix =
+                crate::parser::ingest::generation_scoped_id(&namespace_owned, generation, "");
+            let safe_prefix = escape_ladybug_string(&prefix);
+            let count_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_prefix}' RETURN count(m)"
+            );
+            let count = conn
+                .query(&count_query)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as usize)
+                .unwrap_or(0);
+            if count == 0 {
+                return Ok(0);
+            }
+            let delete_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_prefix}' DETACH DELETE m"
+            );
+            conn.query(&delete_query)?;
+            Ok(count)
+        })
+        .await
+    }
+
+    /// Prune superseded generations, keeping every active generation, every
+    /// per-source previous generation (the rollback target), every staging
+    /// generation, and the newest `keep` generations (clamped to 2).
+    ///
+    /// Returns the number of rows deleted. Generation numbers are
+    /// namespace-wide across sources, so the newest-`keep` window alone cannot
+    /// protect a quiet source's rollback target; the pointer rows record each
+    /// source's previous generation and it is retained explicitly.
+    pub async fn prune_generations(&self, namespace: &str, keep: usize) -> Result<usize> {
+        let keep = keep.max(2);
+        // A failed pointer read must fail the prune, not read as "nothing
+        // active" (which would make every generation look superseded).
+        let ns_for_pointers = namespace.to_string();
+        let pointers = self
+            .with_conn(move |conn| ingest_pointers_of(conn, &ns_for_pointers))
+            .await?;
+        let active: std::collections::HashSet<u64> = pointers
+            .iter()
+            .filter(|(_, active, _)| *active > 0)
+            .map(|(_, active, _)| *active)
+            .collect();
+        // A store upgraded from before `previous_generation` existed has no
+        // recorded rollback targets. Recover them from the retained rows'
+        // source identities rather than pruning a source's history on the
+        // first run after the upgrade.
+        let needs_backfill = pointers.iter().any(|(_, active, previous)| {
+            *active > 0 && *previous == 0
+        });
+
+        let ns_scan = namespace.to_string();
+        let (generations, by_source) = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns_scan);
+                let base = format!(
+                    "{}{}",
+                    ns_scan,
+                    crate::parser::ingest::NAMESPACE_SEPARATOR
+                );
+                let safe_base = escape_ladybug_string(&base);
+                let query = if needs_backfill {
+                    format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_base}' RETURN m.id, m.metadata"
+                    )
+                } else {
+                    format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_base}' RETURN m.id"
+                    )
+                };
+                let mut rows = conn.query(&query)?;
+                let mut generations = std::collections::BTreeSet::new();
+                let mut by_source: HashMap<String, std::collections::BTreeSet<u64>> =
+                    HashMap::new();
+                while let Some(row) = rows.next() {
+                    let id = format!("{}", row[0]);
+                    let Some((_, generation, _)) = split_scoped_id(&id) else {
+                        continue;
+                    };
+                    generations.insert(generation);
+                    if needs_backfill {
+                        let metadata = parse_metadata_or_warn(
+                            &format!("{}", row[1]),
+                            "metadata",
+                        );
+                        if let Some(source) = row_source_key(&metadata) {
+                            if !source.is_empty() {
+                                by_source
+                                    .entry(source.to_string())
+                                    .or_default()
+                                    .insert(generation);
+                            }
+                        }
+                    }
+                }
+                Ok((generations, by_source))
+            })
+            .await?;
+        if generations.is_empty() {
+            return Ok(0);
+        }
+
+        // A crash between begin and publish/abort leaves a marker behind. Clear
+        // markers past the TTL first so an abandoned generation does not stay
+        // unprunable forever; the live set below then excludes generations
+        // whose ingest is genuinely still running.
+        let ns_cleanup = namespace.to_string();
+        self.write_with_deadline("clearing abandoned staging markers", move |conn| {
+            clear_abandoned_staging(conn, &ns_cleanup, chrono::Utc::now().timestamp())
+        })
+        .await?;
+        let ns_for_staging = namespace.to_string();
+        let staging = self
+            .with_conn(move |conn| staging_generations_of(conn, &ns_for_staging))
+            .await?;
+        let mut retained: std::collections::BTreeSet<u64> =
+            active.into_iter().collect();
+        // A generation being staged is not superseded yet: pruning it would
+        // leave the in-flight ingest to publish a pointer onto deleted rows.
+        retained.extend(staging);
+        // The newest-two window is namespace-wide, but rollback is per source:
+        // retain each source's previous generation explicitly, or a quiet
+        // source's rollback target could fall outside the window. For an
+        // upgraded store without the recorded value, take the highest retained
+        // generation below that source's active one from the row scan.
+        let mut backfill: Vec<(String, u64)> = Vec::new();
+        for (source, active, previous) in &pointers {
+            if *previous > 0 {
+                retained.insert(*previous);
+            } else if let Some(history) = by_source.get(source) {
+                if let Some(generation) = history.range(..*active).next_back() {
+                    retained.insert(*generation);
+                    backfill.push((source.clone(), *generation));
+                }
+            }
+        }
+        // Persist the recovered targets before deleting, with a CAS on
+        // `previous_generation = 0`: a concurrent publish that recorded a
+        // fresher value wins, and the delete-time recheck then sees whichever
+        // value is current.
+        if !backfill.is_empty() {
+            let ns_backfill = namespace.to_string();
+            self.write_with_deadline("recording recovered rollback targets", move |conn| {
+                for (source, generation) in backfill.iter() {
+                    let key = crate::parser::ingest::generation_key(&ns_backfill, source);
+                    let query = format!(
+                        "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.previous_generation = 0 SET g.previous_generation = {}",
+                        escape_ladybug_string(&key),
+                        generation
+                    );
+                    conn.query(&query)?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        for generation in generations.iter().rev().take(keep) {
+            retained.insert(*generation);
+        }
+        let prune: Vec<u64> = generations
+            .iter()
+            .filter(|generation| !retained.contains(generation))
+            .copied()
+            .collect();
+        let mut deleted = 0usize;
+        for generation in prune {
+            deleted += self
+                .delete_generation_protected(namespace, generation)
+                .await?;
+        }
+        Ok(deleted)
+    }
+
     pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
         let gens = self.active_generations_public(namespace).await;
         let memories = self
@@ -3677,198 +4914,238 @@ impl LadybugStore {
         .await
     }
 
-
+    /// Repairs row shape and dangling refs.
+    ///
+    /// Two passes, so that no turn is long and no write rests on a stale read:
+    ///   1. A read-only candidate pass pages through the namespace in id
+    ///      order, resolves each distinct edge target once, reads the existing
+    ///      edges once, and plans every row in Rust. It keeps only the ids of
+    ///      the rows that need work; the plan itself is thrown away.
+    ///   2. The candidates are repaired in chunks, each in ONE write turn that
+    ///      re-reads its rows and everything they are planned from (keyed
+    ///      lookups) and plans again before it writes. See
+    ///      `hygiene_repair_chunk`.
+    ///
+    /// Do not go back to scanning and rewriting the whole namespace in one
+    /// turn (it outlived the 30 s write deadline on a large namespace), or to a
+    /// turn and several lookups per row for every row (about 193 s on the same
+    /// namespace). Readers share the
+    /// writer's lock, so keep every turn short.
+    ///
+    /// # Partial success
+    ///
+    /// Each 25-row chunk is its own write turn. A failed chunk does not abort
+    /// the run: the chunks that committed keep their counts, the failure is
+    /// logged with those counts, and the run ends with `Err` carrying the
+    /// partial totals. A caller must not treat `Err` as "nothing happened":
+    /// use the counts in the message for reporting, and leave any completion
+    /// marker (the doctor's `last_run_version`) unchanged so the repair is
+    /// retried.
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
+        const PAGE: usize = 500;
+        self.repair_namespace_hygiene_with_page(namespace, PAGE).await
+    }
+
+    async fn repair_namespace_hygiene_with_page(
+        &self,
+        namespace: &str,
+        page_size: usize,
+    ) -> Result<(usize, usize)> {
+        const RESOLVE_CHUNK: usize = 50;
+        anyhow::ensure!(page_size > 0, "hygiene repair page size must be positive");
         let namespace = namespace.to_string();
-        self.write_with_deadline("repairing namespace hygiene", move |conn| {
-            let safe = crate::store::ladybug::escape_ladybug_string(&namespace);
-            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata", safe);
-            let mut res = conn.query(&query)?;
-            let mut known_ids = std::collections::HashSet::new();
-            let mut rows = Vec::new();
-            while let Some(row) = res.next() {
-                let id = format!("{}", row[0]);
-                let mtype = format!("{}", row[1]);
-                let loc = format!("{}", row[2]);
-                let content_str = format!("{}", row[3]);
-                let meta_str = format!("{}", row[4]);
-                let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap_or(serde_json::json!({}));
-                if meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
-                known_ids.insert(id.clone());
-                rows.push((id, mtype, loc, content_str, meta_str));
+
+        // 1. Pages of rows, ordered by id.
+        let mut rows: Vec<HygieneRow> = Vec::new();
+        let mut known_ids = std::collections::BTreeSet::new();
+        let mut last = String::new();
+        loop {
+            let (ns, after) = (namespace.clone(), last.clone());
+            let page: Vec<(HygieneRow, bool)> = self
+                .with_conn(move |conn| {
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id > '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata ORDER BY m.id LIMIT {}",
+                        escape_ladybug_string(&ns),
+                        escape_ladybug_string(&after),
+                        page_size
+                    );
+                    let mut res = conn.query(&query)?;
+                    let mut out = Vec::new();
+                    while let Some(row) = res.next() {
+                        let meta_str = format!("{}", row[4]);
+                        let meta: Value = serde_json::from_str(&meta_str).unwrap_or(serde_json::json!({}));
+                        let archived = meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+                        out.push((
+                            HygieneRow {
+                                id: format!("{}", row[0]),
+                                mtype: format!("{}", row[1]),
+                                loc: format!("{}", row[2]),
+                                content: format!("{}", row[3]),
+                                content_empty: format!("{}", row[3]).trim().is_empty(),
+                                meta_str,
+                            },
+                            archived,
+                        ));
+                    }
+                    Ok(out)
+                })
+                .await?;
+            let Some((tail, _)) = page.last() else { break };
+            last = tail.id.clone();
+            let full = page.len() == page_size;
+            for (row, archived) in page {
+                if archived {
+                    continue;
+                }
+                known_ids.insert(row.id.clone());
+                rows.push(row);
             }
-            let mut shape_updates = 0usize;
-            let mut dangling_updates = 0usize;
-            for (id, mtype, loc, content_str, meta_str) in &rows {
-                let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
-                if !meta.is_object() { meta = serde_json::json!({}); }
-                let mut shape_changed = false;
-                let mut dangling_changed = false;
-                // (a) rule source
-                if mtype == "rule" {
-                    // A source is usable provenance when it is a non-empty string
-                    // or a non-empty object -- `crate::traits::has_source` is the
-                    // canonical predicate for that, and the task gate and the
-                    // SHACL checker both ask it. Reading the field as a string
-                    // alone made an object source look blank, and this repair
-                    // would then OVERWRITE the structured origin with the row's
-                    // location: the repair destroyed the provenance it was
-                    // supposed to preserve. "N/A" stays a placeholder, not a
-                    // source, so it is still repaired.
-                    let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                    let usable = crate::traits::has_source(&meta) && src != "N/A";
-                    if !usable {
-                        let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("source".to_string(), serde_json::Value::String(val));
-                            shape_changed = true;
+            if !full {
+                break;
+            }
+        }
+
+        // 2. Each distinct unknown edge target, resolved once.
+        let mut unknown: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in &rows {
+            let meta: Value = serde_json::from_str(&row.meta_str).unwrap_or(serde_json::json!({}));
+            for k in HYGIENE_EDGE_KEYS {
+                if let Some(arr) = meta.get(k).and_then(|v| v.as_array()) {
+                    for t in arr.iter().filter_map(|v| v.as_str()) {
+                        if t != "samples" && t != "total" && !known_ids.contains(t) {
+                            unknown.insert(t.to_string());
                         }
-                    }
-                }
-                // (a2) procedure trigger repair
-                if mtype == "procedure" {
-                    let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
-                    let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
-                    if !is_valid {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
-                            shape_changed = true;
-                        }
-                    }
-                    let remaining_missing = meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none();
-                    if remaining_missing {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
-                            shape_changed = true;
-                        }
-                    }
-                }
-                // (a3) task memory repair: backfill metadata.task defaults
-                if mtype == "task" {
-                    let task_meta = meta.get("task").cloned();
-                    let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
-                    let mut task_changed = false;
-                    if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
-                        task_obj.insert("status".to_string(), serde_json::Value::String("open".to_string()));
-                        task_changed = true;
-                    }
-                    if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
-                        task_obj.insert("priority".to_string(), serde_json::Value::Number(serde_json::Number::from(2)));
-                        task_changed = true;
-                    }
-                    if !task_obj.contains_key("task_type") {
-                        task_obj.insert("task_type".to_string(), serde_json::Value::String("task".to_string()));
-                        task_changed = true;
-                    }
-                    if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
-                        if let Some(obj) = meta.as_object_mut() {
-                            obj.insert("task".to_string(), serde_json::Value::Object(task_obj));
-                            shape_changed = true;
-                        }
-                    }
-                }
-                // (a4) content / fact and generic repair: backfill blank content and missing required fields from title/location/legacy
-                let content_empty = content_str.trim().is_empty();
-                let mut content_backfill: Option<String> = None;
-                let structural = matches!(mtype.as_str(), "file" | "directory" | "markdown" | "symbol" | "code_ast" | "doc_section" | "freshness_flag" | "guard_event");
-                if content_empty && !structural {
-                    content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
-                        .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
-                        .unwrap_or_else(|| "legacy".to_string()));
-                }
-                if (content_empty && mtype == "fact") || (content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
-                    content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
-                        .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
-                        .unwrap_or_else(|| "legacy".to_string()));
-                }
-                // (b) dangling refs in edge arrays
-                let keys = ["governs","related_to","relates_to","contained_by","extracted_from","depends_on"];
-                let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
-                let mut unresolvable = Vec::new();
-                for k in &keys {
-                    if let Some(arr) = meta.get(k).and_then(|v| v.as_array()).cloned() {
-                        let mut kept = Vec::new();
-                        for item in &arr {
-                            if let Some(t) = item.as_str() {
-                                // Remove residual unresolved string targets (samples/total) and check existence
-                                if t == "samples" || t == "total" {
-                                    unresolvable.push(t.to_string());
-                                    continue;
-                                }
-                                // Check existence against known_ids, resolved targets, and prefix-unqualified resolution
-                                let ns_prefix = format!("{}{}", namespace, crate::parser::ingest::NAMESPACE_SEPARATOR);
-                                let exists = known_ids.contains(t)
-                                    || exact_target_exists(conn, t).unwrap_or(false)
-                                    || if let Some(stripped) = t.strip_prefix(&ns_prefix) {
-                                        matches!(resolve_target_on_write(conn, &namespace, stripped), crate::traits::TargetResolution::Resolved(_))
-                                    } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-                                        matches!(resolve_target_on_write(conn, &namespace, t), crate::traits::TargetResolution::Resolved(_))
-                                    } else {
-                                        false
-                                    }
-                                    || (t.len() >= 7 && known_ids.iter().filter(|k| k.starts_with(t)).count() == 1);
-                                if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
-                            } else { kept.push(item.clone()); }
-                        }
-                        // Materialize missing graph edges for kept targets (borrow; move happens below)
-                        for item in &kept {
-                            if let Some(t) = item.as_str() {
-                                if known_ids.contains(t) || exact_target_exists(conn, t).unwrap_or(false) {
-                                    let rel_table = match *k {
-                                        "governs" => "GOVERNS",
-                                        "related_to" | "relates_to" => "RELATES_TO",
-                                        "contained_by" => "CONTAINS",
-                                        "extracted_from" => "EXTRACTED_FROM",
-                                        "depends_on" => "DEPENDS_ON",
-                                        _ => "RELATES_TO",
-                                    };
-                                    let safe_self = crate::store::ladybug::escape_ladybug_string(id);
-                                    let safe_target = crate::store::ladybug::escape_ladybug_string(t);
-                                    let (from_id, to_id) = if *k == "contained_by" {
-                                        (safe_target.as_str(), safe_self.as_str())
-                                    } else {
-                                        (safe_self.as_str(), safe_target.as_str())
-                                    };
-                                    let merge_edge_q = format!(
-                                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = '{}', r.origin = 'local'",
-                                        from_id, to_id, rel_table, safe, safe_self
-                                    );
-                                    if let Err(e) = conn.query(&merge_edge_q) {
-                                         tracing::debug!("hygiene edge merge note: {e}");
-                                     }
-                                }
-                            }
-                        } // end for item in &kept
-                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; } }
-                    }
-                }
-                if !unresolvable.is_empty() {
-                    archived_refs.extend(unresolvable);
-                    if let Some(obj) = meta.as_object_mut() {
-                        obj.insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-                    }
-                    dangling_changed = true;
-                }
-                if shape_changed || dangling_changed || content_backfill.is_some() {
-                    let has_backfill = content_backfill.is_some();
-                    let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
-                    if let Err(e) = conn.query(&q_meta) {
-                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
-                    } else {
-                        if let Some(backfill_text) = content_backfill {
-                            let safe_back = crate::store::ladybug::escape_ladybug_string(&backfill_text);
-                            let q_content = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), safe_back);
-                            if let Err(e) = conn.query(&q_content) {
-                                tracing::warn!("hygiene repair: content write failed for {id}: {e}");
-                            }
-                        }
-                        if shape_changed || has_backfill { shape_updates += 1; }
-                        if dangling_changed { dangling_updates += 1; }
                     }
                 }
             }
-            Ok((shape_updates, dangling_updates))
-        }).await
+        }
+        let unknown: Vec<String> = unknown.into_iter().collect();
+        let mut targets: HashMap<String, HygieneTarget> = HashMap::new();
+        for chunk in unknown.chunks(RESOLVE_CHUNK) {
+            let (ns, chunk) = (namespace.clone(), chunk.to_vec());
+            let resolved = self
+                .with_conn(move |conn| {
+                    let mut out = Vec::new();
+                    for t in chunk {
+                        let exact = exact_target_exists(conn, &t).unwrap_or(false);
+                        let resolved = !exact && hygiene_target_resolves(conn, &ns, &t).unwrap_or(false);
+                        out.push((t, HygieneTarget { exact, resolved }));
+                    }
+                    Ok(out)
+                })
+                .await?;
+            targets.extend(resolved);
+        }
+
+        // 3. Edges that already exist, so only missing ones are merged.
+        let ns_edges = namespace.clone();
+        let existing: HashSet<(String, String, &'static str)> = self
+            .with_conn(move |conn| {
+                let safe = escape_ladybug_string(&ns_edges);
+                let mut out = HashSet::new();
+                for rel in ["GOVERNS", "RELATES_TO", "CONTAINS", "EXTRACTED_FROM", "DEPENDS_ON"] {
+                    let q = format!(
+                        "MATCH (a:Memory)-[r:{rel}]->(b:Memory) WHERE a.namespace = '{safe}' OR b.namespace = '{safe}' RETURN a.id, b.id"
+                    );
+                    if let Ok(mut res) = conn.query(&q) {
+                        while let Some(row) = res.next() {
+                            out.insert((format!("{}", row[0]), format!("{}", row[1]), rel));
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+
+        // 4. Find the rows that need work. This pass only chooses candidates;
+        // it writes nothing, and its plan is thrown away.
+        let view = PrefetchedView { known_ids, targets, existing };
+        let mut candidates: Vec<String> = Vec::new();
+        let mut scratch: Vec<HygieneWrite> = Vec::new();
+        for row in &rows {
+            // One row's plan at a time: only whether it is non-empty matters,
+            // and the statements embed whole metadata copies.
+            scratch.clear();
+            plan_hygiene_row(row, &namespace, &view, &mut scratch);
+            if !scratch.is_empty() {
+                candidates.push(row.id.clone());
+            }
+        }
+        // The chunks re-read what they need, so let go of the namespace-sized
+        // data before the long write phase.
+        drop(scratch);
+        drop(view);
+        drop(rows);
+
+        // 5. Repair each chunk of candidates in ONE write turn that re-reads
+        // the rows and everything they are planned from. Nothing planned
+        // earlier is trusted at write time, so a row edited, or a target
+        // published, since the read cannot be repaired from a stale copy.
+        let (shape_updates, dangling_updates, failed_chunks) =
+            self.run_hygiene_chunks(&namespace, &candidates).await?;
+        if failed_chunks > 0 {
+            return Err(hygiene_partial_error(
+                &namespace,
+                shape_updates,
+                dangling_updates,
+                failed_chunks,
+            ));
+        }
+        Ok((shape_updates, dangling_updates))
+    }
+
+    /// Run the candidate chunks, one write turn each, continuing past a failed
+    /// chunk. Returns `(shape_updates, dangling_updates, failed_chunks)`.
+    ///
+    /// A chunk failure is never swallowed: the caller reports the partial
+    /// counts and refuses to mark the repair complete, so the next run retries
+    /// the rows the failed chunk still needs.
+    async fn run_hygiene_chunks(
+        &self,
+        namespace: &str,
+        ids: &[String],
+    ) -> Result<(usize, usize, usize)> {
+        self.run_hygiene_chunks_with(namespace, ids, |ns, chunk| async move {
+            self.write_with_deadline("repairing namespace hygiene", move |conn| {
+                hygiene_repair_chunk(conn, &ns, &chunk)
+            })
+            .await
+        })
+        .await
+    }
+
+    /// The chunk-runner seam. Production passes the real write-turn closure;
+    /// tests inject a failing chunk without a broken engine.
+    async fn run_hygiene_chunks_with<F, Fut>(
+        &self,
+        namespace: &str,
+        ids: &[String],
+        mut run: F,
+    ) -> Result<(usize, usize, usize)>
+    where
+        F: FnMut(String, Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<(usize, usize)>>,
+    {
+        const REPAIR_CHUNK: usize = 25;
+        let total = ids.chunks(REPAIR_CHUNK).count();
+        let (mut shape, mut dangling, mut failed) = (0usize, 0usize, 0usize);
+        for (index, chunk) in ids.chunks(REPAIR_CHUNK).enumerate() {
+            match run(namespace.to_string(), chunk.to_vec()).await {
+                Ok((sh, da)) => {
+                    shape += sh;
+                    dangling += da;
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(
+                        "hygiene repair chunk {}/{} failed for '{namespace}': {e}; keeping {shape} shape / {dangling} dangling updates from earlier chunks",
+                        index + 1,
+                        total
+                    );
+                }
+            }
+        }
+        Ok((shape, dangling, failed))
     }
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
@@ -3961,21 +5238,26 @@ impl LadybugStore {
             if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) }
         });
         doc.archived = is_archived(metadata);
-        doc.user_id = payload.user_id.clone();
-        doc.visible_to = metadata
-            .get("visible_to")
-            .and_then(|v| v.as_array())
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| entry.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // PAR-02 B4 owner parity: the vector route resolves the owner as
+        // user_id, then metadata.user_id / mesh / lifecycle. Using the raw
+        // payload field here made a row with an empty user_id and a metadata
+        // owner unowned on the lexical route only.
+        doc.user_id = crate::rebac::extract_resource_owner(&payload.user_id, metadata);
+        // Canonical ACL extraction (string and {principal, role} entries, with
+        // the fail-closed sentinel for wholly malformed arrays). A string-only
+        // parse here made object-only ACLs look unrestricted to lexical search.
+        doc.visible_to = crate::rebac::extract_visible_to(metadata);
         doc.domains = crate::domain::domain_keys(metadata);
         doc.structural = STRUCTURAL_MEMORY_TYPES.contains(&payload.memory_type.as_str());
         doc.registry = crate::registry::is_registry_row(metadata);
         doc.conflicting = is_mesh_conflicting(metadata);
+        // #149: the id carries the staged generation; the source identity
+        // carries the worktree whose pointer governs it. Both are absent on
+        // legacy/unscoped rows, which stay visible.
+        doc.generation = split_scoped_id(id)
+            .map(|(_, generation, _)| generation)
+            .unwrap_or(0);
+        doc.source_key = row_source_key(metadata).unwrap_or_default().to_string();
         doc
     }
 
@@ -3994,6 +5276,19 @@ impl LadybugStore {
             if doc.archived {
                 meta.insert("archived".to_string(), Value::Number(1.into()));
             }
+            // Preserve the exclusion flags lexical_doc decided: upsert_memory
+            // re-derives them from payload metadata via is_registry_row /
+            // is_conflicting_metadata, so dropping them here would index rows
+            // the rebuild path (full payloads) correctly excludes.
+            if doc.registry {
+                meta.insert(
+                    "domain_registry".to_string(),
+                    serde_json::json!({"domains": []}),
+                );
+            }
+            if doc.conflicting {
+                meta.insert("mesh".to_string(), serde_json::json!({"conflict": true}));
+            }
             let payload = MemoryPayload {
                 content: doc.content.clone(),
                 user_id: doc.user_id.clone(),
@@ -4006,6 +5301,17 @@ impl LadybugStore {
             if let Err(e) = idx.upsert_memory(&doc.namespace, &doc.id, &payload) {
                 tracing::warn!("tantivy upsert_memory failed for {}:{}: {e}", doc.namespace, doc.id);
             }
+        }
+        // A scoped write can stage an unpublished row or update an active one
+        // (archive, metadata, content). Rather than resolving the pointer on
+        // every ingest write, drop the in-memory partition: the next read
+        // reloads the active view from the database. Staged rows therefore
+        // never rank, and an active row's new payload is picked up. The
+        // Tantivy copy is written either way; its query filter runs before
+        // TopDocs collects.
+        if doc.generation != 0 {
+            self.invalidate_inhouse_lexical(&doc.namespace);
+            return;
         }
         let loaded = self
             .lexical_loaded
@@ -4069,50 +5375,85 @@ impl LadybugStore {
             return Ok(());
         }
 
-        let namespace_owned = namespace.to_string();
-        let docs = self
-            .with_conn(move |conn| {
-                let safe_ns = escape_ladybug_string(&namespace_owned);
-                let query = format!(
-                    "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
-                    safe_ns
-                );
-                let rows = conn.query(&query)?;
-                let mut docs = Vec::new();
-                for row in rows {
-                    let id: String = format!("{}", row[0]);
-                    let content: String = format!("{}", row[1]);
-                    let user_id: String = format!("{}", row[2]);
-                    let memory_type: String = format!("{}", row[3]);
-                    let location: String = format!("{}", row[4]);
-                    let metadata_str: String = format!("{}", row[5]);
-                    let metadata: Value =
-                        parse_metadata_or_warn(&metadata_str, "metadata");
-                    let payload = MemoryPayload {
-                        content,
-                        user_id,
-                        memory_type,
-                        agent_name: None,
-                        location,
-                        location_lines: String::new(),
-                        metadata,
-                    };
-                    docs.push(Self::lexical_doc(&namespace_owned, &id, &payload));
-                }
-                Ok(docs)
-            })
-            .await?;
+        // A publish/abort can land while the fetch is in flight. The epoch is
+        // bumped before the cache is cleared, and re-checked under the index
+        // lock, so a load that raced an invalidation cannot install the
+        // superseded generation nor mark the namespace loaded.
+        for _ in 0..2 {
+            let epoch = self
+                .lexical_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let namespace_owned = namespace.to_string();
+            let docs = self
+                .with_conn(move |conn| {
+                    let safe_ns = escape_ladybug_string(&namespace_owned);
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
+                        safe_ns
+                    );
+                    let rows = conn.query(&query)?;
+                    // #149: load only rows the active pointers still reach.
+                    let active = ActiveGenerations::read(conn, &namespace_owned);
+                    let mut docs = Vec::new();
+                    for row in rows {
+                        let id: String = format!("{}", row[0]);
+                        let content: String = format!("{}", row[1]);
+                        let user_id: String = format!("{}", row[2]);
+                        let memory_type: String = format!("{}", row[3]);
+                        let location: String = format!("{}", row[4]);
+                        let metadata_str: String = format!("{}", row[5]);
+                        let metadata: Value =
+                            parse_metadata_or_warn(&metadata_str, "metadata");
+                        let payload = MemoryPayload {
+                            content,
+                            user_id,
+                            memory_type,
+                            agent_name: None,
+                            location,
+                            location_lines: String::new(),
+                            metadata,
+                        };
+                        let doc = Self::lexical_doc(&namespace_owned, &id, &payload);
+                        let source =
+                            (!doc.source_key.is_empty()).then_some(doc.source_key.as_str());
+                        if !active.reaches_source(
+                            &doc.id,
+                            &namespace_owned,
+                            &doc.memory_type,
+                            source,
+                        ) {
+                            continue;
+                        }
+                        docs.push(doc);
+                    }
+                    Ok(docs)
+                })
+                .await?;
 
-        {
-            let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
-            for doc in docs {
-                index.add(doc);
+            {
+                let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
+                if self
+                    .lexical_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != epoch
+                {
+                    // Invalidated mid-load: fetch the active view again.
+                    continue;
+                }
+                for doc in docs {
+                    index.add(doc);
+                }
+                self.lexical_loaded
+                    .write()
+                    .expect("lexical loaded lock")
+                    .insert(namespace.to_string());
             }
+            return Ok(());
         }
-        self.lexical_loaded
-            .write()
-            .expect("lexical loaded lock")
-            .insert(namespace.to_string());
+
+        // Two invalidations in a row: leave the partition unloaded so the next
+        // read retries; this call degrades to "no in-house hits", never stale
+        // ones.
         Ok(())
     }
 
@@ -4155,6 +5496,18 @@ impl LadybugStore {
 
     /// Rebuild the disk-backed Tantivy lexical index from stored Memory rows.
     pub async fn rebuild_tantivy_lexical(&self, namespace: Option<&str>) -> Result<(usize, String)> {
+        let _guard = self.lexical_refresh_lock.lock().await;
+        self.rebuild_tantivy_lexical_locked(namespace).await
+    }
+
+    /// The rebuild body. Callers must hold `lexical_refresh_lock`: it
+    /// serialises the fetch/install with `publish_generation`'s refresh, so a
+    /// rebuild that read the pre-publish rows cannot replace the namespace
+    /// after the refresh installed the new generation.
+    async fn rebuild_tantivy_lexical_locked(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<(usize, String)> {
         self.init("default").await?;
         let ns_opt = namespace.map(|s| s.to_string());
         let rows_data = self
@@ -4168,6 +5521,9 @@ impl LadybugStore {
                 };
                 let rows = conn.query(&query)?;
                 let mut out = Vec::new();
+                // #149: index only rows the active pointers still reach. The
+                // snapshot is per namespace; a whole-store rebuild reuses it.
+                let mut snapshots: HashMap<String, ActiveGenerations> = HashMap::new();
                 for row in rows {
                     let ns: String = format!("{}", row[0]);
                     let id: String = format!("{}", row[1]);
@@ -4193,6 +5549,13 @@ impl LadybugStore {
                         location_lines,
                         metadata,
                     };
+                    let active = snapshots
+                        .entry(ns.clone())
+                        .or_insert_with(|| ActiveGenerations::read(conn, &ns));
+                    let source = row_source_key(&payload.metadata);
+                    if !active.reaches_source(&id, &ns, &payload.memory_type, source) {
+                        continue;
+                    }
                     out.push((ns, id, payload));
                 }
                 Ok(out)
@@ -4203,9 +5566,52 @@ impl LadybugStore {
         let indexed = {
             let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
-            idx.rebuild(&rows_data)?
+            idx.rebuild_scoped(&rows_data, namespace)?
         };
         Ok((indexed, crate::lexical::INDEX_VERSION.to_string()))
+    }
+
+    /// #149 C3: drop the namespace's cached lexical view and rebuild it from
+    /// the rows the new pointer reaches.
+    ///
+    /// Best-effort by design: the graph flip already committed, and every
+    /// lexical read re-checks the row's generation against the pointers, so a
+    /// failed refresh delays index hygiene but cannot surface a stale row. The
+    /// next load/rebuild retries.
+    async fn refresh_lexical_after_pointer_change(&self, namespace: &str) {
+        // Hold the refresh lock across invalidation and rebuild: a concurrent
+        // rebuild that fetched the pre-publish rows waits here instead of
+        // replacing the namespace after the refresh completes.
+        let _guard = self.lexical_refresh_lock.lock().await;
+        self.invalidate_inhouse_lexical(namespace);
+        let tantivy_open = self
+            .tantivy_lexical
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if tantivy_open {
+            if let Err(e) = self
+                .rebuild_tantivy_lexical_locked(Some(namespace))
+                .await
+            {
+                tracing::warn!("lexical refresh after publish failed for {namespace}: {e}");
+            }
+        }
+    }
+
+    /// Drop a namespace's in-memory partition. Bumps the epoch before
+    /// clearing so a load that fetched before this point sees the new epoch
+    /// under the index lock and refetches instead of marking the namespace
+    /// loaded with superseded or stale documents.
+    fn invalidate_inhouse_lexical(&self, namespace: &str) {
+        self.lexical_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
+        index.clear_namespace(namespace);
+        self.lexical_loaded
+            .write()
+            .expect("lexical loaded lock")
+            .remove(namespace);
     }
 
     /// Search using the disk-backed Tantivy lexical index, hydrating payloads from LadybugDB.
@@ -4223,16 +5629,32 @@ impl LadybugStore {
         if self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()).is_none() {
             let _ = self.rebuild_tantivy_lexical(Some(namespace)).await?;
         }
+        // #149: read the pointers once for the whole page, then use the same
+        // snapshot for the query clause (no stale row consumes a slot) and
+        // for hydration (per-source re-check).
+        let ns_owned = namespace.to_string();
+        let active = self
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
+            .await?;
+        // With no pointer rows, the predicate keeps every scoped row, so the
+        // query filter must be skipped too: passing an empty set would admit
+        // only generation 0 and make those rows unsearchable.
+        let active_set = if active.is_empty() {
+            None
+        } else {
+            Some(active.active_generations_u64())
+        };
         let hits = {
             let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
-            idx.search(
+            idx.search_with_active_generations(
                 namespace,
                 query,
                 limit.max(1) * 4,
                 include_tasks,
                 include_archived,
                 None,
+                active_set.as_ref(),
             )?
         };
         let mut candidates = Vec::new();
@@ -4244,11 +5666,50 @@ impl LadybugStore {
                 continue;
             }
             if let Some((_, payload)) = self.get(namespace, &hit.id).await? {
+                // #149 C2.4: a superseded or still-staged row must not surface
+                // even when the index entry is stale. The row's own source
+                // decides, so two worktrees sharing a namespace stay separate.
+                if !active.reaches_source(
+                    &hit.id,
+                    namespace,
+                    &payload.memory_type,
+                    row_source_key(&payload.metadata),
+                ) {
+                    continue;
+                }
                 if !include_tasks && payload.memory_type == "task" {
                     continue;
                 }
-                let vis = crate::rebac::extract_visible_to(&payload.metadata);
-                if !crate::rebac::allowed(principal, &payload.user_id, "viewer", &vis) {
+                // Defense in depth: never surface an archived row when the
+                // caller excluded archived rows, even if its index entry
+                // predates the tombstone fix. Bool/int-tolerant, matching
+                // lexical::archived_flag (duplicated inline per convention).
+                if !include_archived {
+                    let archived = match payload.metadata.get("archived") {
+                        Some(v) if v.as_bool() == Some(true) => true,
+                        Some(v) => v.as_i64().map(|n| n != 0).unwrap_or(false),
+                        None => false,
+                    };
+                    if archived {
+                        continue;
+                    }
+                }
+                // Defense in depth: registry and mesh-conflicting rows are
+                // excluded at index time, but a stale index entry must not
+                // surface them either (the in-house engine's doc_visible
+                // rejects both classes on every read).
+                if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                    continue;
+                }
+                // Defense in depth: never surface a retired row, even if its
+                // index entry predates the valid_to handling. Uses the
+                // is_retired_at predicate defined in this module: a non-null
+                // valid_to that does not parse as an integer reads as 0,
+                // i.e. retired.
+                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                    continue;
+                }
+                if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
                     continue;
                 }
                 candidates.push(crate::traits::SearchResult {
@@ -4786,6 +6247,10 @@ impl VectorStore for LadybugStore {
                 CachedStoreState::Recorded(recorded) => !recorded.has_data,
                 CachedStoreState::FreshUnrecorded => true,
                 CachedStoreState::LockedUnknown => false,
+                // Unreachable in practice — the identity check at
+                // init entry already refused — but an unparseable
+                // sidecar never arms reconciliation.
+                CachedStoreState::Unparseable(_) => false,
             };
         // Issue #74: a LockedUnknown classification is ambiguous — it
         // covers both a genuine pre-sidecar store and a fresh store
@@ -4958,10 +6423,23 @@ impl VectorStore for LadybugStore {
                     tracing::warn!("schema DDL table creation failed: {e}");
                 }
             }
+            // One row per in-flight staging generation. A scalar marker on the
+            // pointer row cannot represent two overlapping ingests of one
+            // source: the second `begin_generation` would overwrite the first
+            // and leave it unprotected from pruning.
+            let create_staging_table = "CREATE NODE TABLE StagingGeneration (id STRING, namespace STRING, source_key STRING, generation INT64, base_generation INT64, created_at INT64, PRIMARY KEY (id))";
+            if let Err(e) = conn.query(create_staging_table) {
+                if format!("{e}").to_lowercase().contains("already exists") {
+                    tracing::debug!("schema DDL query note: {e}");
+                } else {
+                    tracing::warn!("schema DDL table creation failed: {e}");
+                }
+            }
             for stmt in [
                 "ALTER TABLE IngestGeneration ADD source_key STRING",
                 "ALTER TABLE IngestGeneration ADD active_generation INT64",
                 "ALTER TABLE IngestGeneration ADD counter INT64",
+                "ALTER TABLE IngestGeneration ADD previous_generation INT64",
             ] {
                 if let Err(e) = conn.query(stmt) {
                     tracing::debug!("schema DDL query note: {e}");
@@ -5722,6 +7200,56 @@ impl VectorStore for LadybugStore {
         outcome
     }
 
+    /// CAS-by-write-turn: the read and the write happen inside one turn, and
+    /// the store's single-writer lock serialises it against every other writer
+    /// (in-process and, via the database file lock, cross-process). Concurrent
+    /// rule firings therefore serialize instead of losing increments between a
+    /// separate get and upsert.
+    async fn increment_metadata_counter(
+        &self,
+        namespace: &str,
+        id: &str,
+        key: &str,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let key = key.to_string();
+        self.write_with_deadline("recording a metadata counter", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
+            let read = format!(
+                "MATCH (m:Memory) WHERE m.id = '{safe_id}' AND m.namespace = '{safe_ns}' RETURN m.metadata"
+            );
+            let mut rows = conn.query(&read)?;
+            let Some(row) = rows.next() else {
+                return Ok(());
+            };
+            let metadata_str = format!("{}", row[0]);
+            let mut metadata: Value = serde_json::from_str(&metadata_str)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if !metadata.is_object() {
+                anyhow::bail!(
+                    "memory '{id}' carries metadata that is not an object"
+                );
+            }
+            let hits = metadata
+                .get(&key)
+                .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+                .unwrap_or(0);
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(key.clone(), serde_json::json!(hits + 1));
+            }
+            let safe_meta =
+                escape_ladybug_string(&serde_json::to_string(&metadata)?);
+            let write = format!(
+                "MATCH (m:Memory) WHERE m.id = '{safe_id}' AND m.namespace = '{safe_ns}' SET m.metadata = '{safe_meta}'"
+            );
+            conn.query(&write)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn search(
         &self,
         namespace: &str,
@@ -5810,6 +7338,13 @@ impl VectorStore for LadybugStore {
         fuzzy_max_distance: usize,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.ensure_lexical_loaded(namespace).await?;
+        // #149 C2.4: the in-memory partition is filtered at load, but a row
+        // staged after that load (or left by a failed refresh) is re-checked
+        // against the pointers on hydration.
+        let ns_owned = namespace.to_string();
+        let active = self
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
+            .await?;
         self.refresh_ontology(namespace).await;
         let ontology = self.get_ontology(namespace);
         // Domain ontology expansion: expand domain slugs before filtering
@@ -5846,6 +7381,14 @@ impl VectorStore for LadybugStore {
             let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
                 continue;
             };
+            if !active.reaches_source(
+                &hit.id,
+                namespace,
+                &payload.memory_type,
+                row_source_key(&payload.metadata),
+            ) {
+                continue;
+            }
             results.push(SearchResult {
                 id: hit.id,
                 score: hit.score,
@@ -6634,6 +8177,39 @@ impl VectorStore for LadybugStore {
             );
             conn.query(&pointer)?;
 
+            // Each overlapping ingest gets its own staging row; retention
+            // protects them all until each publishes or aborts. The base (the
+            // active generation this ingest will carry forward from) is
+            // protected too: another ingest can publish newer generations
+            // before this one finishes, and carry-forward still reads the base.
+            let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+                &namespace,
+                &source_key,
+            ));
+            let read_active = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+            );
+            let base = conn
+                .query(&read_active)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                .unwrap_or(0);
+            let staging_id = format!(
+                "{}::{}",
+                crate::parser::ingest::generation_key(&namespace, &source_key),
+                next
+            );
+            let staging = format!(
+                "MERGE (s:StagingGeneration {{id: '{}'}}) SET s.namespace = '{}', s.source_key = '{}', s.generation = {}, s.base_generation = {}, s.created_at = {}",
+                escape_ladybug_string(&staging_id),
+                safe_ns,
+                safe_sk,
+                next,
+                base,
+                chrono::Utc::now().timestamp()
+            );
+            conn.query(&staging)?;
+
             Ok(next)
         })
         .await
@@ -6646,6 +8222,7 @@ impl VectorStore for LadybugStore {
         generation: u64,
     ) -> Result<()> {
         let namespace = namespace.to_string();
+        let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
         self.write_with_deadline("publishing a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
@@ -6653,21 +8230,36 @@ impl VectorStore for LadybugStore {
             // The flip is one statement on this source's pointer row: the active
             // pointer moves to `generation` and the previous generation's rows
             // stay as history. Another source's pointer is untouched.
+            let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+                &namespace,
+                &source_key,
+            ));
+            // The value the pointer holds now is this source's rollback
+            // target. Reading it in the same turn as the flip makes the pair
+            // (active, previous) one atomic update.
+            let read_active = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+            );
+            let previous = conn
+                .query(&read_active)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                .unwrap_or(0);
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '{}', g.counter = 0, g.active_generation = {} ON MATCH SET g.active_generation = {}",
-                escape_ladybug_string(&crate::parser::ingest::generation_key(
-                    &namespace,
-                    &source_key
-                )),
-                safe_ns,
-                safe_sk,
-                generation,
-                generation
+                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
             );
             conn.query(&write)?;
+            // Only this generation's staging row: an overlapping ingest's
+            // row must stay protected.
+            let clear_staging = format!(
+                "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {generation} DELETE s"
+            );
+            conn.query(&clear_staging)?;
             Ok(())
         })
-        .await
+        .await?;
+        self.refresh_lexical_after_pointer_change(&refresh_ns).await;
+        Ok(())
     }
 
     async fn abort_generation(
@@ -6677,14 +8269,18 @@ impl VectorStore for LadybugStore {
         generation: u64,
     ) -> Result<()> {
         let namespace = namespace.to_string();
+        let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
         self.write_with_deadline("aborting a staging generation", move |conn| {
             // A staged node's id is `ns::<generation>::<path>`, so every row of
-            // this generation shares the prefix. Nothing else matches it, and
-            // the previous generation is untouched.
+            // this generation shares the prefix. The namespace predicate keeps
+            // a foreign row whose id happens to start with that prefix (a
+            // namespace containing the separator, a corrupt import) out of the
+            // delete. The previous generation is untouched.
             let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
             let query = format!(
-                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' DETACH DELETE m",
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' DETACH DELETE m",
+                escape_ladybug_string(&namespace),
                 escape_ladybug_string(&prefix)
             );
             conn.query(&query)?;
@@ -6701,9 +8297,21 @@ impl VectorStore for LadybugStore {
                 generation
             );
             conn.query(&clear)?;
+            // Remove this generation's staging row (and only that one), so
+            // retention is free to prune the discarded rows.
+            let clear_staging = format!(
+                "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.source_key = '{}' AND s.generation = {} DELETE s",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&source_key),
+                generation
+            );
+            conn.query(&clear_staging)?;
             Ok(())
         })
-        .await
+        .await?;
+        self.refresh_lexical_after_pointer_change(&refresh_ns)
+            .await;
+        Ok(())
     }
 
     async fn active_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
@@ -6720,7 +8328,8 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
             let query = format!(
-                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' RETURN m.id",
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id STARTS WITH '{}' RETURN m.id",
+                escape_ladybug_string(&namespace),
                 escape_ladybug_string(&prefix)
             );
             let mut rows = conn.query(&query)?;
@@ -9403,7 +11012,7 @@ fn is_retired(metadata: &Value) -> bool {
 
 /// Timestamp-aware variant so callers that fetch many rows in one pass can
 /// capture `now` once instead of calling Utc::now() per row.
-fn is_retired_at(metadata: &Value, now: i64) -> bool {
+pub(crate) fn is_retired_at(metadata: &Value, now: i64) -> bool {
     match metadata.get("valid_to") {
         Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
         _ => false,
@@ -9909,6 +11518,421 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn par01_lexical_object_acl_denies_unauthorized() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("acl.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let mut payload = retired_test_payload(
+            "rule",
+            "owner",
+            json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+        );
+        payload.content = "parityneedle confidential memory".to_string();
+        store.upsert("probe", "private", vec![0.0; 4], payload).await.unwrap();
+
+        for principal in ["alice", "owner", "admin"] {
+            let hits = store
+                .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
+                .await.unwrap().results;
+            assert_eq!(hits.len(), 1, "allowed reader {principal} must retain retrieval");
+            assert_eq!(hits[0].id, "private");
+            assert_eq!(hits[0].payload.content, "parityneedle confidential memory");
+        }
+        for principal in ["bob", ""] {
+            let hits = store
+                .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
+                .await.unwrap().results;
+            assert!(hits.is_empty(), "object ACL must deny unauthorized principal {principal:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn par01_lexical_acl_compatibility_matrix() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("acl.lbug");
+        let store = LadybugStore::for_testing(&db, 4).unwrap();
+        store.init("probe").await.unwrap();
+        // Load the empty index first, so upserts must update an already loaded index.
+        assert!(store.search_lexical("probe", "parityneedle", 100, false, false, &[], "admin", 0)
+            .await.unwrap().results.is_empty());
+        let cases: Vec<(&str, Value, &[&str])> = vec![
+            ("object-viewer", json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}), &["alice"]),
+            ("object-editor", json!({"visible_to": [{"principal": "alice", "role": "editor"}]}), &["alice"]),
+            ("object-owner", json!({"visible_to": [{"principal": "alice", "role": "owner"}]}), &["alice"]),
+            ("object-default", json!({"visible_to": [{"principal": "alice"}]}), &["alice"]),
+            ("object-unknown-role", json!({"visible_to": [{"principal": "alice", "role": "unknown"}]}), &["alice"]),
+            ("string", json!({"visible_to": ["bob"]}), &["bob"]),
+            ("mixed", json!({"visible_to": ["bob", {"principal": "alice", "role": "editor"}, 42]}), &["alice", "bob"]),
+            ("malformed-number", json!({"visible_to": [42]}), &[]),
+            ("malformed-object", json!({"visible_to": [{"role": "viewer"}, {"principal": 42}, null]}), &[]),
+            ("partial-object", json!({"visible_to": [null, {"principal": "alice"}]}), &["alice"]),
+            ("partial-string", json!({"visible_to": [42, "bob"]}), &["bob"]),
+            ("wildcard-string", json!({"visible_to": ["*"]}), &["*"]),
+            ("wildcard-object", json!({"visible_to": [{"principal": "*", "role": "editor"}]}), &["*"]),
+            ("empty", json!({"visible_to": []}), &["*"]),
+            ("absent", json!({}), &["*"]),
+            ("legacy-null", json!({"visible_to": null}), &["*"]),
+            ("legacy-nonarray", json!({"visible_to": 42}), &["*"]),
+        ];
+        for (id, metadata, _) in &cases {
+            let mut payload = retired_test_payload("rule", "owner", metadata.clone());
+            payload.content = "parityneedle confidential memory".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+
+        async fn assert_contract(store: &LadybugStore, cases: &[(&str, Value, &[&str])], phase: &str) {
+            for principal in ["owner", "admin", "alice", "bob", "malice", "eve", ""] {
+                let expected: std::collections::BTreeSet<_> = cases.iter()
+                    .filter(|(_, _, readers)| !principal.is_empty()
+                        && (matches!(principal, "owner" | "admin")
+                            || readers.contains(&"*") || readers.contains(&principal)))
+                    .map(|(id, _, _)| id.to_string()).collect();
+                let hits = store.search_lexical("probe", "parityneedle", 100, false, false, &[], principal, 0)
+                    .await.unwrap().results;
+                let actual: std::collections::BTreeSet<_> = hits.iter().map(|hit| hit.id.clone()).collect();
+                assert_eq!(actual, expected, "in-house {phase}, principal {principal:?}");
+                assert!(hits.iter().all(|hit| hit.payload.content == "parityneedle confidential memory"));
+                let tantivy = store.search_tantivy_lexical("probe", "parityneedle", 100, false, false, &[], principal)
+                    .await.unwrap().results;
+                let tantivy_ids: std::collections::BTreeSet<_> = tantivy.iter().map(|hit| hit.id.clone()).collect();
+                assert_eq!(tantivy_ids, expected, "Tantivy hydration {phase}, principal {principal:?}");
+            }
+        }
+
+        assert_contract(&store, &cases, "incremental").await;
+        assert_eq!(store.rebuild_lexical_index(Some("probe")).await.unwrap(), cases.len());
+        assert_contract(&store, &cases, "rebuilt").await;
+        drop(store);
+        let reopened = LadybugStore::for_testing(&db, 4).unwrap();
+        reopened.init("probe").await.unwrap();
+        assert_contract(&reopened, &cases, "cold load").await;
+    }
+
+    fn tantivy_exclusion_payload(content: &str, metadata: Value) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_upsert_path_excludes_registry_and_conflicting_rows() {
+        // lexical_apply_doc rebuilds a payload from the LexicalDoc before
+        // calling upsert_memory; the registry/conflicting flags decided in
+        // lexical_doc must survive that reconstruction, or excluded rows are
+        // indexed and surface in Tantivy search until the next rebuild.
+        let store = retired_test_store().await;
+        *store.tantivy_lexical.write().unwrap() =
+            Some(crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap());
+
+        let registry_payload = tantivy_exclusion_payload(
+            "zebratoken registry row",
+            crate::registry::registry_metadata(&["auth".to_string()]),
+        );
+        let conflicting_payload = tantivy_exclusion_payload(
+            "zebratoken conflicting row",
+            json!({"mesh": {"conflict": true}}),
+        );
+        let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
+
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "registry-row", &registry_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "conflicting-row", &conflicting_payload));
+        store.lexical_apply_doc(LadybugStore::lexical_doc("probe", "clean-row", &clean_payload));
+
+        let guard = store.tantivy_lexical.read().unwrap();
+        let idx = guard.as_ref().expect("tantivy open");
+        let hits = idx.search("probe", "zebratoken", 10, true, true, None).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must be indexed, got: {ids:?}");
+        assert!(
+            !ids.contains(&"registry-row"),
+            "registry row must not be indexed via the upsert path, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conflicting-row"),
+            "mesh-conflicting row must not be indexed via the upsert path, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_excludes_registry_and_conflicting_rows() {
+        // Defense in depth at hydration: a stale index entry whose stored
+        // row is a registry or mesh-conflicting row must not surface from
+        // search_tantivy_lexical even when the entry carries no exclusion
+        // metadata.
+        let store = retired_test_store().await;
+        let registry_payload = tantivy_exclusion_payload(
+            "zebratoken registry row",
+            crate::registry::registry_metadata(&["auth".to_string()]),
+        );
+        let conflicting_payload = tantivy_exclusion_payload(
+            "zebratoken conflicting row",
+            json!({"mesh": {"conflict": true}}),
+        );
+        let clean_payload = tantivy_exclusion_payload("zebratoken clean row", json!({}));
+        // Store rows first (Tantivy not yet open, so nothing indexes live).
+        store.upsert("probe", "registry-row", vec![0.0; 4], registry_payload.clone()).await.unwrap();
+        store.upsert("probe", "conflicting-row", vec![0.0; 4], conflicting_payload.clone()).await.unwrap();
+        store.upsert("probe", "clean-row", vec![0.0; 4], clean_payload.clone()).await.unwrap();
+
+        // Seed a stale index: same ids/content, exclusion metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("registry-row", &registry_payload),
+            ("conflicting-row", &conflicting_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let outcome = store
+            .search_tantivy_lexical("probe", "zebratoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
+        assert!(
+            !ids.contains(&"registry-row"),
+            "registry row must not surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conflicting-row"),
+            "mesh-conflicting row must not surface from tantivy search, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_excludes_retired_rows() {
+        // A stale Tantivy entry (exclusion metadata stripped) must not
+        // surface rows retired under is_retired_at semantics: valid_to 0 and
+        // unparseable non-null valid_to both read as retired.
+        let store = retired_test_store().await;
+        let zero_payload = tantivy_exclusion_payload("retiretoken zero row", json!({"valid_to": 0}));
+        let soon_payload = tantivy_exclusion_payload("retiretoken soon row", json!({"valid_to": "soon"}));
+        let clean_payload = tantivy_exclusion_payload("retiretoken clean row", json!({}));
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            store.upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], payload.clone()).await.unwrap();
+        }
+        // Control: the vector/domain path already excludes both retired rows.
+        let control = store
+            .search_with_domain("probe", vec![1.0, 0.0, 0.0, 0.0], 10, false, false, &[], None, false)
+            .await
+            .unwrap();
+        let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            control_ids.contains(&"clean-row"),
+            "control must surface the clean row, got: {control_ids:?}"
+        );
+        assert!(
+            !control_ids.contains(&"retired-zero") && !control_ids.contains(&"retired-soon"),
+            "control must exclude both retired rows, got: {control_ids:?}"
+        );
+        // Seed a stale Tantivy index: same ids/content, metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        let outcome = store
+            .search_tantivy_lexical("probe", "retiretoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"clean-row"), "clean row must surface, got: {ids:?}");
+        assert!(!ids.contains(&"retired-zero"), "valid_to:0 row must not surface, got: {ids:?}");
+        assert!(!ids.contains(&"retired-soon"), "valid_to:\"soon\" row must not surface, got: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_respects_archive_escape_hatch() {
+        let store = retired_test_store().await;
+        let archived_payload = tantivy_exclusion_payload("archivetoken old row", json!({"archived": true}));
+        let clean_payload = tantivy_exclusion_payload("archivetoken new row", json!({}));
+        for (id, payload) in [("archived-row", &archived_payload), ("clean-row", &clean_payload)] {
+            store.upsert("probe", id, vec![0.0; 4], payload.clone()).await.unwrap();
+        }
+        // Stale entries: metadata stripped, so the index itself cannot know
+        // the row is archived; hydration must consult the stored row.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [("archived-row", &archived_payload), ("clean-row", &clean_payload)] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let hidden = store
+            .search_tantivy_lexical("probe", "archivetoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let hidden_ids: Vec<&str> = hidden.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(hidden_ids.contains(&"clean-row"), "clean row must surface, got: {hidden_ids:?}");
+        assert!(
+            !hidden_ids.contains(&"archived-row"),
+            "archived row must not surface by default, got: {hidden_ids:?}"
+        );
+
+        let shown = store
+            .search_tantivy_lexical("probe", "archivetoken", 10, false, true, &[], "tester")
+            .await
+            .unwrap();
+        let shown_ids: Vec<&str> = shown.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            shown_ids.contains(&"archived-row"),
+            "include_archived must admit the archived row, got: {shown_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn par02_tantivy_hydration_uses_metadata_owner_for_acl() {
+        // The hydration ACL check derives the owner canonically
+        // (can_read_memory): an empty payload user_id with metadata user_id
+        // alice is alice's row, even though its ACL names only carol.
+        let store = retired_test_store().await;
+        let mut payload = tantivy_exclusion_payload(
+            "a1token metadata owner row",
+            json!({"user_id": "alice", "visible_to": [{"principal": "carol", "role": "viewer"}]}),
+        );
+        payload.user_id = String::new();
+        store.upsert("probe", "metadata-owner-row", vec![0.0; 4], payload.clone()).await.unwrap();
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("probe", "metadata-owner-row", &payload).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        for (principal, expected) in [("alice", true), ("admin", true), ("carol", true), ("bob", false), ("eve", false)] {
+            let outcome = store
+                .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], principal)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(
+                ids.contains(&"metadata-owner-row"),
+                expected,
+                "principal {principal:?} hydration decision, got: {ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn par02_inferred_merge_excludes_rows_hidden_from_vector_passes() {
+        // ReasoningAdapter::execute returns a hydrated row for the query
+        // itself when the query equals a memory id, even with no ontology
+        // expansion. The exact/vector passes exclude archived, retired,
+        // task, registry, mesh-conflicting and structural rows (and, under a
+        // domain filter, other-domain rows); the inferred merge must apply
+        // the same predicates or those rows leak back in.
+        let store = retired_test_store().await;
+        let vec4 = vec![0.1; 4];
+        // Anchor primary: at equal distance it sorts first (id ASC), so with
+        // limit 1 it is the only primary and every row below can surface
+        // only through the inferred merge.
+        store
+            .upsert("probe", "a-anchor", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "auth"})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "archived-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"archived": true})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"valid_to": 1})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "task-row", vec4.clone(), retired_test_payload("task", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "registry-row", vec4.clone(), retired_test_payload("fact", "agent", crate::registry::registry_metadata(&["auth".to_string()])))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "conflicting-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"mesh": {"conflict": true}})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "structural-row", vec4.clone(), retired_test_payload("file", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "other-domain-row", vec4.clone(), retired_test_payload("fact", "agent", json!({"domain": "database"})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "z-clean-row", vec4.clone(), retired_test_payload("fact", "agent", json!({})))
+            .await
+            .unwrap();
+
+        for excluded in ["archived-row", "retired-row", "task-row", "registry-row", "conflicting-row", "structural-row"] {
+            let outcome = store
+                .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some(excluded), false)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert!(ids.contains(&"a-anchor"), "anchor primary must surface for {excluded}, got: {ids:?}");
+            assert!(
+                !ids.contains(&excluded),
+                "inferred merge must not surface {excluded}, got: {ids:?}"
+            );
+        }
+
+        // Domain predicate: under an "auth" filter, a database-domain row
+        // queried by id must not re-enter through the inferred merge.
+        let outcome = store
+            .search_with_domain("probe", vec4.clone(), 1, false, false, &["auth".to_string()], Some("other-domain-row"), false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"other-domain-row"),
+            "inferred merge must not surface a domain-mismatched row, got: {ids:?}"
+        );
+
+        // Positive control: a clean row surfaces through the inferred merge
+        // (limit 1 kept it out of the primaries).
+        let outcome = store
+            .search_with_domain("probe", vec4.clone(), 1, false, false, &[], Some("z-clean-row"), false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"z-clean-row"),
+            "clean row must surface via the inferred merge, got: {ids:?}"
+        );
+
+        // The escape hatches still govern the inferred merge: with
+        // include_tasks / include_archived set, those rows are admitted.
+        for (id, include_tasks, include_archived) in [("task-row", true, false), ("archived-row", false, true)] {
+            let outcome = store
+                .search_with_domain("probe", vec4.clone(), 1, include_tasks, include_archived, &[], Some(id), false)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+            assert!(
+                ids.contains(&id),
+                "{id} must surface via the inferred merge when its escape hatch is set, got: {ids:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn lexical_search_ranks_symbols_filters_namespaces_and_rebuilds() {
         let store = retired_test_store().await;
 
@@ -10057,7 +12081,7 @@ eurostrata\src\daemon.rs",
                 .unwrap();
             assert_eq!(
                 node["absolute_path"],
-                expected_root.join("src/lib.rs").to_string_lossy().as_ref()
+                expected_root.join("src").join("lib.rs").to_string_lossy().as_ref()
             );
             assert_eq!(node["metadata"]["refs"][0]["provider_data"]["opaque"], true);
             assert_eq!(
@@ -14759,6 +16783,7 @@ eurostrata\src\daemon.rs",
     /// alternate stack. The Rust standard library gives a thread 8192 bytes
     /// of it, which is too small -- the handler would fault inside itself
     /// and the breadcrumb would be lost.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_engine_thread_has_an_alternate_stack_the_handler_can_run_on() {
         // The size the handler asks for, measured on this thread.
@@ -15279,6 +17304,321 @@ eurostrata\src\daemon.rs",
             row.payload.metadata.get("source"),
             Some(&json!({ "kind": "release-run", "ref": "v1.16.0" })),
             "the repair must not overwrite an object source with a string"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batched repair must do what the per-row one did: archive refs that
+    /// resolve to nothing, keep ones that do, make the missing edge, and then
+    /// find nothing left to do.
+    #[tokio::test]
+    async fn repair_hygiene_archives_dangling_refs_makes_edges_and_settles() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-dangling-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let target = retired_test_payload("fact", "agent", json!({}));
+        store.upsert("probe", "target-row", v.clone(), target).await.unwrap();
+        let declarer = retired_test_payload("fact", "agent", json!({
+            "related_to": ["target-row", "no-such-row", "samples"],
+        }));
+        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+
+        let (_, dangling) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert_eq!(dangling, 1, "one row had refs that resolve to nothing");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        assert_eq!(row.payload.metadata["related_to"], json!(["target-row"]));
+        let archived = row.payload.metadata["archived_refs"].as_array().unwrap();
+        assert!(archived.contains(&json!("no-such-row")) && archived.contains(&json!("samples")));
+
+        let edge_targets = store
+            .with_conn(|conn| {
+                let mut res = conn.query(
+                    "MATCH (a:Memory {id: 'declarer'})-[r:RELATES_TO]->(b:Memory) RETURN b.id",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = res.next() {
+                    out.push(format!("{}", row[0]));
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+        assert!(edge_targets.contains(&"target-row".to_string()), "edges: {edge_targets:?}");
+
+        let again = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert_eq!(again, (0, 0), "a second pass has nothing left to repair");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repair planned from an old copy of a row must not overwrite the row
+    /// after someone else changed it.
+    #[tokio::test]
+    async fn repair_hygiene_write_is_skipped_when_the_row_changed_since_the_read() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-cas-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let rule = retired_test_payload("rule", "agent", json!({ "source": "N/A" }));
+        store.upsert("probe", "r1", vec![0.1, 0.2, 0.3, 0.4], rule).await.unwrap();
+
+        // The plan was made from metadata that is no longer what is stored.
+        let stale = HygieneRow {
+            id: "r1".to_string(),
+            mtype: "rule".to_string(),
+            loc: "src/x.rs".to_string(),
+            content: "kept".to_string(),
+            content_empty: false,
+            meta_str: r#"{"source":"N/A","an_older_field":1}"#.to_string(),
+        };
+        let mut writes = Vec::new();
+        plan_hygiene_row(&stale, "probe", &PrefetchedView::default(), &mut writes);
+        let HygieneWrite::Row { meta_q, .. } = writes.pop().expect("a repair was planned") else {
+            panic!("expected a row write")
+        };
+        let matched = store
+            .with_conn(move |conn| Ok(conn.query(&meta_q)?.next().is_some()))
+            .await
+            .unwrap();
+        assert!(!matched, "a stale plan must not match the changed row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blank-content backfill planned from the read must not overwrite
+    /// content someone saved after the read, even when metadata is unchanged.
+    #[tokio::test]
+    async fn repair_hygiene_content_backfill_is_skipped_when_the_content_was_edited() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-content-cas-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let payload = |content: &str| MemoryPayload {
+            content: content.to_string(),
+            user_id: "probe".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: Some("probe".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        // `edited` was blank when the repair read it and was edited after;
+        // `blank` is still blank.
+        store.upsert("probe", "edited", vec![0.1, 0.2, 0.3, 0.4], payload("a saved correction")).await.unwrap();
+        store.upsert("probe", "blank", vec![0.1, 0.2, 0.3, 0.4], payload("")).await.unwrap();
+
+        let plan = |id: &str| {
+            let read = HygieneRow {
+                id: id.to_string(),
+                mtype: "fact".to_string(),
+                loc: String::new(),
+                content: String::new(),
+                content_empty: true,
+                meta_str: "{}".to_string(),
+            };
+            let mut writes = Vec::new();
+            plan_hygiene_row(&read, "probe", &PrefetchedView::default(), &mut writes);
+            let HygieneWrite::Row { content_q, .. } = writes.pop().expect("a backfill was planned") else {
+                panic!("expected a row write")
+            };
+            content_q.expect("the blank content is backfilled")
+        };
+        let (edited_q, blank_q) = (plan("edited"), plan("blank"));
+        let (edited_matched, blank_matched) = store
+            .with_conn(move |conn| {
+                Ok((conn.query(&edited_q)?.next().is_some(), conn.query(&blank_q)?.next().is_some()))
+            })
+            .await
+            .unwrap();
+        assert!(!edited_matched, "the backfill must not overwrite an edit made since the read");
+        assert!(blank_matched, "a row that is still blank is backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chunk repair re-reads everything inside its own write turn, so what
+    /// happened after the candidate pass is judged as it is now. A target
+    /// published after the pass, by a path that resolves logically and not by
+    /// its literal id, keeps the declaration that names it.
+    #[tokio::test]
+    async fn repair_hygiene_chunk_keeps_a_declaration_whose_target_appeared_after_the_candidate_pass() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-target-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        let declarer = retired_test_payload("fact", "agent", json!({ "related_to": ["src/new.rs", "no-such-row"] }));
+        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+
+        // `src/new.rs` is missing when the candidate pass reads; the file is
+        // published (as the id `new.rs`) before the write turn runs.
+        let target = retired_test_payload("fact", "agent", json!({}));
+        store.upsert("probe", "new.rs", v.clone(), target).await.unwrap();
+
+        let ids = vec!["declarer".to_string()];
+        let (_, dangling) = store
+            .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
+            .await
+            .unwrap();
+        assert_eq!(dangling, 1, "the row still had one ref that resolves to nothing");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        assert_eq!(
+            row.payload.metadata["related_to"],
+            json!(["src/new.rs"]),
+            "the declaration that now resolves is kept"
+        );
+        assert_eq!(row.payload.metadata["archived_refs"], json!(["no-such-row"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content saved after the candidate pass is not overwritten by the
+    /// blank-content backfill, even though the metadata is unchanged; a row
+    /// that is still blank in the same chunk is backfilled.
+    #[tokio::test]
+    async fn repair_hygiene_chunk_leaves_content_edited_after_the_candidate_pass() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-content-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let payload = |content: &str| MemoryPayload {
+            content: content.to_string(),
+            user_id: "probe".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: Some("probe".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        store.upsert("probe", "edited", v.clone(), payload("")).await.unwrap();
+        store.upsert("probe", "blank", v.clone(), payload("")).await.unwrap();
+        // Someone saves a correction on `edited` after the candidate pass.
+        store.upsert("probe", "edited", v.clone(), payload("a saved correction")).await.unwrap();
+
+        let ids = vec!["edited".to_string(), "blank".to_string()];
+        store
+            .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
+            .await
+            .unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let content_of = |id: &str| rows.iter().find(|r| r.id == id).map(|r| r.payload.content.clone()).unwrap();
+        assert_eq!(content_of("edited"), "a saved correction");
+        assert_eq!(content_of("blank"), "legacy", "a row that is still blank is backfilled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The planner counts a long target as present when exactly one live row id
+    /// starts with it. The chunk repair sees only the rows it fetched, so check
+    /// it reproduces that rule: one match keeps the ref, two archive it.
+    #[tokio::test]
+    async fn repair_hygiene_chunk_applies_the_unique_prefix_rule() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-chunk-prefix-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        for id in ["target-row-alpha", "target-row-beta"] {
+            store.upsert("probe", id, v.clone(), retired_test_payload("fact", "agent", json!({}))).await.unwrap();
+        }
+        let declarer = retired_test_payload("fact", "agent", json!({
+            "related_to": ["target-row-al", "target-row"],
+        }));
+        store.upsert("probe", "declarer", v.clone(), declarer).await.unwrap();
+
+        let ids = vec!["declarer".to_string()];
+        store
+            .with_conn(move |conn| hygiene_repair_chunk(conn, "probe", &ids))
+            .await
+            .unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows.iter().find(|r| r.id == "declarer").expect("row survives");
+        assert_eq!(row.payload.metadata["related_to"], json!(["target-row-al"]), "one id starts with it");
+        assert_eq!(row.payload.metadata["archived_refs"], json!(["target-row"]), "two ids start with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G1: a failed chunk must not discard the counts from chunks that
+    /// committed, and the run must keep going.
+    #[tokio::test]
+    async fn chunk_failure_keeps_prior_counts() {
+        let dir = std::env::temp_dir().join(format!("ns-chunk-fail-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let ids: Vec<String> = (0..60).map(|i| format!("row-{i:02}")).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let (shape, dangling, failed) = store
+            .run_hygiene_chunks_with("probe", &ids, |_ns, chunk| {
+                let index = calls.get();
+                calls.set(index + 1);
+                async move {
+                    if index == 1 {
+                        Err(anyhow::anyhow!("injected chunk failure"))
+                    } else {
+                        Ok((chunk.len(), 1usize))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (shape, dangling, failed),
+            (35, 2, 1),
+            "25-row chunks: chunk 2 fails, chunks 1 and 3 keep their counts"
+        );
+    }
+
+    /// G1: the public result reports the committed totals while still
+    /// returning an error, so the caller can log and retry.
+    #[test]
+    fn repair_partial_counts_are_reported() {
+        let message = hygiene_partial_error("probe", 7, 3, 2).to_string();
+        assert!(
+            message.contains("7 shape and 3 dangling updates committed"),
+            "{message}"
+        );
+        assert!(message.contains("2 chunk(s) failed"), "{message}");
+        assert!(message.contains("not complete"), "{message}");
+    }
+
+    /// G4: the candidate pass pages by id. Pin the cursor with a page smaller
+    /// than the namespace and a row that needs repair after the first page.
+    #[tokio::test]
+    async fn hygiene_paging_pin() {
+        let dir = std::env::temp_dir().join(format!("ns-page-pin-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        for id in ["a", "b", "c", "d"] {
+            store
+                .upsert("probe", id, v.clone(), retired_test_payload("fact", "agent", json!({})))
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "z-needs-repair",
+                v.clone(),
+                retired_test_payload("rule", "agent", json!({"source": "N/A"})),
+            )
+            .await
+            .unwrap();
+
+        let (shape, _) = store
+            .repair_namespace_hygiene_with_page("probe", 2)
+            .await
+            .unwrap();
+        assert!(shape >= 1, "the page cursor skipped the row after page one");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == "z-needs-repair")
+            .expect("row survives");
+        assert_eq!(
+            row.payload.metadata.get("source"),
+            Some(&json!("legacy-rule")),
+            "the last-page row was repaired"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15838,7 +18178,9 @@ eurostrata\src\daemon.rs",
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut flipped = false;
         while std::time::Instant::now() < deadline {
-            if let Some(state) = crate::model_choice::read_store_state(&fx.db) {
+            if let crate::model_choice::StoreStateRead::Recorded(state) =
+                crate::model_choice::read_store_state(&fx.db)
+            {
                 if state.has_data {
                     flipped = true;
                     break;
@@ -16632,6 +18974,167 @@ eurostrata\src\daemon.rs",
             .await
             .expect("recycling a store-read vector unbound succeeds under a changed config");
         drop(normalize);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn unparseable_sidecar_refuses_init_and_is_not_reclassified() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("unparseable-init", "ModelA");
+        // A valid pristine sidecar exists before the store is built;
+        // the cache is lazy, so corrupting it after construction —
+        // before the first identity-consulting call — is what init
+        // must classify.
+        crate::model_choice::write_store_state(
+            &fx.db,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: serving_descriptor_for("ModelA"),
+            },
+        )
+        .expect("write the pristine sidecar");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        std::fs::write(crate::model_choice::store_state_path(&fx.db), "{not json")
+            .expect("corrupt the sidecar");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("an unparseable sidecar must refuse init");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to open the store at")
+                && message.contains("unparseable")
+                && message.contains("cannot be parsed"),
+            "the init refusal is the unparseable-sidecar refusal: {message}"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::Unparseable(_)),
+            "an unparseable sidecar must not be reclassified as LockedUnknown"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused init leaves the sidecar byte-identical"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn wrong_version_sidecar_refuses_init_and_is_not_stamped_over() {
+        let previous = without_model_env();
+        // The fixture's sidecar is created by a prior, dropped
+        // instance; the test store below never inits before the
+        // rewrite, so its cache is cold when it classifies version 999.
+        let fx = data_bearing_store_fixture("wrong-version-init").await;
+        let mut sidecar = read_sidecar(&fx.db);
+        sidecar["version"] = json!(999);
+        std::fs::write(
+            crate::model_choice::store_state_path(&fx.db),
+            serde_json::to_string_pretty(&sidecar).expect("serialize sidecar"),
+        )
+        .expect("rewrite the sidecar at version 999");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        // Serving equals configured — the shape that, if the corrupt
+        // sidecar were misclassified LockedUnknown, would be a
+        // candidate for the attest-and-stamp upgrade.
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        let err = store
+            .init("probe")
+            .await
+            .expect_err("a wrong-version sidecar must refuse init");
+        assert!(
+            err.to_string().contains("unsupported store-state version"),
+            "the init refusal names the version problem: {err}"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::Unparseable(_)),
+            "a wrong-version sidecar must not be reclassified as LockedUnknown"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused init must not stamp over the wrong-version sidecar"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn unparseable_sidecar_refuses_upsert_without_init() {
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("unparseable-upsert").await;
+        // No serving descriptor and never init'ed: the unbound
+        // fallback shape. The sidecar is corrupted before this
+        // instance's first identity-consulting call (cold cache).
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let valid_sidecar =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        std::fs::write(crate::model_choice::store_state_path(&fx.db), "{not json")
+            .expect("corrupt the sidecar");
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let err = store
+            .upsert(
+                "probe",
+                "m2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect_err("an unparseable sidecar must refuse an init-less upsert");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to open the store at") && message.contains("unparseable"),
+            "the upsert refusal is the unparseable-sidecar refusal: {message}"
+        );
+        assert_eq!(
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("re-read sidecar"),
+            sidecar_before,
+            "a refused upsert leaves the sidecar byte-identical"
+        );
+        drop(store);
+        // Cure the sidecar and open a fresh instance (the refused
+        // instance's classification is cached), then read the actual
+        // stored state: the refused upsert must have written no row.
+        std::fs::write(crate::model_choice::store_state_path(&fx.db), valid_sidecar)
+            .expect("cure the sidecar");
+        let cured = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        cured.init("probe").await.expect("init after the cure");
+        assert!(
+            cured
+                .get("probe", "m1")
+                .await
+                .expect("get the seeded row")
+                .is_some(),
+            "the seeded row is present, so the namespace read is live"
+        );
+        assert!(
+            cured
+                .get("probe", "m2")
+                .await
+                .expect("get the refused row")
+                .is_none(),
+            "a refused upsert must not have written row m2"
+        );
+        drop(cured);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
@@ -18136,8 +20639,11 @@ eurostrata\src\daemon.rs",
             crate::model_choice::store_state_path(&restored_db),
         )
         .expect("copy the sidecar");
-        let state = crate::model_choice::read_store_state(&restored_db)
-            .expect("the restored store keeps its recorded identity");
+        let crate::model_choice::StoreStateRead::Recorded(state) =
+            crate::model_choice::read_store_state(&restored_db)
+        else {
+            panic!("the restored store keeps its recorded identity");
+        };
         assert!(state.has_data);
         assert_eq!(state.descriptor, serving_descriptor_for("ModelA"));
 
@@ -18288,12 +20794,1085 @@ eurostrata\src\daemon.rs",
             "the restore lands no sidecar from the reused snapshot"
         );
         assert!(
-            crate::model_choice::read_store_state(&restored_db).is_none(),
+            matches!(
+                crate::model_choice::read_store_state(&restored_db),
+                crate::model_choice::StoreStateRead::Absent
+            ),
             "the restored store has no recorded identity"
         );
         let _ = std::fs::remove_dir_all(&fx.root);
         let _ = std::fs::remove_dir_all(&fx2.root);
         restore_model_env(previous);
+    }
+
+    fn generation_payload(content: &str, source: &str, extra: Value) -> MemoryPayload {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "source_identity".to_string(),
+            json!({"worktree_id": source}),
+        );
+        if let Value::Object(fields) = extra {
+            for (key, value) in fields {
+                metadata.insert(key, value);
+            }
+        }
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "ingest-owner".to_string(),
+            memory_type: "memory".to_string(),
+            agent_name: None,
+            location: "/src/a.rs".to_string(),
+            location_lines: String::new(),
+            metadata: Value::Object(metadata),
+        }
+    }
+
+    /// Stage `rows` (path, content) as one generation and publish it. Returns
+    /// the generation the store allocated.
+    async fn publish_fixture_generation(
+        store: &LadybugStore,
+        namespace: &str,
+        source: &str,
+        rows: &[(&str, &str)],
+    ) -> u64 {
+        let generation = store.begin_generation(namespace, source).await.unwrap();
+        for (path, content) in rows {
+            let id = crate::parser::ingest::generation_scoped_id(namespace, generation, path);
+            store
+                .upsert(
+                    namespace,
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload(content, source, json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .publish_generation(namespace, source, generation)
+            .await
+            .unwrap();
+        generation
+    }
+
+    fn result_ids(results: &[SearchResult]) -> Vec<String> {
+        results.iter().map(|result| result.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn lexical_search_returns_only_active_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("gen.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        let first = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "lexgenneedle stale generation")],
+        )
+        .await;
+        // Warm both caches on generation 1, so the second publish must
+        // invalidate a loaded in-memory partition and an open Tantivy index.
+        let warm_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs");
+        let warm_inhouse = store
+            .search_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm_inhouse), vec![warm_id.clone()]);
+        let warm_tantivy = store
+            .search_tantivy_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm_tantivy), vec![warm_id]);
+
+        let second = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "lexgenneedle current generation")],
+        )
+        .await;
+        assert_ne!(first, second, "the fixture must produce two generations");
+        let expected = crate::parser::ingest::generation_scoped_id("gen", second, "src/a.rs");
+
+        let inhouse = store
+            .search_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&inhouse),
+            vec![expected.clone()],
+            "in-house lexical must return exactly the current row"
+        );
+
+        let tantivy = store
+            .search_tantivy_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&tantivy),
+            vec![expected],
+            "Tantivy lexical must return exactly the current row"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_path_absent_from_lexical() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("deleted.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[
+                ("src/kept.rs", "keptfileneedle still here"),
+                ("src/gone.rs", "gonefileneedle removed later"),
+            ],
+        )
+        .await;
+        // Load generation 1 into both caches before it is superseded.
+        let warm = store
+            .search_tantivy_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm.len(), 1, "fixture generation 1 must contain the file");
+        let warm_inhouse = store
+            .search_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm_inhouse.len(), 1);
+
+        let second = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/kept.rs", "keptfileneedle still here")],
+        )
+        .await;
+
+        let inhouse_gone = store
+            .search_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            inhouse_gone.is_empty(),
+            "in-house lexical still returns a deleted file: {:?}",
+            result_ids(&inhouse_gone)
+        );
+        let tantivy_gone = store
+            .search_tantivy_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            tantivy_gone.is_empty(),
+            "Tantivy lexical still returns a deleted file: {:?}",
+            result_ids(&tantivy_gone)
+        );
+
+        let expected = crate::parser::ingest::generation_scoped_id("gen", second, "src/kept.rs");
+        let kept = store
+            .search_tantivy_lexical("gen", "keptfileneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&kept), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn secret_skipped_absent_from_lexical() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("secret.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[
+                ("src/clean.rs", "cleanfileneedle harmless"),
+                ("src/leaked.rs", "leakedsecretneedle scanner would skip this row"),
+            ],
+        )
+        .await;
+        // Load both caches on the generation that still carries the row.
+        let warm = store
+            .search_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm.len(), 1, "fixture generation 1 must carry the row");
+        let warm_tantivy = store
+            .search_tantivy_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(warm_tantivy.len(), 1);
+        // The re-ingest skips the secret-bearing file entirely: it is absent
+        // from the new generation, exactly as the pre-PAR-03 purge intends.
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/clean.rs", "cleanfileneedle harmless")],
+        )
+        .await;
+
+        let inhouse = store
+            .search_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            inhouse.is_empty(),
+            "in-house lexical still serves a secret-bearing superseded row: {:?}",
+            result_ids(&inhouse)
+        );
+        let tantivy = store
+            .search_tantivy_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            tantivy.is_empty(),
+            "Tantivy lexical still serves a secret-bearing superseded row: {:?}",
+            result_ids(&tantivy)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_row_without_any_pointer_stays_searchable() {
+        // No IngestGeneration row exists at all: nothing has been superseded,
+        // so the predicate keeps scoped rows. The Tantivy query must not turn
+        // that into "generation 0 only".
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("nopointer.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("gen", 1, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &id,
+                vec![0.0; 4],
+                generation_payload("nopointerneedle scoped row", "worktree-x", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let inhouse = store
+            .search_lexical("gen", "nopointerneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&inhouse), vec![id.clone()]);
+        let tantivy = store
+            .search_tantivy_lexical("gen", "nopointerneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&tantivy),
+            vec![id],
+            "a scoped row with no pointer must stay searchable on both routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_rows_cannot_starve_the_inhouse_page() {
+        // Warm the in-house partition on generation 1, then stage a batch of
+        // higher-scoring generation-2 rows without publishing. Limit 1 must
+        // still return the active row: staged rows enter the in-memory index
+        // only through the filtered loader, and the Tantivy query excludes
+        // them before TopDocs collects.
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staged.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let first = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/active.rs", "stagedstarveneedle active row")],
+        )
+        .await;
+        let active_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/active.rs");
+        let warm = store
+            .search_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm), vec![active_id.clone()]);
+
+        let second = store.begin_generation("gen", PROBE_SOURCE).await.unwrap();
+        for i in 0..20 {
+            let id =
+                crate::parser::ingest::generation_scoped_id("gen", second, &format!("src/staged-{i}.rs"));
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload(
+                        "stagedstarveneedle stagedstarveneedle stagedstarveneedle stagedstarveneedle stagedstarveneedle",
+                        PROBE_SOURCE,
+                        json!({}),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let inhouse = store
+            .search_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&inhouse),
+            vec![active_id.clone()],
+            "unpublished staged rows must not consume the in-house page"
+        );
+        let tantivy = store
+            .search_tantivy_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&tantivy),
+            vec![active_id],
+            "unpublished staged rows must not consume the Tantivy page"
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_an_active_scoped_row_refreshes_the_inhouse_cache() {
+        // The archive handler upserts the tombstone on the row's current id.
+        // A scoped write must not be silently skipped by the cache, or the
+        // loaded in-memory doc keeps saying "not archived".
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("archive.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let generation = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "archiveneedle visible row")],
+        )
+        .await;
+        let id = crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
+
+        let warm = store
+            .search_lexical("gen", "archiveneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&warm), vec![id.clone()]);
+
+        store
+            .upsert(
+                "gen",
+                &id,
+                vec![0.0; 4],
+                generation_payload(
+                    "archiveneedle visible row",
+                    PROBE_SOURCE,
+                    json!({"archived": true}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let live = store
+            .search_lexical("gen", "archiveneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert!(
+            live.is_empty(),
+            "an archived scoped row must leave the default in-house page: {:?}",
+            result_ids(&live)
+        );
+        let archived = store
+            .search_lexical("gen", "archiveneedle", 10, false, true, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&archived),
+            vec![id],
+            "include_archived must still find the row"
+        );
+
+        let tantivy = store
+            .search_tantivy_lexical("gen", "archiveneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert!(tantivy.is_empty(), "Tantivy must agree the row is archived");
+    }
+
+    #[tokio::test]
+    async fn legacy_namespace_pointer_without_source_stamp_stays_visible() {
+        // Pre-source-split store: the only pointer is keyed by the empty
+        // source (`source_key = ''`), while rows still carry the ingest
+        // worktree identity. Those rows must keep reading; hiding them would
+        // make an upgrade look like data loss.
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("legacy.lbug"), 4).unwrap();
+        store.init("legacy").await.unwrap();
+        let generation = store.begin_generation("legacy", "worktree-x").await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("legacy", generation, "src/a.rs");
+        store
+            .upsert(
+                "legacy",
+                &id,
+                vec![0.0; 4],
+                generation_payload("legacypointerneedle still readable", "worktree-x", json!({})),
+            )
+            .await
+            .unwrap();
+        // The legacy namespace-wide pointer, keyed by the empty source.
+        store
+            .publish_generation("legacy", "", generation)
+            .await
+            .unwrap();
+
+        let inhouse = store
+            .search_lexical("legacy", "legacypointerneedle", 10, false, false, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&inhouse),
+            vec![id.clone()],
+            "a legacy namespace pointer must keep its rows visible"
+        );
+        let tantivy = store
+            .search_tantivy_lexical("legacy", "legacypointerneedle", 10, false, false, &[], "admin")
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(result_ids(&tantivy), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn lexical_owner_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("owner.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+
+        // Empty payload owner, metadata owner alice, ACL that names only bob.
+        // The vector route lets alice in as owner; the lexical routes must too.
+        let mut payload = retired_test_payload(
+            "rule",
+            "",
+            json!({"user_id": "alice", "visible_to": ["bob"]}),
+        );
+        payload.content = "ownerparityneedle".to_string();
+        store
+            .upsert("probe", "owned-by-metadata", vec![0.0; 4], payload)
+            .await
+            .unwrap();
+
+        for (principal, expected) in [("alice", 1), ("bob", 1), ("eve", 0)] {
+            let inhouse = store
+                .search_lexical("probe", "ownerparityneedle", 10, false, false, &[], principal, 0)
+                .await
+                .unwrap()
+                .results;
+            let tantivy = store
+                .search_tantivy_lexical("probe", "ownerparityneedle", 10, false, false, &[], principal)
+                .await
+                .unwrap()
+                .results;
+            assert_eq!(
+                inhouse.len(),
+                expected,
+                "in-house owner verdict for {principal}: {:?}",
+                result_ids(&inhouse)
+            );
+            assert_eq!(
+                tantivy.len(),
+                expected,
+                "Tantivy owner verdict for {principal}: {:?}",
+                result_ids(&tantivy)
+            );
+            assert_eq!(
+                result_ids(&inhouse),
+                result_ids(&tantivy),
+                "both lexical routes must agree for {principal}"
+            );
+        }
+    }
+
+    /// Abort is namespace-scoped: a foreign row whose id happens to start with
+    /// the aborted prefix (a namespace containing the separator, a corrupt
+    /// import) is neither listed nor deleted.
+    #[tokio::test]
+    async fn abort_generation_scoped_to_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("abort.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let foreign_id = "gen::1::src/foreign.rs";
+        store
+            .upsert(
+                "other",
+                foreign_id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let generation = store.begin_generation("gen", "src").await.unwrap();
+        let staged_id =
+            crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &staged_id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let nodes = store.generation_nodes("gen", generation).await.unwrap();
+        assert_eq!(nodes, vec![staged_id.clone()], "only this namespace's rows");
+
+        store
+            .abort_generation("gen", "src", generation)
+            .await
+            .unwrap();
+        assert!(
+            store.get("gen", &staged_id).await.unwrap().is_none(),
+            "the staged row is discarded"
+        );
+        assert!(
+            store.get("other", foreign_id).await.unwrap().is_some(),
+            "a foreign row with the same id prefix survives the abort"
+        );
+    }
+
+    /// Retention keeps the active generation and the one before it (the
+    /// rollback target), and prunes older history.
+    #[tokio::test]
+    async fn retention_keeps_active_and_previous() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("retention.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let mut generations = Vec::new();
+        for content in ["first generation", "second generation", "third generation"] {
+            generations.push(
+                publish_fixture_generation(
+                    &store,
+                    "gen",
+                    PROBE_SOURCE,
+                    &[("src/a.rs", content)],
+                )
+                .await,
+            );
+        }
+        let id = |generation: u64| {
+            crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs")
+        };
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert!(deleted > 0, "the oldest generation has rows to prune");
+        assert!(
+            store.get("gen", &id(generations[0])).await.unwrap().is_none(),
+            "the superseded generation is gone"
+        );
+        assert!(
+            store.get("gen", &id(generations[1])).await.unwrap().is_some(),
+            "the previous generation stays as the rollback target"
+        );
+        assert!(
+            store.get("gen", &id(generations[2])).await.unwrap().is_some(),
+            "the active generation stays"
+        );
+        assert_eq!(
+            store.prune_generations("gen", 2).await.unwrap(),
+            0,
+            "a second prune has nothing older than the retained pair"
+        );
+    }
+
+    /// The prune/delete API is namespace-scoped, like abort.
+    #[tokio::test]
+    async fn delete_generation_is_namespace_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("delete-gen.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let first = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "first generation")],
+        )
+        .await;
+        publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "second generation")],
+        )
+        .await;
+
+        let foreign_id =
+            crate::parser::ingest::generation_scoped_id("gen", first, "src/foreign.rs");
+        store
+            .upsert(
+                "other",
+                &foreign_id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let deleted = store.delete_generation("gen", first).await.unwrap();
+        assert!(deleted > 0, "the superseded generation is deleted");
+        assert!(
+            store
+                .get("gen", &crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.get("other", &foreign_id).await.unwrap().is_some(),
+            "a foreign row with the same prefix survives"
+        );
+    }
+
+    /// An in-flight staged generation is not superseded: deleting it would
+    /// leave the ingest to publish a pointer onto deleted rows.
+    #[tokio::test]
+    async fn delete_generation_refuses_an_in_progress_staging_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staging-delete.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let staged = store.begin_generation("gen", PROBE_SOURCE).await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("gen", staged, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &id,
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let err = store.delete_generation("gen", staged).await.unwrap_err();
+        assert!(
+            err.to_string().contains("still staging"),
+            "the refusal names the in-flight ingest: {err}"
+        );
+        assert!(
+            store.get("gen", &id).await.unwrap().is_some(),
+            "the staged rows survive"
+        );
+        store.abort_generation("gen", PROBE_SOURCE, staged).await.unwrap();
+    }
+
+    /// Retention retains a staging generation even when newer generations push
+    /// it out of the newest-`keep` window.
+    #[tokio::test]
+    async fn retention_keeps_an_in_progress_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staging-retain.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "source a generation one")],
+        )
+        .await;
+        let staged = store.begin_generation("gen", "source-a").await.unwrap();
+        let staged_id = crate::parser::ingest::generation_scoped_id("gen", staged, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &staged_id,
+                vec![0.0; 4],
+                generation_payload("source a generation two", "source-a", json!({})),
+            )
+            .await
+            .unwrap();
+        // Push the staged generation out of the newest-two window.
+        for (source, path) in [("source-b", "src/b.rs"), ("source-c", "src/c.rs")] {
+            let generation = store.begin_generation("gen", source).await.unwrap();
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("other source", source, json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .publish_generation("gen", source, generation)
+                .await
+                .unwrap();
+        }
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert_eq!(deleted, 0, "every generation here is active or staged");
+        assert!(
+            store.get("gen", &staged_id).await.unwrap().is_some(),
+            "the staging generation is retained"
+        );
+        store.abort_generation("gen", "source-a", staged).await.unwrap();
+    }
+
+    /// Two overlapping ingests of one source each hold a staging row; pruning
+    /// must protect both, not just the most recent marker.
+    #[tokio::test]
+    async fn retention_keeps_every_overlapping_staging_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("overlap-staging.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        let first = store.begin_generation("gen", "source-a").await.unwrap();
+        let second = store.begin_generation("gen", "source-a").await.unwrap();
+        assert_ne!(first, second, "two ingests allocate different numbers");
+        let mut staged_ids = Vec::new();
+        for (generation, path) in [(first, "src/a1.rs"), (second, "src/a2.rs")] {
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("overlapping ingest", "source-a", json!({})),
+                )
+                .await
+                .unwrap();
+            staged_ids.push(id);
+        }
+        // Push both staging numbers out of the newest-two window.
+        for (source, path) in [("source-b", "src/b.rs"), ("source-c", "src/c.rs")] {
+            let generation = store.begin_generation("gen", source).await.unwrap();
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("other source", source, json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .publish_generation("gen", source, generation)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.prune_generations("gen", 2).await.unwrap(),
+            0,
+            "every active/staging generation is retained"
+        );
+        for id in &staged_ids {
+            assert!(
+                store.get("gen", id).await.unwrap().is_some(),
+                "overlapping staging generation survives: {id}"
+            );
+        }
+        store.abort_generation("gen", "source-a", first).await.unwrap();
+        store.abort_generation("gen", "source-a", second).await.unwrap();
+    }
+
+    /// An in-flight ingest reads the generation that was active when it began.
+    /// Protecting only its staging number would let a newer publish push that
+    /// base outside the window and prune rows carry-forward still needs.
+    #[tokio::test]
+    async fn retention_keeps_the_base_of_an_in_flight_ingest() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("staging-base.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let base = publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "base generation")],
+        )
+        .await;
+        // A slow ingest stages generation 2 from base generation 1.
+        let slow = store.begin_generation("gen", "source-a").await.unwrap();
+        let slow_id = crate::parser::ingest::generation_scoped_id("gen", slow, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &slow_id,
+                vec![0.0; 4],
+                generation_payload("slow ingest", "source-a", json!({})),
+            )
+            .await
+            .unwrap();
+        // Another ingest for the same source publishes 3 and then 4.
+        publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "three")]).await;
+        publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "four")]).await;
+
+        assert_eq!(
+            store.prune_generations("gen", 2).await.unwrap(),
+            0,
+            "the slow ingest's base and staging generation are retained"
+        );
+        assert!(
+            store
+                .get(
+                    "gen",
+                    &crate::parser::ingest::generation_scoped_id("gen", base, "src/a.rs")
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "the base generation survives for carry-forward"
+        );
+        assert!(store.get("gen", &slow_id).await.unwrap().is_some());
+        store.abort_generation("gen", "source-a", slow).await.unwrap();
+    }
+
+    /// A marker left by a process that died between begin and publish/abort is
+    /// recovered after the TTL so its generation can be pruned again.
+    #[tokio::test]
+    async fn prune_recovers_abandoned_staging_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("abandoned-staging.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let abandoned = store.begin_generation("gen", "source-a").await.unwrap();
+        let abandoned_id =
+            crate::parser::ingest::generation_scoped_id("gen", abandoned, "src/a.rs");
+        store
+            .upsert(
+                "gen",
+                &abandoned_id,
+                vec![0.0; 4],
+                generation_payload("abandoned ingest", "source-a", json!({})),
+            )
+            .await
+            .unwrap();
+        // Age the marker past the TTL, as a crash plus a day would.
+        let aged = chrono::Utc::now().timestamp() - STAGING_TTL_SECS - 60;
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "MATCH (s:StagingGeneration) WHERE s.namespace = 'gen' SET s.created_at = {aged}"
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Push the abandoned number outside the newest-two window.
+        for (source, path) in [("source-b", "src/b.rs"), ("source-c", "src/c.rs")] {
+            let generation = store.begin_generation("gen", source).await.unwrap();
+            let id = crate::parser::ingest::generation_scoped_id("gen", generation, path);
+            store
+                .upsert(
+                    "gen",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload("published", source, json!({})),
+                )
+                .await
+                .unwrap();
+            store
+                .publish_generation("gen", source, generation)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            store.prune_generations("gen", 2).await.unwrap() > 0,
+            "the abandoned generation is pruned"
+        );
+        assert!(store.get("gen", &abandoned_id).await.unwrap().is_none());
+        let remaining = store
+            .with_conn(|conn| {
+                let mut rows = conn
+                    .query("MATCH (s:StagingGeneration) WHERE s.namespace = 'gen' RETURN count(s)")?;
+                Ok(rows.next().map(|r| format!("{}", r[0])).unwrap_or_default())
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, "0", "the abandoned marker is removed");
+    }
+
+    /// Rollback is per source: a quiet source's previous generation can fall
+    /// outside the namespace-wide newest-two window and must still be kept.
+    #[tokio::test]
+    async fn retention_keeps_each_sources_previous_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("per-source-prev.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+
+        let a1 = publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "source a generation one")],
+        )
+        .await;
+        publish_fixture_generation(
+            &store,
+            "gen",
+            "source-b",
+            &[("src/b.rs", "source b generation two")],
+        )
+        .await;
+        // A publishes again: its previous generation is a1, which the
+        // namespace-wide newest-two window would otherwise prune.
+        publish_fixture_generation(
+            &store,
+            "gen",
+            "source-a",
+            &[("src/a.rs", "source a generation three")],
+        )
+        .await;
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert_eq!(
+            deleted, 0,
+            "active and per-source previous generations are all retained"
+        );
+        assert!(
+            store
+                .get(
+                    "gen",
+                    &crate::parser::ingest::generation_scoped_id("gen", a1, "src/a.rs")
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "source A's rollback target survives the namespace-wide window"
+        );
+    }
+
+    /// An upgraded store has no recorded `previous_generation`. The prune
+    /// recovers each source's rollback target from the retained rows instead
+    /// of deleting history the first time it runs.
+    #[tokio::test]
+    async fn prune_backfills_previous_for_upgraded_stores() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("upgrade-prev.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let a1 = publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a one")]).await;
+        publish_fixture_generation(&store, "gen", "source-a", &[("src/a.rs", "a two")]).await;
+        publish_fixture_generation(&store, "gen", "source-b", &[("src/b.rs", "b three")]).await;
+        publish_fixture_generation(&store, "gen", "source-b", &[("src/b.rs", "b four")]).await;
+
+        // The upgrade: the new column exists but is empty for every pointer.
+        let pointers = "MATCH (g:IngestGeneration) WHERE g.namespace = 'gen' SET g.previous_generation = 0";
+        store
+            .with_conn(|conn| {
+                conn.query(pointers)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let deleted = store.prune_generations("gen", 2).await.unwrap();
+        assert_eq!(
+            deleted, 0,
+            "the fallback retains source A's rollback target (generation {a1})"
+        );
+        assert!(
+            store
+                .get(
+                    "gen",
+                    &crate::parser::ingest::generation_scoped_id("gen", a1, "src/a.rs")
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Prune's delete rechecks the rollback target inside its own write turn;
+    /// the explicit delete API still permits an operator purge.
+    #[tokio::test]
+    async fn prune_rechecks_previous_targets_inside_the_write() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("recheck-prev.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let previous = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "generation one")],
+        )
+        .await;
+        publish_fixture_generation(&store, "gen", PROBE_SOURCE, &[("src/a.rs", "generation two")])
+            .await;
+        let previous_id =
+            crate::parser::ingest::generation_scoped_id("gen", previous, "src/a.rs");
+
+        let err = store
+            .delete_generation_protected("gen", previous)
+            .await
+            .expect_err("prune must not remove a rollback target");
+        assert!(
+            err.to_string().contains("rollback target"),
+            "the refusal names the protected target: {err}"
+        );
+        assert!(
+            store.get("gen", &previous_id).await.unwrap().is_some(),
+            "the rollback target survives the protected delete"
+        );
+
+        assert!(
+            store.delete_generation("gen", previous).await.unwrap() > 0,
+            "the explicit delete API still purges a previous generation"
+        );
+        assert!(store.get("gen", &previous_id).await.unwrap().is_none());
+    }
+
+    /// The API documents and enforces the rollback constraint: the active
+    /// generation cannot be deleted, and the refusal names the rollback target.
+    #[tokio::test]
+    async fn rollback_constraint_documented() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("rollback.lbug"), 4).unwrap();
+        store.init("gen").await.unwrap();
+        let active = publish_fixture_generation(
+            &store,
+            "gen",
+            PROBE_SOURCE,
+            &[("src/a.rs", "only generation")],
+        )
+        .await;
+
+        let err = store.delete_generation("gen", active).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("active"), "{message}");
+        assert!(
+            message.contains("rollback target"),
+            "the refusal states why the active generation is protected: {message}"
+        );
+        assert_eq!(
+            store
+                .active_generation("gen", PROBE_SOURCE)
+                .await
+                .unwrap(),
+            active,
+            "the pointer is untouched"
+        );
     }
 }
 

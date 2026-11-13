@@ -184,6 +184,17 @@ pub fn configured_dimensions() -> Result<usize> {
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
+/// Arena allocation is disabled by default; `NEUROSTRATA_EMBED_ARENA` with
+/// one of the house truthy spellings restores it for operators who measured a
+/// benefit. Mirrors the HYBRID_SEARCH convention (1/true/yes/on).
+fn arena_disabled_for(value: Option<&str>) -> bool {
+    let enabled = matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    !enabled
+}
+
 /// The pin gate `FastEmbedder::new` applies to the configured model: a
 /// local entry without a pinned SHA-256 fails closed, so a hand-authored
 /// or setup-written entry can never load unverified.
@@ -353,12 +364,34 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
-        let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_enum.clone())
-                .with_cache_dir(cache_dir.clone())
-                .with_max_length(MAX_EMBED_TOKENS)
-                .with_show_download_progress(true),
-        )?;
+        // The CPU arena keeps the largest buffer any input ever needed.
+        // Texts here are embedded one at a time at their own length, so the
+        // arena ratchets up and never gives it back. This applies to every
+        // local embedding (ingest, daemon queries, MCP calls), not only
+        // ingest. Set NEUROSTRATA_EMBED_ARENA=1 to keep the previous
+        // default; any other value (or unset) disables the arena.
+        let mut init = TextInitOptions::new(model_enum.clone())
+            .with_cache_dir(cache_dir.clone())
+            .with_max_length(MAX_EMBED_TOKENS);
+        // Deliberately pin the CPU execution provider: arena allocation is a
+        // CPU-provider setting, and this build's fastembed/ort path is CPU-only.
+        // A future non-CPU provider needs its own policy rather than inheriting
+        // this one silently.
+        let disable_arena =
+            arena_disabled_for(std::env::var("NEUROSTRATA_EMBED_ARENA").ok().as_deref());
+        static SAID_ARENA: std::sync::Once = std::sync::Once::new();
+        SAID_ARENA.call_once(|| {
+            eprintln!(
+                "Embedding CPU arena: {}",
+                if disable_arena { "disabled" } else { "enabled (NEUROSTRATA_EMBED_ARENA)" }
+            );
+        });
+        if disable_arena {
+            init = init.with_execution_providers(vec![ort::ep::CPU::default()
+                .with_arena_allocator(false)
+                .build()]);
+        }
+        let model = TextEmbedding::try_new(init.with_show_download_progress(true))?;
 
         // Supply-chain verification: the configured entry must carry a
         // pinned SHA-256, and the file fastembed actually loaded (the
@@ -644,6 +677,30 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arena_default_is_disabled_with_an_explicit_opt_in() {
+        for off in [None, Some("0"), Some(""), Some("no"), Some("false")] {
+            assert!(super::arena_disabled_for(off), "{off:?} is not opt-in");
+        }
+        for on in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(!super::arena_disabled_for(Some(on)), "{on:?} opts in");
+        }
+    }
+
+    /// Source assertion: the env-parse test alone cannot catch the arena
+    /// ratchet returning. Both flipping this to `true` and deleting the call
+    /// fail here.
+    #[test]
+    fn the_constructor_disables_the_cpu_arena() {
+        let source = include_str!("embed.rs");
+        // Build the needle so this assertion's own text cannot satisfy it.
+        let needle = format!(".with_arena_allocator({})", "false");
+        assert!(
+            source.contains(&needle),
+            "FastEmbedder must disable the CPU arena allocator"
+        );
+    }
+
     use super::*;
 
     /// Read one full HTTP request (headers + declared body) off the socket,

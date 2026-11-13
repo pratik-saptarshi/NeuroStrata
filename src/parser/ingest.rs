@@ -121,7 +121,7 @@ pub fn is_qualified(namespace: &str, id: &str) -> bool {
 /// GOVERNS edges match ids by exact string, so a rule an agent wrote against
 /// `src/store/ladybug.rs` could never link to the same file ingested from the
 /// GUI -- and an absolute id does not survive the repository being checked out
-/// anywhere else (bead neurostrata-fld).
+/// anywhere else.
 pub fn node_id_for(root: &Path, path: &Path) -> String {
     // A relative walk already produces the documented form. `ingest ./src <ns>`
     // is the example in CLI-readme.md, and it must keep yielding src/lib.rs --
@@ -337,8 +337,14 @@ fn slugify(s: &str) -> String {
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
-    fn file_skipped(&self, path: &str) {
-        tracing::debug!("ingest skipped file: {path}");
+    fn file_skipped(&self, path: &str, reason: &str) {
+        // Security skips are operator-visible at info; the per-file
+        // "unchanged" skip stays at debug so a large tree is not spammed.
+        if reason.contains("ERROR [SECURITY]") {
+            tracing::info!("ingest skipped file: {path} ({reason})");
+        } else {
+            tracing::debug!("ingest skipped file: {path} ({reason})");
+        }
     }
     fn relinked(&self, edges: usize);
     /// Called once per run when the previous generation's `ingest_version`
@@ -372,12 +378,42 @@ enum IngestItem {
         /// SHA-256 of the file bytes, shared by every symbol in the file.
         file_sha256: String,
     },
+    /// A document the secret scanner refused: skipped whole, reported
+    /// through the observer. Carries the file's display path and the
+    /// scanner's reason — never the secret itself.
+    SkippedFile {
+        path_display: String,
+        reason: String,
+        /// The previous generation had rows for this path. Such a skip is a
+        /// change (the old rows must not stay active); a never-indexed skip is
+        /// not.
+        had_previous: bool,
+    },
     /// Embedded markdown sections.
     DocSections {
         node_path: String,
         sections: Vec<DocSection>,
         file_sha256: String,
     },
+}
+
+/// Secret scan over a document's text, run in the producer as the file is
+/// read — before any part of the document reaches the store. The verdict
+/// text is the reason the skip reports.
+fn scan_for_ingest(text: &str) -> Option<String> {
+    crate::secrets::scan_entry_point(text, &serde_json::json!({}), "ingest")
+        .map(|r| r.to_string())
+}
+
+/// Read one file's bytes during an ingest walk.
+///
+/// Extracted so the abort path has a fixture that does not depend on file
+/// mode: reading a directory fails with EISDIR for every uid, including a
+/// root test process whose DAC override can read a mode-000 file.
+fn read_ingest_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| {
+        anyhow::anyhow!("failed to read {} during ingest: {e}", path.display())
+    })
 }
 
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
@@ -534,13 +570,11 @@ fn run_producer(
         let (file_sha256, content, lang_name, raw_bytes) = if is_file {
             // A single read per file: the bytes below are hashed, parsed (when
             // a grammar applies) and reused for the markdown section pass.
-            let bytes = match std::fs::read(path) {
-                Ok(bytes) => Some(bytes),
-                Err(e) => {
-                    tracing::warn!("failed to read {} for sha256: {e}", path.display());
-                    None
-                }
-            };
+            // A file the walk found but we cannot read is not "unchanged" or
+            // "empty": publishing a generation without its bytes would either
+            // lose the row or carry a stale copy over it. Abort the staging
+            // generation instead; the previous one stays active.
+            let bytes = Some(read_ingest_file(path)?);
             let hash = bytes.as_deref().map(sha256_hex);
             let lang_name = path
                 .extension()
@@ -563,7 +597,7 @@ fn run_producer(
                 if let Some(prev_hash) = prev_file_map.get(&node_path) {
                     if prev_hash == file_sha256.as_deref().unwrap_or("") {
                         if let Some(obs) = &observer {
-                            obs.file_skipped(&path_str);
+                            obs.file_skipped(&path_str, "unchanged");
                         }
                         // Record the current hash so unchanged rows can be carried.
                         if let Some(h) = file_sha256.as_deref() {
@@ -577,6 +611,44 @@ fn run_producer(
         // Record the current hash for every file the walk visits.
         if let Some(h) = file_sha256.as_deref() {
             current_hashes.insert(node_path.clone(), h.to_string());
+        }
+
+        // Before its node goes out, a file's text meets the secret scanner
+        // first, and a document that trips it is skipped whole — no file node,
+        // no symbols, no sections — with the skip reported through the
+        // consumer. The scan runs over the bytes already read above, so what
+        // is scanned is exactly what is parsed and stored. Markdown has no
+        // tree-sitter grammar, so its text comes from raw_bytes rather than
+        // `content`; without this arm a credential in a .md file reached the
+        // doc-section embedding path unscanned.
+        let scan_text = match (&content, &raw_bytes) {
+            (Some(text), _) => Some(text.clone()),
+            (None, Some(bytes)) if mem_type == "markdown" => {
+                Some(String::from_utf8_lossy(bytes).to_string())
+            }
+            _ => None,
+        };
+        if let Some(text) = &scan_text {
+            if let Some(reason) = scan_for_ingest(text) {
+                // A never-indexed skip is not a change: exclude it from the
+                // current walk so the unchanged fast path still applies. A
+                // path that had previous rows is a change; leave it in the
+                // sets so the generation advances and the old rows do not
+                // stay active.
+                let had_previous = prev_file_map.contains_key(&node_path);
+                if !had_previous {
+                    current_paths.remove(&node_path);
+                    current_kinds.remove(&node_path);
+                }
+                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
+                    path_display: path_str.to_string(),
+                    reason,
+                    had_previous,
+                }) {
+                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                }
+                continue;
+            }
         }
 
         // Apply backpressure: if the channel is full, block until space is
@@ -749,8 +821,12 @@ async fn run_consumer(
     // read again, so this walk changed something.
     let mut content_items = 0usize;
     while let Some(item) = rx.recv().await {
-        if !matches!(&item, IngestItem::NodeUpsert { mem_type, .. } if mem_type == "directory") {
-            content_items += 1;
+        // A SkippedFile counts only when it replaced previous-generation rows;
+        // a never-indexed skip is not content and must not defeat `unchanged`.
+        match &item {
+            IngestItem::NodeUpsert { mem_type, .. } if mem_type == "directory" => {}
+            IngestItem::SkippedFile { .. } => {}
+            _ => content_items += 1,
         }
         match item {
             IngestItem::NodeUpsert {
@@ -927,6 +1003,19 @@ async fn run_consumer(
                     }
                 }
             }
+            IngestItem::SkippedFile {
+                path_display,
+                reason,
+                had_previous,
+            } => {
+                if had_previous {
+                    content_items += 1;
+                }
+                println!("Skipped {} during ingest: {}", path_display, reason);
+                if let Some(observer) = &observer {
+                    observer.file_skipped(&path_display, &reason);
+                }
+            }
         IngestItem::DocSections {
             node_path,
             sections,
@@ -1051,6 +1140,11 @@ pub async fn ingest_directory(
     // directory of the same name keeps its path.
     let mut prev_node_kinds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // A failed summary leaves prev_stamps empty, which used to read as "no
+    // offending stamp" and disable the version gate; the carry pass then
+    // re-staged pre-fix rows over fresh ones and stamped them current. Treat a
+    // summary failure as a gate trip: re-parsing is the safe answer.
+    let mut summary_failed = false;
     if prev_gen > 0 {
         // Only this generation's rows, and only the fields read below: the
         // full `list` carried every row's text and cost ~100 MB per call on a
@@ -1073,7 +1167,8 @@ pub async fn ingest_directory(
                 }
             }
             Err(e) => {
-                tracing::warn!("vector_store.generation_summary failed while building prev_file_map for '{namespace}': {e}");
+                summary_failed = true;
+                tracing::warn!("vector_store.generation_summary failed while building prev_file_map for '{namespace}': {e}; forcing a full re-parse");
             }
         }
     }
@@ -1102,13 +1197,46 @@ pub async fn ingest_directory(
     // A mixed previous generation (any row missing or differing) trips too.
     let current_version = ingest_version(&schema.fingerprint());
     let offending_stamp = prev_stamps.iter().find(|s| crate::parser::generation::version_gate_tripped(if s.is_empty() { None } else { Some(s.as_str()) }, &current_version)).cloned();
-    let force_reparse = prev_gen > 0 && offending_stamp.is_some();
+    // An empty stamp list after a summary that claimed rows is just as
+    // suspicious as an offending stamp: it is the shape a failed/short read
+    // leaves behind, and carrying from it would publish pre-fix rows as
+    // current. `summary_failed` is explicit; the emptiness check covers a
+    // succeeded-but-empty read.
+    let force_reparse = prev_gen > 0
+        && (offending_stamp.is_some() || summary_failed || prev_stamps.is_empty());
     if force_reparse {
         let warn_prev = offending_stamp.as_deref().filter(|s| !s.is_empty()).unwrap_or("(none)");
         if let Some(obs) = &observer {
             obs.version_gate_tripped(warn_prev, &current_version);
         }
         tracing::warn!(prev = warn_prev, current = %current_version, "ingest version changed; re-parsing all files");
+        // A reparse stages a second copy before it publishes. Refuse on a
+        // host that cannot hold it rather than failing halfway through.
+        if let Some(store) = crate::traits::VectorStore::as_any(vector_store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+        {
+            let store_path = store.local_path();
+            let store_bytes = std::fs::metadata(store_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let projected = crate::storage::preflight::projected_reindex_bytes(store_bytes);
+            if let Err(e) = crate::storage::preflight::check_free_space(store_path, projected) {
+                // Record the failed upgrade before returning: the registry is
+                // the only trace the operator/doctor has of a refused reparse.
+                if let Err(record) = crate::registry::enrichment_fail(
+                    &vector_store,
+                    Some(&embedder),
+                    namespace,
+                    "ingest",
+                    &e.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!("enrichment registry update failed: {record}");
+                }
+                return Err(e);
+            }
+        }
     }
 
     let (tx, rx) = mpsc::channel::<IngestItem>(256);
@@ -1226,15 +1354,22 @@ pub async fn ingest_directory(
     // new generation contains the full tree without re-embedding.
     // A forced re-parse (version trip) stages every current node itself, so
     // no previous row is carried in that mode.
+    //
+    // A failed carry is not a partial carry: unchanged files are skipped by
+    // the producer, so this pass is their only route into the new generation.
+    // Publishing past a failure here would flip the active pointer onto a tree
+    // with holes in it, so the first carry error (summary, fetch or re-stage)
+    // aborts the staging generation exactly like a staging failure above.
     if prev_gen > 0 && !force_reparse && !unchanged {
         let mut carried = 0usize;
+        let mut carry_failure: Option<anyhow::Error> = None;
         let rows = match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!(
+                carry_failure = Some(anyhow::anyhow!(
                     "carry-forward: could not list previous-generation rows of namespace {}: {}",
                     namespace, e
-                );
+                ));
                 Vec::new()
             }
         };
@@ -1295,19 +1430,45 @@ pub async fn ingest_directory(
                     });
                     let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
                     if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
-                        tracing::warn!(
+                        carry_failure = Some(anyhow::anyhow!(
                             "carry-forward: failed to re-stage node {} into generation {}: {}",
                             new_id, generation, e
-                        );
-                    } else {
-                        carried += 1;
+                        ));
+                        break;
                     }
+                    carried += 1;
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!("carry-forward: vector_store.get failed for node {id}: {e}");
+                    carry_failure = Some(anyhow::anyhow!(
+                        "carry-forward: vector_store.get failed for node {id}: {e}"
+                    ));
+                    break;
                 }
             }
+        }
+        if let Some(e) = carry_failure {
+            if let Err(abort) = vector_store
+                .abort_generation(namespace, &source_key, generation)
+                .await
+            {
+                eprintln!(
+                    "Failed to abort staging generation {} of namespace {}: {}",
+                    generation, namespace, abort
+                );
+            }
+            if let Err(e) = crate::registry::enrichment_fail(
+                &vector_store,
+                Some(&embedder),
+                namespace,
+                "ingest",
+                &e.to_string(),
+            )
+            .await
+            {
+                tracing::warn!("enrichment registry update failed: {e}");
+            }
+            return Err(e);
         }
         println!("Carried forward {} unchanged nodes", carried);
     }
@@ -1369,7 +1530,7 @@ pub async fn ingest_directory(
 
     // A rule is not rewritten just because its file came back, so replay what
     // the memories still declare now that the nodes they point at are the
-    // active generation (bead neurostrata-sij).
+    // active generation.
     //
     // A failure here fails the ingest rather than warning about it: reporting
     // success would hand back a graph whose rules reach none of their code.
@@ -1768,6 +1929,42 @@ mod tests {
         );
     }
 
+    /// A file replaced by an empty directory at the same path re-reads no
+    /// file and visits the same path, but it is a change: the old file and its
+    /// symbols must not stay active.
+    #[tokio::test]
+    async fn a_file_replaced_by_a_directory_publishes_a_new_generation() {
+        let tmp = std::env::temp_dir().join(format!("ns-type-change-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("thing.rs"), "fn main() {}").expect("write test file");
+
+        let db = std::env::temp_dir().join(format!("ns-type-change-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let ingest = || {
+            ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "test-ns", None, &[])
+        };
+
+        ingest().await.expect("first ingest");
+        let key = source_key_for(&tmp);
+        assert_eq!(store.active_generation("test-ns", &key).await.expect("read"), 1);
+
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove the file");
+        std::fs::create_dir(tmp.join("thing.rs")).expect("create a directory at the same path");
+        ingest().await.expect("second ingest");
+        assert_eq!(
+            store.active_generation("test-ns", &key).await.expect("read"),
+            2,
+            "a path that changed from a file to a directory publishes a new generation"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
     #[tokio::test]
     async fn producer_consumer_streams_items_to_store() {
         // Create a temp directory with a parseable file.
@@ -2079,7 +2276,7 @@ mod tests {
         struct Recorder(std::sync::Mutex<(usize, usize)>); // (skipped, gate trips)
         impl IngestObserver for Recorder {
             fn file_ingested(&self, _path: &str, _symbols: usize) {}
-            fn file_skipped(&self, _path: &str) {
+            fn file_skipped(&self, _path: &str, _reason: &str) {
                 self.0.lock().unwrap().0 += 1;
             }
             fn relinked(&self, _edges: usize) {}
@@ -2311,7 +2508,7 @@ mod tests {
         struct Rec(std::sync::Mutex<usize>);
         impl IngestObserver for Rec {
             fn file_ingested(&self, _p: &str, _s: usize) {}
-            fn file_skipped(&self, _p: &str) {}
+            fn file_skipped(&self, _p: &str, _r: &str) {}
             fn relinked(&self, _e: usize) {}
             fn version_gate_tripped(&self, _p: &str, _c: &str) {
                 *self.0.lock().unwrap() += 1;
@@ -2479,7 +2676,7 @@ mod tests {
         struct Rec(std::sync::Mutex<usize>);
         impl IngestObserver for Rec {
             fn file_ingested(&self, _p: &str, _s: usize) {}
-            fn file_skipped(&self, _p: &str) {}
+            fn file_skipped(&self, _p: &str, _r: &str) {}
             fn relinked(&self, _e: usize) {}
             fn version_gate_tripped(&self, _p: &str, _c: &str) {
                 *self.0.lock().unwrap() += 1;
@@ -2572,6 +2769,38 @@ use super::x;"#;
         assert!(ts_deps.contains(&"src/utils.ts".to_string()) || ts_deps.contains(&"src/helper.js".to_string()));
     }
 
+    /// Memory probe, not a correctness test: ingests `NS_PROBE_DIR` twice into a
+    /// store opened the way the daemon opens it (default 384 MB buffer-pool cap;
+    /// set `NEUROSTRATA_BUFFER_POOL_MB=0` to measure the engine default) so peak
+    /// working set can be read from outside the process. Run:
+    ///   NS_PROBE_DIR=<dir> cargo test --bin neurostrata-mcp ingest_memory_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ingest_memory_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
+        let db = std::env::temp_dir().join(format!("ns-probe-db-{}", std::process::id()));
+        // NS_PROBE_REAL=1 loads the daemon's embedder, so the model and its
+        // runtime memory are part of what is measured.
+        let embedder: Arc<dyn Embedder> = if std::env::var("NS_PROBE_REAL").is_ok() {
+            Arc::new(crate::embed::FastEmbedder::new().expect("embedder"))
+        } else {
+            Arc::new(ZeroEmbedder)
+        };
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(&db, embedder.dimensions()).expect("open"));
+        store.init("probe").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        for pass in 1..=2 {
+            let t = std::time::Instant::now();
+            ingest_directory(&dir, &schema, embedder.clone(), store.clone(), "probe", None, &[]).await.expect("ingest");
+            println!("PROBE pass {pass} done in {:?}", t.elapsed());
+        }
+        // The probe owns a throwaway store; leave no multi-hundred-MB
+        // directory behind after a measurement.
+        drop(store);
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
     /// F2 incremental ingest + F12 watermark.
     #[tokio::test]
     async fn test_f2_f12_incremental_ingest_and_watermark() {
@@ -2630,6 +2859,888 @@ use super::x;"#;
         ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("deleted");
         let gen5 = store.active_generation("f2", &source_key).await.unwrap();
         assert!(gen5 > gen4, "a deleted file publishes a newer generation");
+    }
+
+    /// Records the documents the walk skipped, so a test asserts on the
+    /// report rather than on what the walk printed.
+    struct SkipRecorder {
+        skipped: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl IngestObserver for SkipRecorder {
+        fn file_ingested(&self, _path: &str, _symbols: usize) {}
+
+        fn relinked(&self, _edges: usize) {}
+
+        fn file_skipped(&self, path: &str, reason: &str) {
+            self.skipped
+                .lock()
+                .expect("recorder lock")
+                .push((path.to_string(), reason.to_string()));
+        }
+    }
+
+    /// PAR-03: a document whose text trips the scanner is skipped whole — no
+    /// file node, no symbols — and reported with the scanner's reason, while
+    /// the rest of the walk proceeds.
+    #[tokio::test]
+    async fn par03_secret_in_ingest_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        // Secret-named fields with type annotations are ordinary source, not
+        // credentials; they must still ingest.
+        let good_source = "struct Config { api_key: String, token: String }\nfn clean() {}";
+        std::fs::write(tmp.join("good.rs"), good_source).expect("write clean file");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        let evil_source = format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret);
+        std::fs::write(tmp.join("evil.rs"), &evil_source).expect("write leaking file");
+
+        let db =
+            std::env::temp_dir().join(format!("ns-ingest-secret-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+            &[],
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped document: {:?}",
+            outcome.err()
+        );
+
+        // The clean document landed whole.
+        let good_node = generation_scoped_id("test-ns", 1, "good.rs");
+        assert!(
+            store
+                .get("test-ns", &good_node)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean file with secret-named typed fields was stored"
+        );
+        let good_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id("good.rs", "functions", "clean", &sha256_hex("fn clean() {}".as_bytes())),
+        );
+        assert!(
+            store
+                .get("test-ns", &good_sym)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean symbol was stored"
+        );
+
+        // The tripping document contributed nothing: no file node, no symbol.
+        let evil_node = generation_scoped_id("test-ns", 1, "evil.rs");
+        assert!(
+            store
+                .get("test-ns", &evil_node)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's file node was not stored"
+        );
+        let evil_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id(
+                "evil.rs",
+                "functions",
+                "leak",
+                &sha256_hex(evil_source.as_bytes()),
+            ),
+        );
+        assert!(
+            store
+                .get("test-ns", &evil_sym)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's symbol was not stored"
+        );
+
+        // And the skip was reported with the file and the scanner's reason.
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(skipped.len(), 1, "exactly one skip reported: {:?}", *skipped);
+        assert!(
+            skipped[0].0.ends_with("evil.rs"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            skipped[0].1.contains("github_pat"),
+            "skip carries the scanner category: {}",
+            skipped[0].1
+        );
+        assert!(
+            !skipped[0].1.contains(&secret),
+            "skip must not echo the secret: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// PAR-03 / C10: markdown has no tree-sitter grammar, so its bytes must be
+    /// scanned independently of grammar availability. A credential in a .md
+    /// file contributes no file node and no doc sections.
+    #[tokio::test]
+    async fn par03_secret_in_markdown_is_refused() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-ingest-md-secret-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        let md = format!("# Notes\n\nkey: {}\n", secret);
+        std::fs::write(tmp.join("guide.md"), &md).expect("write leaking markdown");
+
+        let db = std::env::temp_dir().join(format!(
+            "ns-ingest-md-secret-db-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"),
+        );
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+            &[],
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped markdown: {:?}",
+            outcome.err()
+        );
+
+        let file_id = generation_scoped_id("test-ns", 1, "guide.md");
+        assert!(
+            store
+                .get("test-ns", &file_id)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped markdown's file node was not stored"
+        );
+        for section in parse_markdown_sections(&md) {
+            let sid = generation_scoped_id(
+                "test-ns",
+                1,
+                &format!("guide.md#section:{}@{}", section.slug, section.sha256),
+            );
+            assert!(
+                store
+                    .get("test-ns", &sid)
+                    .await
+                    .expect("read back")
+                    .is_none(),
+                "skipped markdown section was not stored: {}",
+                section.slug
+            );
+        }
+
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(skipped.len(), 1, "exactly one skip reported: {:?}", *skipped);
+        assert!(
+            skipped[0].0.ends_with("guide.md"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            !skipped[0].1.contains(&secret),
+            "skip must not echo the secret: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn clean_markdown_ingests() {
+        let tmp = std::env::temp_dir().join(format!("ns-md-clean-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let md = "# Notes\n\nclean documentation without credentials\n";
+        std::fs::write(tmp.join("guide.md"), md).expect("write clean markdown");
+        let db = std::env::temp_dir().join(format!("ns-md-clean-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("clean markdown ingests");
+        let node = generation_scoped_id("test-ns", 1, "guide.md");
+        assert!(store.get("test-ns", &node).await.expect("read").is_some());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A skip for a path that was never indexed is not a change. Without this,
+    /// one permanently rejected fixture forces a full carry on every ingest.
+    #[tokio::test]
+    async fn skipped_fixture_does_not_force_new_generation() {
+        let tmp = std::env::temp_dir().join(format!("ns-skip-unchanged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        std::fs::write(tmp.join("skip.rs"), format!("let key = \"{secret}\";"))
+            .expect("write skipped file");
+        let db = std::env::temp_dir().join(format!(
+            "ns-skip-unchanged-db-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let ingest = || {
+            ingest_directory(
+                &tmp,
+                &schema,
+                Arc::new(ZeroEmbedder),
+                store.clone(),
+                "test-ns",
+                None,
+                &[],
+            )
+        };
+        ingest().await.expect("first ingest");
+        let key = source_key_for(&tmp);
+        assert_eq!(
+            store.active_generation("test-ns", &key).await.expect("read"),
+            1
+        );
+        ingest().await.expect("second ingest");
+        assert_eq!(
+            store.active_generation("test-ns", &key).await.expect("read"),
+            1,
+            "a never-indexed skipped fixture must not force a new generation"
+        );
+        let skipped_row = generation_scoped_id("test-ns", 1, "skip.rs");
+        assert!(store
+            .get("test-ns", &skipped_row)
+            .await
+            .expect("read")
+            .is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Which carry-forward store call a `CarryFailingStore` fault hits.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CarryFault {
+        Upsert,
+        Get,
+        List,
+        /// Fail the first `generation_summary` call only, modelling a transient
+        /// timeout: the later call (if the code reaches the carry pass) works.
+        Summary,
+    }
+
+    /// Delegating store double whose carry-forward store calls fail while
+    /// `fail` is set, so a test can break the carry-forward pass -- the
+    /// previous-generation list, the row fetch, or the re-stage upsert --
+    /// that runs between staging and publication and is an unchanged file's
+    /// only route into the new generation.
+    struct CarryFailingStore {
+        inner: Arc<dyn VectorStore>,
+        fail: std::sync::atomic::AtomicBool,
+        fault: CarryFault,
+        /// How many `generation_summary` calls the ingest has made. The
+        /// pre-pass call is the first; the carry pass makes the second.
+        summary_calls: std::sync::atomic::AtomicUsize,
+        /// Only re-stage upserts whose scoped id carries this tail marker
+        /// fail: the consumer also upserts the generation-scoped source node
+        /// on every ingest, and failing that one would abort the ingest in
+        /// `run_consumer` instead of exercising the carry-forward pass.
+        upsert_marker: &'static str,
+    }
+
+    impl CarryFailingStore {
+        fn armed(&self, fault: CarryFault) -> bool {
+            self.fault == fault && self.fail.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::traits::AsAny for CarryFailingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for CarryFailingStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            // Only re-staging a carried row into a later generation fails;
+            // unscoped bookkeeping writes are never disturbed.
+            if self.armed(CarryFault::Upsert)
+                && id.contains(self.upsert_marker)
+                && matches!(split_scoped_id(id), Some((_, gen, _)) if gen >= 2)
+            {
+                anyhow::bail!("injected carry upsert failure (test double)");
+            }
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+
+        async fn relink_edges(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
+        }
+
+        async fn begin_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.begin_generation(namespace, source_key).await
+        }
+
+        async fn publish_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn abort_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .abort_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn active_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.active_generation(namespace, source_key).await
+        }
+
+        async fn generation_nodes(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.generation_nodes(namespace, generation).await
+        }
+
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            if self.armed(CarryFault::List) {
+                anyhow::bail!("injected carry list failure (test double)");
+            }
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            let call = self
+                .summary_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The List fault targets the carry pass's summary read: the
+            // pre-pass read must succeed, or the new "a failed summary trips
+            // the version gate" rule would re-parse and never reach carry.
+            if self.armed(CarryFault::List) && call > 0 {
+                anyhow::bail!("injected carry summary failure (test double)");
+            }
+            if self.armed(CarryFault::Summary) {
+                // Fail once, then recover: a transient timeout, not an outage.
+                self.fail
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("injected transient summary failure (test double)");
+            }
+            self.inner.generation_summary(namespace, generation).await
+        }
+
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            // The only generation-scoped fetches in the ingest flow are the
+            // carry-forward pass and the DEPENDS_ON stamping after it; the
+            // carry fetch is the first of them.
+            if self.armed(CarryFault::Get) && split_scoped_id(id).is_some() {
+                anyhow::bail!("injected carry get failure (test double)");
+            }
+            self.inner.get(namespace, id).await
+        }
+
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(include_retired, include_archived, project_contexts, anchor_override)
+                .await
+        }
+
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    /// Shared driver for the carry-fault tests: publish generation 1 of a
+    /// one-file directory, arm one carry-forward fault, then ingest the
+    /// unchanged directory again. The unchanged file is skipped by the
+    /// producer, so the carry-forward pass is its only route into generation
+    /// 2 -- exactly the route the fault breaks.
+    async fn ingest_twice_with_carry_fault(
+        fault: CarryFault,
+    ) -> (
+        anyhow::Result<()>,
+        Arc<dyn VectorStore>,
+        String,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let db = std::env::temp_dir().join(format!("ns-carry-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let failing = Arc::new(CarryFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fault,
+            summary_calls: std::sync::atomic::AtomicUsize::new(0),
+            upsert_marker: "hello.rs",
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store.init("carry-ns").await.expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-carry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn main() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&dir);
+
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "carry-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest publishes generation 1");
+        assert_eq!(
+            inner
+                .active_generation("carry-ns", &source_key)
+                .await
+                .expect("read"),
+            1,
+            "the first ingest publishes generation 1"
+        );
+
+        // Make the namespace changed so the carry pass runs; `hello.rs` itself
+        // is unchanged and is the row the fault injection targets.
+        std::fs::write(dir.join("other.rs"), "fn other() {}").expect("write changed file");
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "carry-ns",
+            None,
+            &[],
+        )
+        .await;
+        (outcome, inner, source_key, dir, db)
+    }
+
+    /// The assertions every carry fault must satisfy: the ingest fails naming
+    /// the carry-forward failure, and generation 1 stays active with its file
+    /// node reachable -- nothing is published over a hole.
+    fn assert_carry_fault_aborted(outcome: anyhow::Result<()>) -> anyhow::Error {
+        let err = outcome.expect_err("a failed carry-forward step must fail the ingest");
+        assert!(
+            format!("{}", err).contains("carry-forward"),
+            "the error names the carry-forward failure: {}",
+            err
+        );
+        err
+    }
+
+    async fn assert_generation_1_survives(inner: &Arc<dyn VectorStore>, source_key: &str) {
+        assert_eq!(
+            inner
+                .active_generation("carry-ns", source_key)
+                .await
+                .expect("read"),
+            1,
+            "the previous generation stays active after a failed carry"
+        );
+        let gen1_id = generation_scoped_id("carry-ns", 1, "hello.rs");
+        assert!(
+            inner
+                .get("carry-ns", &gen1_id)
+                .await
+                .expect("read")
+                .is_some(),
+            "generation 1's file node remains reachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_upsert_aborts_the_ingest() {
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::Upsert).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_list_aborts_the_ingest() {
+        // Largest blast radius: a failed list of the previous generation's
+        // rows used to carry nothing at all and still publish.
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::List).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_get_aborts_the_ingest() {
+        // At the row fetch: a failed get used to drop that node from the new
+        // generation and still publish.
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::Get).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A transient summary failure used to leave `prev_stamps` empty, which
+    /// read as "no offending stamp": the version gate stayed off, the producer
+    /// skipped unchanged files, and the carry pass (whose second summary
+    /// succeeds) copied the pre-fix rows over the fresh ones and stamped them
+    /// current. The failure must now trip the gate and re-parse.
+    #[tokio::test]
+    async fn transient_summary_failure_forces_reparse() {
+        let db = std::env::temp_dir().join(format!("ns-transient-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let failing = Arc::new(CarryFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fault: CarryFault::Summary,
+            summary_calls: std::sync::atomic::AtomicUsize::new(0),
+            upsert_marker: "hello.rs",
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store.init("probe").await.expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-transient-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn hello() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(&dir, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        let key = source_key_for(&dir);
+        let gen1 = inner.active_generation("probe", &key).await.expect("gen1");
+
+        // Simulate a pre-fix extraction: stale content, an old version stamp,
+        // and the file hash unchanged (so the producer would skip it).
+        let mut mutated = 0usize;
+        for row in inner.list("probe", None, None).await.expect("list") {
+            let Some((_, generation, _)) = split_scoped_id(&row.id) else {
+                continue;
+            };
+            if generation != gen1 {
+                continue;
+            }
+            let Some((vector, mut payload)) = inner.get("probe", &row.id).await.expect("read")
+            else {
+                continue;
+            };
+            payload.content = "STALE PRE-FIX EXTRACTION".to_string();
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert(
+                    "ingest_version".to_string(),
+                    serde_json::json!("0.0.0-stale"),
+                );
+            }
+            inner
+                .upsert("probe", &row.id, vector, payload)
+                .await
+                .expect("mutate the previous generation");
+            mutated += 1;
+        }
+        assert!(mutated > 0, "the fixture mutated the previous generation");
+
+        // The tree changed (a new file), so the carry pass would run; the
+        // summary fails once before it can answer.
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(dir.join("other.rs"), "fn other() {}").expect("write changed file");
+        ingest_directory(&dir, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("the re-parse ingests");
+
+        let gen2 = inner.active_generation("probe", &key).await.expect("gen2");
+        assert!(gen2 > gen1, "a changed tree publishes a new generation");
+        let current: Vec<_> = inner
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen2))
+            .collect();
+        assert!(!current.is_empty(), "the current generation has rows");
+        assert!(
+            current
+                .iter()
+                .all(|r| r.payload.content != "STALE PRE-FIX EXTRACTION"),
+            "a transient summary failure must not carry pre-fix rows into the current generation: {:?}",
+            current
+                .iter()
+                .filter(|r| r.payload.content == "STALE PRE-FIX EXTRACTION")
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// The read helper rejects a path that is not a readable file, under every
+    /// uid: a directory read is EISDIR even for root.
+    #[test]
+    fn read_ingest_file_rejects_a_directory() {
+        let dir = std::env::temp_dir().join(format!("ns-read-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let err = read_ingest_file(&dir).expect_err("a directory is not a file");
+        assert!(
+            format!("{err}").contains("failed to read"),
+            "the error names the read failure: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file the walk found but cannot read aborts the ingest instead of
+    /// publishing a generation with its content silently missing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_failure_aborts_generation() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, db, store, schema) = kind_fixture("read-failure").await;
+        let file = tmp.join("locked.rs");
+        std::fs::write(&file, "fn locked() {}").expect("write file");
+        let mut perms = std::fs::metadata(&file).expect("stat").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&file, perms).expect("chmod 000");
+
+        // A root test process can read a mode-000 file (DAC override). Check
+        // the fixture before asserting on it; the helper test above still
+        // proves the error path in that environment.
+        let fixture_unreadable = std::fs::read(&file).is_err();
+        if fixture_unreadable {
+            let err = ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+                .await
+                .expect_err("an unreadable file must abort the ingest");
+            assert!(
+                format!("{err}").contains("failed to read"),
+                "the error names the read failure: {err}"
+            );
+            assert_eq!(
+                store
+                    .active_generation("probe", &source_key_for(&tmp))
+                    .await
+                    .expect("read"),
+                0,
+                "no generation is published"
+            );
+        }
+
+        let mut perms = std::fs::metadata(&file).expect("stat").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&file, perms).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// The file-to-directory invariant: after the path changes kind, the new
+    /// generation serves the directory node and none of the deleted file's
+    /// rows.
+    #[tokio::test]
+    async fn file_to_directory_asserts_old_rows_dead() {
+        let (tmp, db, store, schema) = kind_fixture("file-to-dir-dead").await;
+        std::fs::write(tmp.join("thing.rs"), "pub fn gone() {}").expect("write file");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("first ingest");
+        let key = source_key_for(&tmp);
+
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove file");
+        std::fs::create_dir_all(tmp.join("thing.rs")).expect("create directory");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
+            .await
+            .expect("second ingest");
+        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
+
+        let rows: Vec<_> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen2))
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.id == generation_scoped_id("probe", gen2, "thing.rs")
+                && r.payload.memory_type == "directory"),
+            "the directory node is current"
+        );
+        assert!(
+            rows.iter().all(|r| r.payload.location != "thing.rs"
+                || r.payload.memory_type == "directory"),
+            "no deleted file row is served: {:?}",
+            rows.iter()
+                .filter(|r| r.payload.location == "thing.rs" && r.payload.memory_type != "directory")
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or
