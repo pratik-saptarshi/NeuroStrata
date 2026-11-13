@@ -110,7 +110,12 @@ mod tests {
                     body.len(),
                     body
                 );
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read the request first: closing a socket with the request
+                // still unread makes the peer reset the connection, which
+                // the client reports as a send failure.
+                let mut buf = [0u8; 4096];
+                let _n = socket.read(&mut buf).await.unwrap();
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.ok();
                 break;
@@ -161,7 +166,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Read the request first: closing a socket with the request
+            // still unread makes the peer reset the connection, which
+            // the client reports as a send failure.
+            let mut buf = [0u8; 4096];
+            let _n = socket.read(&mut buf).await.unwrap();
             let body = "gone";
             let response = format!(
                 "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
