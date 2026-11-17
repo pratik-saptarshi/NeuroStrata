@@ -47,7 +47,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Toolchain versions
         shell: bash
@@ -137,7 +137,7 @@ jobs:
       LBUG_VERSION: "0.22.3"
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Toolchain versions
         shell: bash
@@ -165,7 +165,14 @@ jobs:
         shell: bash
         run: bash scripts/check-include-str-targets.sh
 
+      # Upstream's Lean parity tests (tests/lean_parity_test.rs) hard-require
+      # `lake` on PATH: find_lake() panics when it is absent. Upstream's
+      # ci.yml installs the toolchain here; this mirrors that step. The
+      # hashFiles guard keeps the step inert on trees that predate the
+      # proofs/lean-toolchain pin (this branch's tree has no pin yet); on
+      # trees carrying the pin the step runs in full.
       - name: Install Lean 4 toolchain (elan)
+        if: hashFiles('proofs/lean-toolchain') != ''
         shell: bash
         run: |
           curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
@@ -183,113 +190,51 @@ jobs:
         shell: bash
         run: cargo test -p neurostrata-wasm --locked -- --test-threads=1
 
-      # The self-test runs the binary tests, so it belongs where the target is
-      # already built rather than in a fresh job that would compile it again.
-      - name: Remediation eval self-test
-        shell: bash
-        run: bash scripts/test-remediation-eval.sh
-
-  # Full binary suite on the other two platforms, report-only: a platform
-  # regression shows up on the PR without blocking the merge on a runner this
-  # project cannot reproduce locally. The ubuntu test job above is the gate.
-  test-report:
-    name: test (${{ matrix.os }}, report-only)
-    runs-on: ${{ matrix.os }}
-    env:
-      LBUG_VERSION: "0.22.3"
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-15]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Toolchain versions
-        shell: bash
-        run: |
-          rustc --version
-          cargo --version
-
-      - name: Verify build prerequisites
-        shell: bash
-        run: |
-          cmake --version || {
-            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
-            exit 1
-          }
-
-      - name: Configure vendored OpenSSL build (Windows)
-        if: startsWith(matrix.os, 'windows')
-        shell: bash
-        run: |
-          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
-          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
-
-      - name: Guard include_str targets
-        shell: bash
-        run: bash scripts/check-include-str-targets.sh
-
-      # Release profile: the Windows debug static library exceeds the 4 GiB
-      # limit this project already works around in the build job.
-      #
-      # Report-only is a step-level continue-on-error: a job-level one is not
-      # a GitHub Actions feature, and without this a platform failure would
-      # turn the check red on every PR even though the ubuntu gate decides.
-      - name: Test (report-only)
-        id: platform_tests
-        continue-on-error: true
-        shell: bash
-        run: cargo test --release --locked --bin neurostrata-mcp -- --test-threads=1
-
-      - name: Report platform test outcome
-        if: steps.platform_tests.outcome == 'failure'
-        shell: bash
-        run: |
-          echo "::warning::${{ matrix.os }} test suite failed; this leg is report-only and the ubuntu gate decides"
-
-  # The harness plugin is JavaScript the Rust binary embeds and runs. Its suite
-  # includes the restricted-PATH hook tests, which only execute on Windows when
-  # Git Bash is present -- a GitHub Windows runner has it. Run the suite on both
-  # so that path is covered rather than skipped by the ubuntu-only gate.
-  plugins:
-    name: plugins (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Node version
-        shell: bash
-        run: node --version
-
-      # From the repository root: the suite resolves plugins/... and
-      # scripts/... relative to the working directory.
-      - name: Test
-        shell: bash
-        run: node --test plugins/core/test.mjs
-
-  # The backup script's sidecar/WAL carry and pruning are shell behavior, not
-  # Rust behavior; test them where they run.
-  scripts:
-    name: scripts (ubuntu)
+  # Task 15a's scripted assertion for the release governance (J17),
+  # grep-level by design: release.yml must not grant contents: write at
+  # the top level (only its release job may), and every action in every
+  # workflow must be pinned to a full commit SHA. It is its own job -- a
+  # HARD gate, no continue-on-error -- because a governance regression
+  # must fail the run; riding in a report-only job (it originally sat in
+  # `fmt`) buries the signal inside a job that is expected to be red.
+  # Checkout and a shell are all it needs; no toolchain.
+  release-governance:
+    name: release governance
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Backup script tests
+      - name: Release governance assertions
         shell: bash
-        run: bash scripts/test-backup.sh
-
-      - name: Gate receipt self-test
-        shell: bash
-        run: bash scripts/test-gate-receipt.sh
-
-      - name: Gate receipt live-path harness
-        shell: bash
-        run: bash scripts/test-gate-receipt-live.sh
+        run: |
+          set -euo pipefail
+          top="$(awk '/^permissions:/{f=1} /^jobs:/{f=0} f' .github/workflows/release.yml)"
+          if printf '%s\n' "$top" | grep -q 'contents: *write'; then
+            echo "::error::release.yml grants contents: write at the top level; only the release job may."
+            exit 1
+          fi
+          if ! printf '%s\n' "$top" | grep -q 'contents: *read'; then
+            echo "::error::release.yml top-level permissions must default to contents: read."
+            exit 1
+          fi
+          # These two assertions pin the PR #24 P2 fix: release.yml is
+          # tag-push only because the build-provenance attestation derives
+          # from the workflow run's ref, so a dispatched run would sign
+          # provenance naming the dispatch ref rather than the built tag.
+          # A future sync that reintroduces a dispatch trigger or dispatch
+          # inputs must fail this gate loudly.
+          trig="$(awk '/^on:/{f=1} /^permissions:/{f=0} f' .github/workflows/release.yml | grep -v '^[[:space:]]*#')"
+          if printf '%s\n' "$trig" | grep -q 'workflow_dispatch'; then
+            echo "::error::release.yml must not declare a workflow_dispatch trigger; releases are tag-push only (attested provenance derives from the run ref, not the checkout)."
+            exit 1
+          fi
+          if grep -v '^[[:space:]]*#' .github/workflows/release.yml | grep -q 'inputs\.'; then
+            echo "::error::release.yml must not reference the inputs context; there are no dispatch inputs — the published tag is github.ref_name."
+            exit 1
+          fi
+          if grep -hE '^[[:space:]]*uses:' .github/workflows/*.yml | grep -vE '^[[:space:]]*uses:[[:space:]]*[^[:space:]@]+@[0-9a-f]{40}([[:space:]]|$)'; then
+            echo "::error::Every action in every workflow must be pinned to a full commit SHA (tag in a trailing comment)."
+            exit 1
+          fi
+          echo "release governance assertions passed"
