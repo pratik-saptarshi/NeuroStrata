@@ -165,6 +165,20 @@ jobs:
         shell: bash
         run: bash scripts/check-include-str-targets.sh
 
+      # Upstream's Lean parity tests (tests/lean_parity_test.rs) hard-require
+      # `lake` on PATH: find_lake() panics when it is absent. Upstream's
+      # ci.yml installs the toolchain here; this mirrors that step. The
+      # hashFiles guard keeps the step inert on trees that predate the
+      # proofs/lean-toolchain pin (this branch's tree has no pin yet); on
+      # trees carrying the pin the step runs in full.
+      - name: Install Lean 4 toolchain (elan)
+        if: hashFiles('proofs/lean-toolchain') != ''
+        shell: bash
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/lake" --dir proofs build
+
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
