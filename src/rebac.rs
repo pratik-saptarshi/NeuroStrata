@@ -217,6 +217,46 @@ pub fn can_write_memory(principal: &str, user_id: &str, metadata: &Value) -> boo
     )
 }
 
+/// §5.4 / §5.6 — namespace write permission via ReBAC.
+///
+/// The namespace-level write gate:
+/// - `admin` always passes.
+/// - a principal whose name exactly matches the namespace name is allowed
+///   (namespace owner namesake convention).
+/// - any other principal is denied (fail-closed).
+pub fn can_write_namespace(
+    _store: &crate::store::LadybugStore,
+    namespace: &str,
+    principal: Option<&str>,
+) -> bool {
+    let principal = principal.unwrap_or("");
+    // admin bypass
+    if principal == "admin" {
+        return true;
+    }
+    // namespace owner namesake convention
+    principal == namespace
+}
+
+/// Kinetic Action role check: verifies `principal` satisfies `required_role`
+/// (`"editor"` or `"owner"`) on a target row.
+pub fn can_execute_action_on_row(
+    principal: &str,
+    user_id: &str,
+    required_role: &str,
+    metadata: &Value,
+) -> bool {
+    if !matches!(required_role, "editor" | "owner") {
+        return false;
+    }
+    allowed_with_roles(
+        principal,
+        &extract_resource_owner(user_id, metadata),
+        required_role,
+        &extract_acl_with_roles(metadata),
+    )
+}
+
 /// §5.6 — restricted when visible_to non-empty and lacks wildcard.
 pub fn is_restricted(metadata: &Value) -> bool {
     let acl = extract_visible_to(metadata);
@@ -408,5 +448,22 @@ mod tests {
         let mixed = serde_json::json!({"user_id":"alice","visible_to":[42,"bob"]});
         assert!(can_read_memory("bob", "alice", &mixed));
         assert!(!can_read_memory("carol", "alice", &mixed));
+    }
+
+    #[test]
+    fn action_role_check_enforces_editor_or_owner_and_blocks_viewer() {
+        let meta = serde_json::json!({
+            "visible_to": [
+                {"principal": "bob-viewer", "role": "viewer"},
+                {"principal": "carol-editor", "role": "editor"},
+                {"principal": "dave-owner", "role": "owner"}
+            ]
+        });
+        assert!(!can_execute_action_on_row("bob-viewer", "alice", "editor", &meta));
+        assert!(can_execute_action_on_row("carol-editor", "alice", "editor", &meta));
+        assert!(!can_execute_action_on_row("carol-editor", "alice", "owner", &meta));
+        assert!(can_execute_action_on_row("dave-owner", "alice", "owner", &meta));
+        assert!(can_execute_action_on_row("alice", "alice", "owner", &meta));
+        assert!(can_execute_action_on_row("admin", "alice", "owner", &meta));
     }
 }

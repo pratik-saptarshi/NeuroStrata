@@ -9,7 +9,7 @@
 //!
 //! Rule: never hand a project a reminder where a machine will do.
 //!
-//! Registry size: 13 automatic wires and 7 reminder wires. The counts are
+//! Registry size: 14 automatic wires and 7 reminder wires. The counts are
 //! stated here so a stale "four wires" claim in prose cannot outlive the
 //! registry it describes.
 
@@ -133,6 +133,12 @@ pub const AUTOMATIC_WIRES: &[Wire] = &[
         blocks: true,
         reason: "a gate that passes its own test is not a gate: plant a violation, expect fail, prove byte-identical restore",
     },
+    Wire {
+        id: "doc-manifest-gate",
+        runs_in: RunsIn::ProjectPipeline,
+        blocks: true,
+        reason: "enforced by task gate --strict, scripts/task-coverage-gate.sh, and neurostrata-mcp doc-gate across vision, features-api, and extend tiers",
+    },
 ];
 
 pub const REMINDER_WIRES: &[Reminder] = &[
@@ -180,6 +186,11 @@ pub const REMINDER_WIRES: &[Reminder] = &[
         id: "subagent-context-propagation",
         fires_on: "before-edit",
         text: "subagents start with zero memory context: paste the subagent_prompt_injection block from neurostrata_task_claim into EVERY subagent prompt you spawn",
+    },
+    Reminder {
+        id: "formal-lean-verification-check",
+        fires_on: "during-work",
+        text: "when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs",
     },
 ];
 

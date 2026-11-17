@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { execFileSync as execFileSyncTop } from "node:child_process";
 
@@ -68,6 +68,18 @@ function toolPath(cmd) {
       if (existsSync(candidate)) return candidate;
     }
   }
+  if (process.platform === "win32") {
+    // A POSIX prefix ("/usr/bin") resolves against the current Windows drive
+    // and holds nothing. Ask the system where the tool actually is (Git for
+    // Windows provides the POSIX tools the hook needs).
+    try {
+      const found = execFileSyncTop("where", [cmd], { encoding: "utf8" })
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (found) return found;
+    } catch {}
+  }
   return cmd;
 }
 
@@ -115,6 +127,10 @@ import {
   postTurnCandidates,
   extractConceptualBridges,
   persistConceptualBridges,
+  DAEMON_MEMORY_ADVICE_MARKER,
+  resetAdvisoryStateForTesting,
+  extractDaemonMemoryAdvisory,
+  daemonTokenPath,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -619,6 +635,48 @@ describe("extractRepoFilePaths", () => {
     assert.ok(!out.includes("https://example.com/x.json"));
     const dups = extractRepoFilePaths("a/b.ts a/b.ts c/d.ts");
     assert.deepEqual(dups, ["a/b.ts", "c/d.ts"]);
+  });
+
+  it("extracts paths from a sentence, normalizing ./ prefixes, ignoring URLs", () => {
+    const out = extractRepoFilePaths(
+      "Edited src/store/ladybug.rs, ./plugins/core/index.ts, and .github/workflows/ci.yml. Ignore https://example.com/foo/bar.ts",
+    );
+    assert.deepEqual(out, ["src/store/ladybug.rs", "plugins/core/index.ts", ".github/workflows/ci.yml"]);
+  });
+
+  it("adversarial ReDoS input completes in bounded time and returns []", () => {
+    // Best of several runs: the first call on a cold runner pays JIT and GC
+    // and has been measured at ~55 ms, while the guard against catastrophic
+    // backtracking is about seconds-to-minutes, not tens of milliseconds.
+    const input = "a/".repeat(25000) + "!";
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 5; i += 1) {
+      const start = performance.now();
+      const out = extractRepoFilePaths(input);
+      best = Math.min(best, performance.now() - start);
+      assert.deepEqual(out, []);
+    }
+    assert.ok(best < 50, `extractRepoFilePaths best of 5 was ${best}ms on adversarial input, expected < 50ms`);
+  });
+
+  it("extracts generic file extensions (.ttl, .lean, .jsonl, .cmake)", () => {
+    const out = extractRepoFilePaths(
+      "update schemas/neurostrata-ontology.ttl, proofs/NeuroStrata/Safeguards.lean, .NeuroStrata/tasks.jsonl, cmake/FindFoo.cmake",
+    );
+    assert.ok(out.includes("schemas/neurostrata-ontology.ttl"));
+    assert.ok(out.includes("proofs/NeuroStrata/Safeguards.lean"));
+    assert.ok(out.includes(".NeuroStrata/tasks.jsonl"));
+    assert.ok(out.includes("cmake/FindFoo.cmake"));
+  });
+
+  it("ignores numeric-only version suffixes and URL bodies", () => {
+    assert.deepEqual(extractRepoFilePaths("release/v1.2 and https://example.com/a/b.ts"), []);
+    assert.deepEqual(extractRepoFilePaths("pkg/1.2.3"), []);
+  });
+
+  it("ignores empty, '.' and '..' segments", () => {
+    assert.deepEqual(extractRepoFilePaths("src/./foo.ts and a//b.ts"), []);
+    assert.deepEqual(extractRepoFilePaths("a/../b.ts"), []);
   });
 });
 
@@ -1289,7 +1347,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 
   it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-awk-"));
     const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
@@ -1302,7 +1360,14 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
           try {
             symlinkSync(candidate, join(binDir, cmd));
             break;
-          } catch {}
+          } catch {
+            // Windows may not permit symlinks for an unprivileged process;
+            // a copy serves the same restricted-PATH purpose.
+            try {
+              copyFileSync(candidate, join(binDir, cmd));
+              break;
+            } catch {}
+          }
         }
       }
 
@@ -1854,7 +1919,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
 
   it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r6-"));
     const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
@@ -1864,7 +1929,10 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
           const source = toolPath(cmd);
           const candidate = isAbsolute(source) ? source : join(prefix, source);
           if (!existsSync(candidate)) continue;
-          try { symlinkSync(candidate, join(binDir, cmd)); break; } catch {}
+          try { symlinkSync(candidate, join(binDir, cmd)); break; }
+          catch {
+            try { copyFileSync(candidate, join(binDir, cmd)); break; } catch {}
+          }
         }
       }
 
@@ -1964,7 +2032,7 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
   // A file name containing a double quote cannot exist on Windows.
   it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", { skip: winHookSkip() || (process.platform === "win32" && "file names cannot contain a double quote on Windows") }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r8-"));
     try {
@@ -2516,5 +2584,64 @@ describe("Task 1.1: execute.after V2 result mutation (via hook registration)", (
       server.close();
       resetClientForTesting();
     }
+  });
+});
+
+describe("daemonTokenPath honors NEUROSTRATA_TOKEN_DIR", () => {
+  it("uses env var when set and restores default when unset", () => {
+    const old = process.env.NEUROSTRATA_TOKEN_DIR;
+    process.env.NEUROSTRATA_TOKEN_DIR = "/tmp/custom-token-dir";
+    assert.equal(daemonTokenPath(), "/tmp/custom-token-dir");
+    delete process.env.NEUROSTRATA_TOKEN_DIR;
+    assert.equal(daemonTokenPath(), join(homedir(), ".config", "neurostrata", "daemon.token"));
+    if (old !== undefined) process.env.NEUROSTRATA_TOKEN_DIR = old;
+  });
+  it("trims whitespace", () => {
+    const old = process.env.NEUROSTRATA_TOKEN_DIR;
+    process.env.NEUROSTRATA_TOKEN_DIR = "   /tmp/custom-token-dir   ";
+    assert.equal(daemonTokenPath(), "/tmp/custom-token-dir");
+    if (old !== undefined) process.env.NEUROSTRATA_TOKEN_DIR = old;
+    else delete process.env.NEUROSTRATA_TOKEN_DIR;
+  });
+});
+
+describe("daemon memory advisory (#140)", () => {
+  beforeEach(() => {
+    resetAdvisoryStateForTesting();
+  });
+
+  it("extracts the advisory from an error channel carrying the marker and throttles repeats for 10 minutes", () => {
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted; daemon RSS at 90%`;
+    const showAt = 1_000_000;
+    const first = extractDaemonMemoryAdvisory(text, showAt);
+    assert.notEqual(first, null, "a marked error channel yields the advisory");
+    assert.match(first, /DAEMON MEMORY ADVISORY/);
+    assert.match(first, /NEUROSTRATA_BUFFER_POOL_MB/);
+
+    const withinWindow = extractDaemonMemoryAdvisory(text, showAt + 9 * 60 * 1000);
+    assert.equal(withinWindow, null, "repeats inside the 10-minute window are throttled");
+
+    const afterWindow = extractDaemonMemoryAdvisory(text, showAt + 11 * 60 * 1000);
+    assert.notEqual(afterWindow, null, "after the window the advisory shows again");
+  });
+
+  it("ignores memory payload content without the marker", () => {
+    resetAdvisoryStateForTesting();
+    // Mentioning the knob, or the word buffer pool, is not the daemon's advisory.
+    assert.equal(extractDaemonMemoryAdvisory("NEUROSTRATA_BUFFER_POOL_MB is too small for my data", 5_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory("buffer pool pressure described in a memory", 6_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory(null), null);
+    assert.equal(extractDaemonMemoryAdvisory(undefined), null);
+    assert.equal(extractDaemonMemoryAdvisory(""), null);
+  });
+
+  it("resetAdvisoryStateForTesting clears a still-live throttle window", () => {
+    resetAdvisoryStateForTesting();
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted`;
+    const first = extractDaemonMemoryAdvisory(text, 10_000_000);
+    assert.notEqual(first, null);
+    assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
+    resetAdvisoryStateForTesting();
+    assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
   });
 });

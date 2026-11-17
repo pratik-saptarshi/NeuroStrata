@@ -1,4 +1,4 @@
-use crate::config::{DeduplicationConfig, DedupProviderMode};
+use crate::config::{DedupProviderMode, DeduplicationConfig};
 use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
@@ -12,12 +12,39 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// The daemon's token directory: `~/.config/neurostrata`, the directory
-/// that also holds `embedders.json`.
+/// The daemon's token directory. `NEUROSTRATA_TOKEN_DIR` overrides it for
+/// operators and tests alike; under `cargo test` an unset variable yields a
+/// process-scoped temp directory, so a test binary never reads, creates, or
+/// deletes the operator's real `~/.config/neurostrata/daemon.token`.
 fn token_config_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".config").join("neurostrata")
+    if let Ok(val) = std::env::var("NEUROSTRATA_TOKEN_DIR") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    #[cfg(test)]
+    {
+        TEST_TOKEN_DIR
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!("neurostrata-test-token-{}", std::process::id()))
+            })
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".config").join("neurostrata")
+    }
 }
+
+/// The daemon token file's full path. One source of truth for the daemon and
+/// for the server proxy tests, so an isolated token dir is honored by both.
+pub(crate) fn token_path() -> PathBuf {
+    token_config_dir().join("daemon.token")
+}
+
+#[cfg(test)]
+static TEST_TOKEN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// A fresh token: two v4 UUIDs' raw bytes, hex-encoded (64 chars) --
 /// ~244 bits of CSPRNG entropy (122 per UUID after the version and
@@ -48,7 +75,10 @@ fn tighten_token_permissions(path: &Path) {
         if metadata.permissions().mode() & 0o077 != 0 {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .inspect_err(|e| {
-                    tracing::warn!("failed to tighten token file permissions on {}: {e}", path.display());
+                    tracing::warn!(
+                        "failed to tighten token file permissions on {}: {e}",
+                        path.display()
+                    );
                 });
         }
     }
@@ -66,7 +96,10 @@ fn load_or_create_token_file(path: &Path) -> String {
     let token = generate_token();
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!("failed to create token file directory {}: {e}", dir.display());
+            tracing::warn!(
+                "failed to create token file directory {}: {e}",
+                dir.display()
+            );
         }
     }
     #[cfg(unix)]
@@ -101,7 +134,7 @@ fn load_or_create_token_file(path: &Path) -> String {
 /// Load or create the per-user daemon bearer <redacted> Stored at
 /// `~/.config/neurostrata/daemon.token` with mode 0600.
 pub(crate) fn load_or_create_daemon_token() -> String {
-    load_or_create_token_file(&token_config_dir().join("daemon.token"))
+    load_or_create_token_file(&token_path())
 }
 
 /// Load or create the daemon's operator token (DR-5): the second token
@@ -118,7 +151,6 @@ pub(crate) fn load_or_create_daemon_token() -> String {
 pub(crate) fn load_or_create_operator_token() -> String {
     load_or_create_token_file(&token_config_dir().join("operator.token"))
 }
-
 /// Read a token file's contents for a client: the trimmed value, or None
 /// when no usable token is there. Creation is the daemon's job; clients
 /// only read.
@@ -165,6 +197,19 @@ pub(crate) static CREDENTIAL_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::M
 #[cfg(test)]
 pub(crate) fn credential_file_test_lock() -> std::sync::MutexGuard<'static, ()> {
     CREDENTIAL_FILE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `std::env` is process-global, so tests that mutate or depend on
+/// `NEUROSTRATA_PROJECT_ROOT` (`PROJECT_ROOT_ENV`) across modules must share a
+/// single lock.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn project_root_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -305,6 +350,13 @@ async fn auth_middleware(
         }
     }
 
+    // The label is built lazily: `begin_lazy` invokes the closure only
+    // when profiling is enabled, so the disabled fast path allocates
+    // nothing here. The guard is still created for every authenticated
+    // non-/mcp request, exactly as before.
+    let _memory_guard = (req.uri().path() != "/mcp").then(|| {
+        crate::procmem::CallGuard::begin_lazy(|| format!("http:{}", req.uri().path()), None)
+    });
     next.run(req).await
 }
 
@@ -442,6 +494,20 @@ pub async fn start_daemon(
     vector_store: Arc<dyn VectorStore>,
     deduplication_config: Option<DeduplicationConfig>,
 ) -> anyhow::Result<()> {
+    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
+    // over the startup root and every configured project context directory, so
+    // existing workspaces are upgraded immediately on daemon boot. This runs
+    // here and not in `start_daemon_on` because the in-process test daemons
+    // start there: they would write `.claude/` and `.NeuroStrata/plugins/`
+    // into the directory `cargo test` runs in and into every configured
+    // project.
+    let startup_root = resolve_project_root();
+    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
+    if let Ok(cfg) = crate::config::Config::load() {
+        for dir in cfg.project_contexts.values() {
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
+        }
+    }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire
     // contract, so production never does. Tests pass an ephemeral address to
     // `start_daemon_on` directly.
@@ -549,8 +615,7 @@ pub(crate) fn check_caller_path(
         return Ok(resolved);
     }
     for entry in allowlist {
-        let canonical_entry =
-            std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+        let canonical_entry = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
         if resolved.starts_with(&canonical_entry) {
             return Ok(resolved);
         }
@@ -600,7 +665,10 @@ fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
             }
             return Ok(resolved);
         }
-        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+        match (
+            cursor.file_name().map(|n| n.to_os_string()),
+            cursor.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 remainder.push(name);
                 cursor = parent.to_path_buf();
@@ -828,7 +896,11 @@ fn auto_pull_interval_for_policy(
 /// entry (the `Notify` edge). A drain is synchronous git + file I/O, so it is
 /// called directly rather than awaited — the mesh repo is tiny and the
 /// interval is seconds, so it never meaningfully blocks the executor.
-async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>, store: Arc<dyn VectorStore>) {
+async fn mesh_drain_loop(
+    project_root: PathBuf,
+    wake: Arc<tokio::sync::Notify>,
+    store: Arc<dyn VectorStore>,
+) {
     let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -889,7 +961,9 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
         &outbox,
         &namespaces,
         epoch,
-    ).await {
+    )
+    .await
+    {
         tracing::warn!("mesh outbox reconcile failed: {e}");
     }
     match drain_once(&outbox, &mesh, &node_id) {
@@ -965,11 +1039,9 @@ pub(crate) async fn start_daemon_on(
     };
 
     // Initialize guard validator for behavioral constraint checking
-    let guard_validator = Arc::new(crate::guard::GuardValidator::new(
-        vector_store.clone(),
-        embedder.clone(),
-        "guard",
-    ).await);
+    let guard_validator = Arc::new(
+        crate::guard::GuardValidator::new(vector_store.clone(), embedder.clone(), "guard").await,
+    );
 
     // Generate or load the per-user daemon bearer token. Stored at
     // ~/.config/neurostrata/daemon.token (mode 0600) so CLI clients can read it.
@@ -992,16 +1064,7 @@ pub(crate) async fn start_daemon_on(
     // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
     wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
 
-    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
-    // over the startup root and every configured project context directory, so
-    // existing workspaces are upgraded immediately on daemon boot.
     let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
-    if let Ok(cfg) = crate::config::Config::load() {
-        for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
-        }
-    }
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -1032,6 +1095,7 @@ pub(crate) async fn start_daemon_on(
         .route("/info", get(handle_info))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
+        .route("/ingest-scip", post(handle_ingest_scip))
         .route("/delete", post(handle_delete))
         .route("/memory/archive", post(handle_memory_archive))
         .route("/edit", post(handle_edit))
@@ -1047,15 +1111,23 @@ pub(crate) async fn start_daemon_on(
         .route("/sparql", post(handle_http_sparql))
         .route("/graphql", post(handle_http_graphql))
         .route("/chat/ask", post(handle_http_chat_ask))
-        .route("/storage/status", get(handle_http_storage_status).post(handle_http_storage_status))
+        .route(
+            "/storage/status",
+            get(handle_http_storage_status).post(handle_http_storage_status),
+        )
         .route("/learning/status", get(handle_http_learning_status))
         .route("/learning/control", post(handle_http_learning_control))
+        .route("/action", post(handle_http_action))
+        .route("/scenario", post(handle_http_scenario))
+        .route("/object-view", post(handle_http_object_view))
+        .route("/locate", post(handle_http_locate))
+        .route("/diff-tour", post(handle_http_diff_tour))
+        .route("/insights", post(handle_http_insights))
+        .route("/taxonomy", post(handle_http_taxonomy))
+        .route("/data-connector", post(handle_http_data_connector))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            auth_middleware,
-        ));
+        .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
 
     // Bound the loss window for anything that kills us without warning.
     //
@@ -1082,6 +1154,7 @@ pub(crate) async fn start_daemon_on(
     // final checkpoint would then contend with it.
     let (stop_periodic, mut periodic_stopped) = tokio::sync::watch::channel(false);
     // The memory time series stops on the same signal (see procmem).
+    crate::procmem::mark_daemon_process();
     let memory_sampler = crate::procmem::spawn_sampler(periodic_stopped.clone());
     let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;
@@ -1110,8 +1183,7 @@ pub(crate) async fn start_daemon_on(
                         if let Err(e) = ls.flush_metrics().await {
                             tracing::warn!("periodic flush_metrics failed: {e}");
                         }
-                        match crate::storage::compute_storage_status(ls.local_path(), &hygiene)
-                        {
+                        match crate::storage::compute_storage_status(ls.local_path(), &hygiene) {
                             status if status.wal_warn_threshold_exceeded => {
                                 if !wal_warned {
                                     eprintln!(
@@ -1252,7 +1324,10 @@ async fn handle_get_graph(
             anchor_override.as_ref(),
         )
         .await
-        .map_err(|e| { tracing::warn!("handle_get_graph export_graph failed: {e}"); axum::http::StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            tracing::warn!("handle_get_graph export_graph failed: {e}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     if query.all.unwrap_or(false) {
         return Ok(Json(data));
@@ -1355,6 +1430,31 @@ async fn handle_ingest(
     Ok(Json(progress_value))
 }
 
+#[derive(Deserialize)]
+struct IngestScipReq {
+    scip_path: String,
+    namespace: String,
+}
+
+async fn handle_ingest_scip(
+    State(state): State<AppState>,
+    Json(req): Json<IngestScipReq>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let scip_file = caller_path_refusal(&state, &req.scip_path)?;
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    let report =
+        crate::parser::scip::ingest_scip_index(state.vector_store.clone(), &namespace, &scip_file)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let val = serde_json::to_value(&report).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize SCIP report: {e}"),
+        )
+    })?;
+    Ok(Json(val))
+}
+
 /// Backup and restore run here rather than in the CLI so they work against a
 /// live daemon: the database is single-writer, and the daemon holds that writer.
 async fn handle_backup(
@@ -1392,7 +1492,7 @@ async fn handle_export_graph(
     State(state): State<AppState>,
     Json(req): Json<ExportGraphReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-// The graph is written wherever the caller named; the path policy
+    // The graph is written wherever the caller named; the path policy
     // decides whether this daemon may write there, BEFORE any use
     // (Task 2 re-file / J6 — this route postdates the original filing).
     let target = caller_path_refusal(&state, &req.target)?;
@@ -1413,15 +1513,19 @@ async fn handle_export_graph(
         .vector_store
         .export_graph(
             !req.exclude_superseded.unwrap_or(false),
-            req.include_archived.unwrap_or(false),            &project_contexts,
+            req.include_archived.unwrap_or(false),
+            &project_contexts,
             anchor_override.as_ref(),
         )
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    std::fs::write(&target, serde_json::to_string_pretty(&data).map_err(|e| {
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(
+        &target,
+        serde_json::to_string_pretty(&data)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    )
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Graph exported to {}", req.target))
 }
 
@@ -1472,33 +1576,34 @@ async fn handle_cli_read(
     State(state): State<AppState>,
     Json(req): Json<ReadReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let value =
-        match req.op.as_str() {
-            "namespaces" => {
-                let namespaces =
-                    state.vector_store.list_namespaces().await.map_err(|e| {
-                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                    })?;
-                serde_json::json!({ "namespaces": namespaces })
-            }
-            "list" => {
-                let ns = req.namespace.unwrap_or_default();
-                let rows =
-                    state.vector_store.list(&ns, None, None).await.map_err(|e| {
-                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                    })?;
-                serde_json::json!({ "rows": rows })
-            }
-            other => {
-                return Err((
-                    axum::http::StatusCode::BAD_REQUEST,
-                    format!(
-                        "unknown read op '{}': expected 'namespaces' or 'list'",
-                        other
-                    ),
-                ))
-            }
-        };
+    let value = match req.op.as_str() {
+        "namespaces" => {
+            let namespaces = state
+                .vector_store
+                .list_namespaces()
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "namespaces": namespaces })
+        }
+        "list" => {
+            let ns = req.namespace.unwrap_or_default();
+            let rows = state
+                .vector_store
+                .list(&ns, None, None)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "rows": rows })
+        }
+        other => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown read op '{}': expected 'namespaces' or 'list'",
+                    other
+                ),
+            ))
+        }
+    };
     Ok(value.to_string())
 }
 
@@ -1628,13 +1733,15 @@ async fn handle_edit(
     .await
     {
         Ok(crate::server::EditOutcome::Edited) => Ok("OK"),
-        Ok(crate::server::EditOutcome::NotFound) => {
-            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
-        }
+        Ok(crate::server::EditOutcome::NotFound) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Memory not found".to_string(),
+        )),
         // The next ingest of that namespace would overwrite the edit.
-        Ok(crate::server::EditOutcome::Ingested) => {
-            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the edit".to_string()))
-        }
+        Ok(crate::server::EditOutcome::Ingested) => Err((
+            axum::http::StatusCode::CONFLICT,
+            "The next ingest of that namespace would overwrite the edit".to_string(),
+        )),
         Err(e) => {
             eprintln!("edit of {} in {} failed: {}", req.id, old_namespace, e);
             Err((
@@ -1659,16 +1766,24 @@ async fn handle_set_metadata(
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
     // The daemon is bearer-authenticated per user, so its caller is the local
     // operator: the same admin default the CLI uses.
-    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata, "admin")
-        .await
+    match crate::server::set_metadata(
+        &*state.vector_store,
+        &namespace,
+        &req.id,
+        req.metadata,
+        "admin",
+    )
+    .await
     {
         Ok(crate::server::MetadataOutcome::Updated) => Ok("OK"),
-        Ok(crate::server::MetadataOutcome::NotFound) => {
-            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
-        }
-        Ok(crate::server::MetadataOutcome::Ingested) => {
-            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the metadata".to_string()))
-        }
+        Ok(crate::server::MetadataOutcome::NotFound) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Memory not found".to_string(),
+        )),
+        Ok(crate::server::MetadataOutcome::Ingested) => Err((
+            axum::http::StatusCode::CONFLICT,
+            "The next ingest of that namespace would overwrite the metadata".to_string(),
+        )),
         Err(e) => {
             eprintln!("set-metadata of {} in {} failed: {}", req.id, namespace, e);
             Err((
@@ -1683,8 +1798,13 @@ async fn handle_set_metadata(
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
+        // JSON-RPC 2.0: a notification (no `id`) is never answered. 202 with an
+        // empty body, as MCP's HTTP transport answers one; the stdio proxy
+        // writes nothing for an empty body.
+        let is_notification = rpc_req.id.is_none();
         let response = crate::server::process_mcp_request(
             rpc_req,
             state.embedder.clone(),
@@ -1694,11 +1814,15 @@ async fn handle_mcp(
             state.bus.clone(),
         )
         .await;
-        Json(response)
+        if is_notification {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        }
+        Json(response).into_response()
     } else {
         Json(
             serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}),
         )
+        .into_response()
     }
 }
 
@@ -1719,16 +1843,20 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
         let mut close = match tokio::signal::windows::ctrl_close() {
             Ok(s) => s,
             Err(_) => {
-                tracing::warn!("signal registration failed: could not register shutdown signal listener");
-                return std::future::pending::<ShutdownCause>().await
-            },
+                tracing::warn!(
+                    "signal registration failed: could not register shutdown signal listener"
+                );
+                return std::future::pending::<ShutdownCause>().await;
+            }
         };
         let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
             Ok(s) => s,
             Err(_) => {
-                tracing::warn!("signal registration failed: could not register shutdown signal listener");
-                return std::future::pending::<ShutdownCause>().await
-            },
+                tracing::warn!(
+                    "signal registration failed: could not register shutdown signal listener"
+                );
+                return std::future::pending::<ShutdownCause>().await;
+            }
         };
         tokio::select! {
             _ = close.recv() => eprintln!("Console is closing, shutting down."),
@@ -1743,9 +1871,11 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(_) => {
-                tracing::warn!("signal registration failed: could not register shutdown signal listener");
-                return std::future::pending::<ShutdownCause>().await
-            },
+                    tracing::warn!(
+                        "signal registration failed: could not register shutdown signal listener"
+                    );
+                    return std::future::pending::<ShutdownCause>().await;
+                }
             };
         term.recv().await;
         eprintln!("Received SIGTERM, shutting down.");
@@ -1857,6 +1987,9 @@ struct TaskGateReq {
     /// it, because one gate serves MCP, CLI, and the hook (section 4).
     #[serde(default)]
     strict: bool,
+    /// Caller-supplied Git identity; absent keeps the legacy global verdict.
+    #[serde(default)]
+    scope: Option<crate::task::gate::GateScope>,
 }
 
 /// POST /tasks/gate -- what the pre-push hook sees (section 4).
@@ -1871,7 +2004,7 @@ async fn handle_tasks_gate(
     Json(req): Json<TaskGateReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    let report = crate::task::gate::run(&state.vector_store, &namespace)
+    let report = crate::task::gate::run_scoped(&state.vector_store, &namespace, req.scope.as_ref())
         .await
         .map_err(|e| {
             eprintln!("[neurostrata:gate] gate for '{}' failed: {}", namespace, e);
@@ -1896,7 +2029,11 @@ async fn handle_http_sparql(
     // to the federation handler on the underlying LadybugStore. Security per
     // deployment: served-host/namespace allowlists and peers come from env,
     // and everything outside the allowlists is denied.
-    if req.get("federated").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if req
+        .get("federated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         let config = crate::rdf::federation::FederationConfig {
             served_namespaces: env_csv("NEUROSTRATA_SPARQL_SERVED_NAMESPACES"),
             served_hosts: env_csv("NEUROSTRATA_SPARQL_SERVED_HOSTS"),
@@ -2001,12 +2138,9 @@ async fn handle_http_chat_ask(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
-    let body = crate::server::handle_chat_ask(
-        &req,
-        state.embedder.clone(),
-        state.vector_store.clone(),
-    )
-    .await;
+    let body =
+        crate::server::handle_chat_ask(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
@@ -2023,8 +2157,136 @@ async fn handle_http_storage_status(
     )
 }
 
-async fn handle_http_learning_status() -> (axum::http::StatusCode, axum::Json<crate::learning::status::LearnStatus>) {
-    let status = crate::learning::control::load_status(&crate::learning::control::default_learning_dir());
+async fn handle_http_action(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_action(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_data_connector(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_data_connector(
+        &req,
+        state.vector_store.clone(),
+        state.bus.clone(),
+    )
+    .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_scenario(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_scenario(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_object_view(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_object_view(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_locate(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_locate(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_diff_tour(
+    State(state): State<AppState>,
+    Json(mut req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    if let Some(raw_root) = req
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        match caller_path_refusal(&state, raw_root) {
+            Ok(canonical) => {
+                req["project_root"] = serde_json::json!(canonical.to_string_lossy().into_owned());
+            }
+            Err((status, msg)) => {
+                return (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({ "ok": false, "error": msg }).to_string(),
+                );
+            }
+        }
+    }
+    let body = crate::server::handle_diff_tour(&req, state.vector_store.clone()).await;
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_insights(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_insights(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_taxonomy(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+        &req,
+        state.embedder.clone(),
+        state.vector_store.clone(),
+        Some(state.bus.clone()),
+    )
+    .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_learning_status() -> (
+    axum::http::StatusCode,
+    axum::Json<crate::learning::status::LearnStatus>,
+) {
+    let status =
+        crate::learning::control::load_status(&crate::learning::control::default_learning_dir());
     (axum::http::StatusCode::OK, axum::Json(status))
 }
 
@@ -2048,17 +2310,63 @@ async fn handle_http_learning_control(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gate_scope_is_optional_for_older_cli_callers() {
+        let old: TaskGateReq = serde_json::from_value(serde_json::json!({
+            "namespace": "NeuroStrata",
+            "strict": true,
+        }))
+        .unwrap();
+        assert_eq!(old.scope, None);
+
+        let scoped: TaskGateReq = serde_json::from_value(serde_json::json!({
+            "namespace": "NeuroStrata",
+            "strict": true,
+            "scope": { "branch": "main", "worktree": "/repo/main" },
+        }))
+        .unwrap();
+        assert_eq!(scoped.scope.unwrap().branch.as_deref(), Some("main"));
+    }
+
     use super::*;
     use crate::events::{RecursionToken, ThalamicPulse};
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
 
-    /// `std::env` is process-global, so tests that mutate `PROJECT_ROOT_ENV`
-    /// must not run concurrently: one test's `remove_var` strands another's
-    /// `expect`. Held for the full body of every env-mutating test; poisoning
-    /// (a panic while holding it) is tolerated so one failure cannot cascade.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn daemon_token_tests_never_touch_real_home_config() {
+        let path = token_path();
+        if let Ok(dir) = std::env::var("NEUROSTRATA_TOKEN_DIR") {
+            assert!(
+                path.starts_with(dir),
+                "the token path must honor NEUROSTRATA_TOKEN_DIR, got {}",
+                path.display()
+            );
+        } else {
+            let temp = std::env::temp_dir();
+            assert!(
+                path.starts_with(&temp),
+                "under test the token path must live in a process-isolated temp dir, got {}",
+                path.display()
+            );
+            assert!(
+                path.to_string_lossy()
+                    .contains(&format!("neurostrata-test-token-{}", std::process::id())),
+                "the temp dir is scoped to this process: {}",
+                path.display()
+            );
+        }
+        let real = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config")
+            .join("neurostrata")
+            .join("daemon.token");
+        assert_ne!(
+            path, real,
+            "token tests must never resolve to the operator's real daemon.token"
+        );
+    }
 
     #[test]
     fn the_first_retry_comes_quickly() {
@@ -2280,11 +2588,11 @@ mod tests {
         }
     }
 
-impl crate::traits::AsAny for RecordingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    impl crate::traits::AsAny for RecordingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
-}
 
     /// A throwaway project root, named like the subscriber tests' scratch
     /// directories so an earlier run's leftover can never be read as this
@@ -2551,12 +2859,14 @@ impl crate::traits::AsAny for RecordingStore {
         // does not exist yet, the client goes out tokenless, and every
         // authenticated route answers 401.
         let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token_dir = token_config_dir();
+        let daemon_path = token_dir.join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&daemon_path) {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                if let Ok(val) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed))
+                {
                     headers.insert(reqwest::header::AUTHORIZATION, val);
                 }
             }
@@ -2564,7 +2874,7 @@ impl crate::traits::AsAny for RecordingStore {
         // The helper client is the operator's own client: it also carries
         // the operator token, so the destructive routes (its /shutdown
         // cleanup above all) keep working under the operator tier.
-        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        let operator_path = token_dir.join("operator.token");
         if let Ok(operator) = std::fs::read_to_string(&operator_path) {
             let trimmed = operator.trim();
             if !trimmed.is_empty() {
@@ -2573,7 +2883,10 @@ impl crate::traits::AsAny for RecordingStore {
                 }
             }
         }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -2666,12 +2979,14 @@ impl crate::traits::AsAny for RecordingStore {
         // folded into Task 1: the archive-route test failed 401-for-404 in
         // CI while passing wherever a token file already existed.
         let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token_dir = token_config_dir();
+        let daemon_path = token_dir.join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&daemon_path) {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                if let Ok(val) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed))
+                {
                     headers.insert(reqwest::header::AUTHORIZATION, val);
                 }
             }
@@ -2679,7 +2994,7 @@ impl crate::traits::AsAny for RecordingStore {
         // The helper client is the operator's own client: it also carries
         // the operator token, so the destructive routes (its /shutdown
         // cleanup above all) keep working under the operator tier.
-        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        let operator_path = token_dir.join("operator.token");
         if let Ok(operator) = std::fs::read_to_string(&operator_path) {
             let trimmed = operator.trim();
             if !trimmed.is_empty() {
@@ -2688,7 +3003,10 @@ impl crate::traits::AsAny for RecordingStore {
                 }
             }
         }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         (base, client, daemon, credential_guard)
     }
@@ -2711,8 +3029,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// The contents of one of the daemon's token files, or "" if it cannot
     /// be read -- the same read every first-party client performs.
     fn token_file(name: &str) -> String {
-        let home = dirs::home_dir().unwrap_or_default();
-        std::fs::read_to_string(home.join(".config").join("neurostrata").join(name))
+        std::fs::read_to_string(token_config_dir().join(name))
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     }
@@ -2725,18 +3042,91 @@ impl crate::traits::AsAny for RecordingStore {
     /// bearer + operator headers on /shutdown, then require the task to
     /// finish. (Against a daemon without the operator tier the extra header
     /// is ignored, so the same cleanup works on both sides of the change.)
-    async fn stop_test_daemon(
-        base: &str,
-        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
-    ) {
+    async fn stop_test_daemon(base: &str, daemon: tokio::task::JoinHandle<anyhow::Result<()>>) {
         let client = bare_client();
         let _ = client
             .post(format!("{base}/shutdown"))
-            .header(reqwest::header::AUTHORIZATION, bearer(&token_file("daemon.token")))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                bearer(&token_file("daemon.token")),
+            )
             .header("x-neurostrata-operator", token_file("operator.token"))
             .send()
             .await;
         daemon.await.unwrap().unwrap();
+    }
+
+    /// JSON-RPC over /mcp: a method the server does not implement is answered
+    /// with -32601 and the request's id (Claude Code's `server/discover` probe
+    /// used to get a bare `{}` and wait out its timeout), and a notification
+    /// gets no reply body at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_methods_get_method_not_found_and_notifications_no_reply() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let discover = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(discover.status().is_success());
+        let body: serde_json::Value = discover.json().await.unwrap();
+        assert_eq!(body["jsonrpc"], serde_json::json!("2.0"), "{body}");
+        assert_eq!(body["id"], serde_json::json!(7), "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+
+        let initialized = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(initialized.text().await.unwrap(), "", "a notification is not answered");
+
+        let ping = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": "p", "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = ping.json().await.unwrap();
+        assert_eq!(body["id"], serde_json::json!("p"), "{body}");
+        assert_eq!(body["result"], serde_json::json!({}), "{body}");
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// An explicit `"id": null` is a request id, not the notification marker
+    /// (an *omitted* `id`): it must be answered with a real response whose
+    /// top-level `id` is `null`, not swallowed as a 202 empty-body notification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_id_null_request_is_answered_not_treated_as_a_notification() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let explicit_null = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": null, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit_null.status(),
+            axum::http::StatusCode::OK,
+            "{explicit_null:?}"
+        );
+        let body: serde_json::Value = explicit_null.json().await.unwrap();
+        assert!(body.get("id").is_some(), "{body}");
+        assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{body}"
+        );
+
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: no credential at all is a 401 on authenticated routes --
@@ -2769,7 +3159,10 @@ impl crate::traits::AsAny for RecordingStore {
 
         let info = client
             .get(format!("{base}/info"))
-            .header(reqwest::header::AUTHORIZATION, bearer("not-the-daemon-token"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                bearer("not-the-daemon-token"),
+            )
             .send()
             .await
             .unwrap();
@@ -2791,8 +3184,14 @@ impl crate::traits::AsAny for RecordingStore {
         let operator_token = token_file("operator.token");
 
         for (route, body) in [
-            ("/delete", serde_json::json!({"namespace": "trust-test", "id": "m1"})),
-            ("/backup", serde_json::json!({"dir": "/tmp/ns-trust-backup"})),
+            (
+                "/delete",
+                serde_json::json!({"namespace": "trust-test", "id": "m1"}),
+            ),
+            (
+                "/backup",
+                serde_json::json!({"dir": "/tmp/ns-trust-backup"}),
+            ),
         ] {
             let refused = client
                 .post(format!("{base}{route}"))
@@ -2923,9 +3322,9 @@ impl crate::traits::AsAny for RecordingStore {
     async fn token_files_have_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
-        let home = dirs::home_dir().unwrap_or_default();
+        let token_dir = token_config_dir();
         for name in ["daemon.token", "operator.token"] {
-            let path = home.join(".config").join("neurostrata").join(name);
+            let path = token_dir.join(name);
             let metadata = std::fs::metadata(&path)
                 .unwrap_or_else(|e| panic!("{name} must exist once the daemon runs: {e}"));
             assert_eq!(
@@ -3173,8 +3572,7 @@ impl crate::traits::AsAny for RecordingStore {
         let bare = reqwest::Client::new();
         wait_for_serving(&bare, &addr).await;
         std::env::remove_var(PROJECT_ROOT_ENV);
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_dir = home.join(".config").join("neurostrata");
+        let token_dir = token_config_dir();
         let token = std::fs::read_to_string(token_dir.join("daemon.token"))
             .expect("the daemon created its token file before serving");
         let operator = std::fs::read_to_string(token_dir.join("operator.token"))
@@ -3215,6 +3613,31 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
         dir
+    }
+
+    /// The in-process test daemon must not install harness plugins into the
+    /// root it serves. That root is the directory `cargo test` runs in unless
+    /// a test names another, so an install here leaves `.claude/` and
+    /// `.NeuroStrata/plugins/` in the developer's checkout. A `.claude/`
+    /// directory in the scratch root makes the Claude harness count as
+    /// detected without any environment variable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_daemon_does_not_install_plugins_into_its_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("no-plugin-install");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
+        stop_daemon(&client, &base, daemon).await;
+        assert!(
+            !root.join(".NeuroStrata").exists(),
+            "the test daemon wrote .NeuroStrata/ into {}",
+            root.display()
+        );
+        assert!(
+            !root.join(".claude").join("settings.local.json").exists(),
+            "the test daemon wrote .claude/settings.local.json into {}",
+            root.display()
+        );
     }
 
     /// Task 2 re-file (J6): a caller-named backup destination outside the
@@ -3624,6 +4047,83 @@ impl crate::traits::AsAny for RecordingStore {
         }
     }
 
+    /// F-10 wiring pin: `auth_middleware` creates the memory guard for
+    /// an authenticated non-/mcp route (a guard is in flight inside the
+    /// handler), and for nothing else at this layer — /health returns
+    /// before the guard site and /mcp is excluded from it. The handlers
+    /// record procmem's in-flight count; assertions are relative to the
+    /// count immediately before each request, the same baseline shape
+    /// as procmem's own in-flight counting test.
+    #[tokio::test]
+    async fn auth_middleware_guards_only_authenticated_non_mcp_routes() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("f10-middleware-wiring");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = caller_path_state(&root, vec![]).await;
+        let seen: Arc<Mutex<Vec<(&'static str, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = |name: &'static str, seen: Arc<Mutex<Vec<(&'static str, usize)>>>| {
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push((name, crate::procmem::in_flight_for_test()));
+                    "ok"
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/health", get(record("health", seen.clone())))
+            .route("/dummy", get(record("dummy", seen.clone())))
+            .route("/mcp", post(record("mcp", seen.clone())))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+
+        let drive = |app: Router, uri: &'static str, method: axum::http::Method, auth: bool| async move {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::HOST, "127.0.0.1");
+            if auth {
+                builder = builder.header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer test-daemon-token",
+                );
+            }
+            let before = crate::procmem::in_flight_for_test();
+            let response = app
+                .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            (response.status(), before)
+        };
+
+        let (status, before) = drive(app.clone(), "/health", axum::http::Method::GET, false).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("health", before)),
+            "/health runs with no guard active"
+        );
+
+        let (status, before) = drive(app.clone(), "/dummy", axum::http::Method::GET, true).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("dummy", before + 1)),
+            "an authenticated route runs with the guard in flight"
+        );
+
+        let (status, before) = drive(app, "/mcp", axum::http::Method::POST, true).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("mcp", before)),
+            "/mcp runs with no guard at the middleware layer"
+        );
+    }
+
     /// Task 2 re-file (J6): an export target under an
     /// `allowed_external_dirs` entry is written — the escape hatch works
     /// at the handler, not only in the policy function.
@@ -3688,6 +4188,159 @@ impl crate::traits::AsAny for RecordingStore {
             out.0
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_action_route_matches_mcp_and_cli_parses_every_subcommand() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _credential_guard = credential_file_test_lock();
+        let root = scratch_root("daemon-action-parity");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_dir = root.join("db");
+        let lb_store = Arc::new(
+            crate::store::LadybugStore::for_testing(&db_dir, 8).expect("open LadybugStore"),
+        );
+        std::env::set_var(PROJECT_ROOT_ENV, &root);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let daemon = tokio::spawn(start_daemon_on(
+            addr.clone(),
+            Arc::new(StubEmbedder { dimensions: 8 }),
+            lb_store,
+            None,
+        ));
+        let base = format!("http://{addr}");
+        let bare = reqwest::Client::new();
+        wait_for_serving(&bare, &addr).await;
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        let token_dir = token_config_dir();
+        let token = std::fs::read_to_string(token_dir.join("daemon.token")).unwrap();
+        let operator = std::fs::read_to_string(token_dir.join("operator.token")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
+        );
+        headers.insert(
+            "x-neurostrata-operator",
+            reqwest::header::HeaderValue::from_str(operator.trim()).unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+
+        let def_payload = serde_json::json!({
+            "namespace": "daemon-act-ns",
+            "action": "define",
+            "definition": {
+                "slug": "daemon-create-fact",
+                "title": "Daemon Create Fact",
+                "description": "Creates a governed fact via POST /action",
+                "required_role": "editor",
+                "parameters": {
+                    "note": { "param_type": "string", "required": true }
+                },
+                "submission_criteria": [],
+                "effects": [
+                    {
+                        "op": "upsert_memory",
+                        "memory_type": "fact",
+                        "content_template": "Daemon note: {{note}}",
+                        "metadata_template": {}
+                    }
+                ]
+            }
+        });
+
+        let def_res = client
+            .post(format!("{base}/action"))
+            .json(&def_payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(def_res.status(), axum::http::StatusCode::OK);
+        let def_json: serde_json::Value = def_res.json().await.unwrap();
+        assert_eq!(
+            def_json["ok"],
+            serde_json::json!(true),
+            "daemon define: {def_json}"
+        );
+        assert_eq!(
+            def_json["defined"]["slug"],
+            serde_json::json!("daemon-create-fact")
+        );
+
+        let val_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "validate",
+                "slug": "daemon-create-fact",
+                "params": { "note": "hello" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let val_json: serde_json::Value = val_res.json().await.unwrap();
+        assert_eq!(val_json["ok"], serde_json::json!(true));
+        assert_eq!(val_json["valid"], serde_json::json!(true));
+
+        let apply_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "apply",
+                "slug": "daemon-create-fact",
+                "params": { "note": "hello" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let apply_json: serde_json::Value = apply_res.json().await.unwrap();
+        assert_eq!(
+            apply_json["ok"],
+            serde_json::json!(true),
+            "daemon apply: {apply_json}"
+        );
+        let receipt_id = apply_json["applied"]["receipt_id"]
+            .as_str()
+            .expect("receipt_id")
+            .to_string();
+
+        let rev_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "revert",
+                "receipt_id": receipt_id
+            }))
+            .send()
+            .await
+            .unwrap();
+        let rev_json: serde_json::Value = rev_res.json().await.unwrap();
+        assert_eq!(
+            rev_json["ok"],
+            serde_json::json!(true),
+            "daemon revert: {rev_json}"
+        );
+
+        let log_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "log",
+                "limit": 10
+            }))
+            .send()
+            .await
+            .unwrap();
+        let log_json: serde_json::Value = log_res.json().await.unwrap();
+        assert_eq!(log_json["ok"], serde_json::json!(true));
+        assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
+
+        stop_daemon(&client, &base, daemon).await;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3698,7 +4351,9 @@ pub enum DaemonState {
 
 pub fn daemon_status(db_path: &std::path::Path) -> DaemonState {
     if daemon_holds_lock_local(db_path) {
-        DaemonState::Running { since: "active".to_string() }
+        DaemonState::Running {
+            since: "active".to_string(),
+        }
     } else {
         DaemonState::Stopped
     }

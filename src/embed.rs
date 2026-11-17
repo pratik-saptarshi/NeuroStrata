@@ -184,6 +184,13 @@ pub fn configured_dimensions() -> Result<usize> {
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
+/// Forward-pass micro-batch size for local ONNX inference (`FastEmbedder::embed_batch`).
+/// `fastembed` defaults `None` to `batch_size = 256` and pads every item in a batch
+/// up to the longest item's token length (up to `MAX_EMBED_TOKENS = 2048`), which
+/// allocates `[256, 12, 2048, 2048]` self-attention tensors (>22 GB) and OOM-kills
+/// the daemon on large files. `1` embeds each text at its own actual token length.
+const FAST_EMBED_BATCH_SIZE: usize = 1;
+
 /// Arena allocation is disabled by default; `NEUROSTRATA_EMBED_ARENA` with
 /// one of the house truthy spellings restores it for operators who measured a
 /// benefit. Mirrors the HYBRID_SEARCH convention (1/true/yes/on).
@@ -193,6 +200,36 @@ fn arena_disabled_for(value: Option<&str>) -> bool {
         Some("1") | Some("true") | Some("yes") | Some("on")
     );
     !enabled
+}
+
+/// Shared process-wide ONNX Runtime [`ort::environment::Environment`].
+///
+/// `ort 2.0.0-rc.15` enforces a single `Environment` per process (`ort::init().build()`).
+/// Sharing this singleton across `FastEmbedder`, `GlinerExtractor`, and `LayaOnnx`
+/// guarantees they never collide regardless of initialization order.
+pub fn shared_ort_environment() -> Result<&'static ort::environment::Environment> {
+    static ORT_ENV: std::sync::OnceLock<std::result::Result<ort::environment::Environment, String>> =
+        std::sync::OnceLock::new();
+    match ORT_ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string())) {
+        Ok(env) => Ok(env),
+        Err(msg) => Err(anyhow!("Failed to initialize ONNX Runtime environment: {msg}")),
+    }
+}
+
+/// The execution-provider list the constructor installs for the arena
+/// decision: a pinned CPU provider with the arena allocator off, or `None` to
+/// leave fastembed's default. Extracted so the decision-to-wiring path is a
+/// value a test can inspect without loading a model.
+fn arena_execution_providers(
+    disabled: bool,
+) -> Option<Vec<ort::ep::ExecutionProviderDispatch>> {
+    if disabled {
+        Some(vec![ort::ep::CPU::default()
+            .with_arena_allocator(false)
+            .build()])
+    } else {
+        None
+    }
 }
 
 /// The pin gate `FastEmbedder::new` applies to the configured model: a
@@ -364,13 +401,14 @@ impl FastEmbedder {
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
-        // The CPU arena keeps the largest buffer any input ever needed.
         // Texts here are embedded one at a time at their own length, so the
         // arena ratchets up and never gives it back. This applies to every
         // local embedding (ingest, daemon queries, MCP calls), not only
         // ingest. Set NEUROSTRATA_EMBED_ARENA=1 to keep the previous
         // default; any other value (or unset) disables the arena.
+        let ort_env = shared_ort_environment()?.clone();
         let mut init = TextInitOptions::new(model_enum.clone())
+            .with_environment(ort_env)
             .with_cache_dir(cache_dir.clone())
             .with_max_length(MAX_EMBED_TOKENS);
         // Deliberately pin the CPU execution provider: arena allocation is a
@@ -386,10 +424,8 @@ impl FastEmbedder {
                 if disable_arena { "disabled" } else { "enabled (NEUROSTRATA_EMBED_ARENA)" }
             );
         });
-        if disable_arena {
-            init = init.with_execution_providers(vec![ort::ep::CPU::default()
-                .with_arena_allocator(false)
-                .build()]);
+        if let Some(providers) = arena_execution_providers(disable_arena) {
+            init = init.with_execution_providers(providers);
         }
         let model = TextEmbedding::try_new(init.with_show_download_progress(true))?;
 
@@ -431,6 +467,35 @@ impl Embedder for FastEmbedder {
             .ok_or_else(|| anyhow::anyhow!("Embedding model returned an empty vector batch"))
     }
 
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Model inference is CPU-bound and can stall the async runtime when
+        // called from a Tokio task. Isolate it on the blocking thread pool.
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model = Arc::clone(&self.model);
+        let expected = texts.len();
+        let texts = texts.to_vec();
+        let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
+            let mut guard = model
+                .lock()
+                .map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
+            guard
+                .embed(texts, Some(FAST_EMBED_BATCH_SIZE))
+                .context("fastembed embed_batch call failed")
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
+        if embeddings.len() != expected {
+            anyhow::bail!(
+                "fastembed embed_batch returned {} vectors for {} texts",
+                embeddings.len(),
+                expected
+            );
+        }
+        Ok(embeddings)
+    }
+
     fn dimensions(&self) -> usize {
         self.dimensions
     }
@@ -459,6 +524,55 @@ pub struct RemoteEmbedder {
     api_model: String,
     dimensions: usize,
     model_name: String,
+}
+
+/// The most inputs one remote embedding request carries.
+///
+/// A provider's own ceiling is not a universal constant -- one provider's
+/// documented example is 2 048 inputs, but that is that provider's number,
+/// and the refusal differs per provider (`400`, `413`, or a silent
+/// truncation). Sending one request per file made a whole generation depend
+/// on one file's symbol count, so the request carries a budget of its own
+/// and the batch is split to fit it.
+const REMOTE_EMBED_MAX_INPUTS: usize = 64;
+
+/// The most characters one remote embedding request carries.
+///
+/// The remote API does not expose a request-side token count, so the
+/// character count stands in for the token budget: it bounds the request
+/// body without guessing the provider's tokenizer.
+const REMOTE_EMBED_MAX_CHARS: usize = 32 * 1024;
+
+/// How many refusal reasons one degraded batch reports. The count of
+/// refusals is exact; only the samples are capped.
+const REMOTE_EMBED_MAX_WARNING_SAMPLES: usize = 8;
+
+/// Splits `texts` into request-sized chunks: at most
+/// [`REMOTE_EMBED_MAX_INPUTS`] inputs and [`REMOTE_EMBED_MAX_CHARS`]
+/// characters per chunk. The chunks are `(start, end)` index ranges into
+/// `texts`, so the caller never copies the payloads.
+///
+/// A single text longer than the character budget is not split: it goes
+/// alone in its own chunk, and the provider's answer decides its fate.
+fn remote_request_chunks(texts: &[String]) -> Vec<(usize, usize)> {
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut chars = 0usize;
+    for (i, text) in texts.iter().enumerate() {
+        let len = text.chars().count();
+        let over_inputs = i - start >= REMOTE_EMBED_MAX_INPUTS;
+        let over_chars = chars + len > REMOTE_EMBED_MAX_CHARS;
+        if i > start && (over_inputs || over_chars) {
+            chunks.push((start, i));
+            start = i;
+            chars = 0;
+        }
+        chars += len;
+    }
+    if start < texts.len() {
+        chunks.push((start, texts.len()));
+    }
+    chunks
 }
 
 /// A typed carrier for the response status so the retry loop can downcast to
@@ -526,6 +640,223 @@ impl RemoteEmbedder {
                 }
             }
         }
+    }
+
+    async fn embed_batch_with_retry(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut attempts = 0;
+        loop {
+            match self.try_embed_batch(texts).await {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 2 {
+                        return Err(e);
+                    }
+                    if let Some(s) = e.downcast_ref::<StatusError>() {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || s.0.is_server_error()
+                        {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// The batch embed, split into request-sized chunks.
+    ///
+    /// `degrade` decides what a provider refusal means. With `degrade` set,
+    /// a chunk the provider refuses (`400`/`413`) is halved and retried down
+    /// to single items, and a single item the provider still refuses becomes
+    /// a warning: the item is skipped and the rest of the batch lands. With
+    /// `degrade` clear, the first refusal ends the batch with the provider's
+    /// own error, which is what the all-or-nothing `embed_batch` promises.
+    ///
+    /// Every other error keeps the abort path: a `429`/`5xx` is retried by
+    /// [`Self::embed_batch_with_retry`], and anything else fails the batch.
+    ///
+    /// The result is in input order: the chunks are sent in order and each
+    /// chunk's vectors keep their request order, so the concatenation is
+    /// the input order.
+    async fn embed_batch_internal(
+        &self,
+        texts: &[String],
+        degrade: bool,
+    ) -> Result<crate::traits::BatchEmbedOutcome> {
+        let mut outcome = crate::traits::BatchEmbedOutcome {
+            embeddings: Vec::with_capacity(texts.len()),
+            warnings: Vec::new(),
+        };
+        if texts.is_empty() {
+            return Ok(outcome);
+        }
+        // The work list is a queue of `(start, end)` index ranges, and it is
+        // drained strictly in index order: a range that the provider refuses
+        // is split and its halves are put back at the FRONT, so the halves are
+        // embedded before any later range. The result is therefore in input
+        // order no matter how often a range is split.
+        let mut pending: std::collections::VecDeque<(usize, usize)> =
+            remote_request_chunks(texts).into_iter().collect();
+        while let Some((start, end)) = pending.pop_front() {
+            let chunk = &texts[start..end];
+            match self.embed_batch_with_retry(chunk).await {
+                Ok(vectors) => {
+                    if vectors.len() != chunk.len() {
+                        anyhow::bail!(
+                            "remote embedding batch returned {} vectors for {} texts",
+                            vectors.len(),
+                            chunk.len()
+                        );
+                    }
+                    outcome.embeddings.extend(vectors.into_iter().map(Some));
+                }
+                Err(e) => {
+                    let refused = e
+                        .downcast_ref::<StatusError>()
+                        .map(|s| s.0)
+                        .filter(|status| {
+                            *status == reqwest::StatusCode::BAD_REQUEST
+                                || *status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                        });
+                    let Some(status) = refused else {
+                        return Err(e);
+                    };
+                    if end - start > 1 {
+                        // The provider will not take this request as it
+                        // stands: halve it and try again, down to single
+                        // items.
+                        let mid = start + (end - start) / 2;
+                        pending.push_front((mid, end));
+                        pending.push_front((start, mid));
+                        continue;
+                    }
+                    if !degrade {
+                        return Err(e);
+                    }
+                    // A single item the provider refuses: degrade it to a
+                    // warning. The rest of the batch still lands.
+                    if outcome.warnings.len() < REMOTE_EMBED_MAX_WARNING_SAMPLES {
+                        outcome.warnings.push(format!(
+                            "remote embedding refused one input ({}): {}",
+                            status, e
+                        ));
+                    }
+                    outcome.embeddings.push(None);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // R13: Egress authorization check — fail-closed if the token or
+        // namespace/data-class allowlist doesn't authorize this call. Concrete
+        // authorization gate (not a deferral): batch embed call is refused
+        // before any remote data leaves the node.
+        if self.api_key.is_empty() {
+            eprintln!(
+                "[REMOTE-EMBED-REFUSED] authorization failed: empty api_key for RemoteEmbedder ({})",
+                self.base_url
+            );
+            return Err(anyhow::anyhow!(
+                "Remote embedding refused: authorization check failed (empty api_key). Fail-closed per R13 privacy/egress authorization."
+            ));
+        }
+        let response = self
+            .client
+            .post(&format!("{}/embeddings", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "input": texts,
+                "model": self.api_model
+            }))
+            .send()
+            .await
+            .context("HTTP request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::Error::new(StatusError(status))
+                .context(format!("API error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
+        // Embedding-space identity persistence: a malformed remote batch must
+        // be rejected outright, mirroring the single-text path (Composite
+        // Recommendation #11). A zero vector would silently poison cosine
+        // distances, and a length that disagrees with self.dimensions would be
+        // unmixable with every stored vector in the space.
+        let data = json["data"]
+            .as_array()
+            .context("Missing embedding data in response")?;
+        if data.len() != texts.len() {
+            anyhow::bail!(
+                "remote embedding batch returned {} vectors for {} texts",
+                data.len(),
+                texts.len()
+            );
+        }
+        let mut by_index: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for (pos, item) in data.iter().enumerate() {
+            let index = match item.get("index") {
+                Some(v) if !v.is_null() => {
+                    let idx = v
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("remote embedding contained invalid non-integer index"))?
+                        as usize;
+                    if idx >= by_index.len() {
+                        anyhow::bail!(
+                            "remote embedding index {} out of bounds for batch of {}",
+                            idx,
+                            by_index.len()
+                        );
+                    }
+                    idx
+                }
+                _ => pos,
+            };
+            if by_index[index].is_some() {
+                anyhow::bail!(
+                    "remote embedding batch contained duplicate entry for index {}",
+                    index
+                );
+            }
+            let arr = item["embedding"].as_array().context("Missing embedding in response")?;
+            if arr.is_empty() {
+                anyhow::bail!("remote embedding was empty");
+            }
+            let mut embedding = Vec::with_capacity(arr.len());
+            for v in arr {
+                let val = v
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+                if !val.is_finite() {
+                    anyhow::bail!("remote embedding contained non-finite or non-numeric value");
+                }
+                embedding.push(val as f32);
+            }
+            if self.dimensions > 0 && embedding.len() != self.dimensions {
+                anyhow::bail!(
+                    "remote embedding dimension mismatch: expected {}, got {}",
+                    self.dimensions,
+                    embedding.len()
+                );
+            }
+            by_index[index] = Some(embedding);
+        }
+        Ok(by_index
+            .into_iter()
+            .map(|opt| {
+                opt.ok_or_else(|| anyhow!("remote embedding batch was missing an entry for every text"))
+            })
+            .collect::<Result<Vec<Vec<f32>>>>()?)
     }
 
     async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -601,6 +932,36 @@ impl RemoteEmbedder {
 impl Embedder for RemoteEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_with_retry(text).await
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let outcome = self.embed_batch_internal(texts, false).await?;
+        // The all-or-nothing contract: a refused item fails the batch rather
+        // than handing back a placeholder vector.
+        if let Some(missing) = outcome.embeddings.iter().position(|e| e.is_none()) {
+            anyhow::bail!(
+                "remote embedding refused input {} of {}: {}",
+                missing,
+                outcome.embeddings.len(),
+                outcome
+                    .warnings
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no reason recorded".to_string())
+            );
+        }
+        Ok(outcome
+            .embeddings
+            .into_iter()
+            .map(|e| e.expect("checked above"))
+            .collect())
+    }
+
+    async fn embed_batch_degradable(
+        &self,
+        texts: &[String],
+    ) -> Result<crate::traits::BatchEmbedOutcome> {
+        self.embed_batch_internal(texts, true).await
     }
 
     fn dimensions(&self) -> usize {
@@ -687,17 +1048,72 @@ mod tests {
         }
     }
 
-    /// Source assertion: the env-parse test alone cannot catch the arena
-    /// ratchet returning. Both flipping this to `true` and deleting the call
-    /// fail here.
+    /// The decision reaches the provider wiring as a value, not just as text
+    /// in the file: an off-by-default arena yields the pinned CPU provider,
+    /// and an opt-in yields fastembed's default (no override).
+    #[test]
+    fn the_arena_policy_reaches_the_provider_wiring() {
+        assert!(
+            super::arena_execution_providers(true).is_some(),
+            "the default must install the no-arena CPU provider"
+        );
+        assert!(
+            super::arena_execution_providers(false).is_none(),
+            "an opt-in must leave fastembed's provider default"
+        );
+    }
+
+    /// Constructor guard (#164): pins the provider helper's arena-off
+    /// setting and the constructor's wiring of the computed provider list
+    /// into the embedding options, so neither flipping the boolean nor
+    /// deleting the constructor hook can pass unnoticed. The wiring
+    /// needles are assembled with `format!` so they do not appear
+    /// verbatim in this test's own source.
     #[test]
     fn the_constructor_disables_the_cpu_arena() {
-        let source = include_str!("embed.rs");
-        // Build the needle so this assertion's own text cannot satisfy it.
-        let needle = format!(".with_arena_allocator({})", "false");
+        let src = include_str!("embed.rs");
+        let helper_body = src
+            .split("fn arena_execution_providers(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("arena_execution_providers present");
         assert!(
-            source.contains(&needle),
-            "FastEmbedder must disable the CPU arena allocator"
+            helper_body.contains(".with_arena_allocator(false)"),
+            "arena_execution_providers must disable the CPU arena allocator"
+        );
+        let ctor_body = src
+            .split("let disable_arena =")
+            .nth(1)
+            .and_then(|s| {
+                s.split("TextEmbedding::try_new(init.with_show_download_progress(true))")
+                    .next()
+            })
+            .expect("FastEmbedder::new arena wiring present");
+        let call_needle = format!("arena_execution_providers({})", "disable_arena");
+        let wiring_needle = format!("init.with_execution_providers({})", "providers");
+        assert!(
+            ctor_body.contains(&call_needle) && ctor_body.contains(&wiring_needle),
+            "FastEmbedder::new must wire the arena provider decision into the embedding options"
+        );
+    }
+
+    #[test]
+    fn embed_batch_bounds_fastembed_forward_pass_batch_size_to_one() {
+        assert_eq!(
+            super::FAST_EMBED_BATCH_SIZE,
+            1,
+            "FAST_EMBED_BATCH_SIZE must stay 1 so embed_batch never pads a multi-hundred-symbol file to [256, 2048]"
+        );
+        let src = include_str!("embed.rs");
+        let batch_body = src
+            .split("async fn embed_batch(&self, texts: &[String])")
+            .nth(1)
+            .and_then(|s| s.split("fn dimensions(&self)").next())
+            .expect("FastEmbedder::embed_batch present");
+        let needle = format!(".embed(texts, Some({}))", "FAST_EMBED_BATCH_SIZE");
+        assert!(
+            batch_body.contains(&needle),
+            "FastEmbedder::embed_batch must pass Some(FAST_EMBED_BATCH_SIZE) to guard.embed"
         );
     }
 
@@ -773,6 +1189,38 @@ mod tests {
         .unwrap();
         let v = embedder.embed("hello").await.unwrap();
         assert_eq!(v, vec![0.25f32, 0.5, 0.75, 1.0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_preserves_order_without_index() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let body = r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]},{"embedding":[5.0,6.0,7.0,8.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder
+            .embed_batch(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(v, vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]);
         server.await.unwrap();
     }
 
@@ -1157,5 +1605,435 @@ mod tests {
             None => std::env::remove_var("NEUROSTRATA_MODEL"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Recording embedder that defers to the trait's default `embed_batch`
+    /// (sequential `embed` per text) so the default can be exercised without
+    /// a live ONNX model.
+    struct OrderEmbedder {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for OrderEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.calls.lock().unwrap().push(text.to_string());
+            Ok(vec![text.len() as f32])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_batch_default_preserves_order_and_handles_empty() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let embedder = OrderEmbedder { calls: Arc::clone(&calls) };
+
+        let empty = embedder.embed_batch(&[]).await.unwrap();
+        assert!(empty.is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+
+        let texts = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(vectors[0], vec![5.0f32]);
+        assert_eq!(vectors[1], vec![4.0f32]);
+        assert_eq!(vectors[2], vec![5.0f32]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+    }
+
+    /// Spawns a one-shot OpenAI-compatible `/embeddings` server that answers
+    /// every request with `response_body` before closing.
+    async fn spawn_embed_server(response_body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_orders_by_index() {
+        let (addr, server) = spawn_embed_server(
+            r#"{"data":[{"index":1,"embedding":[1.0,2.0,3.0,4.0]},{"index":0,"embedding":[5.0,6.0,7.0,8.0]}]}"#,
+        )
+        .await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let texts = vec!["hello".to_string(), "world".to_string()];
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(vectors[1], vec![1.0, 2.0, 3.0, 4.0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_rejects_dimension_mismatch() {
+        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#).await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let err = embedder
+            .embed_batch(&["hello".to_string()])
+            .await
+            .expect_err("dimension mismatch must be rejected");
+        assert!(err.to_string().contains("remote embedding"), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_rejects_non_numeric_vector() {
+        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0, "not-a-number", 3.0, 4.0]}]}"#).await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let err = embedder
+            .embed_batch(&["hello".to_string()])
+            .await
+            .expect_err("non-numeric vector must be rejected");
+        assert!(err.to_string().contains("remote embedding"), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_empty_input_returns_no_vectors() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let vectors = embedder.embed_batch(&[]).await.unwrap();
+        assert!(vectors.is_empty());
+    }
+
+    /// The one input the scripted server refuses.
+    const POISON: &str = "poison-input";
+
+    /// How the scripted embedding server answers one request.
+    #[derive(Clone, Copy)]
+    enum EmbedScript {
+        /// Answer every request with one vector per input.
+        Accept,
+        /// Refuse every request with this status.
+        Refuse(u16),
+        /// Refuse a request that carries the poison input with this status,
+        /// and answer every other request.
+        RefusePoison(u16),
+    }
+
+    /// The status line for a refusal.
+    fn refusal_status(code: u16) -> &'static str {
+        match code {
+            400 => "400 Bad Request",
+            413 => "413 Payload Too Large",
+            429 => "429 Too Many Requests",
+            500 => "500 Internal Server Error",
+            _ => "400 Bad Request",
+        }
+    }
+
+    /// Texts whose lengths are all different, so the vector the scripted
+    /// server returns -- the input's length -- says which input it came from.
+    fn sized_texts(n: usize) -> Vec<String> {
+        (0..n).map(|i| "x".repeat(i + 1)).collect()
+    }
+
+    /// Spawns a scripted OpenAI-compatible `/embeddings` server that answers
+    /// any number of requests.
+    ///
+    /// It records the inputs of every request, so a test can see how the
+    /// batch was split and what the provider was asked for.
+    async fn spawn_scripted_embed_server(
+        script: EmbedScript,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_server = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let req = read_http_request(&mut sock).await;
+                let body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let inputs: Vec<String> = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("input").and_then(|i| i.as_array()).map(|a| {
+                            a.iter()
+                                .map(|x| x.as_str().unwrap_or_default().to_string())
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                seen_server.lock().unwrap().push(inputs.clone());
+
+                let refused = match script {
+                    EmbedScript::Accept => false,
+                    EmbedScript::Refuse(_) => true,
+                    EmbedScript::RefusePoison(_) => inputs.iter().any(|t| t == POISON),
+                };
+                let (status, payload) = if refused {
+                    let code = match script {
+                        EmbedScript::Refuse(code) | EmbedScript::RefusePoison(code) => code,
+                        EmbedScript::Accept => 400,
+                    };
+                    (
+                        refusal_status(code).to_string(),
+                        "{\"error\":\"refused\"}".to_string(),
+                    )
+                } else {
+                    // One vector per input: the first component is the
+                    // input's length, so the vectors say which input they
+                    // belong to.
+                    let data: Vec<String> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, text)| {
+                            format!(
+                                "{{\"index\":{},\"embedding\":[{},1.0,2.0,3.0]}}",
+                                i,
+                                text.chars().count()
+                            )
+                        })
+                        .collect();
+                    (
+                        "200 OK".to_string(),
+                        format!("{{\"data\":[{}]}}", data.join(",")),
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    payload.len(),
+                    payload
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, server, seen)
+    }
+
+    fn scripted_embedder(addr: std::net::SocketAddr) -> RemoteEmbedder {
+        RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap()
+    }
+
+    /// The request split bounds both the number of inputs and the number of
+    /// characters a single request may carry, and it covers every input
+    /// exactly once, in order.
+    #[test]
+    fn remote_request_chunks_bound_the_inputs_and_the_characters() {
+        let texts = sized_texts(200);
+        let chunks = remote_request_chunks(&texts);
+        assert!(
+            chunks.len() >= 4,
+            "200 inputs cannot fit in fewer than four requests"
+        );
+        let mut covered = 0usize;
+        for (start, end) in &chunks {
+            assert_eq!(*start, covered, "the chunks cover the inputs in order");
+            assert!(
+                end - start <= REMOTE_EMBED_MAX_INPUTS,
+                "a request carries at most {} inputs, got {}",
+                REMOTE_EMBED_MAX_INPUTS,
+                end - start
+            );
+            let chars: usize = texts[*start..*end].iter().map(|t| t.chars().count()).sum();
+            assert!(
+                chars <= REMOTE_EMBED_MAX_CHARS || end - start == 1,
+                "a request carries at most {} characters, got {}",
+                REMOTE_EMBED_MAX_CHARS,
+                chars
+            );
+            covered = *end;
+        }
+        assert_eq!(covered, texts.len(), "every input is sent exactly once");
+
+        // The character bound splits a batch the input bound would keep in
+        // one piece.
+        let wide: Vec<String> = (0..100).map(|_| "x".repeat(1000)).collect();
+        let wide_chunks = remote_request_chunks(&wide);
+        assert!(
+            wide_chunks.len() >= 3,
+            "100k characters need several requests"
+        );
+        for (start, end) in &wide_chunks {
+            let chars: usize = wide[*start..*end].iter().map(|t| t.chars().count()).sum();
+            assert!(
+                chars <= REMOTE_EMBED_MAX_CHARS || end - start == 1,
+                "a request carries at most {} characters, got {}",
+                REMOTE_EMBED_MAX_CHARS,
+                chars
+            );
+        }
+
+        // A single input bigger than the bound cannot be split, so it goes
+        // alone rather than being cut in half.
+        let huge = vec!["x".repeat(REMOTE_EMBED_MAX_CHARS + 1)];
+        assert_eq!(remote_request_chunks(&huge), vec![(0, 1)]);
+    }
+
+    /// A batch larger than one request is split, every request stays inside
+    /// the bounds, and the vectors come back in input order.
+    #[tokio::test]
+    async fn remote_embedder_splits_a_large_batch_into_bounded_requests() {
+        let (addr, server, seen) = spawn_scripted_embed_server(EmbedScript::Accept).await;
+        let embedder = scripted_embedder(addr);
+        let texts = sized_texts(150);
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), texts.len());
+        for (i, vector) in vectors.iter().enumerate() {
+            assert_eq!(
+                vector[0],
+                (i + 1) as f32,
+                "input {} keeps its place in the batch",
+                i
+            );
+        }
+        let requests = seen.lock().unwrap().clone();
+        assert!(
+            requests.len() >= 3,
+            "150 inputs need several requests, got {}",
+            requests.len()
+        );
+        for request in &requests {
+            assert!(
+                request.len() <= REMOTE_EMBED_MAX_INPUTS,
+                "a request carries at most {} inputs, got {}",
+                REMOTE_EMBED_MAX_INPUTS,
+                request.len()
+            );
+        }
+        let total: usize = requests.iter().map(|r| r.len()).sum();
+        assert_eq!(total, texts.len(), "every input is sent exactly once");
+        server.abort();
+    }
+
+    /// A provider that refuses one input does not cost the batch: the
+    /// refused input is reported as `None`, the rest of the batch lands, and
+    /// the order is untouched.
+    #[tokio::test]
+    async fn remote_embedder_degrades_a_refused_item_and_keeps_the_order() {
+        let (addr, server, seen) =
+            spawn_scripted_embed_server(EmbedScript::RefusePoison(413)).await;
+        let embedder = scripted_embedder(addr);
+        let texts = vec!["aa".to_string(), POISON.to_string(), "bb".to_string()];
+        let outcome = embedder.embed_batch_degradable(&texts).await.unwrap();
+        assert_eq!(outcome.embeddings.len(), 3);
+        assert!(outcome.embeddings[0].is_some(), "the first input lands");
+        assert!(
+            outcome.embeddings[1].is_none(),
+            "the refused input is reported, not dropped"
+        );
+        assert!(outcome.embeddings[2].is_some(), "the last input lands");
+        assert_eq!(outcome.embeddings[0].as_ref().unwrap()[0], 2.0);
+        assert_eq!(outcome.embeddings[2].as_ref().unwrap()[0], 2.0);
+        assert_eq!(outcome.warnings.len(), 1, "one refusal, one warning");
+        assert!(
+            outcome.warnings[0].contains("413"),
+            "the warning names the status: {}",
+            outcome.warnings[0]
+        );
+
+        // The refused request was halved on the way down.
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(
+            requests[0].len(),
+            3,
+            "the batch goes out as one request first"
+        );
+        assert!(
+            requests.len() >= 4,
+            "the refused request was halved down to single items, got {} requests",
+            requests.len()
+        );
+        server.abort();
+    }
+
+    /// The all-or-nothing contract is unchanged: `embed_batch` fails the
+    /// whole batch when the provider refuses an input.
+    #[tokio::test]
+    async fn remote_embedder_batch_stays_all_or_nothing() {
+        let (addr, server, _seen) =
+            spawn_scripted_embed_server(EmbedScript::RefusePoison(413)).await;
+        let embedder = scripted_embedder(addr);
+        let texts = vec!["aa".to_string(), POISON.to_string(), "bb".to_string()];
+        let err = embedder
+            .embed_batch(&texts)
+            .await
+            .expect_err("a refused input fails the batch");
+        assert!(
+            err.to_string().contains("refused"),
+            "the error names the refusal: {err}"
+        );
+        server.abort();
+    }
+
+    /// A batch of refused inputs degrades every one of them, and the reasons
+    /// are sampled: the summary keeps a bounded number of samples, not one
+    /// per refused input.
+    #[tokio::test]
+    async fn remote_embedder_caps_the_warning_samples() {
+        let (addr, server, _seen) =
+            spawn_scripted_embed_server(EmbedScript::RefusePoison(400)).await;
+        let embedder = scripted_embedder(addr);
+        let texts: Vec<String> = (0..12).map(|_| POISON.to_string()).collect();
+        let outcome = embedder.embed_batch_degradable(&texts).await.unwrap();
+        assert_eq!(outcome.embeddings.len(), texts.len());
+        assert!(
+            outcome.embeddings.iter().all(|e| e.is_none()),
+            "every refused input is reported"
+        );
+        assert_eq!(
+            outcome.warnings.len(),
+            REMOTE_EMBED_MAX_WARNING_SAMPLES,
+            "the warning samples are capped"
+        );
+        server.abort();
     }
 }

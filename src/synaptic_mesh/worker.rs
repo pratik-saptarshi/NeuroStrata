@@ -251,15 +251,15 @@ fn apply_one(
     if !crate::rebac::can_publish_to_mesh(&entry.metadata, &peer_principals) {
         return Ok((ApplyOutcome::Skipped, None));
     }
-    let id = match Uuid::parse_str(&entry.id) {
-        Ok(id) => id,
-        Err(_) => return Ok((ApplyOutcome::Skipped, None)),
+    let id = match parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, &entry.id) {
+        Some(id) => id,
+        None => return Ok((ApplyOutcome::Skipped, None)),
     };
     let superseded_by = match entry.op.as_str() {
         OP_SUPERSEDED => match entry
             .superseded_by
             .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok())
+            .and_then(|s| parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, s))
         {
             Some(target) => Some(target),
             None => return Ok((ApplyOutcome::Skipped, None)),
@@ -422,7 +422,9 @@ fn build_record(
 
     let mut relationships: Vec<Relationship> = Vec::new();
     if let Some(supersedes) = entry.metadata.get("supersedes").and_then(|v| v.as_str()) {
-        if let Ok(target) = Uuid::parse_str(supersedes) {
+        if let Some(target) =
+            parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, supersedes)
+        {
             relationships.push(Relationship {
                 kind: "supersedes".to_string(),
                 target,
@@ -684,6 +686,26 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
     })
 }
 
+/// Resolve a record's UUID for SynapticMesh storage. Plain UUIDs parse directly;
+/// deterministic non-UUID taxonomy row IDs (`thesis-v*`, `concept-*-v*`) map
+/// deterministically via UUIDv5 over `neurostrata:taxonomy:{namespace}:{raw_id}`.
+pub fn parse_or_derive_mesh_uuid(namespace: &str, memory_type: &str, raw_id: &str) -> Option<Uuid> {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(u) = Uuid::parse_str(trimmed) {
+        Some(u)
+    } else if matches!(memory_type, "thesis" | "concept") {
+        Some(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("neurostrata:taxonomy:{namespace}:{trimmed}").as_bytes(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// The record's `metadata` object: the spec's curated subset. Eligibility is
 /// always present (defaulting to `private`); `source` and `tags` are carried
 /// through when the memory declares them. Everything else — runtime counters,
@@ -704,6 +726,32 @@ fn projected_metadata(metadata: &Value) -> Value {
     // concept_iri is shareable (alignment across namespaces); domain/aliases stay private.
     if let Some(concept_iri) = metadata.get("concept_iri") {
         out.insert("concept_iri".to_string(), concept_iri.clone());
+    }
+    // Carry structured Project Thesis and SKOS Concept payloads when explicitly shareable.
+    let is_taxonomy = metadata.get("thesis").is_some() || metadata.get("concept").is_some();
+    if let Some(thesis) = metadata.get("thesis") {
+        out.insert("thesis".to_string(), thesis.clone());
+    }
+    if let Some(tv) = metadata.get("thesis_version") {
+        out.insert("thesis_version".to_string(), tv.clone());
+    }
+    if let Some(concept) = metadata.get("concept") {
+        out.insert("concept".to_string(), concept.clone());
+    }
+    if let Some(cv) = metadata.get("concept_version") {
+        out.insert("concept_version".to_string(), cv.clone());
+    }
+    if is_taxonomy {
+        for key in ["domain", "valid_from", "valid_to", "supersedes"] {
+            if let Some(val) = metadata.get(key) {
+                out.insert(key.to_string(), val.clone());
+            }
+        }
+    }
+    // Shareable kinetic action_type definitions carry their declarative schema;
+    // action_receipt is strictly private and never projected onto mesh records.
+    if let Some(action_type) = metadata.get("action_type") {
+        out.insert("action_type".to_string(), action_type.clone());
     }
     Value::Object(out)
 }

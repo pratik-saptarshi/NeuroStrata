@@ -43,6 +43,57 @@ pub struct MemoryPayload {
     pub metadata: Value,
 }
 
+/// One row of the task ledger as the executive port sees it: the task's id and
+/// its stored payload, without the surrounding vector or evidence paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummaryRow {
+    pub id: String,
+    pub payload: MemoryPayload,
+}
+
+/// Read-side task ledger surface (spec §3.1). Separate from `VectorStore` so
+/// the central kernel's executive port can read tasks and count extractions
+/// without reaching into the concrete `LadybugStore`.
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    /// Load one task row's payload by id, or `None` when it does not exist.
+    async fn load_task_row(&self, namespace: &str, task_id: &str) -> Result<Option<MemoryPayload>>;
+
+    /// List every task row in the namespace.
+    async fn list_task_rows(&self, namespace: &str) -> Result<Vec<TaskSummaryRow>>;
+
+    /// Count the live memories that name `task_id` in `metadata.extracted_from`,
+    /// excluding the task row itself (the Lock 2 extraction count).
+    async fn count_extracted_memories_for_task(
+        &self,
+        namespace: &str,
+        task_id: &str,
+    ) -> Result<usize>;
+}
+
+/// Read/write ontology surface (spec §3.1): typed memory listing and scoped
+/// writes used by the central kernel's ontology port.
+#[async_trait]
+pub trait OntologyStore: Send + Sync {
+    /// List memories whose `memory_type` is one of `memory_types`, as `(id, payload)`.
+    async fn list_memories_by_types(
+        &self,
+        namespace: &str,
+        memory_types: &[&str],
+    ) -> Result<Vec<(String, MemoryPayload)>>;
+
+    /// Load one memory's payload by id.
+    async fn get_memory_by_id(&self, namespace: &str, id: &str) -> Result<Option<MemoryPayload>>;
+
+    /// Upsert one memory under the given scoped id.
+    async fn put_scoped_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        payload: &MemoryPayload,
+    ) -> Result<()>;
+}
+
 /// FEATURE-4: does this memory say where it came from?
 ///
 /// A memory is an assertion until it names its origin, so `source` is the
@@ -84,7 +135,12 @@ pub struct GenerationRow {
 
 impl GenerationRow {
     pub fn from_payload(id: String, payload: &MemoryPayload) -> Self {
-        Self::from_parts(id, payload.memory_type.clone(), payload.location.clone(), &payload.metadata)
+        Self::from_parts(
+            id,
+            payload.memory_type.clone(),
+            payload.location.clone(),
+            &payload.metadata,
+        )
     }
 
     pub fn from_parts(id: String, memory_type: String, location: String, metadata: &Value) -> Self {
@@ -92,8 +148,15 @@ impl GenerationRow {
             id,
             memory_type,
             location,
-            file_sha256: metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            ingest_version: metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            file_sha256: metadata
+                .get("file_sha256")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            ingest_version: metadata
+                .get("ingest_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         }
     }
 }
@@ -146,8 +209,7 @@ pub struct SearchEvidence {
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
     evidence.as_ref().map_or(false, |evs| {
-        evs.iter()
-            .any(|e| e.kind == EvidenceKind::DirectMatch)
+        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
     })
 }
 
@@ -200,7 +262,6 @@ pub enum RelocateOutcome {
     SameNamespace,
 }
 
-
 /// Embedding-space identity persisted on namespace metadata. Enforcement on
 /// every vector path ensures incompatible spaces are never mixed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -232,6 +293,26 @@ impl EmbeddingDescriptor {
     }
 }
 
+/// The outcome of a batch embed that is allowed to degrade item by item.
+///
+/// A provider that refuses one item of a batch (a `400`/`413` on an
+/// oversized or malformed input) must not cost the whole generation: the
+/// refused item is reported as `None` and the rest of the batch still lands.
+/// The reasons travel with the outcome so the caller can put a count and a
+/// few samples into its summary instead of losing the fact that something
+/// was dropped.
+#[derive(Debug, Clone, Default)]
+pub struct BatchEmbedOutcome {
+    /// One entry per input, in input order. `None` marks an item the
+    /// provider refused: no vector exists for it, and the caller must not
+    /// store a placeholder (a zero vector would poison cosine distances).
+    pub embeddings: Vec<Option<Vec<f32>>>,
+    /// Why items were refused, in the order the refusals happened. The
+    /// embedder caps how many samples it keeps; the count of refusals is
+    /// `embeddings.iter().filter(|e| e.is_none()).count()`.
+    pub warnings: Vec<String>,
+}
+
 /// The core interface for generating vector embeddings from text.
 /// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
@@ -239,6 +320,32 @@ impl EmbeddingDescriptor {
 pub trait Embedder: Send + Sync {
     /// Convert text into a dense vector representation.
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Convert many texts into dense vectors, preserving order. The default
+    /// loops the single-text path so embedders without a native batch mode
+    /// still get batch-shaped callers without changing their behaviour.
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for text in texts {
+            out.push(self.embed(text).await?);
+        }
+        Ok(out)
+    }
+
+    /// Batch embedding that may degrade item by item.
+    ///
+    /// The default is all-or-nothing: it delegates to `embed_batch`, so an
+    /// embedder that never refuses an individual input needs no change and
+    /// keeps its exact semantics. An embedder that can refuse a single
+    /// input (the remote one, whose provider caps the request) overrides
+    /// this to report the refusal instead of failing the whole batch.
+    async fn embed_batch_degradable(&self, texts: &[String]) -> Result<BatchEmbedOutcome> {
+        let vectors = self.embed_batch(texts).await?;
+        Ok(BatchEmbedOutcome {
+            embeddings: vectors.into_iter().map(Some).collect(),
+            warnings: Vec::new(),
+        })
+    }
 
     /// Get the expected dimension of the embeddings (e.g., 768 for nomic-embed-text)
     fn dimensions(&self) -> usize;
@@ -351,12 +458,7 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// The default is a read-modify-write, which is only safe when callers
     /// cannot overlap. Stores with a single-writer lock override it with one
     /// turn, so concurrent increments serialize instead of losing updates.
-    async fn increment_metadata_counter(
-        &self,
-        namespace: &str,
-        id: &str,
-        key: &str,
-    ) -> Result<()> {
+    async fn increment_metadata_counter(&self, namespace: &str, id: &str, key: &str) -> Result<()> {
         let Some((vector, mut payload)) = self.get(namespace, id).await? else {
             return Ok(());
         };
@@ -427,6 +529,14 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// until something replays them (bead neurostrata-sij).
     async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize>;
 
+    /// List all graph edges `(from_id, relation, to_id, provenance)` in `namespace`.
+    async fn list_edges(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        Ok(Vec::new())
+    }
+
     /// Begin a staged ingestion: allocate a fresh generation for this namespace
     /// and source and return it. Nodes written against it are invisible to edge
     /// resolution until `publish_generation` flips the active pointer onto it.
@@ -478,18 +588,19 @@ pub trait VectorStore: Send + Sync + AsAny {
 
     /// The ids of every node in `generation`. A storage-level primitive for
     /// generation-scoped filtering and tests; the default returns nothing.
-    async fn generation_nodes(
-        &self,
-        _namespace: &str,
-        _generation: u64,
-    ) -> Result<Vec<String>> {
+    async fn generation_nodes(&self, _namespace: &str, _generation: u64) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
     /// List all memories, optionally filtered by user_id and/or memory_type.
     /// Pushing filters into the query (rather than filtering in Rust) avoids
     /// deserialising every row in large namespaces (R15).
-    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>>;
+    async fn list(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>>;
 
     /// What ingest needs to know about each row of one generation, without the
     /// row's content or full metadata.
@@ -501,11 +612,18 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// namespace against ~10 MB for the part ingest uses.
     /// Stores that can narrow in the engine override this; the default lists
     /// the whole namespace, as ingest did before.
-    async fn generation_summary(&self, namespace: &str, generation: u64) -> Result<Vec<GenerationRow>> {
+    async fn generation_summary(
+        &self,
+        namespace: &str,
+        generation: u64,
+    ) -> Result<Vec<GenerationRow>> {
         let rows = self.list(namespace, None, None).await?;
         Ok(rows
             .into_iter()
-            .filter(|r| crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == generation))
+            .filter(|r| {
+                crate::parser::ingest::split_scoped_id(&r.id)
+                    .is_some_and(|(_, g, _)| g == generation)
+            })
             .map(|r| GenerationRow::from_payload(r.id, &r.payload))
             .collect())
     }
@@ -623,6 +741,17 @@ pub trait VectorStore: Send + Sync + AsAny {
     fn is_dirty(&self) -> bool {
         true
     }
+
+    /// Whether this store was opened through a recovery fallback in
+    /// `with_system_config` — the checksum-mismatch reopen, the
+    /// unverified-WAL replay, or the WAL-discard reopen — rather than
+    /// the normal verified open. A recovery open's view of the store is
+    /// unauthenticated; callers and operators should treat recovered
+    /// opens as degraded provenance. Conservative by default: assume a
+    /// normal open.
+    fn opened_via_recovery(&self) -> bool {
+        false
+    }
 }
 
 /// Graph-read capability, exposed beside `VectorStore` rather than folded into
@@ -718,7 +847,7 @@ mod tests {
     #[test]
     fn memory_vocabulary_v7_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 10);
+        assert_eq!(v["vocabulary_version"], 11);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
