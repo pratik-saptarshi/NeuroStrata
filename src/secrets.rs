@@ -529,58 +529,12 @@ impl SecretScanner {
     }
 
     fn scan_value_inner(&self, value: &Value, location: &str, depth: usize) -> Option<Rejection> {
-        if depth > MAX_DEPTH {
-            // Fail closed: a deep structure we cannot fully scan is rejected,
-            // not silently passed.
-            return Some(Rejection {
-                location: location.to_string(),
-                category: "max_depth_exceeded",
-            });
-        }
-        match value {
-            // A metadata leaf over the scanner's window cannot be scanned as
-            // one string; say so distinctly instead of reporting a generic
-            // oversized input, so the caller can fix the field it names.
-            Value::String(s) if s.len() > MAX_SCAN_BYTES => Some(Rejection {
-                location: location.to_string(),
-                category: "oversized_metadata",
-            }),
-            Value::String(s) => self.scan_inner(s, location),
-            Value::Array(arr) => {
-                for (i, item) in arr.iter().enumerate() {
-                    if let Some(r) =
-                        self.scan_value_inner(item, &format!("{}.{}", location, i), depth + 1)
-                    {
-                        return Some(r);
-                    }
-                }
-                None
-            }
-            Value::Object(map) => {
-                for (key, val) in map {
-                    let loc = if location.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{}.{}", location, key)
-                    };
-                    // A key is user-controlled too: `{"ghp_…": "x"}` is a
-                    // credential the value scan would never see. The location
-                    // names the field's position without echoing the key: a
-                    // rejection is logged and returned to the caller, so it
-                    // must not repeat the credential.
-                    let key_loc = format!("{location}.<key>");
-                    if let Some(r) = self.scan_inner(key, &key_loc) {
-                        return Some(r);
-                    }
-                    if let Some(r) = self.scan_value_inner(val, &loc, depth + 1) {
-                        return Some(r);
-                    }
-                }
-                None
-            }
-            // numbers, bools, null: not secrets
-            _ => None,
-        }
+        scan_value_with(
+            &|text, loc| self.scan_inner(text, loc),
+            value,
+            location,
+            depth,
+        )
     }
 
     /// Detect a JWT-shaped token: three base64url segments where segment 1
@@ -646,6 +600,73 @@ impl SecretScanner {
             }
         }
         None
+    }
+}
+
+/// Traverse a JSON value, using `scan_text` for every string leaf and object
+/// key. `SecretScanner::scan_value_inner` delegates here with its real
+/// `scan_inner`; the Kani Tier 2 harnesses pass a registered oracle instead,
+/// so the traversal can be proved without fabricating a `SecretScanner`.
+fn scan_value_with<F>(
+    scan_text: &F,
+    value: &Value,
+    location: &str,
+    depth: usize,
+) -> Option<Rejection>
+where
+    F: Fn(&str, &str) -> Option<Rejection>,
+{
+    if depth > MAX_DEPTH {
+        // Fail closed: a deep structure we cannot fully scan is rejected,
+        // not silently passed.
+        return Some(Rejection {
+            location: location.to_string(),
+            category: "max_depth_exceeded",
+        });
+    }
+    match value {
+        // A metadata leaf over the scanner's window cannot be scanned as
+        // one string; say so distinctly instead of reporting a generic
+        // oversized input, so the caller can fix the field it names.
+        Value::String(s) if s.len() > MAX_SCAN_BYTES => Some(Rejection {
+            location: location.to_string(),
+            category: "oversized_metadata",
+        }),
+        Value::String(s) => scan_text(s, location),
+        Value::Array(arr) => {
+            for (i, item) in arr.iter().enumerate() {
+                if let Some(r) =
+                    scan_value_with(scan_text, item, &format!("{}.{}", location, i), depth + 1)
+                {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                let loc = if location.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", location, key)
+                };
+                // A key is user-controlled too: `{"ghp_…": "x"}` is a
+                // credential the value scan would never see. The location
+                // names the field's position without echoing the key: a
+                // rejection is logged and returned to the caller, so it
+                // must not repeat the credential.
+                let key_loc = format!("{location}.<key>");
+                if let Some(r) = scan_text(key, &key_loc) {
+                    return Some(r);
+                }
+                if let Some(r) = scan_value_with(scan_text, val, &loc, depth + 1) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        // numbers, bools, null: not secrets
+        _ => None,
     }
 }
 
@@ -930,6 +951,26 @@ mod kani_proofs {
     use super::properties::*;
     use super::*;
 
+    /// A fixed-size symbolic string over a concrete ASCII alphabet.
+    ///
+    /// Manual membership loop, not `slice::contains`: the pilot's rung 1
+    /// showed that `contains` lowers to memchr and explodes the formula.
+    fn any_alpha<const N: usize>(alphabet: &[u8]) -> [u8; N] {
+        let mut buf = [0u8; N];
+        for slot in buf.iter_mut() {
+            let c: u8 = kani::any();
+            let mut ok = false;
+            for &a in alphabet {
+                if c == a {
+                    ok = true;
+                }
+            }
+            kani::assume(ok);
+            *slot = c;
+        }
+        buf
+    }
+
     /// Tier 1: `is_placeholder` decision battery (the M5 property).
     /// The symbolic form of this harness timed out at 600 s at both
     /// N=16 and N=8 (Stage 1 log, rung 1): the function's composed
@@ -1065,13 +1106,80 @@ mod kani_proofs {
         assert!(base64_decode("aGVsbG8!").is_none());
     }
 
+    /// Tier 1: `is_placeholder` panic-freedom over a symbolic alphabet.
+    /// The concrete placeholder specification is pinned in the battery
+    /// above; this harness asks whether the predicate can panic on any
+    /// bounded string in its documented input class.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_placeholder_symbolic() {
+        assert!(is_placeholder("changeme"));
+        let bytes: [u8; 8] = any_alpha::<8>(b"abcdefghijklmnopqrstuvwxyz-_./:<>{}$");
+        // SAFETY: the alphabet is ASCII.
+        let s = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        let _ = is_placeholder(s);
+    }
+
+    /// Tier 1: the JWT segment specification for every string over
+    /// `{a,b,.}` of length 4: `Some` iff exactly two dots, the three
+    /// parts concatenate to the input, and no part contains a dot.
+    /// PRODUCED BUT NOT VERIFIED: the split-iterator formula exceeds
+    /// 600 s even at N=4 on this host; the panic-freedom form below is
+    /// also produced-not-verified.
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn tier1_jwt_segments_symbolic() {
+        let bytes: [u8; 4] = any_alpha::<4>(b"ab.");
+        // SAFETY: the alphabet is ASCII.
+        let s = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        prop_jwt_segments(s);
+    }
+
+    /// Tier 1: `find_jwt_segments` panic-freedom for every string over
+    /// `{a,b,.}` of length 4. PRODUCED BUT NOT VERIFIED: even this form
+    /// exceeds 300 s on this host (the split-iterator formula, not the
+    /// input count). It is retained as the artifact for the next Kani
+    /// version; the escaped UTF-8 panic is carried by the native test
+    /// `detect_jwt_with_multibyte_utf8_and_non_jwt_eyj_triplet_does_not_panic`.
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn tier1_jwt_segments_panic() {
+        let bytes: [u8; 4] = any_alpha::<4>(b"ab.");
+        // SAFETY: the alphabet is ASCII.
+        let s = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        let _ = find_jwt_segments(s);
+    }
+
+    /// Tier 1: base64 round-trip for every fixed 6-byte array. The
+    /// reference encoder is the spec; the production decoder must
+    /// return the original bytes and must not panic.
+    #[kani::proof]
+    #[kani::unwind(96)]
+    fn tier1_base64_roundtrip_symbolic() {
+        let mut data = [0u8; 6];
+        for b in data.iter_mut() {
+            *b = kani::any();
+        }
+        prop_base64_roundtrip(&data);
+    }
+
+    /// Tier 1: any bounded string with an out-of-alphabet character
+    /// (after padding trim) decodes to `None` and never panics.
+    #[kani::proof]
+    #[kani::unwind(96)]
+    fn tier1_base64_invalid_symbolic() {
+        let bytes: [u8; 6] =
+            any_alpha::<6>(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=!");
+        // SAFETY: the alphabet is ASCII.
+        let s = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        prop_base64_invalid_char(s);
+    }
+
     /// Tier 2 oracle (register T5): rejects iff the scanned text
-    /// contains the planted marker, found by a manual byte scan.
-    fn scan_inner_oracle(
-        _scanner: &SecretScanner,
-        text: &str,
-        location: &str,
-    ) -> Option<Rejection> {
+    /// contains the planted marker, found by a manual byte scan. The
+    /// Tier 2 harnesses call `scan_value_with` with this oracle, so no
+    /// `SecretScanner` receiver is fabricated (v1 register T6 retired).
+    fn scan_inner_oracle(text: &str, location: &str) -> Option<Rejection> {
         let bytes = text.as_bytes();
         let marker = b"KANI_MARKER";
         if bytes.len() >= marker.len() {
@@ -1098,48 +1206,89 @@ mod kani_proofs {
         None
     }
 
-    /// Fabricated scanner receiver for Tier 2 (register T6): the
-    /// receiver's fields are never read — the only callee that would
-    /// read them is stubbed (T5). Concrete zero bytes via transmute
-    /// from a zeroed word array, never dropped.
-    fn fabricated_scanner() -> std::mem::ManuallyDrop<SecretScanner> {
-        const SCANNER_WORDS: usize = std::mem::size_of::<SecretScanner>() / 8;
-        std::mem::ManuallyDrop::new(unsafe {
-            std::mem::transmute::<[u64; SCANNER_WORDS], SecretScanner>([0u64; SCANNER_WORDS])
-        })
-    }
-
-    /// Tier 2: depth fail-closed in `scan_value_inner` (no map, no
-    /// scan call on this path). Verified (Stage 1 log).
+    /// Tier 2: depth fail-closed in the shared traversal (no map, no
+    /// scan call on this path). Concrete battery for calibration.
     #[kani::proof]
     #[kani::unwind(32)]
-    #[kani::stub(SecretScanner::scan_inner, scan_inner_oracle)]
     fn tier2_depth_fail_closed() {
-        let scanner = fabricated_scanner();
-        let r = scanner.scan_value_inner(&Value::Null, "meta", MAX_DEPTH + 1);
+        let r = scan_value_with(&scan_inner_oracle, &Value::Null, "meta", MAX_DEPTH + 1);
         assert!(matches!(r, Some(ref rej) if rej.category == "max_depth_exceeded"));
     }
 
-    /// Tier 2: `scan_value_inner` scans object keys (the M3
-    /// property) — marker in the key, clean value. PRODUCED BUT NOT
-    /// VERIFIED: this harness timed out at 600 s under both the
-    /// default solver and kissat (symex-bound in the serde_json /
-    /// String machinery; Stage 1 log). It is kept as the produced
-    /// artifact of the pilot; the property is carried by the
-    /// cargo-test drivers with the real scanner, and the CI lane
-    /// enumerates only the verified harnesses.
+    /// Tier 2: the depth guard holds for every depth in the tested
+    /// range. Symbolic (`B`).
     #[kani::proof]
     #[kani::unwind(32)]
-    #[kani::stub(SecretScanner::scan_inner, scan_inner_oracle)]
+    fn tier2_depth_symbolic() {
+        let depth: usize = kani::any();
+        kani::assume(depth <= MAX_DEPTH + 1);
+        let r = scan_value_with(&scan_inner_oracle, &Value::Null, "meta", depth);
+        if depth > MAX_DEPTH {
+            assert!(matches!(r, Some(ref rej) if rej.category == "max_depth_exceeded"));
+        } else {
+            assert!(r.is_none());
+        }
+    }
+
+    /// Tier 2: the traversal scans object keys (the M3 property) —
+    /// marker in the key, clean value.
+    #[kani::proof]
+    #[kani::unwind(32)]
     fn tier2_key_scan() {
-        let scanner = fabricated_scanner();
         let mut map = serde_json::Map::new();
         map.insert(
             "KANI_MARKER".to_string(),
             Value::String("clean".to_string()),
         );
-        let v = Value::Object(map);
-        let r = scanner.scan_value_inner(&v, "meta", 0);
+        let r = scan_value_with(&scan_inner_oracle, &Value::Object(map), "meta", 0);
+        assert!(matches!(r, Some(ref rej) if rej.category == "oracle_marker"));
+    }
+
+    /// Tier 2: every string leaf reaches the scanner. The oracle rejects
+    /// any non-empty text, so the assertion fails if the traversal ever
+    /// drops a leaf. This is the cheap symbolic half of the M3 family;
+    /// the concrete key battery covers object keys.
+    fn leaf_oracle(text: &str, _location: &str) -> Option<Rejection> {
+        if text.is_empty() {
+            None
+        } else {
+            Some(Rejection {
+                location: "leaf".to_string(),
+                category: "leaf_seen",
+            })
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn tier2_string_leaf_symbolic() {
+        let bytes: [u8; 4] = any_alpha::<4>(b"abc");
+        // SAFETY: the alphabet is ASCII.
+        let s = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        let value = Value::String(s.to_string());
+        let r = scan_value_with(&leaf_oracle, &value, "meta", 0);
+        assert!(matches!(r, Some(ref rej) if rej.category == "leaf_seen"));
+    }
+
+    /// Tier 2: a clean symbolic key is not rejected, while a marker key
+    /// is. This is the symbolic form of the M3 property.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    fn tier2_key_scan_symbolic() {
+        let key_bytes: [u8; 4] = any_alpha::<4>(b"abcdefghijklmnopqrstuvwxyz0123456789_-");
+        // SAFETY: the alphabet is ASCII.
+        let key = unsafe { std::str::from_utf8_unchecked(&key_bytes) };
+        let mut map = serde_json::Map::new();
+        map.insert(key.to_string(), Value::String("clean".to_string()));
+        let r = scan_value_with(&scan_inner_oracle, &Value::Object(map), "meta", 0);
+        assert!(r.is_none());
+
+        let mut marker_map = serde_json::Map::new();
+        marker_map.insert(
+            "KANI_MARKER".to_string(),
+            Value::String("clean".to_string()),
+        );
+        let r = scan_value_with(&scan_inner_oracle, &Value::Object(marker_map), "meta", 0);
         assert!(matches!(r, Some(ref rej) if rej.category == "oracle_marker"));
     }
 
@@ -1156,6 +1305,31 @@ mod kani_proofs {
     /// Entropy stub (register T3-S1): constant entropy above threshold.
     fn entropy_above_threshold(_s: &str) -> Option<f64> {
         Some(4.21)
+    }
+
+    /// Symbolic entropy stub (register T3): the value is set by the
+    /// harness, so one proof covers every `f64` the entropy function
+    /// could return rather than three chosen constants.
+    static mut KANI_ENTROPY: f64 = 0.0;
+
+    fn entropy_symbolic(_s: &str) -> Option<f64> {
+        Some(unsafe { KANI_ENTROPY })
+    }
+
+    /// M4 threshold decision for a symbolic entropy value: for a token
+    /// that meets the length/class preconditions, `meets_high_entropy`
+    /// must return exactly `e >= 4.2`. This is the proof form of the
+    /// three-constant battery below.
+    #[kani::proof]
+    #[kani::stub(shannon_entropy_bits_per_char, entropy_symbolic)]
+    fn tier1_entropy_symbolic() {
+        let e: f64 = kani::any();
+        // SAFETY: single-threaded harness; the stub reads this slot.
+        unsafe {
+            KANI_ENTROPY = e;
+        }
+        let got = meets_high_entropy("abcdefghijklmnopqrstuv1x");
+        assert!(got == (e >= 4.2));
     }
 
     /// M4 threshold decision: with the entropy value stubbed to
