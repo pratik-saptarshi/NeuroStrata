@@ -42,7 +42,7 @@
       ]
     }
   },
-  "support_dirs": ["docs/releases", "docs/assets", "docs/archive", "docs/superpowers"],
+  "support_dirs": ["docs/releases", "docs/assets", "docs/archive", "docs/superpowers", "docs/kani-pilot", "docs/kani-pilot-v2"],
   "prohibited_filename_substrings": ["cognee", "oxirs", "mem0", "zep", "langmem"],
   "surface_rules": [
     {
