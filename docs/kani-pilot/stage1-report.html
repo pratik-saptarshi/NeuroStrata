@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeuroStrata Kani Pilot — Stage 1 Result Report</title>
+<style>
+  :root { --ink:#1a1d21; --muted:#5b6470; --line:#d9dee6; --accent:#5b4bc4; --good:#177245; --warn:#9a6a00; --bad:#b3261e; --bg:#ffffff; --panel:#f6f7fb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width: 880px; margin: 0 auto; padding: 40px 24px 64px; }
+  h1 { font-size: 28px; line-height:1.2; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 34px 0 10px; padding-top: 18px; border-top: 1px solid var(--line); }
+  p { margin: 8px 0; }
+  .sub { color: var(--muted); margin-bottom: 4px; }
+  .verdict { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); padding: 14px 18px; border-radius: 6px; margin: 20px 0; }
+  .verdict strong { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  td.n, th.n { text-align: right; }
+  .pass { color: var(--good); font-weight: 600; }
+  .fail { color: var(--bad); font-weight: 600; }
+  .mid { color: var(--warn); font-weight: 600; }
+  ul, ol { margin: 8px 0 8px 20px; padding: 0; }
+  li { margin: 4px 0; }
+  code { font: 13.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  .small { font-size: 13.5px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+<h1>NeuroStrata Kani Pilot — Stage 1 Result Report</h1>
+<p class="sub">Executed 2026-11-17 → 2026-11-18 under the pre-registration frozen at Stage 0 · Subject: secrets scanner, <code>src/secrets.rs</code>, upstream main @ <code>dd1affef</code> · Kani 0.68.0 / CBMC 6.11.0 · Work on local branch <code>feat/kani-secrets-scanner-pilot</code> (commits <code>bfee639</code>, <code>8b36ec9</code>) — nothing pushed</p>
+
+<div class="verdict">
+<p><strong>Stage 1 execution is complete. Under the frozen success criteria, the pilot cannot be declared "succeeded" — and no kill criterion fired either. The judgement is the owner's, on the exact split below.</strong> 13 Kani harnesses were produced; <strong>9 verified</strong> with zero failed checks, and 4 could not be verified on this machine (solver timeouts and CBMC memory exhaustion — never a property failure). Frozen success criterion 2 requires <em>all</em> harnesses to pass, so it is not met as written. Against that: the pre-registered non-vacuity check passed in full — <strong>all five seeded mutants were caught</strong>, two of them by Kani harnesses directly — and the dual-use design the judge mandated did exactly its job, carrying the properties Kani could not reach onto executable tests. The headline technical discovery: <strong>Kani 0.68 cannot compile the <code>regex</code> crate at all</strong> (an internal compiler error), so everything above the extraction seam is outside proof scope for this toolchain, a fact now registered as T4-S1 rather than worked around.</p>
+</div>
+
+<h2>1. The proof-of-life ladder — what Kani 0.68 can and cannot do here</h2>
+<table>
+<tr><th>Rung</th><th>Target</th><th>Result</th></tr>
+<tr><td>1</td><td><code>is_placeholder</code></td><td>Concrete battery <span class="pass">VERIFIED</span> (99 s). Symbolic form timed out at 600 s even at length 8</td></tr>
+<tr><td>2a</td><td><code>find_jwt_segments</code></td><td>Symbolic: timeout. Exhaustive small forms: <span class="fail">CBMC out of memory</span> — the <code>str::split</code> iterator machinery is the binding constraint on an ~8 GB shared box</td></tr>
+<tr><td>2b</td><td><code>base64_decode</code></td><td>Concrete battery <span class="pass">VERIFIED</span> (111 s, OnceLock table path included). Symbolic round-trips timed out; one early run's truncated unwinding made its "pass" vacuous — caught and corrected in the log, per the non-vacuity discipline</td></tr>
+<tr><td>3</td><td>regex crate</td><td><span class="fail">Kani compiler ICE</span> (<code>TryFromIntError(PosOverflow)</code> codegen'ing <code>regex_automata::meta::strategy::new</code>). Anything reaching <code>Regex::new</code> or matching is un-compilable by Kani 0.68 — confirmed again first-hand on rung 4</td></tr>
+<tr><td>4</td><td><code>scan_str</code> end-to-end</td><td>Same ICE — no end-to-end proof of the assembled scanner is possible with this toolchain</td></tr>
+<tr><td>5</td><td>Entropy (<code>shannon_entropy…</code>)</td><td>Concrete inputs timed out at 600 s (the <code>HashMap</code> seed is modelled nondeterministically, so every lookup branches). Resolved via the registered T3 stub route for the threshold decision</td></tr>
+<tr><td>Tier 2 probe</td><td><code>scan_value_inner</code> with stubbed <code>scan_inner</code></td><td>Stubbing prunes the regex codegen (no ICE). Depth fail-closed <span class="pass">VERIFIED</span> (67 s). Key-scan timed out at 600 s under two different solvers — symbolic-execution-bound, not a property failure</td></tr>
+</table>
+
+<h2>2. Produced / verified split (the shipped harness set)</h2>
+<table>
+<tr><th>Harness</th><th>Outcome</th><th class="n">Time</th><th>Notes</th></tr>
+<tr><td><code>tier1_placeholder_battery</code></td><td class="pass">Verified</td><td class="n">99 s</td><td>Placeholder exemptions + near-miss non-exemptions</td></tr>
+<tr><td><code>tier1_base64_battery</code></td><td class="pass">Verified</td><td class="n">111 s</td><td>Decode correctness incl. invalid-char rejection, T1 table path</td></tr>
+<tr><td><code>tier1_exempt_code_expression</code></td><td class="pass">Verified</td><td class="n">88 s</td><td>Code-expression exemption predicate</td></tr>
+<tr><td><code>tier1_exempt_source_reference</code></td><td class="pass">Verified</td><td class="n">113 s</td><td>Source-reference exemption predicate</td></tr>
+<tr><td><code>tier1_exempt_type_names</code></td><td class="pass">Verified</td><td class="n">104 s</td><td>Type-annotation exemption predicates</td></tr>
+<tr><td><code>tier1_entropy_at_threshold</code></td><td class="pass">Verified</td><td class="n">66 s</td><td>Threshold decision at exactly 4.2 — modulo T3-S1</td></tr>
+<tr><td><code>tier1_entropy_below_threshold</code></td><td class="pass">Verified</td><td class="n">64 s</td><td>Modulo T3-S1</td></tr>
+<tr><td><code>tier1_entropy_above_threshold</code></td><td class="pass">Verified</td><td class="n">65 s</td><td>Modulo T3-S1</td></tr>
+<tr><td><code>tier2_depth_fail_closed</code></td><td class="pass">Verified</td><td class="n">67 s</td><td>Depth &gt; MAX_DEPTH rejects — modulo T5/T6</td></tr>
+<tr><td><code>tier2_key_scan</code></td><td class="mid">Not verified</td><td class="n">600 s ×2</td><td>Timeout under CaDiCaL and kissat; property carried by the pre-existing test <code>metadata_key_carrying_a_secret_is_detected</code></td></tr>
+<tr><td><code>tier1_jwt_segments_some</code> / <code>_none</code></td><td class="mid">Not verified</td><td class="n">OOM</td><td>CBMC memory exhaustion; carried by <code>jwt_segments_cases</code> + the bolero driver</td></tr>
+<tr><td><code>tier1_exempt_member_chain</code></td><td class="mid">Not verified</td><td class="n">OOM ×3 forms</td><td>Carried by <code>exemption_predicates_cases</code></td></tr>
+</table>
+<p>Totals: <strong>13 produced, 9 verified, 4 not verified, 0 property failures.</strong> Verified runtimes sum to 777 s (~13 min) sequential on this VM. The four unverified harnesses remain in the file, documented in situ, and are excluded from the CI lane's enumeration; on a larger machine they may verify as produced. Seven new executable tests (3 bolero property drivers + 4 case tests) were added alongside and all pass.</p>
+
+<h2>3. Seeded-defect check — all five mutants caught</h2>
+<table>
+<tr><th>Mutant</th><th>Caught by</th><th>Carrier</th></tr>
+<tr><td>M1 — provider <code>min_len</code> comparison inverted (<code>&lt;</code> → <code>&lt;=</code>)</td><td><code>provider_form_length_boundaries</code> FAILED (36 s)</td><td>Executable test — <code>validate_provider_form</code> sits above the ICE'd regex seam (its AKIA branch compiles a regex), so no Kani harness can reach it with this toolchain</td></tr>
+<tr><td>M2 — too-many-dots rejection deleted (JWT segments)</td><td><code>jwt_segments_cases</code> and the bolero driver both FAILED (54 s)</td><td>Executable tests (Kani harness OOM'd, §2)</td></tr>
+<tr><td>M3 — metadata-key scan branch deleted</td><td>Pre-existing <code>metadata_key_carrying_a_secret_is_detected</code> FAILED (46 s)</td><td>Executable test (Tier 2 Kani harness timed out)</td></tr>
+<tr><td>M4 — entropy threshold <code>&gt;=</code> → <code>&gt;</code></td><td><code>tier1_entropy_at_threshold</code> VERIFICATION FAILED, exactly 1 failing check (68 s)</td><td><strong>Kani proof</strong></td></tr>
+<tr><td>M5 — placeholder-pattern exemption sabotaged</td><td><code>tier1_placeholder_battery</code> VERIFICATION FAILED, exactly 1 failing check (69 s)</td><td><strong>Kani proof</strong></td></tr>
+</table>
+<p>Zero repair cycles were needed; every mutant was reverted completely and the tree re-verified to the harness-only diff after the series. <strong>Kill criterion 5 did not fire.</strong> The honest reading of this table is the pilot in miniature: the mutant check — the judge's non-vacuity guarantee — holds in full, but three of its five catches ride on the dual-use test carriers rather than on proofs, because the toolchain, not the code, walls off those sites.</p>
+
+<h2>4. Trusted-annotation register (final state)</h2>
+<ul>
+<li><strong>T1</strong> — Two <code>OnceLock</code> immutable statics (scanner singleton; base64 table). The base64 table path is inside a verified harness; the singleton sits above the regex seam and was never constructed under Kani.</li>
+<li><strong>T2</strong> — Harness input envelope (bounded strings/values). All verified results are concrete-battery or bounded-form results; no claim is made at production input bounds (256,000 bytes / depth 8).</li>
+<li><strong>T3 + T3-S1</strong> — Entropy: <code>shannon_entropy_bits_per_char</code> stubbed at three constant values bracketing 4.2 for the threshold-decision harnesses. The threshold <em>decision</em> is verified modulo the stubbed entropy value; the entropy computation itself rests on example tests. Filed before use, as the register rule requires.</li>
+<li><strong>T4 + T4-S1</strong> — The regex extraction seam, resolved by evidence: Kani 0.68 ICEs compiling the regex crate, so extraction and everything above it (<code>scan_inner</code>, <code>scan_str</code>, <code>detect_jwt</code>'s matching phase, the AKIA branch) is outside proof scope and rests on the example-test suite. Not stubbed, not worked around.</li>
+<li><strong>T5</strong> — <code>scan_inner</code> oracle for Tier 2 structural harnesses (rejects iff the text contains a planted marker). Tier 2 properties cover <code>scan_value_inner</code>'s traversal only. Uses Kani 0.68's unstable <code>-Z stubbing</code>; the CI lane carries the same flag.</li>
+<li><strong>T6</strong> — Fabricated <code>SecretScanner</code> receiver for Tier 2 (concrete-zero bytes, never dropped, fields never read by the callee — auditable in source). The entry documents three abandoned fabrication attempts before this device was relied on. If <code>scan_value_inner</code> ever reads a receiver field, T6 is void and Tier 2 must be re-derived.</li>
+</ul>
+
+<h2>5. Zero-behaviour-change evidence</h2>
+<ul>
+<li><code>cargo test --bin neurostrata-mcp secrets::</code> — <strong>59 passed, 0 failed</strong>.</li>
+<li>Full binary suite (2,064 tests): 2,052 passed, <strong>8 failed</strong>, 4 ignored (351 s). Attribution proven first-hand: 7 of the 8 (embedder / GLiNER / Laya-ONNX / trainer class) fail identically on the pristine <code>dd1affef</code> tree in this environment; the 8th passes in isolation on both trees (a parallel-load flake). None are in <code>secrets::</code>, and none are caused by the pilot diff.</li>
+<li><code>rustfmt --check src/secrets.rs</code> passes. The pristine file was not rustfmt-clean at <code>dd1affef</code>, so the diff includes 22 whitespace-only reflowed lines in pre-existing code — disclosed here rather than buried.</li>
+<li>Production-code changes are confined to the pre-registered envelope: the cfg(kani) harness module, the bolero dev-dependency, and those whitespace lines. One process incident is on record in the log: an over-broad <code>cargo fmt</code> mid-run reformatted 143 files; it was fully reverted and the tree re-verified to the intended diff before proceeding.</li>
+<li>Environment note: local runs required <code>ORT_LIB_LOCATION</code>/<code>ORT_PREFER_DYNAMIC_LINK=1</code> against a local ONNX Runtime (the ort-sys prebuilt download is blocked in this sandbox). The CI lane needs neither.</li>
+</ul>
+
+<h2>6. CI lane</h2>
+<p><code>.github/workflows/kani.yml</code> is committed on the branch per the Stage 0 design: separate workflow, <code>ubuntu-latest</code> (x86_64), Kani 0.68.0 pinned via <code>cargo install kani-verifier --locked</code>, advisory (not a required check), 15-minute timeout, triggers on PRs touching <code>src/secrets.rs</code> plus a weekly run, enumerating only the 9 verified harnesses. <strong>Ceiling risk, recorded plainly:</strong> the verified set sums to ~13 minutes on this VM; GitHub's runners are faster per-core but the margin under the 15-minute ceiling is thinner than the design assumed. If the lane times out in practice, that is a ceiling breach under the pre-registration, not a tuning detail.</p>
+
+<h2>7. Against the frozen success criteria</h2>
+<table>
+<tr><th>Criterion</th><th>State</th></tr>
+<tr><td>1. Shipped code is what is verified (refactor-in-place)</td><td class="pass">Met — harnesses call the production functions in place; no copy exists</td></tr>
+<tr><td>2. All harnesses pass with unwinding assertions passing</td><td class="fail">Not met — 9 of 13 verified; the other 4 are timeouts/OOM, with unwinding behaviour on the verified set clean</td></tr>
+<tr><td>3. Atomics/threads gate</td><td class="pass">Met — census zero; the two OnceLock statics are T1</td></tr>
+<tr><td>4. Seeded-defect check: all five mutants caught</td><td class="pass">Met — §3 (two catches by proof, three by the dual-use carriers)</td></tr>
+<tr><td>5. CI ceiling (≤15 min advisory lane)</td><td class="mid">Designed to the ceiling; at risk in practice — §6</td></tr>
+<tr><td>6. Reporting with produced/verified splits + full register</td><td class="pass">Met — this report; full record in <code>state/stage1-log.md</code></td></tr>
+</table>
+<p><strong>What the pilot established:</strong> Kani can prove real, mutant-sensitive properties of this codebase's pure decision predicates (placeholder exemptions, base64 decoding, exemption predicates, the entropy threshold decision, depth fail-closed) — and the Bolero dual-use discipline meant nothing the toolchain couldn't reach was left unguarded. <strong>What it did not establish:</strong> any proof over the assembled scanner, the regex extraction layer, or the provider-form validator — Kani 0.68's regex ICE puts the scanner's highest-value surface out of proof reach until the toolchain matures. Per the pre-registration, a success finding requires all criteria; criterion 2 fails as frozen. Whether the outcome is recorded as a partial success with the split standing as the result, a not-succeeded close-out, or a bounded continuation aimed at the four unverified harnesses is the owner's ruling. Any wider Kani use remains a separate decision in all three branches.</p>
+<p class="small">Workspace: <code><pilot-workspace>/</code> (state/stage1-log.md, state/runs/, state/pre-registration.md, state/g2-bridge-design.md). — Musebot-Astro</p>
+</main>
+</body>
+</html>
