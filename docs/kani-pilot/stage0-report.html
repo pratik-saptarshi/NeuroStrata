@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeuroStrata Kani Pilot — Stage 0 Report</title>
+<style>
+  :root { --ink:#1a1d21; --muted:#5b6470; --line:#d9dee6; --accent:#5b4bc4; --good:#177245; --warn:#9a6a00; --bad:#b3261e; --bg:#ffffff; --panel:#f6f7fb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width: 880px; margin: 0 auto; padding: 40px 24px 64px; }
+  h1 { font-size: 28px; line-height:1.2; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 34px 0 10px; padding-top: 18px; border-top: 1px solid var(--line); }
+  h3 { font-size: 16px; margin: 20px 0 6px; }
+  p { margin: 8px 0; }
+  .sub { color: var(--muted); margin-bottom: 4px; }
+  .verdict { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); padding: 14px 18px; border-radius: 6px; margin: 20px 0; }
+  .verdict strong { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel); }
+  td.n, th.n { text-align: right; }
+  .pass { color: var(--good); font-weight: 600; }
+  .kill { color: var(--bad); }
+  ul, ol { margin: 8px 0 8px 20px; padding: 0; }
+  li { margin: 4px 0; }
+  code { font: 13.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  .small { font-size: 13.5px; color: var(--muted); }
+  .quote { border-left: 3px solid var(--line); padding: 2px 0 2px 14px; color: #33383f; margin: 12px 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>NeuroStrata Kani Pilot — Stage 0 Report</h1>
+<p class="sub">Seeding and setup, as authorized by the owner on 2026-11-17 · Prepared 2026-11-17 · Census basis: upstream <code>Cognilogical/NeuroStrata</code> main @ <code>dd1affef</code> (v1.18.1)</p>
+<p class="sub">Governing spec: the verification-frameworks panel judge's verdict §5 (2026-11-16) and completeness audit gaps G1/G2. Stage 0 time-box: 2 working days. This report is the Stage 0 deliverable; Stage 1 begins only on the owner's ruling.</p>
+
+<div class="verdict">
+<p><strong>Stage 0 outcome: the gate passes, and the subject is the secrets scanner (<code>src/secrets.rs</code>).</strong> The defect census (100 fix commits, classified) confirms the auditor's suspicion and sharpens it: the defect stream is dominated by sequential logic (SEQ 29%), but only <strong>1 of 100</strong> defects is a clean Kani catch as the code stands — the rest manifest through the FFI store, the async daemon, or integration seams. The pilot therefore lives or dies on subjects whose sequential core is already the shipped code. The secrets scanner is exactly that: a pure synchronous core that already carries escaped sequential defects of its own (a panic in pure string code, two matcher-logic defects), needs no extraction, and guards the highest-blast-radius write surface in the system. Pre-registered metrics, kill criteria, the equivalence-bridge design, and the CI lane design are filed with this report.</p>
+</div>
+
+<h2>1. What Stage 0 had to produce</h2>
+<p>Per the judge, Stage 0 exists to close the audit's two blocking gaps before any verification spend: <strong>G1</strong> — no defect census (the pilot subject was an assumption, not a finding) — and <strong>G2</strong> — no equivalence bridge (a verified copy would recreate, at pilot scale, the model-fidelity gap the panel charged against Aeneas). Five preconditions: (1) the census plus an existing-controls inventory; (2) a subject census and a selection made from it, with no pre-commitment; (3) the G2 design — refactor-in-place plan, extraction ceiling, trusted-boundary register, atomics/threads census of the subject; (4) pre-registered success/kill metrics, including a seeded-defect non-vacuity check; (5) a CI lane design against the repo's actual workflows. If Stage 0 cannot close G1 and G2, the pilot dies automatically.</p>
+
+<h2>2. The defect census (G1)</h2>
+<p>Method: the most recent 100 commits on upstream <code>main</code> whose subject matches <code>^fix(\(|:)</code> (306 exist; the sample spans 2026-11-17 → 2026-11-02), each classified by defect class × primary component × "would Kani, on code it can read, have caught this?" Full data: <code>data/census.md</code> and <code>data/census.csv</code> in the pilot workspace.</p>
+<table>
+<tr><th>Defect class</th><th class="n">Count</th><th>Kani-catchable (YES / PARTIAL / NO)</th><th>Reading</th></tr>
+<tr><td>SEQ — sequential logic</td><td class="n">29</td><td>1 / 28 / 0</td><td>Largest class; almost all of it manifests through a seam (FFI store, async pipeline)</td></tr>
+<tr><td>OTHER</td><td class="n">16</td><td>0 / 5 / 11</td><td>Review-round bundles, TypeScript plugin mass, docs; one "fix" touches no code at all</td></tr>
+<tr><td>ATOM — multi-step consistency</td><td class="n">12</td><td>0 / 11 / 1</td><td>The recurring failure mode: WAL recovery (4), ingest generation swaps, action CAS, sign-after-rebuild ordering</td></tr>
+<tr><td>BUILD</td><td class="n">12</td><td>0 / 0 / 12</td><td>CI/build/platform — outside any code verifier</td></tr>
+<tr><td>SEC — security policy</td><td class="n">10</td><td>0 / 9 / 1</td><td>Mostly seam gaps: scanning not wired into a path (×3), gates bypassed/unenforced (×4); the predicates are sequential, the defects are wiring</td></tr>
+<tr><td>SCHEMA — type/storage integration</td><td class="n">9</td><td>0 / 8 / 1</td><td>Representation defects at the storage seam</td></tr>
+<tr><td>ERRH — error handling / panics</td><td class="n">9</td><td>0 / 8 / 1</td><td>Includes a genuine panic in pure string code (below)</td></tr>
+<tr><td>CONC — concurrency</td><td class="n">3</td><td>0 / 0 / 3</td><td>Nearly absent despite the daemon/mesh architecture — the window's pain is consistency and wiring, not races</td></tr>
+<tr><td><strong>Total</strong></td><td class="n"><strong>100</strong></td><td><strong>1 / 69 / 30</strong></td><td></td></tr>
+</table>
+<p><strong>The headline the panel predicted, confirmed with numbers:</strong> the historical defect mass is not a concurrency population, and it is not directly provable either — 69 of 100 defects have a sequential core but manifest through integration. A Kani pilot pointed at the code as-is would catch almost nothing. The pilot's only honest shape is the judge's: pick a subject whose sequential core <em>is</em> the shipped code, and verify that.</p>
+<h3>Existing controls (the baseline any adoption must beat)</h3>
+<p>2,176 test functions (1,416 <code>#[test]</code> + 760 <code>#[tokio::test]</code>), all example-based, run single-threaded in CI; CI jobs cover build (3 OSes), test, plugins, scripts, and cargo-audit — with <strong>no clippy, rustfmt, Miri, or sanitizer jobs</strong>, and <strong>no property, fuzz, or concurrency-testing tooling anywhere</strong> (no proptest/quickcheck/bolero/loom in the manifests; no <code>fuzz/</code> directory; no <code>#[kani]</code>). The one existing formal control is a Lean 4 proof tree with parity tests, covering parts of the formal kernel and taxonomy. (The panel-era count of 1,083 tests was taken on an older tree with a narrower count; the fresh census basis above supersedes it.)</p>
+
+<h2>3. Subject census and selection</h2>
+<p>All six panel-named candidates were located as identifiable code, plus three unnamed decision-shaped components the inspection surfaced. Ranked by the judge's axes — defect history in the census × blast radius × extractability:</p>
+<table>
+<tr><th>Candidate</th><th>Escaped defects in census window</th><th>Blast radius</th><th>Extractability</th><th>Disposition</th></tr>
+<tr><td><strong>Secrets scanner</strong> (<code>src/secrets.rs</code>, ~950 core LOC)</td><td><strong>4</strong>: UTF-8 slice panic in <code>detect_jwt</code> (ERRH, pure string code); metadata keys unscanned (SEC); source false positives + unreported skips (SEC); scanning unwired on two write paths (SEC, wiring)</td><td>High — a false negative persists a live credential into a searchable, mesh-synced store; a false positive silently drops a legitimate write</td><td>Already a pure core: zero env/fs/clock/rand/FFI/async contact; extraction ≈ nil</td><td><strong>SELECTED</strong></td></tr>
+<tr><td>Guard verdict core (<code>src/guard/</code>, ~750 LOC)</td><td>3: prose false-positive in the trigger matcher (SEQ, in <code>validator.rs</code>); candidate-rule ranking error (SEQ); Zero-Action filter (SEQ, server-side) — plus one CONC defect, out of Kani scope</td><td>High — the safety boundary for agent actions</td><td>Good — verdict core already pure, zero sync primitives in the decision files; small–medium shell split needed</td><td>Alternate (recorded, not a fallback — see §6)</td></tr>
+<tr><td>Formal kernel (<code>src/formal_kernel.rs</code>)</td><td>1 — the census's only clean YES</td><td>Medium</td><td>Already pure</td><td>Not selected: it already sits behind Lean 4 proofs + parity tests, a stronger existing formal control. Kani there would duplicate coverage and test nothing about the pilot's real question</td></tr>
+<tr><td>Store-identity core (~160 LOC, in the store monolith)</td><td>2, both SCHEMA at the FFI seam; the pure decision fns themselves (equality, target picking) carry no escaped defect in the window</td><td>High</td><td>Good (one half already pure; one needs a snapshot-input refactor)</td><td>Not selected: fails the judge's test — the census does not show the <em>core</em> carrying the defect class</td></tr>
+<tr><td>Vocabulary envelope (~180 LOC)</td><td>0 in window</td><td>Medium (soft-fail design caps downside)</td><td>Good — already pure</td><td>Not selected: no escaped-defect basis in the census</td></tr>
+<tr><td>ReBAC (<code>src/rebac.rs</code>, 469 LOC, unnamed candidate)</td><td>0 in window</td><td>High — access-control decisions</td><td>Excellent shape — pure, synchronous</td><td>Not selected <em>this</em> pilot: perfect shape, but the judge's rule requires the census to show the subject carrying the class. First candidate if a future subject is chosen on a wider census basis</td></tr>
+<tr><td>Retention gate (~60 pure LOC)</td><td>0 in window</td><td>Medium</td><td>Trivial (already factored)</td><td>Not selected: no defect basis; too small to be informative</td></tr>
+<tr><td>Staged-publication atomicity</td><td>ATOM cluster exists (ingest generations, action CAS)</td><td>High</td><td><strong>Poor</strong> — the guarantee is LadybugDB's single-statement execution semantics; a Kani core could only prove a pointer-transition shadow</td><td>Excluded: verifying it would mean verifying a different component than the one that carries the property</td></tr>
+</table>
+<p><strong>Selection rationale, in one paragraph.</strong> The secrets scanner is the only candidate that satisfies every term of the judge's selection rule at once: the census shows it carrying a bounded, sequential, escaped-defect class (a panic in pure code; matcher false negatives and false positives — predicate logic, Kani's home ground); its blast radius is the highest of the pure cores (credentials at rest, propagated by mesh sync); and its extractability is not a promise but a present fact — the shipped functions are the core, so refactor-in-place, the G2 gate, is satisfied by construction. One honesty note: of its four census defects, the wiring defect (scanning not invoked on two paths) is <em>not</em> something Kani on the core would have caught — verification of the core proves the scanner's decisions, not its invocation. The pilot claims the other three.</p>
+
+<h2>4. Equivalence bridge (G2)</h2>
+<p>Filed in full as <code>state/g2-bridge-design.md</code>. The design in brief: harnesses live in a <code>#[cfg(kani)]</code> module inside <code>src/secrets.rs</code> and call the production <code>scan_str</code>/<code>scan_value</code> functions directly — the verified code is byte-for-byte the shipped code, a single source of truth. Permitted production edits in Stage 1 are visibility widening and cfg(kani) harness hooks only, under a zero-behaviour-change evidence rule (the full 2,176-test suite stays green). The bounded-envelope honesty clause is stated in the design: proofs run at a shrunk input envelope (≤128-byte strings, depth ≤4) while production caps are 256,000 bytes / depth 8; behaviour at production bounds rests on the cap-enforcement path and the example tests, and no report may claim otherwise. <strong>Atomics/threads census of the subject: zero</strong> in production logic; the two <code>OnceLock</code> immutable lookup statics are carried as register item T1. The trusted-boundary register is opened with four entries (T1 OnceLock tables, T2 the input envelope, T3 floating-point entropy modelling, T4 a pattern-engine inventory owed at Stage 1 start) under the rule that an item is registered <em>before</em> it is relied on.</p>
+
+<h2>5. Pre-registered metrics (G9)</h2>
+<p>Filed in full, frozen, as <code>state/pre-registration.md</code> — before any Stage 1 work, as required. The binding numbers:</p>
+<ul>
+<li><strong>Ceilings:</strong> verified core ≤ 1,200 production LOC; ≤ 40 harnesses, all Bolero dual-use style; CI advisory lane ≤ 15 minutes; refactor diff extraction-only with zero behaviour change.</li>
+<li><strong>Success (all required):</strong> shipped code is what is verified; all harnesses pass with unwinding assertions passing; atomics gate holds; <strong>all five pre-registered mutants are caught</strong> (pattern-predicate inversion, JWT boundary off-by-one, metadata-key branch deletion, entropy-threshold weakening, placeholder-exemption removal) — a surviving mutant voids the green, one repair cycle allowed; CI ceiling held; results reported with produced/verified splits and the full register.</li>
+<li><strong>Kill (any one, no fallback):</strong> refactor-in-place infeasible or verify-a-copy becomes the only route; the subject can't be isolated from async/FFI/Drop/atomics without becoming a different component; either time-box or the CI ceiling is exceeded; success would need the unstable contracts path or an unregistered <code>assume</code>/stub; the seeded-defect check fails after one repair cycle; the census basis materially changes mid-pilot.</li>
+<li><strong>On a kill,</strong> the census and the dual-use harnesses (re-expressed as property/fuzz tests) remain as deliverables of the alternatives-first stack. On success, any wider use is a new decision. The stack is sequenced first because it covers the actual risk surface — it is <em>not</em> assurance-equivalent to proof, and no wording in this programme says otherwise.</li>
+</ul>
+
+<h2>6. CI lane design (G7)</h2>
+<p>Against the actual workflows at the census basis (<code>ci.yml</code>: build/test/test-report/plugins/scripts/audit/release-references; no clippy or fmt jobs): the pilot adds <strong>nothing</strong> to <code>ci.yml</code>. A separate <code>kani.yml</code> workflow runs the lane on <code>ubuntu-latest</code> (x86_64; architecture covered by any proof: <strong>x86_64-unknown-linux-gnu</strong>), with Kani pinned and installed only inside that job — the shipping toolchain is never touched. Triggers: PRs touching <code>src/secrets.rs</code> plus a weekly run. The lane is <strong>advisory</strong> (not a required check; failure uploads its JSON/SARIF report as an artifact and does not block merge), with a 15-minute job timeout per the pre-registration.</p>
+
+<h2>7. Stage 0 gate self-assessment</h2>
+<table>
+<tr><th>Judge's Stage 0 precondition</th><th>State</th></tr>
+<tr><td>1. G1 census + existing-controls inventory</td><td class="pass">Done — 100 commits classified (data/census.md, census.csv); controls inventoried</td></tr>
+<tr><td>2. Subject census + selection from it, no pre-commitment</td><td class="pass">Done — 8 candidates ranked; secrets scanner selected on census evidence; the identity core was treated as one row among several and not selected</td></tr>
+<tr><td>3. G2 design: refactor-in-place plan, extraction ceiling, trusted-boundary register, atomics/threads census</td><td class="pass">Done — state/g2-bridge-design.md; atomics census of the subject is zero (two OnceLock statics registered)</td></tr>
+<tr><td>4. Pre-registered metrics incl. seeded-defect check</td><td class="pass">Filed — state/pre-registration.md, frozen 2026-11-17, five named mutants</td></tr>
+<tr><td>5. CI lane design against actual workflows</td><td class="pass">Done — §6 above; separate advisory workflow, pinned isolated toolchain, named architecture, stated failure policy</td></tr>
+</table>
+<p><strong>Stage 0 passes its gate.</strong> Neither automatic kill condition is present: the census <em>does</em> show a bounded sequential escaped-defect class in an extractable subject, and refactor-in-place is not merely feasible but nearly free for this subject. The guard verdict core is recorded as the alternate candidate for the record — it is <em>not</em> an in-pilot fallback; if the pilot is killed, it stops, per the judge.</p>
+
+<h2>8. The decision in front of the owner</h2>
+<p>Authorize <strong>Stage 1</strong> as pre-registered: ≤ 10 working days, one subject (the secrets scanner), harnesses with unwinding assertions in Bolero dual-use style, the five-mutant seeded-defect check, the advisory CI lane, and a result report with produced/verified splits and the full trusted-annotation register. Stage 1 work happens on a branch; <strong>opening any PR, pushing, or merging remains a separate decision</strong> — this report asks only for the Stage 1 go/no-go.</p>
+<p class="small">Workspace: <code><pilot-workspace>/</code> (data/census.md, data/census.csv, data/subject-census.md, state/pre-registration.md, state/g2-bridge-design.md). — Musebot-Astro</p>
+</main>
+</body>
+</html>

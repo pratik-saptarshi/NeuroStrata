@@ -1,0 +1,48 @@
+# Kani Pilot — G2 Equivalence-Bridge Design (refactor-in-place)
+
+**Filed:** 2026-11-17, Stage 0 (closes audit gap G2 by construction, per the judge's ruling: refactor-in-place is mandatory; verify-a-copy earns no credit and is not a fallback).
+**Subject:** the secrets scanner, `src/secrets.rs` (upstream main @ `dd1affef`, v1.18.1).
+
+## Why this subject makes G2 closable by construction
+
+The judge's G2 test asks what extraction means mechanically. For this subject the honest answer is: **there is almost nothing to extract.** `src/secrets.rs` is already a pure synchronous core — `SecretScanner::scan_str` / `scan_value` / `scan_entry_point` map (text | JSON value) → `Option<Rejection>` with zero environment, filesystem, clock, randomness, async, or FFI contact (verified by grep in the subject census: zero hits for `env::`, `fs::`, `File`, `SystemTime`, `Instant`, `rand`). The daemon's write surfaces already call these exact functions. Stage 1 therefore does not move the decision logic at all:
+
+1. Harnesses are added in a `#[cfg(kani)]` module **inside `src/secrets.rs`** (plus, if needed, a sibling `src/secrets_kani.rs` harness module compiled only under cfg(kani)), calling the production `scan_str`/`scan_value` functions directly. The code Kani verifies is byte-for-byte the code the daemon ships — a single source of truth, not a copy, a model, or a reimplementation.
+2. The only production-code edits permitted in Stage 1 are: (a) visibility widening (`pub(crate)`) where a harness module needs it, and (b) shrinking hooks for the harness input envelope (e.g. a cfg(kani)-only early bound), each reviewed as extraction-only and covered by the zero-behaviour-change evidence rule in the pre-registration (full existing suite green).
+3. If Stage 1 discovers that a production function cannot be harnessed without restructuring it into different logic, that is kill criterion 2 territory — stop and report, never quietly verify a restructured twin.
+
+## The bounded-envelope honesty clause
+
+Production caps are `MAX_SCAN_BYTES` = 256,000 and JSON depth 8. Bounded proofs will run at the pre-registered harness envelope (strings ≤ 128 bytes, depth ≤ 4, collections ≤ 8). The bridge states plainly what that means: the proofs cover the scanner's decision logic for inputs within the envelope; behaviour at production-scale inputs rests on (i) the cap-enforcement code path itself (a small, separately testable boundary: over-cap inputs are rejected/truncated before the core logic, per the existing implementation) and (ii) the existing example-test suite. No Stage 1 report may claim proof coverage at production bounds.
+
+## Atomics / threads census of the subject (the judge's gate)
+
+`src/secrets.rs` at census basis: **zero** `Atomic*`, `Mutex`, `RwLock`, `thread::`, `RefCell`, `UnsafeCell`, `Cell` in production logic (the Mutex/RwLock grep hits are string literals in a type-name list). Two `OnceLock` statics exist — the scanner singleton (line 322) and the base64 decode table (line 765) — both immutable-after-init lookup data. They are carried in the register below (T1), and Stage 1 harnesses must initialize them concretely or prove over their actual contents; no `assume` about their contents is permitted unregistered.
+
+## Trusted-boundary register (opened day one; binding on Stage 1)
+
+| ID | Item | Nature | Bound / handling |
+|---|---|---|---|
+| T1 | Two `OnceLock` statics (scanner singleton; base64 decode table) | Immutable lookup data initialized once | Harnesses initialize concretely or verify against actual table contents; contents are constants in the source, auditable by eye and by the produced/verified report |
+| T2 | Harness input envelope (≤128-byte strings, depth ≤4, ≤8 elements) | Boundedness of the proofs themselves | Stated in every report; production caps covered outside the proofs (see honesty clause) |
+| T3 | Shannon-entropy computation (floating point, `ln`) | CBMC float modelling is trusted and can be slow | If Stage 1 must stub or bound the entropy internals, the stub is registered here **before** use, and the affected properties are reported as verified-modulo-T3; an unregistered stub is kill criterion 4 |
+| T4 | Any pattern-matching engine internals the core depends on (to be inventoried at Stage 1 start) | Potential Kani-modelling limit | Inventory is a Stage 1 entry task; any item that cannot be modelled and cannot be bounded is reported against kill criterion 2 rather than silently stubbed |
+| T4-S1 (Stage 1, 2026-11-18) | T4 inventory outcome: the pattern engine is the `regex` crate (regex-automata 0.4.18). Kani 0.68's compiler fails with an internal compiler error codegen'ing it (`TryFromIntError(PosOverflow)`, `regex_automata::meta::strategy::new`, strategy.rs:81–84) — observed first-hand on ladder rung 3a | Kani-modelling limit, total for this crate/toolchain pairing | No harness may rely on regex compilation or matching; everything above the extraction seam (`scan_inner`, `scan_str`, `detect_jwt`'s matching phase, the AKIA branch of `validate_provider_form`) is outside proof scope and rests on the example-test suite. This is the harness plan's AKIA amendment trigger in stronger form (whole-crate ICE, not one call site) and is reported to the owner as an amendment-relevant discovery; it is not silently stubbed |
+| T5 (Stage 1, 2026-11-18) | `scan_inner` oracle for the Tier 2 structural harnesses over `scan_value_inner`: under `#[kani::stub]`, `scan_inner` is replaced by an oracle that returns a rejection with category `oracle_marker` iff the scanned text contains a planted byte marker (manual byte scan, no library search). Note: in Kani 0.68 the stub attribute requires the unstable `stubbing` feature, enabled per-invocation as `cargo kani -Z stubbing`; the CI lane uses the same flag | Model of the callee, not of the traversal under test | Tier 2 properties cover `scan_value_inner`'s traversal logic only — metadata-key scanning (M3), recursion into arrays/objects, depth fail-closed. They assert nothing about `scan_inner`'s detection quality, which is Tier 1 + example-test territory. The stub is used by Tier 2 harnesses only |
+| T6 (Stage 1, 2026-11-18) | Fabricated `SecretScanner` receiver for Tier 2 harnesses: a `ManuallyDrop`-wrapped value whose bytes are concrete zeros (transmute from a zeroed word array), passed only as the `&self` argument of `scan_value_inner`. (Attempts before this device, all abandoned before any reliance: `mem::zeroed` — Kani's own safety check on its `write_bytes` rejected it for this type, 1 failing check in an otherwise-passing probe; `MaybeUninit` uninitialized storage — the solve timed out at 600 s on the nondeterministic receiver state; a reference cast from an aligned byte buffer — the solve blew past 4 GB and was operator-killed) | Modelling device for a receiver the callee never inspects | `scan_value_inner` never reads the receiver's regex fields (auditable in source: it forwards `self` only to the T5-stubbed `scan_inner` and to its own recursion); the fabricated value is never dropped and never used for anything else. If a production change ever makes `scan_value_inner` read a field, this entry is void and the Tier 2 harnesses must be re-derived |
+| T3-S1 (Stage 1, 2026-11-18) | Entropy stub under T3, for the M4 threshold-decision harnesses only: `shannon_entropy_bits_per_char` is replaced via `#[kani::stub]` by constant-returning stubs at three values bracketing the threshold (exactly 4.2, and ±ε around it); each harness asserts `meets_high_entropy`'s boolean decision for a token meeting the length/class preconditions | Stub of the entropy value, registered before use as T3 requires | The threshold property is reported verified-modulo-T3. The entropy computation itself is covered by example tests and the concrete Kani battery on the decision's preconditions. Rung 5 evidence for why: even fully concrete entropy inputs time out at 600 s (the `HashMap` seed is modelled nondeterministically, so every lookup branches symbolically) |
+
+Register rule: an entry is added **before** the trusted item is relied on, with its bound stated. The register ships with the Stage 1 result report in full.
+
+## CI lane design (against the repo's actual workflows; audit G7)
+
+Basis: `.github/workflows/ci.yml` at census HEAD has jobs build (3-OS), test, test-report, plugins, scripts, audit (cargo-audit), release-references; there are no clippy/fmt/Miri jobs. The pilot adds **no** job to `ci.yml`. Instead:
+
+- **Separate workflow** `kani.yml`, so the required gate set and the merge-gate receipt flow are untouched.
+- **Runner/architecture:** `ubuntu-latest`, x86_64 only. Architecture covered by any proof: **x86_64-unknown-linux-gnu**, named here as the judge requires; the scanner is platform-independent string logic, and no cross-platform proof claim is made.
+- **Toolchain isolation:** Kani installed in the lane's own job (pinned `cargo-kani` version recorded in the workflow file at Stage 1; 0.68.0 was the current release at panel time — the pin is re-confirmed at Stage 1 start and the version recorded in the result report). The lane never touches the shipping build's toolchain or `ci.yml`'s jobs.
+- **Triggers:** pull requests touching `src/secrets.rs`, plus a weekly scheduled run. Not a required check.
+- **Failure policy:** advisory — a red lane does not block merge; it uploads its report (Kani JSON/SARIF export) as a workflow artifact and is reviewed under the pilot. Promotion to required is a post-pilot decision, not part of this design.
+- **Ceiling:** job timeout 15 minutes (pre-registered).
+
+— Filed by Musebot-Astro, Stage 0, 2026-11-17.
