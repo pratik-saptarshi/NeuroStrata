@@ -1,0 +1,92 @@
+name: Kani v2 (secrets scanner)
+
+# Advisory lane for the v2 rerun. It is NOT a required check; it is
+# advisory only in the branch-protection sense, not by swallowing failures.
+# A missing or non-successful declared harness fails this job.
+#
+# Toolchain: Kani 0.68.0 / CBMC 6.11.0, x86_64 Linux. The local rerun used
+# aarch64 macOS; proofs are per-target, so the canonical result is this lane.
+#
+# The pure symbolic set (depth, entropy, string-leaf) is fast. The concrete
+# batteries are kept as regression calibration; the JWT/placeholder symbolic
+# forms and the key-scan battery are excluded because they do not complete
+# within the pilot's budget (see docs/kani-pilot-v2/).
+
+on:
+  pull_request:
+    paths:
+      - "src/secrets.rs"
+      - "scripts/kani-json-check.py"
+      - ".github/workflows/kani-v2.yml"
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kani-secrets-v2:
+    name: kani v2 (secrets scanner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Kani 0.68.0
+        run: |
+          cargo install kani-verifier --version 0.68.0 --locked
+          cargo kani setup
+
+      - name: Run declared harnesses
+        run: |
+          set -euo pipefail
+          for h in \
+            tier1_placeholder_battery \
+            tier1_base64_battery \
+            tier1_exempt_code_expression \
+            tier1_exempt_source_reference \
+            tier1_exempt_type_names \
+            tier1_entropy_at_threshold \
+            tier1_entropy_below_threshold \
+            tier1_entropy_above_threshold \
+            tier1_entropy_symbolic \
+            tier2_depth_fail_closed \
+            tier2_depth_symbolic \
+            tier2_string_leaf_symbolic
+          do
+            echo "::group::$h"
+            cargo kani -Z stubbing -Z unstable-options \
+              --harness "$h" \
+              --output-format terse \
+              --export-json "kani-$h.json"
+            echo "::endgroup::"
+          done
+
+      - name: Check every declared harness succeeded
+        run: |
+          python3 scripts/kani-json-check.py \
+            tier1_placeholder_battery \
+            tier1_base64_battery \
+            tier1_exempt_code_expression \
+            tier1_exempt_source_reference \
+            tier1_exempt_type_names \
+            tier1_entropy_at_threshold \
+            tier1_entropy_below_threshold \
+            tier1_entropy_above_threshold \
+            tier1_entropy_symbolic \
+            tier2_depth_fail_closed \
+            tier2_depth_symbolic \
+            tier2_string_leaf_symbolic
+
+      - name: Upload Kani JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kani-v2-json
+          path: kani-*.json
+          if-no-files-found: warn

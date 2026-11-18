@@ -54,3 +54,7 @@ plugins/github-cli/node_modules/
 plugins/openclaw/node_modules/
 plugins/opencode/@opencode/
 kge/
+
+# Local Kani v2 run artifacts (logs/JSON); docs/kani-pilot-v2/run-log.md is tracked.
+/runs/
+
