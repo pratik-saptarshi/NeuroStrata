@@ -173,4 +173,11 @@ the breach is reported as such. A cached fast PR lane (or a larger runner)
 is future work and is not claimed. The local 777 s v1 sum was never a
 representative CI measurement; this run is.
 
+**Post-renegotiation measurements:** run 44394453130 passed in **13m26s**
+and run 44398491086 passed in **10m32s**, both with all 12 declared harnesses
+`Success` and the JSON gate passing. The 15-minute ceiling was therefore met
+on the second and third runs but breached on the first cold run; it remains
+recorded as **at risk**, not as a comfortable pass. The 45-minute budget is
+the safe envelope.
+
 — Amended 2026-11-18.
