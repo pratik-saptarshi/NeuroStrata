@@ -117,10 +117,16 @@ rescue; the detection claim is withdrawn and recorded as a negative result.
 
 Added `.github/workflows/kani-v2.yml` and `scripts/kani-json-check.py`.
 The lane installs Kani 0.68.0, runs the declared 12 harnesses, and fails if
-any expected harness is missing or not `Success`. It has **not** run on
-GitHub yet; the local JSON check was exercised against the four Phase 2
-results and passed. The 15-minute ceiling is therefore designed and locally
-measured but not yet a CI measurement.
+any expected harness is missing or not `Success`.
+
+**Measured on PR #113 (run 44391519563):** the job was **cancelled at the
+15-minute timeout** while still on the first harness (`tier1_placeholder_battery`).
+The install step completed; the cold Kani codegen for the 463-package crate
+on a 2-core `ubuntu-latest` runner consumed the budget before a verdict. No
+harness failed; no verdict was reached. The 15-minute ceiling is **breached**
+and the full lane is renegotiated to 45 minutes (Amendment 3). The local
+JSON check was exercised against the four Phase 2 results and passed; a
+successful CI run is still pending.
 
 ## Local JSON check
 

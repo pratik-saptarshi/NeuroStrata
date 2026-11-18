@@ -33,7 +33,12 @@ jobs:
   kani-secrets-v2:
     name: kani v2 (secrets scanner)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The original 15-minute ceiling was breached on the first run (cold
+    # Kani codegen for the 463-package crate; no harness verdict before the
+    # cancel). This is the renegotiated full-lane budget, recorded in
+    # docs/kani-pilot-v2/pre-registration.md (Amendment 3). A cached fast
+    # PR lane is future work, not claimed here.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
