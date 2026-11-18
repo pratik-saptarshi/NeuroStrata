@@ -1,0 +1,65 @@
+name: Kani (secrets scanner pilot)
+
+# Advisory lane for the Kani pilot over src/secrets.rs (Stage 1).
+# NOT a required check: it runs only the harnesses that verified
+# locally (see the pilot's produced/verified split in the Stage 1
+# log); the remaining produced harnesses are excluded by name
+# because they exceed this toolchain's limits on a small machine
+# (regex-crate ICE, CBMC memory in split/serde_json machinery).
+# The harnesses rely on Kani's unstable stubbing feature, enabled
+# per-invocation with `-Z stubbing` (register items T5/T6/T3-S1).
+
+on:
+  pull_request:
+    paths:
+      - "src/secrets.rs"
+      - ".github/workflows/kani.yml"
+  schedule:
+    # Weekly, Mondays 06:17 UTC.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kani-secrets:
+    name: kani (secrets scanner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Kani 0.68.0
+        run: |
+          cargo install kani-verifier --version 0.68.0 --locked
+          cargo kani setup
+
+      - name: Run verified harnesses
+        run: |
+          set -e
+          for h in \
+            tier1_placeholder_battery \
+            tier1_base64_battery \
+            tier1_exempt_code_expression \
+            tier1_exempt_source_reference \
+            tier1_exempt_type_names \
+            tier1_entropy_at_threshold \
+            tier1_entropy_below_threshold \
+            tier1_entropy_above_threshold \
+            tier2_depth_fail_closed
+          do
+            cargo kani -Z stubbing -Z unstable-options --harness "$h" --export-json "kani-$h.json" || true
+          done
+
+      - name: Upload Kani reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kani-reports
+          path: kani-*.json
+          if-no-files-found: ignore
