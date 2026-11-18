@@ -714,19 +714,22 @@ pub async fn build_task_graph_context(
     for r in &golden_rules {
         seen_ids.insert(r.id.clone());
         let snippet: String = r.payload.content.chars().take(240).collect();
+        let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
         prompt_lines.push(format!(
             "  - [GOLDEN {}] `{}`: {}",
             r.payload.memory_type,
             r.id,
-            snippet.replace('\n', " ")
+            presented.replace('\n', " ")
         ));
-        golden_json.push(json!({
+        let mut entry = json!({
             "id": r.id,
             "memory_type": r.payload.memory_type,
             "location": r.payload.location,
-            "snippet": snippet,
+            "snippet": presented,
             "metadata": r.payload.metadata,
-        }));
+        });
+        crate::rdf::provenance::attach_presentation(&mut entry, &r.payload.metadata, "snippet");
+        golden_json.push(entry);
     }
 
     let raw_hits = store
@@ -744,6 +747,7 @@ pub async fn build_task_graph_context(
             continue;
         }
         let snippet: String = r.payload.content.chars().take(140).collect();
+        let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
         let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
         let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
         let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
@@ -753,20 +757,22 @@ pub async fn build_task_graph_context(
             r.payload.memory_type,
             r.id,
             if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
-            snippet.replace('\n', " ")
+            presented.replace('\n', " ")
         ));
-        hits_json.push(json!({
+        let mut entry = json!({
             "id": r.id,
             "memory_type": r.payload.memory_type,
             "location": r.payload.location,
-            "snippet": snippet,
+            "snippet": presented,
             "metadata": r.payload.metadata,
             "calls": calls,
             "imports": imports,
             "governs": governs,
             "depends_on": depends_on,
             "evidence": r.evidence,
-        }));
+        });
+        crate::rdf::provenance::attach_presentation(&mut entry, &r.payload.metadata, "snippet");
+        hits_json.push(entry);
         if hits_json.len() >= 5 {
             break;
         }
@@ -1329,6 +1335,70 @@ fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+async fn resolve_task_scope(
+    args: &Value,
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> (std::path::PathBuf, gate::GateScope) {
+    let explicit_root = arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))
+        .map(std::path::PathBuf::from);
+    let rid = crate::registry::registry_row_id(namespace);
+    let registry_root = if let Ok(Some((_, reg_p))) = store.get(namespace, &rid).await {
+        reg_p
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let daemon_root = crate::daemon::resolve_project_root();
+
+    let mut candidates = Vec::new();
+    if let Some(r) = explicit_root {
+        candidates.push(r);
+    }
+    if let Some(r) = registry_root {
+        if !candidates.contains(&r) {
+            candidates.push(r);
+        }
+    }
+    if !candidates.contains(&daemon_root) {
+        candidates.push(daemon_root.clone());
+    }
+
+    let mut chosen_root = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| daemon_root.clone());
+    let mut scope = gate::GateScope::default();
+    for cand in &candidates {
+        let captured = gate::GateScope::capture(cand);
+        if captured.branch.is_some() || captured.worktree.is_some() {
+            chosen_root = cand.clone();
+            scope = captured;
+            break;
+        }
+    }
+    if let Some(explicit_branch) = arg_str(args, "branch") {
+        scope.branch = Some(explicit_branch.to_string());
+    }
+    if scope.worktree.is_none() {
+        if let Some(explicit_wt) = arg_str(args, "worktree") {
+            let wt_path = std::path::PathBuf::from(explicit_wt);
+            let canonical = wt_path
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| explicit_wt.to_string());
+            scope.worktree = Some(canonical);
+        }
+    }
+    (chosen_root, scope)
+}
+
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -1394,7 +1464,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             // but not the branch/worktree: backfill what is missing so the
             // strict gate can judge them, persist it, and leave already
             // attributed rows exactly as they are.
-            let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
             let obj = task_obj_mut(&mut task.payload);
             let branch_missing = obj
                 .get("branch")
@@ -1496,7 +1566,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Err(e) => return format!("ERROR: {}", e),
     };
     task = claimed;
-    let scope = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+    let (scope_root, scope) = resolve_task_scope(&args, &store, &namespace).await;
     {
         let obj = task_obj_mut(&mut task.payload);
         obj.insert("assignee".to_string(), json!(assignee));
@@ -1540,7 +1610,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
+        let binding = crate::task::receipt::Receipt::capture(&id, &scope_root);
         r.record(crate::receipts::store::Receipt {
             session_id: session.clone(),
             task_id: id.clone(),
@@ -1727,8 +1797,7 @@ pub async fn handle_task_update(
                         }
                     }
                     if new_claim {
-                        let scope =
-                            gate::GateScope::capture(&crate::daemon::resolve_project_root());
+                        let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
                         obj.insert("branch".to_string(), json!(scope.branch));
                         obj.insert("worktree".to_string(), json!(scope.worktree));
                     }
@@ -2587,6 +2656,21 @@ pub async fn handle_task_complete(
         })
         .collect();
 
+    // Capability E: post-commit learning hook. Best-effort by design — a
+    // mining/reflection failure is reported and logged, never allowed to roll
+    // back the already-committed task or make completion look successful when
+    // reflection did not happen. The hook never completes a task, so no
+    // recursion back into this handler is possible.
+    let learning_report = crate::learning::hooks::on_task_completed(
+        &store,
+        &emb,
+        &namespace,
+        &id,
+        dedup.as_ref(),
+        &crate::daemon::resolve_project_root(),
+    )
+    .await;
+
     let mut reply = json!({
         "task": task_summary(&id, &completed.payload),
         "extracted_memory_ids": extracted,
@@ -2594,6 +2678,8 @@ pub async fn handle_task_complete(
         "task_intent_signals": signals,
         "transition": { "from": task.status().as_str(), "to": "done" },
     });
+    reply["learning_hook"] = serde_json::to_value(&learning_report)
+        .unwrap_or_else(|_| json!({ "errors": ["serialize learning hook report"] }));
     if !registry_warnings.is_empty() {
         reply["registry_warning"] = json!(registry_warnings.join("; "));
     }
@@ -4937,11 +5023,18 @@ mod tests {
 
     /// Runs the scaffolded pre-commit hook in `dir`; returns its stderr.
     fn run_pre_commit(bash: &std::path::Path, hook: &std::path::Path, dir: &std::path::Path) -> String {
-        let out = std::process::Command::new(bash)
-            .arg(hook)
-            .current_dir(dir)
-            .output()
-            .expect("the hook runs");
+        let mut cmd = std::process::Command::new(bash);
+        cmd.arg(hook).current_dir(dir);
+        // Git for Windows puts its usr/bin (grep, sed, tr, ...) on PATH when it
+        // runs a hook; a bare bash.exe launch does not, so add it the same way.
+        if cfg!(windows) {
+            if let Some(bin) = bash.parent() {
+                let mut paths = vec![bin.to_path_buf()];
+                paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+                cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+            }
+        }
+        let out = cmd.output().expect("the hook runs");
         String::from_utf8_lossy(&out.stderr).to_string()
     }
 
@@ -6156,6 +6249,131 @@ mod tests {
             payload.metadata["task"]["worktree"],
             json!(expected.worktree)
         );
+    }
+
+    #[tokio::test]
+    async fn claim_resolves_scope_from_registry_project_root_and_explicit_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let non_git = tempfile::tempdir().unwrap();
+        let git_wt = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-b", "feature/mcp-claim"])
+            .current_dir(git_wt.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Point daemon project root at a non-git directory (simulating daemon startup in $HOME),
+        // while registering the namespace's project_root at the actual git worktree.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", non_git.path());
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "project_root": git_wt.path().to_string_lossy().to_string()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let id = create_task(&store, "MyProj", "mcp claimed work", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_mcp"
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let expected = gate::GateScope::capture(git_wt.path());
+        assert_eq!(expected.branch.as_deref(), Some("feature/mcp-claim"));
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(payload.metadata["task"]["worktree"], json!(expected.worktree));
+
+        // Another worktree pushing its own branch is not blocked by this MCP-claimed task.
+        let other_scope = gate::GateScope {
+            branch: Some("feature/other-wt".to_string()),
+            worktree: Some("/repo/other-wt".to_string()),
+        };
+        let other_report = gate::run_scoped(&store, "MyProj", Some(&other_scope))
+            .await
+            .unwrap();
+        assert!(
+            !other_report.violations.iter().any(|v| v.kind == "in_progress"),
+            "other worktree must not be blocked: {:?}",
+            other_report.violations
+        );
+    }
+
+    #[test]
+    fn zero_action_exempt_shell_payload_allows_git_push_and_rejects_mutations() {
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push -u origin fix/task-claim-push-scope"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "CARGO_TARGET_DIR=/tmp/target git push -u origin main && git status -s"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "shell",
+            "git pull --rebase && git push && git status"
+        ));
+        assert!(crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "neurostrata-mcp task gate NeuroStrata --strict"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git commit -m 'mutate history'"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push && rm -rf src"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git push > /tmp/pwn"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git diff --output=src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git show --output src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git log --output=src/file.rs"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "bash",
+            "git -c core.sshCommand=evil push"
+        ));
+        assert!(!crate::server::is_zero_action_exempt_shell_payload(
+            "edit",
+            "git push"
+        ));
     }
 
     #[tokio::test]
@@ -8900,6 +9118,110 @@ impl crate::traits::AsAny for ListHidingStore {
         assert!(
             golden.iter().any(|g| g["id"] == "pinned-local-1"),
             "golden_rules must include local pinned rule: {golden:?}"
+        );
+    }
+
+    // ── Capability C: task views + task_validate production surfaces ──────
+    #[tokio::test]
+    async fn task_validate_exposes_advisory_stale_memories_from_non_task_rows() {
+        let store = store_with_namespace("MyProj").await;
+        let fact_id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "MyProj",
+                &fact_id,
+                StubEmbedder.embed("decayed external API fact").await.unwrap(),
+                MemoryPayload {
+                    content: "external API fact that decayed".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"stale_after": "2000-01-01T00:00:00Z"}),
+                },
+            )
+            .await
+            .expect("seed stale fact");
+
+        let reply = handle_task_validate(json!({ "namespace": "MyProj" }), store).await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let alias = parsed
+            .get("stale_memories")
+            .expect("task_validate must expose stale_memories alias");
+        let items = alias.as_array().expect("stale_memories is a list");
+        assert!(
+            items.iter().any(|v| v["id"] == json!(fact_id)),
+            "non-task stale row must be listed: {reply}"
+        );
+        assert!(
+            items.iter().any(|v| v.to_string().contains("advisory")),
+            "stale_memories must be labelled advisory (nonblocking): {reply}"
+        );
+        assert!(parsed.get("stale").is_some(), "legacy `stale` key retained");
+    }
+
+    #[tokio::test]
+    async fn task_view_governing_memories_emit_deprecation_presentation() {
+        let store = store_with_namespace("MyProj").await;
+        let rule_id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "MyProj",
+                &rule_id,
+                StubEmbedder.embed("legacy podman rule").await.unwrap(),
+                MemoryPayload {
+                    content: "legacy podman rule that was superseded".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "deprecation": {
+                            "status": "deprecated",
+                            "superseded_by": "mem-replacement-42",
+                            "reason": "replaced by the podman v2 rule",
+                            "effective_at": 1700000000
+                        },
+                        "not_definition": "does not apply to rootless podman sockets",
+                    }),
+                },
+            )
+            .await
+            .expect("seed deprecated rule");
+
+        let task_id = create_task(&store, "MyProj", "Review podman guidance", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": task_id,
+                "assignee": "agent-a",
+                "session_id": "ses-capc-view"
+            }),
+            store.clone(),
+        )
+        .await;
+        let list: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt = list["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .expect("prompt present");
+        assert!(
+            prompt.contains(
+                "[DEPRECATED — SUPERSEDED BY mem-replacement-42: replaced by the podman v2 rule]"
+            ),
+            "governing memory in task view must emit exact banner: {prompt}"
+        );
+        assert!(
+            prompt.contains("NOT DEFINITION: does not apply to rootless podman sockets"),
+            "governing memory in task view must emit boundary: {prompt}"
         );
     }
 }
