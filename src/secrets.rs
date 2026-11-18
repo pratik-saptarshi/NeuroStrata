@@ -185,8 +185,8 @@ fn source_statement_prefix(text: &str, key_start: usize) -> bool {
     let line_start = text[..key_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let prefix = text[line_start..key_start].trim_start();
     [
-        "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ",
-        "pub ", "fn ", "struct ", "enum ", "impl ", "type ",
+        "let ", "const ", "var ", "return ", "if ", "match ", "for ", "while ", "pub ", "fn ",
+        "struct ", "enum ", "impl ", "type ",
     ]
     .iter()
     .any(|p| prefix.starts_with(p))
@@ -218,9 +218,31 @@ fn looks_like_member_chain(value: &str) -> bool {
 /// (`api_key: String`, `token: Option<PathBuf>`) rather than a credential.
 fn is_known_type_name(value: &str) -> bool {
     const TYPES: &[&str] = &[
-        "String", "str", "bool", "usize", "u64", "u32", "u16", "u8", "i64", "i32",
-        "i16", "i8", "f64", "f32", "PathBuf", "Path", "Option", "Result", "Vec",
-        "Arc", "Rc", "Box", "Mutex", "RwLock", "SecretString",
+        "String",
+        "str",
+        "bool",
+        "usize",
+        "u64",
+        "u32",
+        "u16",
+        "u8",
+        "i64",
+        "i32",
+        "i16",
+        "i8",
+        "f64",
+        "f32",
+        "PathBuf",
+        "Path",
+        "Option",
+        "Result",
+        "Vec",
+        "Arc",
+        "Rc",
+        "Box",
+        "Mutex",
+        "RwLock",
+        "SecretString",
     ];
     TYPES.iter().any(|ty| {
         value == *ty
@@ -454,9 +476,10 @@ impl SecretScanner {
             // The capture stops at `;`, so a quoted value containing `;` has no
             // closing quote at `m.end()`; the opening quote is the reliable
             // marker that this is a literal.
-            let quoted = cap.get(2).map(|m| {
-                matches!(text[..m.start()].chars().last(), Some('"') | Some('\''))
-            }).unwrap_or(false);
+            let quoted = cap
+                .get(2)
+                .map(|m| matches!(text[..m.start()].chars().last(), Some('"') | Some('\'')))
+                .unwrap_or(false);
             // Type annotations use `:`. A config value after `=` (for example
             // `password=&hunter2!`) is never a type annotation, even if it
             // starts with a reference sigil.
@@ -472,8 +495,8 @@ impl SecretScanner {
                 .get(1)
                 .map(|key| source_statement_prefix(text, key.start()))
                 .unwrap_or(false);
-            let literal_keyword = matches!(value, "None" | "true" | "false")
-                || value.starts_with("&self.");
+            let literal_keyword =
+                matches!(value, "None" | "true" | "false") || value.starts_with("&self.");
             if !quoted
                 && (literal_keyword
                     || looks_like_code_expression(value)
@@ -800,6 +823,366 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
+// ─── Kani pilot: proofs over the production decision functions ─────────────
+//
+// Harnesses call the production functions above directly — the verified
+// code is the shipped code (refactor-in-place; see the pilot's G2 bridge
+// design). Properties are factored as plain functions in `mod properties`
+// so the same property can be driven by Kani (proof) and by bolero under
+// `cargo test` (dual-use).
+
+#[cfg(any(test, kani))]
+mod properties {
+    use super::*;
+
+    /// Reference base64 encoder (standard alphabet, with padding), used to
+    /// state the decode round-trip property. Array-based: a `String::push`
+    /// loop over symbolic content is needlessly expensive under CBMC.
+    pub fn base64_encode_ref(data: &[u8]) -> String {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = [0u8; 12];
+        let mut n = 0usize;
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = chunk.get(1).map_or(0, |&b| b as u32);
+            let b2 = chunk.get(2).map_or(0, |&b| b as u32);
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out[n] = CHARS[((triple >> 18) & 0x3F) as usize];
+            out[n + 1] = CHARS[((triple >> 12) & 0x3F) as usize];
+            out[n + 2] = if chunk.len() > 1 {
+                CHARS[((triple >> 6) & 0x3F) as usize]
+            } else {
+                b'='
+            };
+            out[n + 3] = if chunk.len() > 2 {
+                CHARS[(triple & 0x3F) as usize]
+            } else {
+                b'='
+            };
+            n += 4;
+        }
+        // All written bytes are ASCII (CHARS or '='), so this is valid UTF-8.
+        unsafe { String::from_utf8_unchecked(out[..n].to_vec()) }
+    }
+
+    /// `find_jwt_segments` spec: returns Some iff the input has exactly
+    /// two dots, and then the parts are exactly the dot-separated
+    /// segments, in order, with no dot inside any part. Assertions are
+    /// manual byte loops: `format!`/`assert_eq!` on heap values drag
+    /// `core::fmt` into a Kani reachable set and price the proof out.
+    pub fn prop_jwt_segments(s: &str) {
+        let sb = s.as_bytes();
+        let mut dots = 0usize;
+        for i in 0..sb.len() {
+            if sb[i] == b'.' {
+                dots += 1;
+            }
+        }
+        match find_jwt_segments(s) {
+            Some((a, b, c)) => {
+                assert!(dots == 2);
+                let (ab, bb, cb) = (a.as_bytes(), b.as_bytes(), c.as_bytes());
+                assert!(ab.len() + bb.len() + cb.len() + 2 == sb.len());
+                for i in 0..ab.len() {
+                    assert!(sb[i] == ab[i] && ab[i] != b'.');
+                }
+                assert!(sb[ab.len()] == b'.');
+                for i in 0..bb.len() {
+                    assert!(sb[ab.len() + 1 + i] == bb[i] && bb[i] != b'.');
+                }
+                assert!(sb[ab.len() + 1 + bb.len()] == b'.');
+                for i in 0..cb.len() {
+                    assert!(sb[ab.len() + bb.len() + 2 + i] == cb[i] && cb[i] != b'.');
+                }
+            }
+            None => assert!(dots != 2),
+        }
+    }
+
+    /// `base64_decode` round-trip: decoding the reference encoding of
+    /// any byte string returns that byte string.
+    pub fn prop_base64_roundtrip(data: &[u8]) {
+        let enc = base64_encode_ref(data);
+        assert!(base64_decode(&enc) == Some(data.to_vec()));
+    }
+
+    /// `base64_decode` rejection: any character outside the alphabet
+    /// (after trailing `=` padding is trimmed) makes the input invalid,
+    /// and decoding never panics either way.
+    pub fn prop_base64_invalid_char(s: &str) {
+        let trimmed = s.trim_end_matches('=');
+        let mut has_invalid = false;
+        for i in 0..trimmed.len() {
+            let b = trimmed.as_bytes()[i];
+            if !(b.is_ascii_alphanumeric() || b == b'+' || b == b'/') {
+                has_invalid = true;
+            }
+        }
+        let r = base64_decode(s);
+        if has_invalid {
+            assert!(r.is_none());
+        }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::properties::*;
+    use super::*;
+
+    /// Tier 1: `is_placeholder` decision battery (the M5 property).
+    /// The symbolic form of this harness timed out at 600 s at both
+    /// N=16 and N=8 (Stage 1 log, rung 1): the function's composed
+    /// string searches price out a symbolic proof on this machine.
+    /// The concrete battery is the verified form; the general property
+    /// is sampled by the bolero drivers under `cargo test`.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_placeholder_battery() {
+        assert!(is_placeholder("changeme"));
+        assert!(is_placeholder(" your-api-key-here "));
+        assert!(is_placeholder("<api-key>"));
+        assert!(is_placeholder("${API_KEY}"));
+        assert!(is_placeholder("***"));
+        assert!(is_placeholder("xxxx"));
+        assert!(!is_placeholder("xchangeme"));
+        assert!(!is_placeholder("hunter2"));
+        assert!(!is_placeholder("correct-horse-battery"));
+    }
+
+    /// Tier 1: exemption predicates, split per predicate (the combined
+    /// battery exhausted CBMC's memory on this machine; Stage 1 log).
+    /// The predicates must reject password-shaped counterexamples (a
+    /// value that merely contains a dot is not a member chain, a plain
+    /// word is not a type name) while accepting the code shapes they
+    /// exist for.
+    /// Tier 1: `looks_like_member_chain` battery. PRODUCED BUT NOT
+    /// VERIFIED: this harness exhausted CBMC's memory on this machine
+    /// in three forms (8 assertions in one harness; two 4-assertion
+    /// splits) — the `str::split` iterator machinery in the callee is
+    /// the binding constraint (Stage 1 log). Kept as the produced
+    /// artifact; the property is carried by the native test
+    /// `exemption_predicates_cases` under `cargo test`, and the CI
+    /// lane enumerates only the verified harnesses.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_exempt_member_chain() {
+        assert!(looks_like_member_chain("self.token"));
+        assert!(looks_like_member_chain("response.token"));
+        assert!(looks_like_member_chain("process.env.SECRET"));
+        assert!(!looks_like_member_chain("p@ss.w0rd"));
+        assert!(!looks_like_member_chain("a..b"));
+        assert!(!looks_like_member_chain("a."));
+        assert!(!looks_like_member_chain("123.456"));
+        assert!(!looks_like_member_chain("nodots"));
+    }
+
+    /// Tier 1: `looks_like_code_expression` battery.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_exempt_code_expression() {
+        assert!(looks_like_code_expression("a::b"));
+        assert!(looks_like_code_expression("x->y"));
+        assert!(looks_like_code_expression("f(x)"));
+        assert!(looks_like_code_expression("self.token"));
+        assert!(!looks_like_code_expression("correct.horse"));
+        assert!(!looks_like_code_expression("hunter2"));
+    }
+
+    /// Tier 1: `looks_like_source_reference` battery.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_exempt_source_reference() {
+        assert!(looks_like_source_reference("response.token"));
+        assert!(!looks_like_source_reference("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(looks_like_source_reference("a[0"));
+        assert!(!looks_like_source_reference("a[0]"));
+    }
+
+    /// Tier 1: type-name / type-annotation battery.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_exempt_type_names() {
+        assert!(is_known_type_name("String"));
+        assert!(is_known_type_name("Vec<u8>"));
+        assert!(is_known_type_name("Option"));
+        assert!(!is_known_type_name("Stringy"));
+        assert!(!is_known_type_name("MyType"));
+        assert!(looks_like_type_annotation("Vec<u8>"));
+        assert!(!looks_like_type_annotation(""));
+    }
+
+    /// Tier 1: `find_jwt_segments` (the M2 property), acceptance cases
+    /// by direct tuple equality. PRODUCED BUT NOT VERIFIED: every
+    /// attempted form exhausted CBMC's memory or timed out on this
+    /// machine (Stage 1 log, rung 2a) — symbolic strings, exhaustive
+    /// enumeration over {a, b, .} (length <= 5, then <= 3), a
+    /// designed-family form through the shared property function, and
+    /// this micro-battery: the callee's `str::split` machinery is the
+    /// binding constraint. Kept as the produced artifact; the property
+    /// is carried by the bolero driver and the native test
+    /// `jwt_segments_cases`, and the CI lane enumerates only the
+    /// verified harnesses.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_jwt_segments_some() {
+        assert!(find_jwt_segments("a.b.c") == Some(("a", "b", "c")));
+        assert!(find_jwt_segments("ab.cd.ef") == Some(("ab", "cd", "ef")));
+        assert!(find_jwt_segments("..") == Some(("", "", "")));
+        assert!(find_jwt_segments("a..c") == Some(("a", "", "c")));
+    }
+
+    /// Tier 1: `find_jwt_segments` rejection cases (wrong dot count).
+    /// PRODUCED BUT NOT VERIFIED (same outcome as its companion;
+    /// see `tier1_jwt_segments_some`).
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn tier1_jwt_segments_none() {
+        assert!(find_jwt_segments("a.b") == None);
+        assert!(find_jwt_segments("a.b.c.d") == None);
+        assert!(find_jwt_segments("...") == None);
+        assert!(find_jwt_segments("") == None);
+    }
+
+    /// Tier 1: `base64_decode` concrete battery — pins the decode
+    /// table's observable behaviour, including the OnceLock
+    /// initialization path (register T1). The symbolic round-trip and
+    /// invalid-char forms timed out at 600 s in three variants
+    /// (Stage 1 log, rung 2b); those properties are carried by the
+    /// bolero drivers under `cargo test`.
+    #[kani::proof]
+    #[kani::unwind(96)]
+    fn tier1_base64_battery() {
+        assert!(base64_decode("") == Some(Vec::new()));
+        assert!(base64_decode("QQ==") == Some(b"A".to_vec()));
+        assert!(base64_decode("QUI=") == Some(b"AB".to_vec()));
+        assert!(base64_decode("QUJD") == Some(b"ABC".to_vec()));
+        assert!(base64_decode("aGVsbG8=") == Some(b"hello".to_vec()));
+        // Padding is optional: trailing '=' is trimmed before decoding.
+        assert!(base64_decode("aGVsbG8") == Some(b"hello".to_vec()));
+        assert!(base64_decode("====") == Some(Vec::new()));
+        assert!(base64_decode("!!").is_none());
+        assert!(base64_decode("aGVsbG8!").is_none());
+    }
+
+    /// Tier 2 oracle (register T5): rejects iff the scanned text
+    /// contains the planted marker, found by a manual byte scan.
+    fn scan_inner_oracle(
+        _scanner: &SecretScanner,
+        text: &str,
+        location: &str,
+    ) -> Option<Rejection> {
+        let bytes = text.as_bytes();
+        let marker = b"KANI_MARKER";
+        if bytes.len() >= marker.len() {
+            let mut i = 0;
+            while i + marker.len() <= bytes.len() {
+                let mut j = 0;
+                let mut hit = true;
+                while j < marker.len() {
+                    if bytes[i + j] != marker[j] {
+                        hit = false;
+                        break;
+                    }
+                    j += 1;
+                }
+                if hit {
+                    return Some(Rejection {
+                        location: location.to_string(),
+                        category: "oracle_marker",
+                    });
+                }
+                i += 1;
+            }
+        }
+        None
+    }
+
+    /// Fabricated scanner receiver for Tier 2 (register T6): the
+    /// receiver's fields are never read — the only callee that would
+    /// read them is stubbed (T5). Concrete zero bytes via transmute
+    /// from a zeroed word array, never dropped.
+    fn fabricated_scanner() -> std::mem::ManuallyDrop<SecretScanner> {
+        const SCANNER_WORDS: usize = std::mem::size_of::<SecretScanner>() / 8;
+        std::mem::ManuallyDrop::new(unsafe {
+            std::mem::transmute::<[u64; SCANNER_WORDS], SecretScanner>([0u64; SCANNER_WORDS])
+        })
+    }
+
+    /// Tier 2: depth fail-closed in `scan_value_inner` (no map, no
+    /// scan call on this path). Verified (Stage 1 log).
+    #[kani::proof]
+    #[kani::unwind(32)]
+    #[kani::stub(SecretScanner::scan_inner, scan_inner_oracle)]
+    fn tier2_depth_fail_closed() {
+        let scanner = fabricated_scanner();
+        let r = scanner.scan_value_inner(&Value::Null, "meta", MAX_DEPTH + 1);
+        assert!(matches!(r, Some(ref rej) if rej.category == "max_depth_exceeded"));
+    }
+
+    /// Tier 2: `scan_value_inner` scans object keys (the M3
+    /// property) — marker in the key, clean value. PRODUCED BUT NOT
+    /// VERIFIED: this harness timed out at 600 s under both the
+    /// default solver and kissat (symex-bound in the serde_json /
+    /// String machinery; Stage 1 log). It is kept as the produced
+    /// artifact of the pilot; the property is carried by the
+    /// cargo-test drivers with the real scanner, and the CI lane
+    /// enumerates only the verified harnesses.
+    #[kani::proof]
+    #[kani::unwind(32)]
+    #[kani::stub(SecretScanner::scan_inner, scan_inner_oracle)]
+    fn tier2_key_scan() {
+        let scanner = fabricated_scanner();
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "KANI_MARKER".to_string(),
+            Value::String("clean".to_string()),
+        );
+        let v = Value::Object(map);
+        let r = scanner.scan_value_inner(&v, "meta", 0);
+        assert!(matches!(r, Some(ref rej) if rej.category == "oracle_marker"));
+    }
+
+    /// Entropy stub (register T3-S1): constant entropy at the threshold.
+    fn entropy_at_threshold(_s: &str) -> Option<f64> {
+        Some(4.2)
+    }
+
+    /// Entropy stub (register T3-S1): constant entropy below threshold.
+    fn entropy_below_threshold(_s: &str) -> Option<f64> {
+        Some(4.19)
+    }
+
+    /// Entropy stub (register T3-S1): constant entropy above threshold.
+    fn entropy_above_threshold(_s: &str) -> Option<f64> {
+        Some(4.21)
+    }
+
+    /// M4 threshold decision: with the entropy value stubbed to
+    /// exactly the threshold, `meets_high_entropy` must accept (the
+    /// comparison is `>=`). A `>` mutant flips this harness.
+    /// Verified modulo T3 (Stage 1 log).
+    #[kani::proof]
+    #[kani::stub(shannon_entropy_bits_per_char, entropy_at_threshold)]
+    fn tier1_entropy_at_threshold() {
+        assert!(meets_high_entropy("abcdefghijklmnopqrstuv1x"));
+    }
+
+    /// M4 companion: just below the threshold, the decision is reject.
+    #[kani::proof]
+    #[kani::stub(shannon_entropy_bits_per_char, entropy_below_threshold)]
+    fn tier1_entropy_below_threshold() {
+        assert!(!meets_high_entropy("abcdefghijklmnopqrstuv1x"));
+    }
+
+    /// M4 companion: just above the threshold, the decision is accept.
+    #[kani::proof]
+    #[kani::stub(shannon_entropy_bits_per_char, entropy_above_threshold)]
+    fn tier1_entropy_above_threshold() {
+        assert!(meets_high_entropy("abcdefghijklmnopqrstuv1x"));
+    }
+}
+
 /// Scan user-controlled content + metadata at an entry point.
 /// Returns `Some(Rejection)` on detection, `None` if clean.
 pub fn scan_entry_point(
@@ -1053,18 +1436,20 @@ mod tests {
     #[test]
     fn high_entropy_low_entropy_value_falls_back_to_password() {
         // >=24 chars but (almost) all the same character → entropy below 4.2.
-        let r = SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content")
-            .unwrap();
+        let r =
+            SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content").unwrap();
         assert_eq!(r.category, "password");
     }
 
     #[test]
     fn short_value_not_high_entropy_detected() {
         // 20 chars, below the 24-char threshold.
-        assert!(SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
-            || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
-                .map(|r| r.category == "password")
-                .unwrap_or(false));
+        assert!(
+            SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
+                || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
+                    .map(|r| r.category == "password")
+                    .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -1108,7 +1493,11 @@ mod tests {
         );
         let r = SecretScanner::scan_value(&Value::Object(map), "metadata").unwrap();
         assert_eq!(r.category, "github_pat");
-        assert!(r.location.contains("<key>"), "the location names the key: {}", r.location);
+        assert!(
+            r.location.contains("<key>"),
+            "the location names the key: {}",
+            r.location
+        );
         assert!(
             !r.to_string().contains("ghp_"),
             "the rejection must not echo the credential-bearing key: {r}"
@@ -1133,7 +1522,10 @@ mod tests {
     fn single_line_token_straddling_a_chunk_boundary_is_detected() {
         let header = base64_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let payload = base64_encode(br#"{"sub":"1234567890","name":"John"}"#);
-        let jwt = format!("{}.{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", header, payload);
+        let jwt = format!(
+            "{}.{}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            header, payload
+        );
         let mut text = "a".repeat(MAX_SCAN_BYTES - 10);
         text.push_str(&jwt);
         assert!(
@@ -1205,7 +1597,10 @@ mod tests {
         // A document that starts with `${` likewise.
         let xml = r#"<config>api_key = "sk-live-1234567890abcdefghijklmnop"</config>"#;
         let r = SecretScanner::scan_str(xml, "content");
-        assert!(r.is_some(), "secret inside <config> document must be rejected");
+        assert!(
+            r.is_some(),
+            "secret inside <config> document must be rejected"
+        );
         assert!(
             matches!(
                 r.as_ref().map(|r| r.category),
@@ -1386,6 +1781,163 @@ mod tests {
         let dirty_doc = format!("{prefix}\n{non_jwt_triplet}\n{valid_jwt}\n");
         let r = SecretScanner::scan_str(&dirty_doc, "content").expect("valid jwt after non-jwt");
         assert_eq!(r.category, "jwt");
+    }
+
+    // ── Kani pilot: property drivers (dual-use) ─────────────────────
+    //
+    // The shared property functions in `mod properties` are proven by
+    // the Kani harnesses in `mod kani_proofs` where the machine allows
+    // and sampled here under bolero where it does not (symbolic forms
+    // that timed out; see the Stage 1 log for the produced/verified
+    // split). In test mode bolero runs each driver over its built-in
+    // corpus of generated inputs.
+
+    #[test]
+    fn jwt_segments_property_sampled() {
+        bolero::check!()
+            .with_type::<Vec<u8>>()
+            .for_each(|bytes: &Vec<u8>| {
+                // Map arbitrary bytes onto the structural alphabet so
+                // dot placement is densely sampled.
+                let s: String = bytes
+                    .iter()
+                    .take(12)
+                    .map(|b| [b'a', b'b', b'.'][(b % 3) as usize] as char)
+                    .collect();
+                crate::secrets::properties::prop_jwt_segments(&s);
+            });
+    }
+
+    #[test]
+    fn base64_roundtrip_property_sampled() {
+        bolero::check!()
+            .with_type::<Vec<u8>>()
+            .for_each(|bytes: &Vec<u8>| {
+                // The reference encoder is sized for <= 9 input bytes.
+                let n = bytes.len().min(9);
+                crate::secrets::properties::prop_base64_roundtrip(&bytes[..n]);
+            });
+    }
+
+    #[test]
+    fn base64_invalid_char_property_sampled() {
+        bolero::check!()
+            .with_type::<String>()
+            .for_each(|s: &String| {
+                let t: String = s.chars().take(12).collect();
+                crate::secrets::properties::prop_base64_invalid_char(&t);
+            });
+    }
+
+    /// M1 driver: `validate_provider_form` length boundaries, called
+    /// directly. The end-to-end tests above exercise the same forms
+    /// through the regex phases; this test pins the boundary itself
+    /// (a candidate of exactly `min_len` is accepted, one byte shorter
+    /// is not) for every provider form, including the AKIA suffix rule.
+    #[test]
+    fn provider_form_length_boundaries() {
+        let scanner = SecretScanner::instance();
+        let at = |prefix: &str, total: usize| -> String {
+            let mut s = String::from(prefix);
+            while s.len() < total {
+                s.push('A');
+            }
+            s
+        };
+        // (prefix, min_len, expected category)
+        let forms = [
+            ("ghp_", 16, "github_pat"),
+            ("gho_", 16, "github_pat"),
+            ("github_pat_", 40, "github_pat"),
+            ("sk-ant-", 16, "anthropic_token"),
+            ("sk-proj-", 20, "openai_project_key"),
+            ("sk-", 40, "openai_key"),
+            ("xoxb-", 16, "slack_token"),
+        ];
+        for (prefix, min_len, category) in forms {
+            assert_eq!(
+                scanner.validate_provider_form(&at(prefix, min_len)),
+                Some(category),
+                "{prefix} at min_len {min_len} must be accepted"
+            );
+            assert_eq!(
+                scanner.validate_provider_form(&at(prefix, min_len - 1)),
+                None,
+                "{prefix} below min_len must be rejected"
+            );
+        }
+        // AKIA: 4-char prefix + 16-char [0-9A-Z] suffix = 20.
+        assert_eq!(
+            scanner.validate_provider_form("AKIAIOSFODNN7EXAMPLE"),
+            Some("aws_access_key")
+        );
+        // Lowercase suffix fails the suffix regex.
+        assert_eq!(scanner.validate_provider_form("AKIAiosfodnn7example"), None);
+        // 15-char suffix: below min_len and fails the suffix shape.
+        assert_eq!(scanner.validate_provider_form("AKIAIOSFODNN7EXAMP"), None);
+    }
+
+    /// Native carrier for the exemption-predicate batteries whose
+    /// Kani forms are split-limited (member chain) or verified
+    /// (code expression, source reference, type names): the same
+    /// assertions, executed natively.
+    #[test]
+    fn exemption_predicates_cases() {
+        assert!(looks_like_member_chain("self.token"));
+        assert!(looks_like_member_chain("response.token"));
+        assert!(looks_like_member_chain("process.env.SECRET"));
+        assert!(!looks_like_member_chain("p@ss.w0rd"));
+        assert!(!looks_like_member_chain("a..b"));
+        assert!(!looks_like_member_chain("a."));
+        assert!(!looks_like_member_chain("123.456"));
+        assert!(!looks_like_member_chain("nodots"));
+        assert!(looks_like_code_expression("a::b"));
+        assert!(looks_like_code_expression("x->y"));
+        assert!(looks_like_code_expression("f(x)"));
+        assert!(looks_like_code_expression("self.token"));
+        assert!(!looks_like_code_expression("correct.horse"));
+        assert!(!looks_like_code_expression("hunter2"));
+        assert!(looks_like_source_reference("response.token"));
+        assert!(!looks_like_source_reference("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(looks_like_source_reference("a[0"));
+        assert!(!looks_like_source_reference("a[0]"));
+        assert!(is_known_type_name("String"));
+        assert!(is_known_type_name("Vec<u8>"));
+        assert!(is_known_type_name("Option"));
+        assert!(!is_known_type_name("Stringy"));
+        assert!(!is_known_type_name("MyType"));
+        assert!(looks_like_type_annotation("Vec<u8>"));
+        assert!(!looks_like_type_annotation(""));
+    }
+
+    /// Native carrier for the `find_jwt_segments` micro-battery (the
+    /// M2 property; its Kani forms are split-limited — see
+    /// `tier1_jwt_segments_some`). The general property is sampled by
+    /// `jwt_segments_property_sampled` above.
+    #[test]
+    fn jwt_segments_cases() {
+        assert_eq!(find_jwt_segments("a.b.c"), Some(("a", "b", "c")));
+        assert_eq!(find_jwt_segments("ab.cd.ef"), Some(("ab", "cd", "ef")));
+        assert_eq!(find_jwt_segments(".."), Some(("", "", "")));
+        assert_eq!(find_jwt_segments("a..c"), Some(("a", "", "c")));
+        assert_eq!(find_jwt_segments(".b.c"), Some(("", "b", "c")));
+        assert_eq!(find_jwt_segments("a.b."), Some(("a", "b", "")));
+        assert_eq!(find_jwt_segments("a.b"), None);
+        assert_eq!(find_jwt_segments("a.b.c.d"), None);
+        assert_eq!(find_jwt_segments("..."), None);
+        assert_eq!(find_jwt_segments(""), None);
+        assert_eq!(find_jwt_segments("abc"), None);
+    }
+
+    /// JWT header validation on the canonical example header.
+    #[test]
+    fn jwt_header_validation_cases() {
+        // {"alg":"HS256","typ":"JWT"} in base64url, unpadded.
+        assert!(is_valid_jwt_header("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        // Decodes to "hello": not JSON, not a JWT header.
+        assert!(!is_valid_jwt_header("aGVsbG8"));
+        // Not base64 at all.
+        assert!(!is_valid_jwt_header("!!!"));
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
