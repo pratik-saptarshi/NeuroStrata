@@ -158,3 +158,19 @@ as a rescue; the detection claim is withdrawn and the negative result is
 reported.
 
 — Amended 2026-11-18, before the symbolic success ruling.
+
+## Amendment 3 — 2026-11-18 (CI ceiling breach)
+
+The first run of `kani-v2.yml` on PR #113 was cancelled by its 15-minute job
+timeout. The log shows the job reached `Run declared harnesses` and then
+`Checking harness ... tier1_placeholder_battery`; no harness verdict was
+produced. The cause is cold Kani codegen for the 463-package crate on a
+2-core `ubuntu-latest` runner, not a harness failure. The 15-minute number
+in the frozen terms is therefore **not met** on the first cold run.
+
+The full advisory lane is renegotiated to a **45-minute** job timeout, and
+the breach is reported as such. A cached fast PR lane (or a larger runner)
+is future work and is not claimed. The local 777 s v1 sum was never a
+representative CI measurement; this run is.
+
+— Amended 2026-11-18.
