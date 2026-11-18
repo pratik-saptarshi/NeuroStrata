@@ -13,7 +13,7 @@ pre-registration, not a continuation.
 | 2 — symbolic harnesses on Kani 0.68 | complete; **3 symbolic proofs** (entropy, depth, string leaf) |
 | 3 — detection core on Kani `main` (#5066) | attempted; #5024 cleared, blocked by #5101 thread-local `AnonConst`; detection claim withdrawn |
 | 4 — mutant matrix v2 | partial; M3′ and M4′ caught **by proof** (false negative) |
-| 5 — CI lane | workflow + JSON gate added; first PR run breached the 15-min ceiling during cold codegen; full lane renegotiated to 45 min |
+| 5 — CI lane | measured on PR #113: first cold run breached 15 min; renegotiated runs **passed all 12 harnesses in 13m26s and 10m32s** on x86_64 Linux |
 | 6 — report and close-out | run log written; final report pending |
 
 See `run-log.md` for the full execution record and `pre-registration.md`

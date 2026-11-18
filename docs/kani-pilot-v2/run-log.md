@@ -119,14 +119,46 @@ Added `.github/workflows/kani-v2.yml` and `scripts/kani-json-check.py`.
 The lane installs Kani 0.68.0, runs the declared 12 harnesses, and fails if
 any expected harness is missing or not `Success`.
 
-**Measured on PR #113 (run 44391519563):** the job was **cancelled at the
-15-minute timeout** while still on the first harness (`tier1_placeholder_battery`).
-The install step completed; the cold Kani codegen for the 463-package crate
-on a 2-core `ubuntu-latest` runner consumed the budget before a verdict. No
-harness failed; no verdict was reached. The 15-minute ceiling is **breached**
-and the full lane is renegotiated to 45 minutes (Amendment 3). The local
-JSON check was exercised against the four Phase 2 results and passed; a
-successful CI run is still pending.
+**Measured on PR #113, first run (44391519563, 15-minute timeout):** the job
+was **cancelled at 15m18s** while still on the first harness
+(`tier1_placeholder_battery`). The install step completed; the cold Kani
+codegen for the 463-package crate on a 2-core `ubuntu-latest` runner consumed
+the budget before a verdict. No harness failed; no verdict was reached.
+
+**Second run (44394453130, 45-minute renegotiated timeout): SUCCESS in
+13m26s**, with all 12 declared harnesses `Success` and the JSON gate passing:
+
+| Harness | Result | Verification time |
+|---|---|---|
+| `tier1_placeholder_battery` | Success | 16.6 s |
+| `tier1_base64_battery` | Success | 21.6 s |
+| `tier1_exempt_code_expression` | Success | 9.8 s |
+| `tier1_exempt_source_reference` | Success | 32.5 s |
+| `tier1_exempt_type_names` | Success | 24.7 s |
+| `tier1_entropy_at_threshold` | Success | 1.76 s |
+| `tier1_entropy_below_threshold` | Success | 1.94 s |
+| `tier1_entropy_above_threshold` | Success | 1.85 s |
+| `tier1_entropy_symbolic` | Success | 2.25 s |
+| `tier2_depth_fail_closed` | Success | 0.69 s |
+| `tier2_depth_symbolic` | Success | 0.82 s |
+| `tier2_string_leaf_symbolic` | Success | 1.48 s |
+
+The 15-minute ceiling is therefore **at risk, and was breached on the first
+cold run**; the 45-minute budget is the measured safe envelope for the full
+lane. The base64 concrete battery passes on x86_64 Linux, which confirms the
+aarch64 base64 failure is host-std-specific, not a property failure.
+
+**Third run (44398491086, after the doc-gate fix): SUCCESS in 10m32s**, all
+12 declared harnesses again. The 15-minute ceiling is met on warm/typical
+runs (13m26s, 10m32s) but breached on the cold first run (15m18s); it remains
+recorded as at-risk rather than guaranteed.
+
+**Repo-wide check:** the first `test (ubuntu)` run failed
+`doc_gate::tests::doc_gate_passes_on_live_repository` because
+`docs/kani-pilot` and `docs/kani-pilot-v2` were unclassified top-level docs
+directories. `docs/manifest.json` now lists both under `support_dirs`; the
+live doc-gate test passes locally and `test (ubuntu)` passes on run
+44398491106.
 
 ## Local JSON check
 
@@ -156,10 +188,12 @@ done
 
 ## Verdict at this point
 
-**Inconclusive, with a positive symbolic core and a negative detection result.**
-The rerun proves three properties v1 did not (one over all `f64` entropy
-values, one over all depths, one over all bounded string leaves) and catches
-two false-negative mutants by proof. It does not reach the scanner's detection
-path, because Kani `main` is blocked by the open #5101 thread-local
-`AnonConst` class after #5066 clears the regex ICE. The CI lane is written but
-unmeasured on GitHub.
+**Inconclusive, with a positive symbolic core, a negative detection result,
+and a measured CI lane.** The rerun proves three properties v1 did not (one
+over all `f64` entropy values, one over all depths, one over all bounded
+string leaves) and catches two false-negative mutants by proof. It does not
+reach the scanner's detection path, because Kani `main` is blocked by the open
+#5101 thread-local `AnonConst` class after #5066 clears the regex ICE. The CI
+lane runs all 12 declared harnesses successfully in 13m26s on x86_64 Linux
+under a 45-minute budget; the original 15-minute ceiling was breached on the
+first cold run and is recorded as at-risk.
