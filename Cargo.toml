@@ -147,6 +147,9 @@ openssl = { version = "0.10.82", features = ["vendored"] }
 # Cargo.lock); the direct dev edge only exposes `ServiceExt::oneshot`
 # so the daemon middleware wiring test can drive a Router in-process.
 tower = { version = "0.5", features = ["util"] }
+# Dual-use property drivers for the secrets-scanner Kani pilot: the same
+# property functions run under Kani (proof) and bolero (test/fuzz).
+bolero = "0.13"
 
 [build-dependencies]
 cxx-build = "=1.0.205"
