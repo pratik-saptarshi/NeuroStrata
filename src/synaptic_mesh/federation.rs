@@ -117,7 +117,7 @@ mod tests {
             }
         });
         let result = remote_list(&format!("http://127.0.0.1:{}", port), "ns", "t").await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
         let arr = result.unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], "m1");
