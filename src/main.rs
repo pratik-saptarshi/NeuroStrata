@@ -1147,24 +1147,39 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
 
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
 fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
-    use std::io::Write;
     if let Some(file) = DAEMON_LOCK.get() {
         let report = match outcome {
             Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
             Err(e) => format!("error: {}", e),
         };
-        let _ = file.set_len(0);
-        let _ = (&*file).write_all(report.as_bytes());
-        let _ = file.sync_all();
-        if let Err(e) = file.set_len(0) {
-            tracing::warn!("final checkpoint report truncate failed: {e}");
-        }
-        if let Err(e) = (&*file).write_all(report.as_bytes()) {
-            tracing::warn!("final checkpoint report write failed: {e}");
-        }
-        if let Err(e) = file.sync_all() {
-            tracing::warn!("final checkpoint report sync failed: {e}");
-        }
+        write_final_checkpoint_report(file, &report);
+    }
+}
+
+/// Writes the final-checkpoint report as the lock file's whole content.
+///
+/// `shutdown` compares the file against FINAL_CHECKPOINT_OK verbatim, so
+/// the report must start at offset 0 with nothing before or after it.
+/// `set_len` truncates without moving the file offset: a truncate-then-write
+/// sequence run from a nonzero offset writes past the new end of file and
+/// leaves a NUL hole in front of the report, which the comparison then
+/// rejects. Seek to the start, write once, and only then truncate away any
+/// tail a longer earlier report left behind.
+fn write_final_checkpoint_report(mut file: &std::fs::File, report: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        tracing::warn!("final checkpoint report seek failed: {e}");
+        return;
+    }
+    if let Err(e) = (&*file).write_all(report.as_bytes()) {
+        tracing::warn!("final checkpoint report write failed: {e}");
+        return;
+    }
+    if let Err(e) = file.set_len(report.len() as u64) {
+        tracing::warn!("final checkpoint report truncate failed: {e}");
+    }
+    if let Err(e) = file.sync_all() {
+        tracing::warn!("final checkpoint report sync failed: {e}");
     }
 }
 
@@ -3198,6 +3213,54 @@ mod tests {
         assert!(
             !daemon_holds_lock(&db),
             "the lock is free once its holder is gone"
+        );
+    }
+
+    #[test]
+    fn a_final_checkpoint_report_is_the_lock_files_whole_content() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let db = std::env::temp_dir()
+            .join(format!("ns-checkpoint-report-{}", uuid::Uuid::new_v4()))
+            .join("ladybug.db");
+        let file = open_daemon_lock(&db).expect("the lock file opens");
+        let path = daemon_lock_path(&db);
+
+        // The state that used to corrupt the report: earlier bytes in the
+        // file and the shared offset sitting past them, so a truncate-then-
+        // write lands beyond the new end of file.
+        let stale = b"error: an earlier, longer report";
+        (&file).write_all(stale).unwrap();
+        assert_eq!(
+            (&file).seek(SeekFrom::Current(0)).unwrap(),
+            stale.len() as u64,
+            "the offset starts where the last write left it"
+        );
+
+        write_final_checkpoint_report(&file, FINAL_CHECKPOINT_OK);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            FINAL_CHECKPOINT_OK,
+            "a completed checkpoint reads back as exactly the OK report"
+        );
+
+        // A longer error report replaces it completely, and a shorter OK
+        // report after that leaves none of the error's tail behind.
+        write_final_checkpoint_report(&file, "error: the checkpoint failed");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "error: the checkpoint failed"
+        );
+        write_final_checkpoint_report(&file, FINAL_CHECKPOINT_OK);
+        let mut raw = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(
+            raw,
+            FINAL_CHECKPOINT_OK.as_bytes(),
+            "no NUL hole in front, no tail behind"
         );
     }
 
