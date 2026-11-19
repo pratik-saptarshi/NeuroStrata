@@ -901,10 +901,9 @@ mod tests {
         std::env::remove_var("NEUROSTRATA_KGE_WEIGHT");
         assert!(kge_weight_from_env() - DEFAULT_KGE_WEIGHT < 1e-6);
 
-        let (model_path, meta_path) =
-            artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
-        assert!(model_path.to_string_lossy().contains("/kge/ns/model.bin"));
-        assert!(meta_path.to_string_lossy().contains("/kge/ns/meta.json"));
+        let (model_path, meta_path) = artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
+        assert!(model_path.ends_with("kge/ns/model.bin"));
+        assert!(meta_path.ends_with("kge/ns/meta.json"));
     }
 
     #[test]

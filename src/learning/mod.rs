@@ -11,6 +11,9 @@ pub mod runtime;
 pub mod split;
 pub mod status;
 pub mod trainer;
+pub mod trajectory;
+pub mod reflection;
+pub mod hooks;
 
 pub use blob_store::BlobStore;
 pub use calibration::TemperatureFitter;

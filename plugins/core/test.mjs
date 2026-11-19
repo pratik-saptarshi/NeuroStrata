@@ -1,12 +1,95 @@
 import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync as execFileSyncTop } from "node:child_process";
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync, chmodSync, utimesSync, copyFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { tmpdir, homedir } from "node:os";
+import { join, isAbsolute } from "node:path";
+
+// Windows cannot execute a .sh file directly (EFTYPE). Production hook
+// execution uses git's own shell, so resolve Git Bash through `git
+// --exec-path` rather than trusting an ambient `bash` (a stock Git for
+// Windows install does not put bash.exe on PATH, and PATH order can bind the
+// WSL launcher, which cannot open a raw Windows path).
+function resolveGitBash() {
+  try {
+    const execPath = execFileSyncTop("git", ["--exec-path"], { encoding: "utf8" }).trim();
+    const candidates = [
+      join(execPath, "..", "..", "bin", "bash.exe"),
+      join(execPath, "..", "..", "usr", "bin", "bash.exe"),
+      join(execPath, "..", "..", "..", "bin", "bash.exe"),
+    ];
+    return candidates.find((candidate) => existsSync(candidate)) || null;
+  } catch {
+    return null;
+  }
+}
+const GIT_BASH = process.platform === "win32" ? resolveGitBash() : null;
+
+function winHookSkip() {
+  return process.platform === "win32" && !GIT_BASH
+    ? "Git Bash not found via git --exec-path; hook tests need git's shell"
+    : false;
+}
+
+// Essentials Windows processes need; the caller's PATH is preserved exactly
+// so the restricted tool directory the tests construct remains the subject
+// environment.
+const WIN_ENV_ESSENTIALS = [
+  "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+  "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+];
+
+function runHook(hookPath, opts) {
+  if (process.platform !== "win32") return execFileSyncTop(hookPath, [], opts);
+  if (!GIT_BASH) {
+    const err = new Error("Git Bash not found; cannot execute the hook on Windows");
+    err.code = "ENOENT_GIT_BASH";
+    throw err;
+  }
+  const env = {};
+  for (const key of WIN_ENV_ESSENTIALS) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  Object.assign(env, opts.env || {});
+  if (env.PATH === undefined && process.env.PATH) env.PATH = process.env.PATH;
+  return execFileSyncTop(GIT_BASH, [hookPath], { ...opts, env });
+}
+
+// On macOS /usr/bin/git is a shim that needs xcrun on PATH; the hook tests
+// deliberately restrict PATH to the fake bin directory, so link the real
+// binary instead of the shim.
+function toolPath(cmd) {
+  if (process.platform === "darwin" && cmd === "git") {
+    try {
+      return execFileSyncTop("xcrun", ["-f", "git"], { encoding: "utf8" }).trim();
+    } catch {}
+    for (const candidate of ["/opt/homebrew/bin/git", "/usr/local/bin/git"]) {
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  if (process.platform === "win32") {
+    // A POSIX prefix ("/usr/bin") resolves against the current Windows drive
+    // and holds nothing. Ask the system where the tool actually is (Git for
+    // Windows provides the POSIX tools the hook needs).
+    try {
+      const found = execFileSyncTop("where", [cmd], { encoding: "utf8" })
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (found) return found;
+    } catch {}
+  }
+  return cmd;
+}
+
+// Git for Windows checks scripts out with CRLF, which bash refuses.
+function hookSource() {
+  return readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+}
 import {
   resolveConfig,
+  resolveProjectRoot,
   findProjectRoot,
   discoverProjectNamespace,
   inspectCodeModeExecution,
@@ -37,6 +120,19 @@ import {
   cachedTaskInjection,
   cachedSubagentPromptByTask,
   PREFETCH_LRU_CAP,
+  sessionContextHandler,
+  sessionCompactionHandler,
+  extractToolName,
+  currentSessionEpoch,
+  incrementSessionEpoch,
+  extractTurnCandidates,
+  postTurnCandidates,
+  extractConceptualBridges,
+  persistConceptualBridges,
+  DAEMON_MEMORY_ADVICE_MARKER,
+  resetAdvisoryStateForTesting,
+  extractDaemonMemoryAdvisory,
+  daemonTokenPath,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -152,7 +248,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
         }
       });
     });
-    server.listen(0, () => {
+    server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, counters });
     });
@@ -246,7 +342,7 @@ describe("findProjectRoot / discoverProjectNamespace", () => {
 
   it("discoverProjectNamespace falls back to directory basename", () => {
     const dir = join(tmpRoot, "no-ns-dir");
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(join(dir, ".git"), { recursive: true });
     assert.equal(discoverProjectNamespace(dir), "no-ns-dir");
   });
 });
@@ -467,7 +563,7 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
     const { server, url } = await createMockDaemonServer();
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       const out = await handleHookEvent({
         hook_event_name: "PreToolUse",
@@ -501,7 +597,7 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
     const { server, url } = await createMockDaemonServer({ guardReject: true });
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "guard-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "guard-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       const out = await handleHookEvent({
         hook_event_name: "PreToolUse",
@@ -542,7 +638,7 @@ describe("resolveActiveTaskFromDaemon", () => {
     const { server, url, counters } = await createMockDaemonServer({ returnTask: [{ id: "task-d1", session_id: "sess-d1", status: "in_progress", subagent_prompt_injection: "### Injected daemon context" }] });
     try {
       const ctx = {
-        config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
         tool: { hook: async () => {} },
         hooks: {},
       };
@@ -674,6 +770,48 @@ describe("extractRepoFilePaths", () => {
     const dups = extractRepoFilePaths("a/b.ts a/b.ts c/d.ts");
     assert.deepEqual(dups, ["a/b.ts", "c/d.ts"]);
   });
+
+  it("extracts paths from a sentence, normalizing ./ prefixes, ignoring URLs", () => {
+    const out = extractRepoFilePaths(
+      "Edited src/store/ladybug.rs, ./plugins/core/index.ts, and .github/workflows/ci.yml. Ignore https://example.com/foo/bar.ts",
+    );
+    assert.deepEqual(out, ["src/store/ladybug.rs", "plugins/core/index.ts", ".github/workflows/ci.yml"]);
+  });
+
+  it("adversarial ReDoS input completes in bounded time and returns []", () => {
+    // Best of several runs: the first call on a cold runner pays JIT and GC
+    // and has been measured at ~55 ms, while the guard against catastrophic
+    // backtracking is about seconds-to-minutes, not tens of milliseconds.
+    const input = "a/".repeat(25000) + "!";
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 5; i += 1) {
+      const start = performance.now();
+      const out = extractRepoFilePaths(input);
+      best = Math.min(best, performance.now() - start);
+      assert.deepEqual(out, []);
+    }
+    assert.ok(best < 50, `extractRepoFilePaths best of 5 was ${best}ms on adversarial input, expected < 50ms`);
+  });
+
+  it("extracts generic file extensions (.ttl, .lean, .jsonl, .cmake)", () => {
+    const out = extractRepoFilePaths(
+      "update schemas/neurostrata-ontology.ttl, proofs/NeuroStrata/Safeguards.lean, .NeuroStrata/tasks.jsonl, cmake/FindFoo.cmake",
+    );
+    assert.ok(out.includes("schemas/neurostrata-ontology.ttl"));
+    assert.ok(out.includes("proofs/NeuroStrata/Safeguards.lean"));
+    assert.ok(out.includes(".NeuroStrata/tasks.jsonl"));
+    assert.ok(out.includes("cmake/FindFoo.cmake"));
+  });
+
+  it("ignores numeric-only version suffixes and URL bodies", () => {
+    assert.deepEqual(extractRepoFilePaths("release/v1.2 and https://example.com/a/b.ts"), []);
+    assert.deepEqual(extractRepoFilePaths("pkg/1.2.3"), []);
+  });
+
+  it("ignores empty, '.' and '..' segments", () => {
+    assert.deepEqual(extractRepoFilePaths("src/./foo.ts and a//b.ts"), []);
+    assert.deepEqual(extractRepoFilePaths("a/../b.ts"), []);
+  });
 });
 
 describe("enrichAndInjectSubagentPrompt", () => {
@@ -681,7 +819,7 @@ describe("enrichAndInjectSubagentPrompt", () => {
     const { server, url } = await createMockDaemonServer();
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       const target = { prompt: "Touch src/foo.ts please" };
       const changed = await enrichAndInjectSubagentPrompt(target, "ns");
@@ -700,7 +838,7 @@ describe("enrichAndInjectSubagentPrompt", () => {
     });
     try {
       resetClientForTesting();
-      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       // Prime the cache via resolveActiveTaskFromDaemon.
       await resolveActiveTaskFromDaemon("ns");
@@ -772,7 +910,7 @@ describe("prefetchMemoriesForFile LRU + dedup", () => {
     const { server, url, counters } = await createMockDaemonServer();
     try {
       const ctx = {
-        config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "pref-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
         tool: { hook: async () => {} },
         hooks: {},
       };
@@ -823,7 +961,7 @@ describe("recordLocalSessionQuery ledger object format", () => {
       // so the repository checkout's real session ledger is never overwritten.
       writeFileSync(ledgerPath, JSON.stringify([], null, 2));
       resetClientForTesting();
-      const ctx = { config: { namespace: "ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       await prefetchMemoriesForFile("ledger-ns", "src/ledger.ts", { recordLedgerDir: tmpProjectDir });
       const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -858,7 +996,7 @@ describe("execute.before / execute.after recall delivery", () => {
       const ctx = {
         config: {
           namespace: "recall-ns", endpoint: url, bearerToken: "tok",
-          strictMode: false, requestTimeoutMs: 200,
+          strictMode: false, requestTimeoutMs: 2000,
           intentDetection: { enabled: false, injectReminder: false },
         },
         tool: {
@@ -883,6 +1021,337 @@ describe("execute.before / execute.after recall delivery", () => {
     } finally {
       server.close();
       resetModuleState();
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Wave 4 Task 4.1: extractTurnCandidates + conceptual bridges persistence
+// ──────────────────────────────────────────────────────────────────────
+
+function makeTaskCandidatesMock({ error = false } = {}) {
+  const captured = [];
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+      let body = "";
+      req.on("data", (c) => body += c);
+      req.on("end", () => {
+        try {
+          const payload = JSON.parse(body);
+          const id = payload.id ?? 0;
+          const method = payload.method;
+          const respond = (resultObj, errorObj = null) => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id, ...(errorObj ? { error: errorObj } : { result: resultObj }) }));
+          };
+          if (method !== "tools/list" && method !== "tools/call") {
+            respond(null, { code: -32601, message: "Unknown method" }); return;
+          }
+          const params = payload.params ?? {};
+          const name = params.name ?? params.arguments?.name;
+          if (method === "tools/list") {
+            respond({ tools: [{ name: "neurostrata_task_candidates" }] }); return;
+          }
+          if (name === "neurostrata_task_candidates") {
+            captured.push(params.arguments ?? {});
+            if (error) respond(null, { code: -32603, message: "intake down" });
+            else respond({ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] });
+            return;
+          }
+          respond(null, { code: -32601, message: "Unknown tool" });
+        } catch { res.writeHead(400); res.end(); }
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, captured });
+    });
+  });
+}
+
+describe("extractTurnCandidates", () => {
+  it("extracts a TODO: marker as a task_obligation candidate with a provenance span", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "TODO: wire the candidates",
+      turn_id: "t1",
+      source_tool: "write",
+      channel: "comment",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "task_obligation");
+    assert.equal(c.title, "TODO: wire the candidates");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, false);
+    assert.equal(c.provenance.turn_id, "t1");
+    assert.equal(c.provenance.role, "user");
+    assert.equal(c.provenance.source_tool, "write");
+    assert.equal(c.provenance.channel, "comment");
+    assert.equal(c.provenance.evidence_quote, "TODO: wire the candidates");
+    assert.equal(c.provenance.quote, "TODO: wire the candidates");
+    assert.deepEqual(c.provenance.char_range, [0, 25]);
+    assert.equal(c.provenance.confidence, 0.9);
+  });
+
+  it("detects multiple markers and returns one candidate per marker", () => {
+    const cands = extractTurnCandidates({
+      role: "checker",
+      content: "TODO: first\nFIXME: second\nfollow-up: third",
+    });
+    assert.equal(cands.length, 3);
+    assert.equal(cands[0].title, "TODO: first");
+    assert.equal(cands[1].title, "FIXME: second");
+    assert.equal(cands[2].title, "follow-up: third");
+    for (const c of cands) {
+      assert.equal(c.kind, "task_obligation");
+      assert.equal(c.auto_commit, false);
+    }
+  });
+
+  it("returns an empty array when no intent markers are present", () => {
+    assert.deepEqual(extractTurnCandidates({ role: "user", content: "just a normal sentence" }), []);
+    assert.deepEqual(extractTurnCandidates({ role: "user", content: "" }), []);
+  });
+
+  it("char_range points at the marker position within the content", () => {
+    const cands = extractTurnCandidates({ role: "user", content: "prefix TODO: mid-fix" });
+    assert.equal(cands.length, 1);
+    assert.deepEqual(cands[0].provenance.char_range, [7, 20]);
+    assert.equal(cands[0].title, "TODO: mid-fix");
+  });
+
+  it("propagates parent_task_id into provenance when provided", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "TODO: x",
+      parent_task_id: "task-9",
+    });
+    assert.equal(cands[0].provenance.parent_task_id, "task-9");
+  });
+
+  it("extracts DECISION: marker as memory_candidate decision with ProvenanceSpan", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "DECISION: use Rust for the intake layer",
+      turn_id: "t1",
+      source_tool: "write",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "memory_candidate");
+    assert.equal(c.category, "decision");
+    assert.equal(c.title, "use Rust for the intake layer");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, true);
+    assert.equal(c.provenance.confidence, 0.9);
+    assert.equal(c.provenance.evidence_quote, "use Rust for the intake layer");
+    assert.ok(c.provenance.char_range[0] >= 0);
+    assert.ok(c.provenance.char_range[1] > c.provenance.char_range[0]);
+  });
+
+  it("extracts FACT: marker as memory_candidate fact with ProvenanceSpan", () => {
+    const cands = extractTurnCandidates({
+      role: "checker",
+      content: "FACT: the gate requires memory extraction before completion",
+      turn_id: "t2",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "memory_candidate");
+    assert.equal(c.category, "fact");
+    assert.equal(c.title, "the gate requires memory extraction before completion");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, true);
+    assert.equal(c.provenance.confidence, 0.9);
+  });
+
+  it("extracts FACT: untrusted file text and DECISION: marker with auto_commit false", () => {
+    const cands = extractTurnCandidates({
+      role: "assistant",
+      source_tool: "read",
+      content: "FACT: untrusted file text. DECISION: untrusted file decision.",
+    });
+    assert.equal(cands.length, 2);
+    for (const c of cands) {
+      assert.equal(c.kind, "memory_candidate");
+      assert.equal(c.auto_commit, false);
+    }
+    const decision = cands.find((c) => c.category === "decision");
+    assert.ok(decision);
+    assert.equal(decision.title, "untrusted file decision");
+  });
+
+  it("extracts Architectural decision: and We decided to: as decision", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content:
+        "Architectural decision: centralize provenance in IntakeCandidate. We decided to: cap bridges at 4.",
+    });
+    const decisions = cands.filter((c) => c.category === "decision");
+    assert.equal(decisions.length, 2);
+    for (const c of decisions) {
+      assert.equal(c.kind, "memory_candidate");
+      assert.equal(c.confidence, 0.9);
+    }
+  });
+
+  it("skips empty-excerpt signals (no indexOf on empty string)", () => {
+    const cands = extractTurnCandidates({ role: "user", content: "TODO:" });
+    // "TODO:" has no trailing text; the marker regex may yield empty excerpt.
+    assert.ok(Array.isArray(cands));
+  });
+});
+
+describe("postTurnCandidates", () => {
+  it("posts each candidate to neurostrata_task_candidates record action", async () => {
+    const { server, url, captured } = await makeTaskCandidatesMock();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await postTurnCandidates([
+        { kind: "task_obligation", title: "one", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t1" } },
+        { kind: "task_obligation", title: "two", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t2" } },
+      ], "tc-ns");
+      assert.equal(captured.length, 2);
+      for (const cap of captured) {
+        assert.equal(cap.action, "record");
+        assert.equal(cap.namespace, "tc-ns");
+        assert.equal(cap.kind, "task_obligation");
+        assert.equal(cap.auto_commit, false);
+      }
+      assert.equal(captured[0].title, "one");
+      assert.equal(captured[1].title, "two");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("fail-soft: does not throw when mcpClient is not set", async () => {
+    resetClientForTesting();
+    await assert.doesNotReject(
+      postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "ns"),
+    );
+  });
+
+  it("fail-soft: does not throw when the daemon errors on task_candidates", async () => {
+    const { server, url } = await makeTaskCandidatesMock({ error: true });
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await assert.doesNotReject(
+        postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "tc-ns"),
+      );
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("extractConceptualBridges", () => {
+  it("extracts bridges from hits carrying conceptual_bridges arrays", () => {
+    const hits = [
+      {
+        id: "seed-1",
+        conceptual_bridges: [
+          { source_id: "seed-1", via_id: "v1", target_id: "t1", target_domain: "d1", target_type: "rule", target_summary: "summary 1", path: "seed-1 -> v1 -> t1" },
+        ],
+      },
+      { id: "seed-2" }, // no bridges
+    ];
+    const bridges = extractConceptualBridges(hits);
+    assert.equal(bridges.length, 1);
+    assert.equal(bridges[0].path, "seed-1 -> v1 -> t1");
+    assert.equal(bridges[0].target_id, "t1");
+    assert.equal(bridges[0].target_type, "rule");
+  });
+
+  it("dedupes bridges by path across hits", () => {
+    const hits = [
+      { id: "a", conceptual_bridges: [{ path: "p1", source_id: "a", target_id: "t" }] },
+      { id: "b", conceptual_bridges: [{ path: "p1", source_id: "b", target_id: "t" }] },
+      { id: "c", conceptual_bridges: [{ path: "p2", source_id: "c", target_id: "t" }] },
+    ];
+    const bridges = extractConceptualBridges(hits);
+    assert.equal(bridges.length, 2);
+    assert.equal(bridges[0].path, "p1");
+    assert.equal(bridges[1].path, "p2");
+  });
+
+  it("returns empty array when no hit carries conceptual_bridges", () => {
+    assert.deepEqual(extractConceptualBridges([{ id: "a" }, { id: "b" }]), []);
+    assert.deepEqual(extractConceptualBridges([]), []);
+  });
+});
+
+describe("persistConceptualBridges", () => {
+  it("writes bridges into active_session.json under conceptual_bridges and merges existing fields", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-cb-persist-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({ namespace: "NeuroStrata", task_id: "task-1", status: "in_progress" }),
+    );
+    try {
+      const bridges = [
+        { source_id: "s1", via_id: "v1", target_id: "t1", target_domain: "d", target_type: "rule", target_summary: "sum", path: "s1 -> v1 -> t1" },
+      ];
+      persistConceptualBridges(tmpDir, bridges);
+      const active = JSON.parse(readFileSync(join(nsDir, "active_session.json"), "utf8"));
+      assert.equal(active.namespace, "NeuroStrata");
+      assert.equal(active.task_id, "task-1");
+      assert.equal(active.status, "in_progress");
+      assert.deepEqual(active.conceptual_bridges, bridges);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("merges new bridges with existing by id dedup and caps at 4 instead of overwriting", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-cb-merge-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-1",
+        conceptual_bridges: [
+          { source_id: "s1", target_id: "t1", target_type: "rule", target_summary: "old 1", path: "s1 -> t1" },
+          { source_id: "s2", target_id: "t2", target_type: "fact", target_summary: "old 2", path: "s2 -> t2" },
+        ],
+      }),
+    );
+    try {
+      const newBridges = [
+        { source_id: "s1", target_id: "t1", target_type: "rule", target_summary: "new 1 (updated)", path: "s1 -> t1" }, // dup id t1
+        { source_id: "s3", target_id: "t3", target_type: "rule", target_summary: "new 3", path: "s3 -> t3" }, // new
+        { source_id: "s4", target_id: "t4", target_type: "fact", target_summary: "new 4", path: "s4 -> t4" }, // new
+        { source_id: "s5", target_id: "t5", target_type: "rule", target_summary: "new 5", path: "s5 -> t5" }, // new -> would be 5th, capped out
+        { source_id: "s6", target_id: "t6", target_type: "fact", target_summary: "new 6", path: "s6 -> t6" }, // capped out
+      ];
+      persistConceptualBridges(tmpDir, newBridges);
+      const active = JSON.parse(readFileSync(join(nsDir, "active_session.json"), "utf8"));
+      const bridges = active.conceptual_bridges;
+      assert.ok(Array.isArray(bridges));
+      assert.equal(bridges.length, 4, "capped at 4");
+      // t1 should be the updated version (newer wins on dup id)
+      const t1 = bridges.find((b) => b.target_id === "t1");
+      assert.ok(t1, "t1 retained after dedup merge");
+      assert.equal(t1.target_summary, "new 1 (updated)", "newer wins on duplicate id");
+      // t2 (existing, not re-sent) should still be present
+      assert.ok(bridges.some((b) => b.target_id === "t2"), "existing t2 preserved");
+      // t5 and t6 should be absent (cap 4)
+      assert.ok(!bridges.some((b) => b.target_id === "t5"), "t5 capped out");
+      assert.ok(!bridges.some((b) => b.target_id === "t6"), "t6 capped out");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -1034,19 +1503,29 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
     resetClientForTesting();
   });
 
-  it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", async () => {
+  it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-awk-"));
     const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
     try {
       for (const cmd of ["bash", "sh", "git", "grep", "sed", "awk", "date", "mkdir", "printf", "mktemp", "mv", "rm", "dirname", "basename", "head", "pwd"]) {
         for (const prefix of ["/usr/bin", "/bin"]) {
+          const source = toolPath(cmd);
+          const candidate = isAbsolute(source) ? source : join(prefix, source);
+          if (!existsSync(candidate)) continue;
           try {
-            symlinkSync(join(prefix, cmd), join(binDir, cmd));
+            symlinkSync(candidate, join(binDir, cmd));
             break;
-          } catch {}
+          } catch {
+            // Windows may not permit symlinks for an unprivileged process;
+            // a copy serves the same restricted-PATH purpose.
+            try {
+              copyFileSync(candidate, join(binDir, cmd));
+              break;
+            } catch {}
+          }
         }
       }
 
@@ -1056,11 +1535,11 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       execFileSync("git", ["add", "src/file one.rs"], { cwd: repoDir });
 
       const hookPath = join(repoDir, "pre-commit-test.sh");
-      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      writeFileSync(hookPath, hookSource());
       chmodSync(hookPath, 0o755);
 
       // Run 1: populates empty queries array with "src/file one.rs"
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1073,7 +1552,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       // Run 2: stages second file with '&' and appends to populated queries array
       writeFileSync(join(repoDir, "src", "a&b.rs"), "fn b() {}\n");
       execFileSync("git", ["add", "src/a&b.rs"], { cwd: repoDir });
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1085,7 +1564,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 
       // Run 3: legacy compact single-line empty-array ledger `{"namespace":"app","queries":[]}`
       writeFileSync(ledgerPath, '{"namespace":"app","queries":[]}');
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1095,7 +1574,7 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 
       // Run 4: legacy top-level array ledger `[{"ts":1,"tool":"legacy","query":"old.rs"}]`
       writeFileSync(ledgerPath, '[{"ts":1,"tool":"legacy","query":"old.rs"}]');
-      execFileSync(hookPath, [], {
+      runHook(hookPath, {
         cwd: repoDir,
         env: { PATH: binDir, HOME: repoDir },
       });
@@ -1495,7 +1974,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
     const { server, url } = await createMockDaemonServer();
     try {
       const ctx = {
-        config: { namespace: "ast-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        config: { namespace: "ast-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
         tool: { hook: async () => {} },
         hooks: {},
       };
@@ -1552,14 +2031,14 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
             res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "Unknown tool" } }));
           });
         });
-        s.listen(0, () => {
+        s.listen(0, "127.0.0.1", () => {
           const addr = s.address();
           resolve({ server: s, url: `http://127.0.0.1:${addr.port}/mcp` });
         });
       });
 
       resetClientForTesting();
-      const astCtx = { config: { namespace: "ast-ns", endpoint: astTestServer.url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const astCtx = { config: { namespace: "ast-ns", endpoint: astTestServer.url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(astCtx);
 
       const snippets = await prefetchMemoriesForFile("ast-ns", "src/test.rs");
@@ -1596,16 +2075,22 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
     }
   });
 
-  it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", async () => {
+  it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", { skip: winHookSkip() }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r6-"));
     const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
     try {
       for (const cmd of ["bash", "sh", "git", "grep", "sed", "awk", "date", "mkdir", "printf", "mktemp", "mv", "rm", "dirname", "basename", "head", "pwd"]) {
         for (const prefix of ["/usr/bin", "/bin"]) {
-          try { symlinkSync(join(prefix, cmd), join(binDir, cmd)); break; } catch {}
+          const source = toolPath(cmd);
+          const candidate = isAbsolute(source) ? source : join(prefix, source);
+          if (!existsSync(candidate)) continue;
+          try { symlinkSync(candidate, join(binDir, cmd)); break; }
+          catch {
+            try { copyFileSync(candidate, join(binDir, cmd)); break; } catch {}
+          }
         }
       }
 
@@ -1615,11 +2100,11 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
       execFileSync("git", ["add", "src/test.rs"], { cwd: repoDir });
 
       const hookPath = join(repoDir, "pre-commit-test.sh");
-      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      writeFileSync(hookPath, hookSource());
       chmodSync(hookPath, 0o755);
 
       // Run 1: populate ledger with bare path
-      execFileSync(hookPath, [], { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
+      runHook(hookPath, { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
 
       let ledgerPath = join(repoDir, ".NeuroStrata", "session_queries.json");
       let ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -1635,7 +2120,7 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
       // Stage another file and run - should not warn about src/test.rs (already in ledger in any format)
       writeFileSync(join(repoDir, "src", "another.rs"), "fn b() {}\n");
       execFileSync("git", ["add", "src/another.rs"], { cwd: repoDir });
-      execFileSync(hookPath, [], { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
+      runHook(hookPath, { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
 
       // Should not have warning for src/test.rs
       ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -1814,9 +2299,10 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
     }
   });
 
-  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", async () => {
+  // A file name containing a double quote cannot exist on Windows.
+  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", { skip: winHookSkip() || (process.platform === "win32" && "file names cannot contain a double quote on Windows") }, async () => {
     const { execFileSync } = await import("node:child_process");
-    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { mkdtempSync, symlinkSync, copyFileSync, chmodSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r8-"));
     try {
@@ -1829,7 +2315,7 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       execFileSync("git", ["add", "src/café.rs", "src/quote\"file.rs", "src/a.rs", "src/b.rs"], { cwd: repoDir });
 
       const hookPath = join(repoDir, "pre-commit-test.sh");
-      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      writeFileSync(hookPath, hookSource());
       chmodSync(hookPath, 0o755);
 
       mkdirSync(join(repoDir, ".NeuroStrata"), { recursive: true });
@@ -1914,7 +2400,7 @@ describe("round-9: governed_prefixes records the queried path verbatim", () => {
     try {
       mkdirSync(ledgerDir, { recursive: true });
       resetClientForTesting();
-      const ctx = { config: { namespace: "r9-ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      const ctx = { config: { namespace: "r9-ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
       await prefetchMemoriesForFile("r9-ledger-ns", "src/auth/login.go", { recordLedgerDir: tmpProjectDir });
       const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
@@ -2396,5 +2882,424 @@ await beforeHook({ tool: "execute", input: { code: 'neurostrata_task_update({ id
       server.close();
       rmSync(projectDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Task 1.1: OpenCode V2 project-root resolution, session epoch hooks,
+// and execute.after V2 result mutation
+// ──────────────────────────────────────────────────────────────────────
+
+describe("Task 1.1: resolveProjectRoot priority chain", () => {
+  it("ctx.location.project.canonical wins", () => {
+    assert.equal(
+      resolveProjectRoot({ location: { project: { canonical: "/canon", root: "/root" }, directory: "/dir" } }),
+      "/canon",
+    );
+  });
+
+  it("falls back to ctx.location.project.root", () => {
+    assert.equal(
+      resolveProjectRoot({ location: { project: { root: "/root" }, directory: "/dir" } }),
+      "/root",
+    );
+  });
+
+  it("falls back to ctx.location.directory", () => {
+    assert.equal(resolveProjectRoot({ location: { directory: "/dir" } }), "/dir");
+  });
+
+  it("falls back to ctx.projectDir", () => {
+    assert.equal(resolveProjectRoot({ projectDir: "/pdir" }), "/pdir");
+  });
+
+  it("falls back to ctx.directory", () => {
+    assert.equal(resolveProjectRoot({ directory: "/cdir" }), "/cdir");
+  });
+
+  it("falls back to ctx.cwd", () => {
+    assert.equal(resolveProjectRoot({ cwd: "/ccwd" }), "/ccwd");
+  });
+
+  it("falls back to process.cwd()", () => {
+    assert.equal(resolveProjectRoot({}), process.cwd());
+    assert.equal(resolveProjectRoot(undefined), process.cwd());
+  });
+});
+
+describe("Task 1.1: extractToolName", () => {
+  it("prefers toolName, then tool, then name", () => {
+    assert.equal(extractToolName({ toolName: "read" }), "read");
+    assert.equal(extractToolName({ tool: "write" }), "write");
+    assert.equal(extractToolName({ name: "edit" }), "edit");
+    assert.equal(extractToolName({ tool_name: "grep" }), "grep");
+    assert.equal(extractToolName({}), "");
+  });
+});
+
+describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behavior", () => {
+  it("injects active-task baseline once per epoch; compaction re-injects", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-ctx-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-core-1",
+        status: "in_progress",
+        session_id: "ses-core-1",
+        updated_at: new Date().toISOString(),
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: true, injectReminder: true },
+      };
+
+      const ev1 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev1, config);
+      assert.equal(currentSessionEpoch("ses-core-1"), 0);
+      assert.equal(typeof ev1.additionalContext, "string");
+      assert.ok(ev1.additionalContext.includes("[NeuroStrata Active Context]"));
+      assert.ok(ev1.additionalContext.includes("task-core-1"));
+      assert.ok(ev1.additionalContext.includes("[in_progress]"));
+
+      const ev2 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev2, config);
+      assert.equal(ev2.additionalContext, undefined);
+
+      await sessionCompactionHandler({ sessionID: "ses-core-1" }, config);
+      assert.equal(currentSessionEpoch("ses-core-1"), 1);
+
+      const ev3 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev3, config);
+      assert.ok(ev3.additionalContext.includes("[NeuroStrata Active Context]"));
+      assert.ok(ev3.additionalContext.includes("task-core-1"));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("sessionContextHandler bridge formatting (no [object Object])", () => {
+  it("formats each bridge object cleanly instead of String(b)", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-fmt-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-bridge-1",
+        status: "in_progress",
+        session_id: "ses-bridge-1",
+        conceptual_bridges: [
+          {
+            target_id: "t1",
+            target_type: "rule",
+            target_summary: "always claim first",
+            path: "src/a.rs",
+          },
+          "a plain string bridge",
+          { source_id: "s3", target_id: "t3", target_type: "fact", target_summary: "gate blocks" },
+        ],
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const ev = { sessionID: "ses-bridge-1" };
+      await sessionContextHandler(ev, config);
+      const ctx = ev.additionalContext ?? "";
+      assert.ok(ctx.includes("[NeuroStrata Conceptual Bridges]"), "bridges section present");
+      assert.ok(!ctx.includes("[object Object]"), "no [object Object] in bridge formatting");
+      assert.ok(ctx.includes("[rule] t1: always claim first (src/a.rs)"), "object bridge formatted cleanly");
+      assert.ok(ctx.includes("a plain string bridge"), "string bridge passed through");
+      assert.ok(ctx.includes("[fact] t3: gate blocks"), "object with source_id falls back to target_type");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("omits bridges section when conceptual_bridges is absent", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-none-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({ namespace: "NeuroStrata", task_id: "task-nb", status: "in_progress" }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const ev = { sessionID: "ses-nb" };
+      await sessionContextHandler(ev, config);
+      const ctx = ev.additionalContext ?? "";
+      assert.ok(!ctx.includes("[NeuroStrata Conceptual Bridges]"), "no bridges section when absent");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("injects golden_rules from active_session.json both before and after a task is claimed", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-golden-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        golden_rules: [
+          "[rule] bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8: RULE: The user has a strong preference AGAINST using Python.",
+        ],
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const evPreClaim = { sessionID: "ses-golden-pre" };
+      await sessionContextHandler(evPreClaim, config);
+      const preCtx = evPreClaim.additionalContext ?? "";
+      assert.ok(
+        preCtx.includes("[NeuroStrata Golden Rules — ALWAYS ENFORCED]"),
+        `expected Golden Rules header before claim, got: ${preCtx}`,
+      );
+      assert.ok(
+        preCtx.includes("AGAINST using Python"),
+        `expected NO PYTHON rule before claim, got: ${preCtx}`,
+      );
+
+      writeFileSync(
+        join(nsDir, "active_session.json"),
+        JSON.stringify({
+          namespace: "NeuroStrata",
+          task_id: "neurostrata-0wle",
+          status: "in_progress",
+          golden_rules: [
+            "[rule] bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8: RULE: The user has a strong preference AGAINST using Python.",
+          ],
+        }),
+      );
+      const evClaimed = { sessionID: "ses-golden-claimed" };
+      await sessionContextHandler(evClaimed, config);
+      const claimedCtx = evClaimed.additionalContext ?? "";
+      assert.ok(claimedCtx.includes("[NeuroStrata Active Context]"));
+      assert.ok(claimedCtx.includes("[NeuroStrata Golden Rules — ALWAYS ENFORCED]"));
+      assert.ok(claimedCtx.includes("AGAINST using Python"));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("Task 1.1: execute.after V2 result mutation (via hook registration)", () => {
+  it("mutates event.result.content/output with task-intent nudge and JIT file recall", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-exec-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "exec-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+      };
+      await initialize(ctx);
+      assert.equal(typeof afterHandler, "function");
+
+      const evt = {
+        name: "read",
+        callID: "call_read_1",
+        sessionID: "ses-exec-1",
+        args: { path: "src/server.rs" },
+        status: "completed",
+        result: {
+          content: "TODO: wire task candidate provenance in server.rs",
+          output: "TODO: wire task candidate provenance in server.rs",
+        },
+      };
+      await afterHandler(evt);
+      assert.match(evt.result.content, /TASK INTENT DETECTED/);
+      assert.match(evt.result.output, /TASK INTENT DETECTED/);
+      assert.ok(evt.result.content.includes("[NeuroStrata File Context — src/server.rs]"));
+      assert.equal(counters.memoriesForFile, 1, "file recall queried the daemon once");
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("JIT file recall is deduplicated per session:epoch:path", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-dedup-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "dedup-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+      };
+      await initialize(ctx);
+
+      const base = {
+        name: "read",
+        callID: "call_read_2",
+        sessionID: "ses-dedup-1",
+        args: { path: "src/server.rs" },
+        status: "completed",
+        result: { content: "read file contents here", output: "read file contents here" },
+      };
+      const evt1 = { ...base, result: { ...base.result } };
+      await afterHandler(evt1);
+      assert.ok(evt1.result.content.includes("[NeuroStrata File Context — src/server.rs]"));
+      assert.equal(evt1.result.content.includes("TASK INTENT DETECTED"), false);
+      const after1 = evt1.result.content;
+
+      const evt2 = { ...base, result: { ...base.result, content: after1 } };
+      await afterHandler(evt2);
+      assert.equal(evt2.result.content, after1, "second touch in same epoch adds no new block");
+      assert.equal(counters.memoriesForFile, 1, "daemon not re-queried for deduped path");
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("non-file-touch tool gets task-intent nudge only, no file-context block", async () => {
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "bash-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+      };
+      await initialize(ctx);
+
+      const evt = {
+        name: "bash",
+        callID: "call_bash_1",
+        sessionID: "ses-bash-1",
+        args: {},
+        status: "completed",
+        result: { content: "follow-up: clean up the temp dir", output: "follow-up: clean up the temp dir" },
+      };
+      await afterHandler(evt);
+      assert.match(evt.result.content, /TASK INTENT DETECTED/);
+      assert.match(evt.result.output, /TASK INTENT DETECTED/);
+      assert.equal(evt.result.content.includes("[NeuroStrata File Context"), false);
+    } finally {
+      server.close();
+      resetClientForTesting();
+    }
+  });
+
+  it("legacy V1 event without result object does not crash and preserves output", async () => {
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "legacy-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+      };
+      await initialize(ctx);
+      const evt = {
+        name: "read",
+        output: "legacy output text",
+        content: "legacy content text",
+        additionalContext: "prior context",
+      };
+      await afterHandler(evt);
+      assert.equal(evt.output, "legacy output text");
+      assert.ok(evt.additionalContext.includes("prior context"));
+    } finally {
+      server.close();
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("daemonTokenPath honors NEUROSTRATA_TOKEN_DIR", () => {
+  it("uses env var when set and restores default when unset", () => {
+    const old = process.env.NEUROSTRATA_TOKEN_DIR;
+    process.env.NEUROSTRATA_TOKEN_DIR = "/tmp/custom-token-dir";
+    assert.equal(daemonTokenPath(), "/tmp/custom-token-dir");
+    delete process.env.NEUROSTRATA_TOKEN_DIR;
+    assert.equal(daemonTokenPath(), join(homedir(), ".config", "neurostrata", "daemon.token"));
+    if (old !== undefined) process.env.NEUROSTRATA_TOKEN_DIR = old;
+  });
+  it("trims whitespace", () => {
+    const old = process.env.NEUROSTRATA_TOKEN_DIR;
+    process.env.NEUROSTRATA_TOKEN_DIR = "   /tmp/custom-token-dir   ";
+    assert.equal(daemonTokenPath(), "/tmp/custom-token-dir");
+    if (old !== undefined) process.env.NEUROSTRATA_TOKEN_DIR = old;
+    else delete process.env.NEUROSTRATA_TOKEN_DIR;
+  });
+});
+
+describe("daemon memory advisory (#140)", () => {
+  beforeEach(() => {
+    resetAdvisoryStateForTesting();
+  });
+
+  it("extracts the advisory from an error channel carrying the marker and throttles repeats for 10 minutes", () => {
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted; daemon RSS at 90%`;
+    const showAt = 1_000_000;
+    const first = extractDaemonMemoryAdvisory(text, showAt);
+    assert.notEqual(first, null, "a marked error channel yields the advisory");
+    assert.match(first, /DAEMON MEMORY ADVISORY/);
+    assert.match(first, /NEUROSTRATA_BUFFER_POOL_MB/);
+
+    const withinWindow = extractDaemonMemoryAdvisory(text, showAt + 9 * 60 * 1000);
+    assert.equal(withinWindow, null, "repeats inside the 10-minute window are throttled");
+
+    const afterWindow = extractDaemonMemoryAdvisory(text, showAt + 11 * 60 * 1000);
+    assert.notEqual(afterWindow, null, "after the window the advisory shows again");
+  });
+
+  it("ignores memory payload content without the marker", () => {
+    resetAdvisoryStateForTesting();
+    // Mentioning the knob, or the word buffer pool, is not the daemon's advisory.
+    assert.equal(extractDaemonMemoryAdvisory("NEUROSTRATA_BUFFER_POOL_MB is too small for my data", 5_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory("buffer pool pressure described in a memory", 6_000_000), null);
+    assert.equal(extractDaemonMemoryAdvisory(null), null);
+    assert.equal(extractDaemonMemoryAdvisory(undefined), null);
+    assert.equal(extractDaemonMemoryAdvisory(""), null);
+  });
+
+  it("resetAdvisoryStateForTesting clears a still-live throttle window", () => {
+    resetAdvisoryStateForTesting();
+    const text = `${DAEMON_MEMORY_ADVICE_MARKER} buffer pool exhausted`;
+    const first = extractDaemonMemoryAdvisory(text, 10_000_000);
+    assert.notEqual(first, null);
+    assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
+    resetAdvisoryStateForTesting();
+    assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
   });
 });

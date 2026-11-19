@@ -240,14 +240,9 @@ fn sanitize_metadata(metadata: &Value, principal: &str, user_id: &str) -> Value 
 
 fn is_structural(memory_type: &str) -> bool {
     const STRUCTURAL: &[&str] = &[
-        "directory",
-        "file",
-        "markdown",
-        "freshness_flag",
-        "guard_event",
-        "community_summary",
-        "digital_twin",
-        "digital_twin_schema",
+        "directory", "file", "markdown", "freshness_flag",
+        "guard_event", "community_summary", "digital_twin",
+        "digital_twin_schema", "action_type", "action_receipt",
     ];
     STRUCTURAL.contains(&memory_type)
 }

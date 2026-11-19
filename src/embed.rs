@@ -3,42 +3,14 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-/// An HTTP failure from the embedding endpoint, carrying the status so the
-/// retry loop can recognise it.
-///
-/// Formatting the status into an `anyhow!` string used to erase the type: the
-/// resulting error chain held no `StatusCode`, so the downcast in
-/// `embed_with_retry` never matched and the 429/5xx probe was dead code.
-#[derive(Debug)]
-struct EmbedApiStatus {
-    status: reqwest::StatusCode,
-    body: String,
-}
-
-impl std::fmt::Display for EmbedApiStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "embedding API error {}: {}", self.status, self.body)
-    }
-}
-
-impl std::error::Error for EmbedApiStatus {}
-
-/// Whether this failure is worth a second attempt. Kept separate from the loop
-/// so the classification can be tested without a server.
-fn should_retry(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<EmbedApiStatus>()
-        .map(|e| e.status == reqwest::StatusCode::TOO_MANY_REQUESTS || e.status.is_server_error())
-        .unwrap_or(false)
-}
+use sha2::{Digest, Sha256};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
@@ -50,20 +22,10 @@ pub struct AcceptableEmbedder {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_model: Option<String>,
-    /// Provenance recorded by the binary when it materializes
-    /// `embedders.json` itself. Per-entry, not a file-level field: the file
-    /// is a bare JSON array and an object wrapper would be destroyed by an
-    /// older binary on rollback (its parser treats an unparseable file as
-    /// absent and overwrites it with the defaults). Older parsers tolerate
-    /// this field (no `deny_unknown_fields`), and it is omitted when unset
-    /// so user-written entries serialize exactly as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generated_by: Option<String>,
-    /// Optional SHA-256 pin over the model's downloaded artifact set
-    /// (Task 9 / DR-7). Absent = unpinned: the computed pin is recorded
-    /// as a PIN-CANDIDATE at load instead of being enforced.
+    /// Provenance stamp: `EMBEDDERS_FILE_PROVENANCE` when this entry was
+    /// materialized by the binary rather than written by the operator.
     #[serde(default)]
-    pub artifact_pin: Option<String>,
+    pub generated_by: Option<String>,
     /// Pinned SHA-256 of the model weights. When set, the embedder verifies
     /// the downloaded model against this hash before accepting it.
     /// Supply-chain protection: a mismatched hash is a fatal error.
@@ -71,35 +33,9 @@ pub struct AcceptableEmbedder {
     pub model_sha256: Option<String>,
 }
 
-/// The provenance value stamped on every entry when the binary writes
-/// `embedders.json` itself.
+/// Provenance marker stamped into every entry of an embedders.json the
+/// binary materialized itself (ported from the fork's embed layer).
 pub(crate) const EMBEDDERS_FILE_PROVENANCE: &str = "neurostrata-auto-generated";
-
-/// The built-in default embedder list, without provenance.
-fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
-    vec![
-        AcceptableEmbedder {
-            model_name: "NomicEmbedTextV15".to_string(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        },
-        AcceptableEmbedder {
-            model_name: "BGEBaseENV15".to_string(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        },
-    ]
-}
 
 /// The default list as the binary materializes it: every entry stamped
 /// with its provenance.
@@ -124,11 +60,9 @@ fn same_embedder_choice(a: &AcceptableEmbedder, b: &AcceptableEmbedder) -> bool 
 
 /// Whether a parsed `embedders.json` is the file the binary materialized,
 /// untouched since: every entry carries the provenance stamp and the full
-/// entry contents (order included -- position 0 is the selection) match
-/// the built-in defaults semantically. Anything else is user-edited, the
-/// conservative direction: when in doubt, the file wins over a profile.
-/// (Consequence: if a future release changes the built-in defaults,
-/// previously auto-generated files flip to user-edited.)
+/// entry contents (order included) match the built-in defaults
+/// semantically. Anything else is user-edited.
+#[allow(dead_code)]
 fn is_auto_generated(models: &[AcceptableEmbedder]) -> bool {
     let defaults = default_acceptable_embedders();
     models.len() == defaults.len()
@@ -138,269 +72,106 @@ fn is_auto_generated(models: &[AcceptableEmbedder]) -> bool {
         })
 }
 
-/// The three states of `embedders.json` the product distinguishes
-/// (Spec Feature 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EmbeddersFileState {
-    /// Never materialized (or unparseable/empty, which materialization
-    /// treats the same way): not an operator choice.
-    Absent,
-    /// Written by the binary itself, contents untouched since: not an
-    /// operator choice.
-    AutoGenerated,
-    /// Anything else: an explicit operator choice.
-    UserEdited,
+/// The built-in default acceptable-embedder list: the single full-size
+/// Nomic entry every fresh install starts from.
+pub(crate) fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
+    vec![
+        AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15".to_string(),
+            dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
+        generated_by: None,
+            // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
+            model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
+        },
+    ]
 }
 
-struct EmbedderFileLoad {
-    models: Vec<AcceptableEmbedder>,
-    state: EmbeddersFileState,
-}
-
-fn load_acceptable_embedders() -> Result<EmbedderFileLoad> {
+/// The operator's config directory (`~/.config/neurostrata`).
+pub(crate) fn config_dir() -> PathBuf {
     // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
     // reading the variable directly sends this to a relative path under whatever
     // directory happened to launch the process. config.rs already resolves it this way.
-    let config_dir = dirs::home_dir()
+    dirs::home_dir()
         .map(|home| home.join(".config").join("neurostrata"))
-        .unwrap_or_else(|| PathBuf::from(".neurostrata"));
+        .unwrap_or_else(|| PathBuf::from(".neurostrata"))
+}
 
-    // Configuration is optional: the built-in defaults remain usable when
-    // the home directory is read-only. Persisting those defaults is best
-    // effort, like the write below, rather than a prerequisite for startup.
+fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
+    get_acceptable_embedders_in(&config_dir())
+}
+
+pub(crate) fn get_acceptable_embedders_in(config_dir: &Path) -> Result<Vec<AcceptableEmbedder>> {
     if !config_dir.exists() {
-        let _ = fs::create_dir_all(&config_dir);
+        fs::create_dir_all(config_dir).context("Failed to create config directory")?;
     }
 
     let config_path = config_dir.join("embedders.json");
 
+    // Default list if file doesn't exist or is empty
+    let default_models = default_acceptable_embedders();
+
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
-        if let Ok(models) = serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
-            if !models.is_empty() {
-                let state = if is_auto_generated(&models) {
-                    EmbeddersFileState::AutoGenerated
-                } else {
-                    EmbeddersFileState::UserEdited
-                };
-                return Ok(EmbedderFileLoad { models, state });
+        match serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
+            Ok(mut models) => {
+                if !models.is_empty() {
+                    // Backfill known pins for configs written before supply-chain
+                    // verification existed; unknown models remain unpinned and fail
+                    // closed at load time.
+                    for model in &mut models {
+                        if model.model_sha256.is_none()
+                            && model.model_name.eq_ignore_ascii_case("NomicEmbedTextV15")
+                        {
+                            model.model_sha256 = Some(
+                                "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    return Ok(models);
+                }
+            }
+            Err(e) => {
+                // A corrupt user file must never be silently overwritten: the
+                // user's edits stay on disk while we run on the in-memory default.
+                tracing::warn!(
+                    "Failed to parse {}: {e}; using default embedder list in memory without overwriting existing file",
+                    config_path.display()
+                );
+                return Ok(default_models);
             }
         }
     }
 
-    // Default list if file doesn't exist or is empty. The materialized
-    // copy carries provenance on every entry; the in-memory list is the
-    // same choices without it (resolution treats the state, not the
-    // stamp, as the signal).
-    let default_models = default_acceptable_embedders();
-
-    // Write default to file so user can edit it
+    // Write default to file so user can edit it (only when the file is absent
+    // or was an empty, valid list)
     if let Ok(json_content) = serde_json::to_string_pretty(&auto_generated_defaults()) {
-        let _ = fs::write(&config_path, json_content);
-    }
-
-    Ok(EmbedderFileLoad {
-        models: default_models,
-        state: EmbeddersFileState::Absent,
-    })
-}
-
-/// Which layer supplied the resolved embedder, for the startup summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelSource {
-    Environment,
-    UserEditedFile,
-    Profile,
-    AutoGeneratedFile,
-}
-
-impl ModelSource {
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Environment => "environment",
-            Self::UserEditedFile => "file (user-edited)",
-            Self::Profile => "profile",
-            Self::AutoGeneratedFile => "file (auto-generated)",
+        if let Err(e) = fs::write(&config_path, json_content) {
+            tracing::warn!(
+                "Failed to write default embedder config to {}: {e}",
+                config_path.display()
+            );
+        } else {
+            // The default file was just materialized, so a first-run model
+            // choice may still be offered: record it as pending for the
+            // next interactive command. This path runs inside daemon and
+            // serving processes, so it never prompts here.
+            crate::model_choice::record_pending_choice(config_dir);
         }
     }
+
+    Ok(default_models)
 }
 
-/// The resolved embedder and the layer that supplied it.
-#[derive(Clone)]
-pub(crate) struct ResolvedModel {
-    pub model: AcceptableEmbedder,
-    pub source: ModelSource,
-}
-
-/// The profile's model as a configured embedder, constructed directly --
-/// deliberately not a lookup into the acceptable-embedders list, so a
-/// profile can name a model the list does not contain (BGESmallENV15Q is
-/// not in the built-in default list). Local by construction: a remote
-/// embedder can only arrive via a user-edited file, which outranks the
-/// profile, so the profile default never displaces a remote (Spec
-/// Feature 1, non-goals).
-fn profile_model(profile: crate::config::CapacityProfile) -> AcceptableEmbedder {
-    AcceptableEmbedder {
-        model_name: profile.model_name().to_string(),
-        dimensions: profile.embedder_dimensions(),
-        base_url: None,
-        api_key_env: None,
-        api_model: None,
-        generated_by: None,
-        artifact_pin: None,
-        model_sha256: None,
-    }
-}
-
-/// Model resolution, first match wins (Spec Feature 1):
-/// 1. `NEUROSTRATA_MODEL`; 2. a user-edited `embedders.json`; 3. the
-/// profile default; 4. the auto-generated list's first entry.
-pub(crate) fn resolve_configured_model(
-    acceptable_models: Vec<AcceptableEmbedder>,
-    state: EmbeddersFileState,
-    requested: Option<&str>,
-    profile: Option<crate::config::CapacityProfile>,
-) -> Result<ResolvedModel> {
-    if let Some(name) = requested.filter(|name| !name.trim().is_empty()) {
-        let model = acceptable_models
-            .into_iter()
-            .find(|model| model.model_name.eq_ignore_ascii_case(name.trim()))
-            .ok_or_else(|| anyhow::anyhow!("NEUROSTRATA_MODEL names no configured embedder"))?;
-        return Ok(ResolvedModel {
-            model,
-            source: ModelSource::Environment,
-        });
-    }
-    if state == EmbeddersFileState::UserEdited {
-        let model = acceptable_models
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no embedding models are configured"))?;
-        return Ok(ResolvedModel {
-            model,
-            source: ModelSource::UserEditedFile,
-        });
-    }
-    if let Some(profile) = profile {
-        return Ok(ResolvedModel {
-            model: profile_model(profile),
-            source: ModelSource::Profile,
-        });
-    }
-    let model = acceptable_models
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no embedding models are configured"))?;
-    Ok(ResolvedModel {
-        model,
-        source: ModelSource::AutoGeneratedFile,
-    })
-}
-
-/// As `resolve_configured_model`, taking the profile as its raw value so
-/// the invalid-value error surfaces here, on the embedder-construction
-/// path -- the surface Spec AC6 scopes it to.
-pub(crate) fn resolve_configured_model_from_inputs(
-    acceptable_models: Vec<AcceptableEmbedder>,
-    state: EmbeddersFileState,
-    requested: Option<&str>,
-    profile_raw: Option<&str>,
-) -> Result<ResolvedModel> {
-    let profile = crate::config::CapacityProfile::from_value(profile_raw)?;
-    resolve_configured_model(acceptable_models, state, requested, profile)
-}
-
-/// Resolution against the live inputs: the embedders file, the
-/// environment, and the capacity profile. This is a profile-consuming
-/// surface, so an invalid `NEUROSTRATA_PROFILE` fails here.
-pub(crate) fn configured_resolution() -> Result<ResolvedModel> {
-    let load = load_acceptable_embedders()?;
-    let requested = std::env::var("NEUROSTRATA_MODEL").ok();
-    let profile_raw = std::env::var("NEUROSTRATA_PROFILE").ok();
-    resolve_configured_model_from_inputs(
-        load.models,
-        load.state,
-        requested.as_deref(),
-        profile_raw.as_deref(),
-    )
-}
-
-/// Coarse model class for the disagreement check. Judged by class, not by
-/// a dimension threshold: BGEBaseENV15 is 768 wide but belongs to the
-/// small-model family a `low` profile intends, and must not trip the
-/// warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelClass {
-    Small,
-    Large,
-    Unknown,
-}
-
-fn model_class(model_name: &str) -> ModelClass {
-    if model_name.starts_with("BGESmall") || model_name.starts_with("BGEBase") {
-        ModelClass::Small
-    } else if model_name.starts_with("NomicEmbed") || model_name.starts_with("MultilingualE5Large")
-    {
-        ModelClass::Large
-    } else {
-        ModelClass::Unknown
-    }
-}
-
-/// A profile/model disagreement: a profile is set, a higher layer
-/// (environment or user-edited file) supplied the model, and the resolved
-/// model's class differs from the profile's intent.
-#[derive(Debug, Clone)]
-pub(crate) struct ProfileDisagreement {
-    pub profile: crate::config::CapacityProfile,
-    pub resolved_model: String,
-    pub winning_layer: ModelSource,
-}
-
-pub(crate) fn profile_disagreement(
-    resolved: &ResolvedModel,
-    profile: Option<crate::config::CapacityProfile>,
-) -> Option<ProfileDisagreement> {
-    let profile = profile?;
-    if !matches!(
-        resolved.source,
-        ModelSource::Environment | ModelSource::UserEditedFile
-    ) {
-        return None;
-    }
-    let intent_class = model_class(profile.model_name());
-    let resolved_class = model_class(&resolved.model.model_name);
-    if intent_class == ModelClass::Unknown
-        || resolved_class == ModelClass::Unknown
-        || intent_class == resolved_class
-    {
-        return None;
-    }
-    Some(ProfileDisagreement {
-        profile,
-        resolved_model: resolved.model.model_name.clone(),
-        winning_layer: resolved.source,
-    })
-}
-
-/// The one startup warning for a disagreement: it names the profile's
-/// intent, the resolved model, and the winning layer. Startup proceeds --
-/// the explicit setting governs.
-pub(crate) fn format_disagreement_warning(disagreement: &ProfileDisagreement) -> String {
-    format!(
-        "WARNING: NEUROSTRATA_PROFILE={} intends {}, but the resolved model is {} (source: {}); the explicit setting governs and startup proceeds",
-        disagreement.profile.name(),
-        disagreement.profile.model_name(),
-        disagreement.resolved_model,
-        disagreement.winning_layer.label(),
-    )
-}
-
-fn find_existing_cache_dir() -> PathBuf {
+fn find_existing_cache_dir() -> Result<PathBuf> {
     // Same reason as above: $HOME is absent on Windows, and an empty home turns
     // every candidate below into a relative path, which is how a 523 MB model
     // cache ends up inside the caller's working directory.
-    let home_path = dirs::home_dir().unwrap_or_default();
+    let home_path = dirs::home_dir()
+        .context("Could not find home directory ($HOME / USERPROFILE unset)")?;
 
     // Adopt the Neuro cache pattern: share models across all Neuro* tools
     let primary_neuro_cache = home_path.join(".cache/neuro/models/fastembed");
@@ -419,300 +190,31 @@ fn find_existing_cache_dir() -> PathBuf {
                 .map(|mut i| i.next().is_some())
                 .unwrap_or(false)
         {
-            return dir; // Return the first valid existing cache directory
+            return Ok(dir); // Return the first valid existing cache directory
         }
     }
 
-    primary_neuro_cache
+    Ok(primary_neuro_cache)
 }
 
-/// The model this process is configured to use. An absent selection chooses
-/// the first configured model; an explicit invalid selection fails closed.
+/// The model this process is configured to use: the one NEUROSTRATA_MODEL names
+/// when it is acceptable, otherwise the first acceptable entry.
 fn configured_model() -> Result<AcceptableEmbedder> {
-    Ok(configured_resolution()?.model)
+    pick_configured_model(get_acceptable_embedders()?)
 }
 
-fn select_configured_model(
-    acceptable_models: Vec<AcceptableEmbedder>,
-    requested: Option<&str>,
-) -> Result<AcceptableEmbedder> {
-    Ok(resolve_configured_model(
-        acceptable_models,
-        EmbeddersFileState::UserEdited,
-        requested,
-        None,
-    )?
-    .model)
+/// [`configured_model`] against an explicit config directory.
+pub(crate) fn configured_model_in(config_dir: &Path) -> Result<AcceptableEmbedder> {
+    pick_configured_model(get_acceptable_embedders_in(config_dir)?)
 }
 
-fn local_model_details(model: &AcceptableEmbedder) -> Result<(EmbeddingModel, usize)> {
-    let parsed = EmbeddingModel::from_str(&model.model_name)
-        .map_err(|_| anyhow::anyhow!("unsupported local embedding model {:?}", model.model_name))?;
-    let info = TextEmbedding::get_model_info(&parsed)?;
-    let dimensions = info.dim;
-    if model.dimensions != dimensions {
-        anyhow::bail!(
-            "configured embedding width {} does not match model {:?} width {}",
-            model.dimensions,
-            parsed,
-            dimensions
-        );
-    }
-    Ok((parsed, dimensions))
-}
-
-fn is_remote_model(model: &AcceptableEmbedder) -> bool {
-    model.base_url.is_some() && model.api_key_env.is_some()
-}
-
-/// Canonical identity for a remote embedding space. The endpoint is hashed so
-/// credentials embedded in a URL never enter the database marker or errors.
-/// Trailing slashes do not change the endpoint identity.
-pub(crate) fn remote_embedder_id(base_url: &str, api_model: &str) -> String {
-    let endpoint_hash = sha2::Sha256::digest(base_url.trim_end_matches('/').as_bytes());
-    format!("remote-sha256:{}:{}", hex::encode(endpoint_hash), api_model)
-}
-
-/// Upgrade a legacy runtime identity only when it can be matched exactly to
-/// the configured canonical identity. Both endpoint URLs and model names may
-/// contain colons, so the legacy string cannot be split safely in isolation.
-pub(crate) fn canonicalize_persisted_embedder_id(
-    identity: &str,
-    configured_identity: &str,
-) -> Result<String> {
-    if identity == configured_identity || !identity.starts_with("remote:") {
-        return Ok(identity.to_string());
-    }
-    let Some(legacy) = identity.strip_prefix("remote:") else {
-        unreachable!();
-    };
-    if configured_identity.starts_with("remote-sha256:") {
-        for (split, _) in legacy.match_indices(':') {
-            let endpoint = &legacy[..split];
-            let model = &legacy[split + 1..];
-            if remote_embedder_id(endpoint, model) == configured_identity {
-                return Ok(configured_identity.to_string());
-            }
-        }
-    }
-    // Refusal Standard, maximal satisfiable form at this site: the saved
-    // legacy identity cannot be shown (it is precisely the string that
-    // could not be canonicalized, and it can embed a credential-bearing
-    // URL — element 6 is absolute), so the message describes it and names
-    // the configured canonical identity instead. Widths are out of
-    // context here: this function receives only the two identities, and
-    // its store-open caller in read_width_marker has no configured width
-    // in scope.
-    anyhow::bail!("Refusing to open: the database's saved legacy remote embedding model identity cannot be safely matched to the configured identity {:?}. Keep the database intact and reopen it with its original endpoint and model (the original embedder), or use a separate database path for the new model; no in-place re-embedding migration is available.", configured_identity)
-}
-
-pub(crate) fn configured_identity_for(model: &AcceptableEmbedder) -> Result<String> {
-    if is_remote_model(model) {
-        if model.dimensions == 0 {
-            anyhow::bail!("configured embedding dimensions must be positive");
-        }
-        let (Some(base_url), Some(_)) = (&model.base_url, &model.api_key_env) else {
-            unreachable!();
-        };
-        Ok(remote_embedder_id(
-            base_url,
-            model
-                .api_model
-                .as_deref()
-                .unwrap_or("text-embedding-3-small"),
-        ))
-    } else {
-        let (canonical_model, _) = local_model_details(model)?;
-        Ok(format!("fastembed:{canonical_model}"))
-    }
-}
-
-/// Stable, non-secret identity for the configured embedding space. This is
-/// available without loading the local model, so backup, restore, and metadata
-/// reads can validate the same identity as the daemon.
-pub fn configured_embedder_id() -> Result<String> {
-    let model = configured_model()?;
-    configured_identity_for(&model)
-}
-
-/// Resolve an embedders.json model name to the fastembed model it names.
-///
-/// An unrecognized name refuses (J29): the previous behavior silently
-/// substituted NomicEmbedTextV15, so a typo in embedders.json ran a
-/// different model than the configuration named. The error names the
-/// requested name and the acceptable list — the models this build of
-/// fastembed can actually load.
-fn resolve_embedding_model(model_name: &str) -> Result<EmbeddingModel> {
-    EmbeddingModel::from_str(model_name).map_err(|_| {
-        let acceptable = TextEmbedding::list_supported_models()
-            .iter()
-            .map(|info| format!("{:?}", info.model))
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::anyhow!(
-            "unknown embedder model '{model_name}': this build cannot load a model by that name \
-             and no fallback is substituted — set model_name in embedders.json to one of the \
-             acceptable models: {acceptable}"
-        )
-    })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-/// The DR-7 artifact pin over one model's snapshot directory: every file
-/// present (recursively; the snapshot layout nests some models' graph
-/// under an `onnx/` subdir), hashed by content. The pin is the SHA-256
-/// hex of the concatenation of `"<file-sha256>  <relative-path>\n"` lines
-/// sorted by relative path — a pin over the ONNX file alone would let a
-/// swapped tokenizer walk past it. The PIN-CANDIDATE adoption record is
-/// the one exclusion: it is this gate's own output, not a model artifact.
-/// Files are hashed incrementally — a model's graph is hundreds of MB
-/// and this gate runs on every load, so no artifact is buffered whole.
-fn compute_artifact_pin(model_dir: &Path) -> Result<String> {
-    let mut rel_paths: Vec<String> = Vec::new();
-    collect_artifact_files(model_dir, model_dir, &mut rel_paths)?;
-    if rel_paths.is_empty() {
-        anyhow::bail!(
-            "no embedder artifacts found in {} — the model cache is empty or incomplete",
-            model_dir.display()
-        );
-    }
-    rel_paths.sort();
-    let mut listing = String::new();
-    for rel in &rel_paths {
-        let digest = sha256_hex_of_file(&model_dir.join(rel))
-            .with_context(|| format!("failed to read embedder artifact {rel}"))?;
-        listing.push_str(&format!("{}  {}\n", digest, rel));
-    }
-    Ok(sha256_hex(listing.as_bytes()))
-}
-
-/// SHA-256 hex of one file's bytes, streamed in fixed-size chunks so a
-/// several-hundred-MB model graph never lands in memory whole.
-fn sha256_hex_of_file(path: &Path) -> Result<String> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn collect_artifact_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("failed to read model cache directory {}", dir.display()))?
-    {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_artifact_files(root, &path, out)?;
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .map_err(|_| {
-                    anyhow::anyhow!("model cache walk escaped its root at {}", path.display())
-                })?
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            if rel != "PIN-CANDIDATE" {
-                out.push(rel);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The artifact-pin gate for one model's snapshot directory (Task 9).
-///
-/// With a recorded pin, the artifact set must hash to it or the load
-/// refuses. With no pin, the load proceeds and the computed pin is
-/// recorded through the channels that exist today — a PIN-CANDIDATE
-/// file in the model's cache directory and one `eprintln!` line. It is
-/// deliberately not a `tracing` record: no subscriber is installed until
-/// Task 19 (J26), so a tracing adoption record would be discarded.
-fn enforce_artifact_pin(
-    model_dir: &Path,
-    recorded_pin: Option<&str>,
-    model_name: &str,
-) -> Result<()> {
-    let computed = compute_artifact_pin(model_dir)?;
-    match recorded_pin {
-        Some(pin) => {
-            if pin.trim() == computed {
-                Ok(())
-            } else {
-                anyhow::bail!(
-                    "embedder artifact pin mismatch for model '{model_name}': the artifact set \
-                     in {} does not match the artifact_pin recorded in embedders.json \
-                     (recorded {}, computed {}) — refusing to load; if the model cache was \
-                     legitimately refreshed, update artifact_pin to the computed value or \
-                     remove it to re-adopt",
-                    model_dir.display(),
-                    pin.trim(),
-                    computed
-                );
-            }
-        }
-        None => {
-            let candidate = model_dir.join("PIN-CANDIDATE");
-            // Best-effort: an unwritable cache must not fail a load that
-            // would have succeeded unpinned — the eprintln below still
-            // records the computed pin, and the warning names the failure.
-            if let Err(e) = fs::write(&candidate, format!("{computed}\n")) {
-                eprintln!(
-                    "warning: could not write artifact pin candidate {}: {e}",
-                    candidate.display()
-                );
-            }
-            eprintln!(
-                "No artifact_pin recorded for embedder model '{model_name}': computed pin \
-                 {computed} over the artifact set in {} and wrote it to {} — record it as \
-                 artifact_pin in embedders.json to pin this model",
-                model_dir.display(),
-                candidate.display()
-            );
-            Ok(())
-        }
-    }
-}
-
-/// The model's snapshot directory under the shared fastembed cache root,
-/// in the Hugging Face hub layout fastembed downloads into:
-/// `models--<org>--<repo>/snapshots/<revision>`, the revision named by
-/// `refs/main`. None when the model has not been downloaded yet.
-fn model_snapshot_dir(cache_root: &Path, model: &EmbeddingModel) -> Option<PathBuf> {
-    let code = TextEmbedding::get_model_info(model)
-        .ok()?
-        .model_code
-        .clone();
-    let repo_dir = cache_root.join(format!("models--{}", code.replace('/', "--")));
-    let snapshots = repo_dir.join("snapshots");
-    if let Ok(revision) = fs::read_to_string(repo_dir.join("refs").join("main")) {
-        let candidate = snapshots.join(revision.trim());
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    let mut dirs: Vec<PathBuf> = fs::read_dir(&snapshots)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.sort();
-    if dirs.len() == 1 {
-        dirs.pop()
-    } else {
-        None
-    }
+fn pick_configured_model(acceptable_models: Vec<AcceptableEmbedder>) -> Result<AcceptableEmbedder> {
+    let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
+    Ok(acceptable_models
+        .iter()
+        .find(|m| m.model_name.eq_ignore_ascii_case(&env_model))
+        .unwrap_or(&acceptable_models[0])
+        .clone())
 }
 
 /// The embedding width of the configured model, without loading the model.
@@ -721,18 +223,182 @@ fn model_snapshot_dir(cache_root: &Path, model: &EmbeddingModel) -> Option<PathB
 /// can mean a 523 MB download, which is the wrong thing to require on the fresh
 /// or offline machine a restore is usually run on.
 pub fn configured_dimensions() -> Result<usize> {
-    let model = configured_model()?;
-    if is_remote_model(&model) {
-        if model.dimensions == 0 {
-            anyhow::bail!("configured embedding dimensions must be positive");
-        }
-        Ok(model.dimensions)
-    } else {
-        Ok(local_model_details(&model)?.1)
+    Ok(configured_model()?.dimensions)
+}
+
+/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
+const MAX_EMBED_TOKENS: usize = 2048;
+
+/// Forward-pass micro-batch size for local ONNX inference (`FastEmbedder::embed_batch`).
+/// `fastembed` defaults `None` to `batch_size = 256` and pads every item in a batch
+/// up to the longest item's token length (up to `MAX_EMBED_TOKENS = 2048`), which
+/// allocates `[256, 12, 2048, 2048]` self-attention tensors (>22 GB) and OOM-kills
+/// the daemon on large files. `1` embeds each text at its own actual token length.
+const FAST_EMBED_BATCH_SIZE: usize = 1;
+
+/// Arena allocation is disabled by default; `NEUROSTRATA_EMBED_ARENA` with
+/// one of the house truthy spellings restores it for operators who measured a
+/// benefit. Mirrors the HYBRID_SEARCH convention (1/true/yes/on).
+fn arena_disabled_for(value: Option<&str>) -> bool {
+    let enabled = matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    !enabled
+}
+
+/// Shared process-wide ONNX Runtime [`ort::environment::Environment`].
+///
+/// `ort 2.0.0-rc.15` enforces a single `Environment` per process (`ort::init().build()`).
+/// Sharing this singleton across `FastEmbedder`, `GlinerExtractor`, and `LayaOnnx`
+/// guarantees they never collide regardless of initialization order.
+pub fn shared_ort_environment() -> Result<&'static ort::environment::Environment> {
+    static ORT_ENV: std::sync::OnceLock<std::result::Result<ort::environment::Environment, String>> =
+        std::sync::OnceLock::new();
+    match ORT_ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string())) {
+        Ok(env) => Ok(env),
+        Err(msg) => Err(anyhow!("Failed to initialize ONNX Runtime environment: {msg}")),
     }
 }
 
-const MAX_EMBED_TOKENS: usize = 2048;
+/// The execution-provider list the constructor installs for the arena
+/// decision: a pinned CPU provider with the arena allocator off, or `None` to
+/// leave fastembed's default. Extracted so the decision-to-wiring path is a
+/// value a test can inspect without loading a model.
+fn arena_execution_providers(
+    disabled: bool,
+) -> Option<Vec<ort::ep::ExecutionProviderDispatch>> {
+    if disabled {
+        Some(vec![ort::ep::CPU::default()
+            .with_arena_allocator(false)
+            .build()])
+    } else {
+        None
+    }
+}
+
+/// The pin gate `FastEmbedder::new` applies to the configured model: a
+/// local entry without a pinned SHA-256 fails closed, so a hand-authored
+/// or setup-written entry can never load unverified.
+fn pinned_sha_for(target_model: &AcceptableEmbedder) -> Result<&str> {
+    target_model.model_sha256.as_deref().ok_or_else(|| {
+        anyhow!(
+            "Embedder supply-chain error: model '{}' has no pinned SHA-256",
+            target_model.model_name
+        )
+    })
+}
+
+/// Verify the SHA-256 of the exact model file fastembed loads for
+/// `model` against a pinned value. The file is located through
+/// fastembed's own registry entry (`model_code` / `model_file`), in the
+/// HuggingFace cache layout — never by filename guesswork: quantized
+/// and optimized variants load files a `model.onnx`-only search cannot
+/// see, and a sibling model's file must never satisfy this model's pin.
+/// Returns `Err` on mismatch or when the file cannot be located
+/// unambiguously (fail-closed).
+pub fn verify_model_checksum(
+    cache_dir: &Path,
+    model: &EmbeddingModel,
+    pinned_sha: &str,
+) -> Result<()> {
+    let model_name = format!("{model:?}");
+    let info = TextEmbedding::get_model_info(model).map_err(|e| {
+        anyhow!("Embedder supply-chain error: no fastembed model info for '{model_name}': {e}")
+    })?;
+    let model_dir = cache_dir.join(format!("models--{}", info.model_code.replace('/', "--")));
+    let snapshot = resolve_snapshot_dir(&model_dir, &model_name, pinned_sha)?;
+    let file = snapshot.join(&info.model_file);
+    if !file.is_file() {
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
+            model_name, pinned_sha
+        ));
+    }
+    let actual = hash_file_sha256(&file)?;
+    if actual != pinned_sha {
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
+            model_name,
+            file.display(),
+            pinned_sha,
+            actual
+        ));
+    }
+    Ok(())
+}
+
+/// Select a cached model's snapshot directory: the one `refs/main`
+/// names when it exists, else the only snapshot present. Several
+/// snapshots with no ref to disambiguate fail closed rather than guess
+/// which bytes the pin should be checked against.
+fn resolve_snapshot_dir(model_dir: &Path, model_name: &str, pinned_sha: &str) -> Result<PathBuf> {
+    let snapshots_dir = model_dir.join("snapshots");
+    if let Ok(rev) = fs::read_to_string(model_dir.join("refs").join("main")) {
+        let named = snapshots_dir.join(rev.trim());
+        if named.is_dir() {
+            return Ok(named);
+        }
+        // A refs/main that reads successfully but names a missing
+        // snapshot is fail-closed — the ref is present and
+        // authoritative, so falling through to enumeration
+        // would verify a snapshot the ref does not name. Only a
+        // genuinely unreadable refs/main (absent file) falls through
+        // to the exactly-one-snapshot rule below.
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' refs/main names snapshot '{}', which is not in the cache; refusing to verify a different snapshot (pinned SHA: {}).",
+            model_name,
+            rev.trim(),
+            pinned_sha
+        ));
+    }
+    let mut snapshots: Vec<PathBuf> = match fs::read_dir(&snapshots_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    match snapshots.len() {
+        1 => Ok(snapshots.pop().expect("exactly one snapshot")),
+        0 => Err(anyhow!(
+            "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
+            model_name, pinned_sha
+        )),
+        count => Err(anyhow!(
+            "Embedder supply-chain error: model '{}' has {} cached snapshots and no refs/main to select one; refusing to guess which to verify (pinned SHA: {}).",
+            model_name, count, pinned_sha
+        )),
+    }
+}
+
+/// Streamed SHA-256 of a file (model files run to hundreds of MiB; the
+/// digest must not require holding one in memory).
+fn hash_file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to read model file {} for checksum verification",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).with_context(|| {
+            format!(
+                "Failed to read model file {} for checksum verification",
+                path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
 
 /// The opt-in idle-unload setting (Task 4), env-only:
 /// `NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS`. Unset or `0` disables the
@@ -888,208 +554,6 @@ impl<T> IdleSession<T> {
     }
 }
 
-/// Verify a model file's SHA-256 checksum against a pinned value.
-/// Returns `Err` on mismatch (fail-closed supply-chain protection).
-
-/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
-use std::fmt;
-
-fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
-    // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
-    // reading the variable directly sends this to a relative path under whatever
-    // directory happened to launch the process. config.rs already resolves it this way.
-    let config_dir = dirs::home_dir()
-        .map(|home| home.join(".config").join("neurostrata"))
-        .unwrap_or_else(|| PathBuf::from(".neurostrata"));
-
-    if !config_dir.exists() {
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
-    }
-
-    let config_path = config_dir.join("embedders.json");
-
-    // Default list if file doesn't exist or is empty
-    let default_models = vec![AcceptableEmbedder {
-        model_name: "NomicEmbedTextV15".to_string(),
-        dimensions: 768,
-        base_url: None,
-        api_key_env: None,
-        api_model: None,
-        // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
-        model_sha256: Some(
-            "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string(),
-        ),
-        generated_by: None,
-        artifact_pin: None,
-    }];
-
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
-        match serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
-            Ok(mut models) => {
-                if !models.is_empty() {
-                    // Backfill known pins for configs written before supply-chain
-                    // verification existed; unknown models remain unpinned and fail
-                    // closed at load time.
-                    for model in &mut models {
-                        if model.model_sha256.is_none()
-                            && model.model_name.eq_ignore_ascii_case("NomicEmbedTextV15")
-                        {
-                            model.model_sha256 = Some(
-                                "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    return Ok(models);
-                }
-            }
-            Err(e) => {
-                // A corrupt user file must never be silently overwritten: the
-                // user's edits stay on disk while we run on the in-memory default.
-                tracing::warn!(
-                    "Failed to parse {}: {e}; using default embedder list in memory without overwriting existing file",
-                    config_path.display()
-                );
-                return Ok(default_models);
-            }
-        }
-    }
-
-    // Write default to file so user can edit it (only when the file is absent
-    // or was an empty, valid list)
-    if let Ok(json_content) = serde_json::to_string_pretty(&default_models) {
-        if let Err(e) = fs::write(&config_path, json_content) {
-            tracing::warn!(
-                "Failed to write default embedder config to {}: {e}",
-                config_path.display()
-            );
-        }
-    }
-
-    Ok(default_models)
-}
-
-/// The model this process is configured to use: the one NEUROSTRATA_MODEL names
-/// when it is acceptable, otherwise the first acceptable entry.
-
-/// The embedding width of the configured model, without loading the model.
-///
-/// Backup and restore need only this number to open the store. Loading the model
-/// can mean a 523 MB download, which is the wrong thing to require on the fresh
-/// or offline machine a restore is usually run on.
-
-/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
-
-/// Verify a model file's SHA-256 checksum against a pinned value.
-/// Returns `Err` on mismatch or when no model file can be found (fail-closed).
-pub fn verify_model_checksum(
-    cache_dir: &PathBuf,
-    model_name: &str,
-    pinned_sha: &str,
-) -> Result<()> {
-    // Collect candidate model files. Check the flat cache layout first, then
-    // walk the fastembed/HuggingFace snapshot layout (models--X/snapshots/*/onnx/model.onnx).
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    // Flat fallback: cache_dir/model.onnx
-    let flat = cache_dir.join("model.onnx");
-    if flat.is_file() {
-        candidates.push(flat);
-    }
-
-    // fastembed layout: cache_dir/models--{name}/snapshots/*/onnx/model.onnx (and model.onnx)
-    let model_dir_name = format!("models--{}", model_name.replace("/", "--"));
-    let model_dir = cache_dir.join(&model_dir_name);
-    if model_dir.is_dir() {
-        collect_onnx_files(&model_dir, &mut candidates, 0, 6);
-    }
-
-    // Generic walk of cache_dir for any model.onnx (covers alternate cache roots)
-    if candidates.is_empty() {
-        collect_onnx_files(cache_dir, &mut candidates, 0, 4);
-    }
-
-    if candidates.is_empty() {
-        return Err(anyhow!(
-            "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
-            model_name, pinned_sha
-        ));
-    }
-
-    // Verify candidates: at least one must match the pinned SHA, and the
-    // newest candidate (sorted order ⇒ last entry) must match too. Stale
-    // non-matching candidates only warn, so a fresh valid download beside an
-    // old one still verifies.
-    candidates.sort();
-    let oldest_sha = |path: &PathBuf| -> Result<String> {
-        let data = std::fs::read(path).with_context(|| {
-            format!(
-                "Failed to read model file {} for checksum verification",
-                path.display()
-            )
-        })?;
-        Ok(hex::encode(Sha256::digest(&data)))
-    };
-
-    let mut matched: Option<&PathBuf> = None;
-    let mut stale: Vec<(&PathBuf, String)> = Vec::new();
-    for path in &candidates {
-        let actual = oldest_sha(path)?;
-        if actual == pinned_sha {
-            matched = Some(path);
-        } else {
-            stale.push((path, actual));
-        }
-    }
-
-    let newest = candidates.last().expect("candidates checked non-empty");
-    if matched.is_none() || stale.iter().any(|(p, _)| *p == newest) {
-        let path = newest;
-        let actual = oldest_sha(path)?;
-        return Err(anyhow!(
-            "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
-            model_name, path.display(), pinned_sha, actual
-        ));
-    }
-
-    for (path, actual) in stale {
-        tracing::warn!(
-            "Embedder '{}': stale model file {} does not match pin (expected {}, actual {}); using verified candidate {}",
-            model_name, path.display(), pinned_sha, actual,
-            matched.map_or("", |m| m.to_str().unwrap_or(""))
-        );
-    }
-    Ok(())
-}
-
-fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_depth: usize) {
-    if depth > max_depth {
-        return;
-    }
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name == "model.onnx" {
-                        out.push(path);
-                    }
-                } else if path.is_dir() {
-                    collect_onnx_files(&path, out, depth + 1, max_depth);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "collect_onnx_files: read_dir({}) failed: {e}",
-                dir.display()
-            );
-        }
-    }
-}
-
 /// Local fastembed-backed embedding provider.
 pub struct FastEmbedder {
     session: Arc<IdleSession<TextEmbedding>>,
@@ -1099,33 +563,47 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
-        Self::with_model(configured_model()?)
+        // The arena opt-out is read here, on the startup surface, so the
+        // construction path below — and the reload factory inside it —
+        // never re-reads the environment (the Task 4 factory contract).
+        let disable_arena =
+            arena_disabled_for(std::env::var("NEUROSTRATA_EMBED_ARENA").ok().as_deref());
+        Self::with_model(configured_model()?, disable_arena)
     }
 
     /// Construct from an already-resolved model, without re-running
     /// resolution: startup paths that resolved the model once (and
-    /// reported its provenance) build from that same model.
-    fn with_model(target_model: AcceptableEmbedder) -> Result<Self> {
-        let (model_enum, dimensions) = local_model_details(&target_model)?;
-        let cache_dir = find_existing_cache_dir();
+    /// reported it) build from that same model. The idle-unload
+    /// factory built here captures ONLY the values fixed at
+    /// construction (model enum, cache dir, ORT environment, arena
+    /// decision, identity), so a reload reproduces the startup
+    /// session exactly; it never re-resolves the model and never
+    /// re-reads any configuration source.
+    fn with_model(target_model: AcceptableEmbedder, disable_arena: bool) -> Result<Self> {
+        // The descriptor must describe the model actually loaded: an unknown
+        // configured name silently falls back to NomicEmbedTextV15 (768 dims).
+        let (model_enum, loaded_model_name, loaded_dims) = match EmbeddingModel::from_str(
+            &target_model.model_name,
+        ) {
+            Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
+            Err(_) => {
+                tracing::warn!(
+                    "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
+                    target_model.model_name
+                );
+                (
+                    EmbeddingModel::NomicEmbedTextV15,
+                    "NomicEmbedTextV15".to_string(),
+                    768,
+                )
+            }
+        };
+
+        let cache_dir = find_existing_cache_dir()?;
 
         if !cache_dir.exists() {
             fs::create_dir_all(&cache_dir)
                 .context("Failed to create shared model cache directory")?;
-        }
-
-        // Artifact pin (Task 9 / DR-7): when the model's snapshot is
-        // already cached, the pin gate runs before fastembed touches it,
-        // so a mismatched artifact set never reaches the loader. A
-        // missing snapshot means a first download; the gate then runs
-        // after the load, before the embedder is handed out.
-        let snapshot_dir = model_snapshot_dir(&cache_dir, &model_enum);
-        if let Some(dir) = &snapshot_dir {
-            enforce_artifact_pin(
-                dir,
-                target_model.artifact_pin.as_deref(),
-                &target_model.model_name,
-            )?;
         }
 
         eprintln!(
@@ -1133,86 +611,61 @@ impl FastEmbedder {
             target_model.model_name, cache_dir
         );
 
+        let ort_env = shared_ort_environment()?.clone();
+        static SAID_ARENA: std::sync::Once = std::sync::Once::new();
+        SAID_ARENA.call_once(|| {
+            eprintln!(
+                "Embedding CPU arena: {}",
+                if disable_arena { "disabled" } else { "enabled (NEUROSTRATA_EMBED_ARENA)" }
+            );
+        });
+
         // The values the startup session is constructed with, captured
-        // once here: identity, canonical model name, cache dir, and the
-        // max length below. The idle-unload factory rebuilds ONLY the
-        // ONNX session from these captured values; it never re-resolves
-        // the configured model and never re-reads any configuration
-        // source, so a reload can only ever reproduce the startup
-        // session (the P1-2 contract).
-        let model_name = format!("fastembed:{model_enum}");
-        let captured_identity = model_name.clone();
-        let captured_model_name = model_enum.to_string();
-        let captured_max_length = MAX_EMBED_TOKENS;
-        // The factory owns a clone of the cache dir (Task 9): the outer
-        // cache_dir and model_enum stay borrowable after the session is
-        // built, which the post-load pin gate below depends on.
+        // once here: model enum, cache dir, ORT environment, arena
+        // decision, and the identity the embedder reports. The factory
+        // rebuilds ONLY the ONNX session from these captured values,
+        // so a reload can only ever reproduce the startup session.
+        let captured_model_enum = model_enum.clone();
         let captured_cache_dir = cache_dir.clone();
+        let captured_identity = loaded_model_name.clone();
         let factory = move || -> Result<(TextEmbedding, String)> {
-            let model_enum = EmbeddingModel::from_str(&captured_model_name).map_err(|_| {
-                anyhow::anyhow!(
-                    "captured local embedding model {:?} no longer parses",
-                    captured_model_name
-                )
-            })?;
             // fastembed defaults to 512 tokens regardless of what the model supports
             // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
             // what ingestion actually stores per symbol is wasted, so this is set to
             // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
-            let model = TextEmbedding::try_new(
-                TextInitOptions::new(model_enum)
-                    .with_cache_dir(captured_cache_dir.clone())
-                    .with_max_length(captured_max_length)
-                    .with_show_download_progress(true),
-            )?;
+            // Texts here are embedded one at a time at their own length, so the
+            // arena ratchets up and never gives it back. This applies to every
+            // local embedding (ingest, daemon queries, MCP calls), not only
+            // ingest. Set NEUROSTRATA_EMBED_ARENA=1 to keep the previous
+            // default; any other value (or unset) disables the arena.
+            let mut init = TextInitOptions::new(captured_model_enum.clone())
+                .with_environment(ort_env.clone())
+                .with_cache_dir(captured_cache_dir.clone())
+                .with_max_length(MAX_EMBED_TOKENS);
+            // Deliberately pin the CPU execution provider: arena allocation is a
+            // CPU-provider setting, and this build's fastembed/ort path is CPU-only.
+            // A future non-CPU provider needs its own policy rather than inheriting
+            // this one silently.
+            if let Some(providers) = arena_execution_providers(disable_arena) {
+                init = init.with_execution_providers(providers);
+            }
+            let model = TextEmbedding::try_new(init.with_show_download_progress(true))?;
             Ok((model, captured_identity.clone()))
         };
         let session = IdleSession::new(factory, idle_unload_threshold()?)?;
 
-        if snapshot_dir.is_none() {
-            match model_snapshot_dir(&cache_dir, &model_enum) {
-                Some(dir) => enforce_artifact_pin(
-                    &dir,
-                    target_model.artifact_pin.as_deref(),
-                    &target_model.model_name,
-                )?,
-                None => {
-                    if target_model.artifact_pin.is_some() {
-                        anyhow::bail!(
-                            "embedder model '{}' has a recorded artifact_pin \
-                             but no artifact directory was found under {} after load — refusing \
-                             to run it unpinned",
-                            target_model.model_name,
-                            cache_dir.display()
-                        );
-                    }
-                    // Unpinned with an unresolvable snapshot layout: there
-                    // is no artifact set to record a candidate over, so the
-                    // adoption record is skipped — say so on stderr rather
-                    // than letting the load proceed unpinned in silence.
-                    eprintln!(
-                        "Skipped recording an artifact pin candidate for embedder model \
-                         '{}': the model's snapshot directory could not be resolved under \
-                         {} after load, so there is no artifact set to pin — the load \
-                         proceeds unpinned",
-                        target_model.model_name,
-                        cache_dir.display()
-                    );
-                }
-            }
-        }
-
-        // Supply-chain verification: if a pinned SHA-256 is specified, verify
-        // the model file against it. This protects against cache poisoning
-        // attacks where an attacker could replace a downloaded model.
-        if let Some(pinned_sha) = &target_model.model_sha256 {
-            verify_model_checksum(&cache_dir, &target_model.model_name, pinned_sha)?;
-        }
+        // Supply-chain verification: the configured entry must carry a
+        // pinned SHA-256, and the file fastembed actually loaded (the
+        // resolved enum above, fallback included) must hash to it. This
+        // protects against cache poisoning attacks where an attacker
+        // could replace a downloaded model.
+        let pinned_sha = pinned_sha_for(&target_model)?;
+        verify_model_checksum(&cache_dir, &model_enum, pinned_sha)?;
 
         Ok(Self {
             session: Arc::new(session),
-            model_name,
-            dimensions,
+            model_name: loaded_model_name,
+            dimensions: loaded_dims,
         })
     }
 }
@@ -1236,18 +689,37 @@ impl Embedder for FastEmbedder {
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
-        let embedding = embeddings
+        embeddings
             .pop()
-            .ok_or_else(|| anyhow::anyhow!("fastembed returned no embedding"))?;
-        if embedding.len() != self.dimensions {
+            .ok_or_else(|| anyhow::anyhow!("Embedding model returned an empty vector batch"))
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Model inference is CPU-bound and can stall the async runtime when
+        // called from a Tokio task. Isolate it on the blocking thread pool.
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session = Arc::clone(&self.session);
+        let expected = texts.len();
+        let texts = texts.to_vec();
+        let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
+            session.with_session(|model| {
+                model
+                    .embed(texts, Some(FAST_EMBED_BATCH_SIZE))
+                    .context("fastembed embed_batch call failed")
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
+        if embeddings.len() != expected {
             anyhow::bail!(
-                "fastembed returned width {}, but configured model identity {} requires {}",
-                embedding.len(),
-                self.model_name,
-                self.dimensions
+                "fastembed embed_batch returned {} vectors for {} texts",
+                embeddings.len(),
+                expected
             );
         }
-        Ok(embedding)
+        Ok(embeddings)
     }
 
     fn dimensions(&self) -> usize {
@@ -1261,6 +733,7 @@ impl Embedder for FastEmbedder {
     fn session_loaded_snapshot(&self) -> Option<bool> {
         Some(self.session.snapshot_loaded())
     }
+
     fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
         crate::traits::EmbeddingDescriptor {
             provider: "fastembed".into(),
@@ -1283,41 +756,53 @@ pub struct RemoteEmbedder {
     model_name: String,
 }
 
-/// Validate a remote embedder base_url before any request is built from
-/// it (J23): it must parse as a URL with a host, and its scheme must be
-/// https — http is accepted only for loopback hosts. Refusals name the
-/// host only, never the full URL (which can carry userinfo) and never
-/// the API key.
-fn validate_remote_base_url(base_url: &str) -> Result<()> {
-    let url = reqwest::Url::parse(base_url).map_err(|_| {
-        anyhow::anyhow!(
-            "remote embedder base_url does not parse as a URL with a host — refusing; \
-             base_url must use https (http is accepted only for loopback hosts)"
-        )
-    })?;
-    let host = url.host_str().ok_or_else(|| {
-        anyhow::anyhow!(
-            "remote embedder base_url has no host — refusing; \
-             base_url must use https (http is accepted only for loopback hosts)"
-        )
-    })?;
-    // Judge loopback from the parsed host, not host_str(): host_str()
-    // keeps the brackets of an IPv6 literal ("[::1]"), which IpAddr
-    // parsing rejects — url::Host yields the address itself.
-    let loopback = match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if loopback => Ok(()),
-        scheme => anyhow::bail!(
-            "remote embedder base_url host '{host}' uses scheme '{scheme}' — refusing; \
-             base_url must use https (http is accepted only for loopback hosts)"
-        ),
+/// The most inputs one remote embedding request carries.
+///
+/// A provider's own ceiling is not a universal constant -- one provider's
+/// documented example is 2 048 inputs, but that is that provider's number,
+/// and the refusal differs per provider (`400`, `413`, or a silent
+/// truncation). Sending one request per file made a whole generation depend
+/// on one file's symbol count, so the request carries a budget of its own
+/// and the batch is split to fit it.
+const REMOTE_EMBED_MAX_INPUTS: usize = 64;
+
+/// The most characters one remote embedding request carries.
+///
+/// The remote API does not expose a request-side token count, so the
+/// character count stands in for the token budget: it bounds the request
+/// body without guessing the provider's tokenizer.
+const REMOTE_EMBED_MAX_CHARS: usize = 32 * 1024;
+
+/// How many refusal reasons one degraded batch reports. The count of
+/// refusals is exact; only the samples are capped.
+const REMOTE_EMBED_MAX_WARNING_SAMPLES: usize = 8;
+
+/// Splits `texts` into request-sized chunks: at most
+/// [`REMOTE_EMBED_MAX_INPUTS`] inputs and [`REMOTE_EMBED_MAX_CHARS`]
+/// characters per chunk. The chunks are `(start, end)` index ranges into
+/// `texts`, so the caller never copies the payloads.
+///
+/// A single text longer than the character budget is not split: it goes
+/// alone in its own chunk, and the provider's answer decides its fate.
+fn remote_request_chunks(texts: &[String]) -> Vec<(usize, usize)> {
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut chars = 0usize;
+    for (i, text) in texts.iter().enumerate() {
+        let len = text.chars().count();
+        let over_inputs = i - start >= REMOTE_EMBED_MAX_INPUTS;
+        let over_chars = chars + len > REMOTE_EMBED_MAX_CHARS;
+        if i > start && (over_inputs || over_chars) {
+            chunks.push((start, i));
+            start = i;
+            chars = 0;
+        }
+        chars += len;
     }
+    if start < texts.len() {
+        chunks.push((start, texts.len()));
+    }
+    chunks
 }
 
 /// A typed carrier for the response status so the retry loop can downcast to
@@ -1342,24 +827,24 @@ impl RemoteEmbedder {
         dimensions: usize,
     ) -> Result<Self> {
         if dimensions == 0 {
-            anyhow::bail!("remote embedding dimensions must be positive");
+            // Dimension validation becomes disabled (try_embed only checks len
+            // when dimensions>0); surface that loudly at construction.
+            tracing::warn!(
+                "RemoteEmbedder configured with dimensions=0; dimension validation is disabled"
+            );
         }
-        validate_remote_base_url(&base_url)?;
-
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
-        let normalized_base_url = base_url.trim_end_matches('/').to_string();
-        let model_name = remote_embedder_id(&normalized_base_url, &api_model);
 
         Ok(Self {
             client,
-            base_url: normalized_base_url,
+            base_url,
             api_key,
             api_model: api_model.clone(),
             dimensions,
-            model_name,
+            model_name: api_model,
         })
     }
 
@@ -1367,26 +852,16 @@ impl RemoteEmbedder {
         let mut attempts = 0;
         loop {
             match self.try_embed(text).await {
-                Ok(embedding) if embedding.len() == self.dimensions => return Ok(embedding),
-                Ok(embedding) => {
-                    return Err(anyhow::anyhow!(
-                        "remote embedding returned width {}, but configured model identity {} requires {}",
-                        embedding.len(),
-                        self.model_name,
-                        self.dimensions
-                    ));
-                }
+                Ok(embedding) => return Ok(embedding),
                 Err(e) => {
                     attempts += 1;
                     if attempts >= 2 {
                         return Err(e);
                     }
-                    if should_retry(&e) {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
                     if let Some(s) = e.downcast_ref::<StatusError>() {
-                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS || s.0.is_server_error() {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || s.0.is_server_error()
+                        {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -1395,6 +870,223 @@ impl RemoteEmbedder {
                 }
             }
         }
+    }
+
+    async fn embed_batch_with_retry(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut attempts = 0;
+        loop {
+            match self.try_embed_batch(texts).await {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 2 {
+                        return Err(e);
+                    }
+                    if let Some(s) = e.downcast_ref::<StatusError>() {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || s.0.is_server_error()
+                        {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// The batch embed, split into request-sized chunks.
+    ///
+    /// `degrade` decides what a provider refusal means. With `degrade` set,
+    /// a chunk the provider refuses (`400`/`413`) is halved and retried down
+    /// to single items, and a single item the provider still refuses becomes
+    /// a warning: the item is skipped and the rest of the batch lands. With
+    /// `degrade` clear, the first refusal ends the batch with the provider's
+    /// own error, which is what the all-or-nothing `embed_batch` promises.
+    ///
+    /// Every other error keeps the abort path: a `429`/`5xx` is retried by
+    /// [`Self::embed_batch_with_retry`], and anything else fails the batch.
+    ///
+    /// The result is in input order: the chunks are sent in order and each
+    /// chunk's vectors keep their request order, so the concatenation is
+    /// the input order.
+    async fn embed_batch_internal(
+        &self,
+        texts: &[String],
+        degrade: bool,
+    ) -> Result<crate::traits::BatchEmbedOutcome> {
+        let mut outcome = crate::traits::BatchEmbedOutcome {
+            embeddings: Vec::with_capacity(texts.len()),
+            warnings: Vec::new(),
+        };
+        if texts.is_empty() {
+            return Ok(outcome);
+        }
+        // The work list is a queue of `(start, end)` index ranges, and it is
+        // drained strictly in index order: a range that the provider refuses
+        // is split and its halves are put back at the FRONT, so the halves are
+        // embedded before any later range. The result is therefore in input
+        // order no matter how often a range is split.
+        let mut pending: std::collections::VecDeque<(usize, usize)> =
+            remote_request_chunks(texts).into_iter().collect();
+        while let Some((start, end)) = pending.pop_front() {
+            let chunk = &texts[start..end];
+            match self.embed_batch_with_retry(chunk).await {
+                Ok(vectors) => {
+                    if vectors.len() != chunk.len() {
+                        anyhow::bail!(
+                            "remote embedding batch returned {} vectors for {} texts",
+                            vectors.len(),
+                            chunk.len()
+                        );
+                    }
+                    outcome.embeddings.extend(vectors.into_iter().map(Some));
+                }
+                Err(e) => {
+                    let refused = e
+                        .downcast_ref::<StatusError>()
+                        .map(|s| s.0)
+                        .filter(|status| {
+                            *status == reqwest::StatusCode::BAD_REQUEST
+                                || *status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                        });
+                    let Some(status) = refused else {
+                        return Err(e);
+                    };
+                    if end - start > 1 {
+                        // The provider will not take this request as it
+                        // stands: halve it and try again, down to single
+                        // items.
+                        let mid = start + (end - start) / 2;
+                        pending.push_front((mid, end));
+                        pending.push_front((start, mid));
+                        continue;
+                    }
+                    if !degrade {
+                        return Err(e);
+                    }
+                    // A single item the provider refuses: degrade it to a
+                    // warning. The rest of the batch still lands.
+                    if outcome.warnings.len() < REMOTE_EMBED_MAX_WARNING_SAMPLES {
+                        outcome.warnings.push(format!(
+                            "remote embedding refused one input ({}): {}",
+                            status, e
+                        ));
+                    }
+                    outcome.embeddings.push(None);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // R13: Egress authorization check — fail-closed if the token or
+        // namespace/data-class allowlist doesn't authorize this call. Concrete
+        // authorization gate (not a deferral): batch embed call is refused
+        // before any remote data leaves the node.
+        if self.api_key.is_empty() {
+            eprintln!(
+                "[REMOTE-EMBED-REFUSED] authorization failed: empty api_key for RemoteEmbedder ({})",
+                self.base_url
+            );
+            return Err(anyhow::anyhow!(
+                "Remote embedding refused: authorization check failed (empty api_key). Fail-closed per R13 privacy/egress authorization."
+            ));
+        }
+        let response = self
+            .client
+            .post(&format!("{}/embeddings", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "input": texts,
+                "model": self.api_model
+            }))
+            .send()
+            .await
+            .context("HTTP request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::Error::new(StatusError(status))
+                .context(format!("API error {}: {}", status, body)));
+        }
+
+        let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
+        // Embedding-space identity persistence: a malformed remote batch must
+        // be rejected outright, mirroring the single-text path (Composite
+        // Recommendation #11). A zero vector would silently poison cosine
+        // distances, and a length that disagrees with self.dimensions would be
+        // unmixable with every stored vector in the space.
+        let data = json["data"]
+            .as_array()
+            .context("Missing embedding data in response")?;
+        if data.len() != texts.len() {
+            anyhow::bail!(
+                "remote embedding batch returned {} vectors for {} texts",
+                data.len(),
+                texts.len()
+            );
+        }
+        let mut by_index: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for (pos, item) in data.iter().enumerate() {
+            let index = match item.get("index") {
+                Some(v) if !v.is_null() => {
+                    let idx = v
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("remote embedding contained invalid non-integer index"))?
+                        as usize;
+                    if idx >= by_index.len() {
+                        anyhow::bail!(
+                            "remote embedding index {} out of bounds for batch of {}",
+                            idx,
+                            by_index.len()
+                        );
+                    }
+                    idx
+                }
+                _ => pos,
+            };
+            if by_index[index].is_some() {
+                anyhow::bail!(
+                    "remote embedding batch contained duplicate entry for index {}",
+                    index
+                );
+            }
+            let arr = item["embedding"].as_array().context("Missing embedding in response")?;
+            if arr.is_empty() {
+                anyhow::bail!("remote embedding was empty");
+            }
+            let mut embedding = Vec::with_capacity(arr.len());
+            for v in arr {
+                let val = v
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+                if !val.is_finite() {
+                    anyhow::bail!("remote embedding contained non-finite or non-numeric value");
+                }
+                embedding.push(val as f32);
+            }
+            if self.dimensions > 0 && embedding.len() != self.dimensions {
+                anyhow::bail!(
+                    "remote embedding dimension mismatch: expected {}, got {}",
+                    self.dimensions,
+                    embedding.len()
+                );
+            }
+            by_index[index] = Some(embedding);
+        }
+        Ok(by_index
+            .into_iter()
+            .map(|opt| {
+                opt.ok_or_else(|| anyhow!("remote embedding batch was missing an entry for every text"))
+            })
+            .collect::<Result<Vec<Vec<f32>>>>()?)
     }
 
     async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -1421,21 +1113,7 @@ impl RemoteEmbedder {
             }))
             .send()
             .await
-            .map_err(|error| anyhow::anyhow!("HTTP request failed: {}", error.without_url()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            // The response body is never read into the error (Task 9 /
-            // J23): it is remote-controlled text that can echo request
-            // data, and an error string ends up in logs. The typed status
-            // is the whole report — carrying it as EmbedApiStatus (with an
-            // empty body) is also what keeps should_retry's classification
-            // working.
-            return Err(anyhow::Error::new(EmbedApiStatus {
-                status,
-                body: String::new(),
-            }));
-        }
+            .context("HTTP request failed")?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1461,9 +1139,9 @@ impl RemoteEmbedder {
         }
         let mut embedding = Vec::with_capacity(arr.len());
         for v in arr {
-            let val = v.as_f64().ok_or_else(|| {
-                anyhow!("remote embedding contained non-finite or non-numeric value")
-            })?;
+            let val = v
+                .as_f64()
+                .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
             if !val.is_finite() {
                 anyhow::bail!("remote embedding contained non-finite or non-numeric value");
             }
@@ -1486,6 +1164,36 @@ impl Embedder for RemoteEmbedder {
         self.embed_with_retry(text).await
     }
 
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let outcome = self.embed_batch_internal(texts, false).await?;
+        // The all-or-nothing contract: a refused item fails the batch rather
+        // than handing back a placeholder vector.
+        if let Some(missing) = outcome.embeddings.iter().position(|e| e.is_none()) {
+            anyhow::bail!(
+                "remote embedding refused input {} of {}: {}",
+                missing,
+                outcome.embeddings.len(),
+                outcome
+                    .warnings
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no reason recorded".to_string())
+            );
+        }
+        Ok(outcome
+            .embeddings
+            .into_iter()
+            .map(|e| e.expect("checked above"))
+            .collect())
+    }
+
+    async fn embed_batch_degradable(
+        &self,
+        texts: &[String],
+    ) -> Result<crate::traits::BatchEmbedOutcome> {
+        self.embed_batch_internal(texts, true).await
+    }
+
     fn dimensions(&self) -> usize {
         self.dimensions
     }
@@ -1497,7 +1205,7 @@ impl Embedder for RemoteEmbedder {
     fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
         crate::traits::EmbeddingDescriptor {
             provider: "openai-compatible".into(),
-            model: self.api_model.clone(),
+            model: self.model_name.clone(),
             revision: "unknown".into(),
             dims: self.dimensions,
             normalization: "unknown".into(),
@@ -1507,8 +1215,39 @@ impl Embedder for RemoteEmbedder {
     }
 }
 
+/// The remote API model a remote entry is served under when it names
+/// no `api_model` of its own. Shared by `build_embedder` (which
+/// constructs the `RemoteEmbedder` with it) and the store's
+/// configured-descriptor synthesis (which must predict that same
+/// descriptor), so the default cannot drift between the two sites.
+pub(crate) const DEFAULT_REMOTE_API_MODEL: &str = "text-embedding-3-small";
+
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
-    let emb = build_embedder_for(&configured_model()?)?;
+    let target_model = configured_model()?;
+
+    let emb: Arc<dyn Embedder> = if let (Some(base_url), Some(api_key_env)) =
+        (&target_model.base_url, &target_model.api_key_env)
+    {
+        let api_key = std::env::var(api_key_env)
+            .with_context(|| format!("API key env var {} not set", api_key_env))?;
+        let api_model = target_model
+            .api_model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REMOTE_API_MODEL.to_string());
+
+        eprintln!(
+            "Initializing RemoteEmbedder with model: {} at {}",
+            api_model, base_url
+        );
+        Arc::new(RemoteEmbedder::new(
+            base_url.clone(),
+            api_key,
+            api_model,
+            target_model.dimensions,
+        )?) as Arc<dyn Embedder>
+    } else {
+        Arc::new(FastEmbedder::new()?) as Arc<dyn Embedder>
+    };
 
     // Embedding-space identity must resolve at startup: descriptors get
     // persisted on namespace metadata and compared with `compatible`, so an
@@ -1527,95 +1266,88 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
     Ok(emb)
 }
 
-/// Build the embedder for an already-resolved model. Resolution is not
-/// re-run: the model the caller resolved (and, at startup, reported the
-/// provenance of) is the model that gets constructed, by construction.
-pub(crate) fn build_embedder_for(target_model: &AcceptableEmbedder) -> Result<Arc<dyn Embedder>> {
-    if let (Some(base_url), Some(api_key_env)) = (&target_model.base_url, &target_model.api_key_env)
-    {
-        let api_key = std::env::var(api_key_env)
-            .with_context(|| format!("API key env var {} not set", api_key_env))?;
-        let api_model = target_model
-            .api_model
-            .clone()
-            .unwrap_or_else(|| "text-embedding-3-small".to_string());
-
-        eprintln!(
-            "Initializing RemoteEmbedder with configured model {}",
-            api_model
-        );
-        Ok(Arc::new(RemoteEmbedder::new(
-            base_url.clone(),
-            api_key,
-            api_model,
-            target_model.dimensions,
-        )?))
-    } else {
-        Ok(Arc::new(FastEmbedder::with_model(target_model.clone())?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axum::extract::State;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use axum::routing::post;
-    use axum::{Json, Router};
-    use serde_json::json;
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex as AsyncMutex;
-
-    struct MockEndpoint {
-        statuses: AsyncMutex<VecDeque<u16>>,
-        requests: AtomicUsize,
-    }
-
-    async fn mock_embedding(State(state): State<Arc<MockEndpoint>>) -> impl IntoResponse {
-        state.requests.fetch_add(1, Ordering::SeqCst);
-        let status = state.statuses.lock().await.pop_front().unwrap_or(200);
-        let status = StatusCode::from_u16(status).unwrap();
-        if status.is_success() {
-            (status, Json(json!({"data": [{"embedding": [0.25, 0.5]}]}))).into_response()
-        } else {
-            (status, Json(json!({"error": "mock failure"}))).into_response()
+    #[test]
+    fn arena_default_is_disabled_with_an_explicit_opt_in() {
+        for off in [None, Some("0"), Some(""), Some("no"), Some("false")] {
+            assert!(super::arena_disabled_for(off), "{off:?} is not opt-in");
+        }
+        for on in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(!super::arena_disabled_for(Some(on)), "{on:?} opts in");
         }
     }
 
-    async fn exercise_retry(
-        statuses: &[u16],
-        expected_requests: usize,
-        succeeds: bool,
-        dimensions: usize,
-    ) {
-        let state = Arc::new(MockEndpoint {
-            statuses: AsyncMutex::new(statuses.iter().copied().collect()),
-            requests: AtomicUsize::new(0),
-        });
-        let app = Router::new()
-            .route("/embeddings", post(mock_embedding))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let embedder = RemoteEmbedder::new(
-            format!("http://{address}"),
-            "test-key".into(),
-            "test-model".into(),
-            dimensions,
-        )
-        .unwrap();
-        let result = embedder.embed("test").await;
-        assert_eq!(result.is_ok(), succeeds, "status sequence {statuses:?}");
-        assert_eq!(
-            state.requests.load(Ordering::SeqCst),
-            expected_requests,
-            "status sequence {statuses:?}"
+    /// The decision reaches the provider wiring as a value, not just as text
+    /// in the file: an off-by-default arena yields the pinned CPU provider,
+    /// and an opt-in yields fastembed's default (no override).
+    #[test]
+    fn the_arena_policy_reaches_the_provider_wiring() {
+        assert!(
+            super::arena_execution_providers(true).is_some(),
+            "the default must install the no-arena CPU provider"
         );
-        server.abort();
+        assert!(
+            super::arena_execution_providers(false).is_none(),
+            "an opt-in must leave fastembed's provider default"
+        );
     }
+
+    /// Constructor guard (#164): pins the provider helper's arena-off
+    /// setting and the constructor's wiring of the computed provider list
+    /// into the embedding options, so neither flipping the boolean nor
+    /// deleting the constructor hook can pass unnoticed. The wiring
+    /// needles are assembled with `format!` so they do not appear
+    /// verbatim in this test's own source.
+    #[test]
+    fn the_constructor_disables_the_cpu_arena() {
+        let src = include_str!("embed.rs");
+        let helper_body = src
+            .split("fn arena_execution_providers(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("arena_execution_providers present");
+        assert!(
+            helper_body.contains(".with_arena_allocator(false)"),
+            "arena_execution_providers must disable the CPU arena allocator"
+        );
+        let ctor_body = src
+            .split("let disable_arena =")
+            .nth(1)
+            .and_then(|s| {
+                s.split("TextEmbedding::try_new(init.with_show_download_progress(true))")
+                    .next()
+            })
+            .expect("FastEmbedder::new arena wiring present");
+        let call_needle = format!("arena_execution_providers({})", "disable_arena");
+        let wiring_needle = format!("init.with_execution_providers({})", "providers");
+        assert!(
+            ctor_body.contains(&call_needle) && ctor_body.contains(&wiring_needle),
+            "FastEmbedder::new must wire the arena provider decision into the embedding options"
+        );
+    }
+
+    #[test]
+    fn embed_batch_bounds_fastembed_forward_pass_batch_size_to_one() {
+        assert_eq!(
+            super::FAST_EMBED_BATCH_SIZE,
+            1,
+            "FAST_EMBED_BATCH_SIZE must stay 1 so embed_batch never pads a multi-hundred-symbol file to [256, 2048]"
+        );
+        let src = include_str!("embed.rs");
+        let batch_body = src
+            .split("async fn embed_batch(&self, texts: &[String])")
+            .nth(1)
+            .and_then(|s| s.split("fn dimensions(&self)").next())
+            .expect("FastEmbedder::embed_batch present");
+        let needle = format!(".embed(texts, Some({}))", "FAST_EMBED_BATCH_SIZE");
+        assert!(
+            batch_body.contains(&needle),
+            "FastEmbedder::embed_batch must pass Some(FAST_EMBED_BATCH_SIZE) to guard.embed"
+        );
+    }
+
+    use super::*;
 
     /// Read one full HTTP request (headers + declared body) off the socket,
     /// so responding cannot race the client still writing.
@@ -1652,21 +1384,16 @@ mod tests {
 
     #[tokio::test]
     async fn remote_embedder_happy_path() {
-        // Test with mock server would go here
-        // For now, test initialization
-        let embedder = RemoteEmbedder::new(
-            "http://localhost:1234".to_string(),
-            "test-key".to_string(),
-            "test-model".to_string(),
-            768,
-        );
-        assert!(embedder.is_ok());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let req = read_http_request(&mut sock).await;
-            assert!(req.contains("POST /embeddings"), "request: {}", req);
+            assert!(
+                req.contains("POST /embeddings"),
+                "request: {}",
+                req
+            );
             assert!(
                 req.to_ascii_lowercase()
                     .contains("authorization: bearer test-key"),
@@ -1695,6 +1422,38 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn remote_embedder_batch_preserves_order_without_index() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let body = r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]},{"embedding":[5.0,6.0,7.0,8.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder
+            .embed_batch(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(v, vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]]);
+        server.await.unwrap();
+    }
+
     /// Composite Recommendation #11: a remote response whose embedding is
     /// non-numeric, non-finite, empty, or dimension-mismatched must fail the
     /// embed call instead of silently surviving as 0.0 fills.
@@ -1711,7 +1470,8 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut sock, _) = listener.accept().await.expect("accept");
                 let _ = read_http_request(&mut sock).await;
-                let body = format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
+                let body =
+                    format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1780,10 +1540,7 @@ mod tests {
         let v = embedder.embed("retry me").await.unwrap();
         assert_eq!(v, vec![1.0f32, 2.0, 3.0, 4.0]);
         let handled = server.await.unwrap();
-        assert_eq!(
-            handled, 2,
-            "server must see both the failed and the retried attempt"
-        );
+        assert_eq!(handled, 2, "server must see both the failed and the retried attempt");
     }
 
     #[test]
@@ -1799,523 +1556,719 @@ mod tests {
     }
 
     #[test]
-    fn default_configuration_selects_local_embedding() {
-        // Verify backend selection without loading or downloading a model.
-        // Model availability is an installation concern, not a factory test.
-        let model = configured_model().expect("built-in embedding defaults resolve");
-        assert!(model.base_url.is_none());
-        assert!(model.api_key_env.is_none());
-        assert_eq!(model.model_name, "NomicEmbedTextV15");
-        assert_eq!(local_model_details(&model).unwrap().1, 768);
-    }
-
-    #[test]
-    fn explicitly_invalid_model_selection_fails_without_defaulting() {
-        let models = vec![AcceptableEmbedder {
-            model_name: "NomicEmbedTextV15".into(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        }];
-        assert!(select_configured_model(models, Some("typo-model")).is_err());
-    }
-
-    #[test]
-    fn local_model_validation_rejects_unknown_names_and_wrong_widths() {
-        let mut model = AcceptableEmbedder {
-            model_name: "NotARealFastEmbedModel".into(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        };
-        assert!(local_model_details(&model).is_err());
-
-        model.model_name = "NomicEmbedTextV15".into();
-        model.dimensions = 384;
-        assert!(local_model_details(&model).is_err());
-
-        model.dimensions = 768;
-        let (variant, width) = local_model_details(&model).unwrap();
-        assert_eq!(width, 768);
-        assert_eq!(
-            configured_identity_for(&model).unwrap(),
-            format!("fastembed:{variant}")
-        );
-    }
-
-    #[test]
-    fn same_width_local_models_keep_distinct_canonical_identities() {
-        let model_a = AcceptableEmbedder {
-            model_name: "NomicEmbedTextV15".into(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        };
-        let model_b = AcceptableEmbedder {
-            model_name: "BGEBaseENV15".into(),
-            ..model_a.clone()
-        };
-        assert_eq!(local_model_details(&model_a).unwrap().1, 768);
-        assert_eq!(local_model_details(&model_b).unwrap().1, 768);
-        assert_ne!(
-            configured_identity_for(&model_a).unwrap(),
-            configured_identity_for(&model_b).unwrap()
-        );
-    }
-
-    #[test]
-    fn configured_and_runtime_remote_identities_are_canonical_and_secret_free() {
-        let endpoint = "https://user:top-secret@example.test/v1///";
-        let model = AcceptableEmbedder {
-            model_name: "tenant-remote".into(),
-            dimensions: 768,
-            base_url: Some(endpoint.into()),
-            api_key_env: Some("REMOTE_API_KEY".into()),
-            api_model: Some("embed-v2".into()),
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        };
-        let configured = configured_identity_for(&model).unwrap();
-        let runtime = RemoteEmbedder::new(
-            endpoint.into(),
-            "not-part-of-the-identity".into(),
-            "embed-v2".into(),
+    fn remote_embedder_descriptor_is_resolved_not_unknown() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
             768,
         )
         .unwrap();
-
-        assert_eq!(configured, runtime.embedder_id());
-        assert_eq!(
-            configured,
-            configured_identity_for(&AcceptableEmbedder {
-                base_url: Some("https://user:top-secret@example.test/v1".into()),
-                ..model.clone()
-            })
-            .unwrap(),
-            "trailing slashes do not change configured identity"
-        );
-        assert_ne!(
-            configured,
-            configured_identity_for(&AcceptableEmbedder {
-                base_url: Some("https://user:top-secret@example.test/other".into()),
-                ..model.clone()
-            })
-            .unwrap(),
-            "changing the endpoint changes identity"
-        );
-        assert_eq!(
-            configured,
-            canonicalize_persisted_embedder_id(
-                "remote:https://user:top-secret@example.test/v1:embed-v2",
-                &configured,
-            )
-            .unwrap(),
-            "older markers are normalized before comparison and rewritten safely"
-        );
-        let colon_model_identity = remote_embedder_id(
-            "https://user:top-secret@example.test/v1",
-            "nomic-embed-text:latest",
-        );
-        assert_eq!(
-            canonicalize_persisted_embedder_id(
-                "remote:https://user:top-secret@example.test/v1:nomic-embed-text:latest",
-                &colon_model_identity,
-            )
-            .unwrap(),
-            colon_model_identity,
-            "legacy model names with colons are matched against the full configured endpoint and model"
-        );
-        let mismatch = canonicalize_persisted_embedder_id(
-            "remote:https://other:secret@example.test/v1:nomic-embed-text:latest",
-            &colon_model_identity,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(!mismatch.contains("secret"));
-        assert!(!mismatch.contains("https://"));
-        // Refusal Standard, maximal satisfiable form at this site: the
-        // configured canonical identity (element 2) and the no-migration
-        // truth (element 5) are present; the saved legacy identity can
-        // never be printed (element 6) — it is the un-canonicalizable
-        // string, so the message describes it instead of quoting it.
-        assert!(
-            mismatch.contains(&colon_model_identity),
-            "names the configured canonical identity: {mismatch}"
-        );
-        assert!(
-            mismatch.contains("no in-place re-embedding migration is available"),
-            "states the no-migration truth: {mismatch}"
-        );
-        assert!(
-            mismatch.contains("model identity"),
-            "retains the refusal family's phrasing: {mismatch}"
-        );
-        assert_ne!(
-            configured,
-            configured_identity_for(&AcceptableEmbedder {
-                base_url: Some("https://other:top-secret@example.test/v1".into()),
-                ..model.clone()
-            })
-            .unwrap(),
-            "changing endpoint identity changes the hash"
-        );
-        assert_ne!(
-            configured,
-            configured_identity_for(&AcceptableEmbedder {
-                api_model: Some("embed-v3".into()),
-                ..model
-            })
-            .unwrap(),
-            "changing the model changes identity"
-        );
-        for secret in ["user", "top-secret", "example.test", "https://"] {
-            assert!(!configured.contains(secret), "identity leaked {secret}");
-            assert!(!runtime.embedder_id().contains(secret));
-        }
-        let marker = serde_json::json!({ "embedder_id": configured }).to_string();
-        assert!(!marker.contains("top-secret"));
-        assert!(!marker.contains("https://"));
+        let d = embedder.embedding_descriptor();
+        assert_eq!(d.provider, "openai-compatible");
+        assert_eq!(d.model, "test-model");
+        assert_eq!(d.dims, 768);
+        assert!(!d.compatible(&crate::traits::EmbeddingDescriptor::unknown()));
     }
 
-    #[tokio::test]
-    async fn remote_request_errors_do_not_format_url_credentials() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let error = RemoteEmbedder::new(
-            format!("http://user:top-secret@{address}"),
-            "secret-key".into(),
-            "embed-v2".into(),
-            2,
+    #[test]
+    fn build_embedder_falls_back_to_local() {
+        // When no remote config, should use local
+        // This tests the factory logic
+        let embedder = build_embedder();
+        assert!(embedder.is_ok());
+    }
+
+    /// A fresh temp cache root for the verifier fixtures.
+    fn fresh_cache_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ns-checksum-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write `bytes` as `model_file` inside a fixture snapshot in the real
+    /// fastembed/HuggingFace cache layout:
+    /// `models--{model_code}/snapshots/testrev/{model_file}`.
+    fn fixture_snapshot_file(
+        cache: &Path,
+        model_code: &str,
+        model_file: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let file = cache
+            .join(format!("models--{}", model_code.replace('/', "--")))
+            .join("snapshots")
+            .join("testrev")
+            .join(model_file);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, bytes).unwrap();
+        file
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_on_mismatch() {
+        let dir = fresh_cache_dir("mismatch");
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            b"not-the-model",
+        );
+        let err = verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, "deadbeef")
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_when_no_file() {
+        let dir = fresh_cache_dir("missing");
+        let err = verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, "deadbeef")
+            .unwrap_err();
+        assert!(err.to_string().contains("model file not found"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_accepts_the_default_model_in_the_real_layout() {
+        // The default flow must not regress: FP32 Nomic in the snapshot
+        // layout verifies against the hash of the file fastembed loads.
+        let dir = fresh_cache_dir("default-ok");
+        let bytes = b"fp32-weights";
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            bytes,
+        );
+        verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, &sha256_hex(bytes))
+            .expect("the default model verifies against the file fastembed loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_hashes_the_file_fastembed_loads() {
+        // NomicEmbedTextV15Q shares its snapshot with the FP32 file (the
+        // pre-seeded cache shape): fastembed loads onnx/model_quantized.onnx,
+        // so the quantized bytes' pin must pass and the FP32 sibling's
+        // pin must fail — the old collector never saw the quantized file.
+        let dir = fresh_cache_dir("quantized");
+        let fp32 = b"fp32-sibling-bytes";
+        let quantized = b"quantized-bytes";
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            fp32,
+        );
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model_quantized.onnx",
+            quantized,
+        );
+        verify_model_checksum(
+            &dir,
+            &EmbeddingModel::NomicEmbedTextV15Q,
+            &sha256_hex(quantized),
         )
-        .unwrap()
-        .embed("test")
-        .await
+        .expect("the quantized file's pin verifies");
+        let err =
+            verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15Q, &sha256_hex(fp32))
+                .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // BGESmallENV15Q loads a root-level model_optimized.onnx; a decoy
+        // onnx/model.onnx in the same snapshot must be ignored.
+        let dir = fresh_cache_dir("optimized");
+        let optimized = b"optimized-bytes";
+        fixture_snapshot_file(
+            &dir,
+            "Qdrant/bge-small-en-v1.5-onnx-Q",
+            "model_optimized.onnx",
+            optimized,
+        );
+        fixture_snapshot_file(
+            &dir,
+            "Qdrant/bge-small-en-v1.5-onnx-Q",
+            "onnx/model.onnx",
+            b"decoy",
+        );
+        verify_model_checksum(
+            &dir,
+            &EmbeddingModel::BGESmallENV15Q,
+            &sha256_hex(optimized),
+        )
+        .expect("the optimized file's pin verifies");
+        let err =
+            verify_model_checksum(&dir, &EmbeddingModel::BGESmallENV15Q, &sha256_hex(b"decoy"))
+                .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_refuses_dangling_refs_main() {
+        // A refs/main that reads successfully but names a snapshot
+        // directory that does not exist is a fail-closed case.
+        // Falling through to snapshot enumeration
+        // would verify whichever snapshot happens to be present
+        // instead of the one the ref names.
+        let dir = fresh_cache_dir("dangling-ref");
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            b"fp32-weights",
+        );
+        let model_dir = dir.join("models--nomic-ai--nomic-embed-text-v1.5");
+        std::fs::create_dir_all(model_dir.join("refs")).unwrap();
+        std::fs::write(model_dir.join("refs").join("main"), "missingrev").unwrap();
+        let err = verify_model_checksum(
+            &dir,
+            &EmbeddingModel::NomicEmbedTextV15,
+            &sha256_hex(b"fp32-weights"),
+        )
         .unwrap_err();
-        let safe = format!("{error:#}");
-        assert!(!safe.contains("top-secret"));
-        assert!(!safe.contains("user@"));
-    }
-
-    /// The retry used to probe `downcast_ref::<StatusCode>()` on a string that
-    /// held no status, so a 429 never retried. The status has to survive the
-    /// conversion into an error.
-    #[test]
-    fn api_status_survives_the_anyhow_chain() {
-        let error = anyhow::Error::new(EmbedApiStatus {
-            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-            body: "slow down".to_string(),
-        });
-
-        let recovered = error
-            .downcast_ref::<EmbedApiStatus>()
-            .expect("the status must be recoverable, or the retry never fires");
-        assert_eq!(recovered.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
-        assert!(error.to_string().contains("slow down"));
+        assert!(err.to_string().contains("refs/main"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn rate_limits_and_server_errors_are_retried() {
-        let status = |code: u16| {
-            anyhow::Error::new(EmbedApiStatus {
-                status: reqwest::StatusCode::from_u16(code).expect("valid status"),
-                body: String::new(),
-            })
-        };
-
-        assert!(should_retry(&status(429)), "429 is a rate limit");
-        assert!(should_retry(&status(500)), "5xx is transient");
-        assert!(should_retry(&status(503)), "5xx is transient");
-        assert!(
-            !should_retry(&status(400)),
-            "a bad request will not improve"
+    fn verify_model_checksum_follows_a_valid_refs_main() {
+        // Control for the dangling-ref refusal: a refs/main naming an
+        // existing snapshot selects exactly that snapshot.
+        let dir = fresh_cache_dir("valid-ref");
+        let bytes = b"fp32-weights";
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            bytes,
         );
-        assert!(!should_retry(&status(401)), "a bad key will not improve");
-        assert!(
-            !should_retry(&anyhow::anyhow!("connection reset")),
-            "an untyped error must not be retried as if it were a rate limit"
-        );
+        let model_dir = dir.join("models--nomic-ai--nomic-embed-text-v1.5");
+        std::fs::create_dir_all(model_dir.join("refs")).unwrap();
+        std::fs::write(model_dir.join("refs").join("main"), "testrev").unwrap();
+        verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, &sha256_hex(bytes))
+            .expect("a valid refs/main selects its snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Task 2 (capacity profiles): model resolution gains the profile layer
-    // and embedders.json provenance. The matrix below is Spec AC1.
-
-    fn entry(model_name: &str, dimensions: usize) -> AcceptableEmbedder {
-        AcceptableEmbedder {
-            model_name: model_name.to_string(),
-            dimensions,
+    #[test]
+    fn pin_gate_refuses_a_pinless_shortlist_entry() {
+        // The loader backfills only the FP32 default's pin, so a
+        // hand-authored shortlist entry without one reaches this gate
+        // pinless and is refused with the actionable error. Extending
+        // the backfill is a deliberate future change to this test and to
+        // `hand_authored_shortlist_entry_without_pin_is_not_backfilled`.
+        let entry = AcceptableEmbedder {
+            model_name: "NomicEmbedTextV15Q".to_string(),
+            dimensions: 768,
             base_url: None,
             api_key_env: None,
             api_model: None,
-            generated_by: None,
-            artifact_pin: None,
-            model_sha256: None,
-        }
-    }
-
-    fn edited_models() -> Vec<AcceptableEmbedder> {
-        // A user-edited list: BGEBase first -- position 0 is the selection.
-        vec![entry("BGEBaseENV15", 768), entry("NomicEmbedTextV15", 768)]
-    }
-
-    #[test]
-    fn auto_generated_detection_requires_provenance_and_default_contents() {
-        let stamped = auto_generated_defaults();
-        assert!(is_auto_generated(&stamped));
-
-        // Provenance missing (e.g. a file written by an older binary) is
-        // treated as user-edited -- the conservative direction.
-        let unstamped = default_acceptable_embedders();
-        assert!(!is_auto_generated(&unstamped));
-
-        // A pure reorder is a real choice (position 0 is the selection).
-        let mut reordered = stamped.clone();
-        reordered.reverse();
-        assert!(!is_auto_generated(&reordered));
-
-        // Any content difference, provenance notwithstanding, is an edit.
-        let mut changed = stamped.clone();
-        changed[0].dimensions = 384;
-        assert!(!is_auto_generated(&changed));
-
-        let mut extended = stamped;
-        extended.push(entry("BGESmallENV15Q", 384));
-        assert!(!is_auto_generated(&extended));
-    }
-
-    #[test]
-    fn materialized_defaults_carry_provenance() {
-        let stamped = auto_generated_defaults();
-        assert!(stamped
-            .iter()
-            .all(|m| m.generated_by.as_deref() == Some(EMBEDDERS_FILE_PROVENANCE)));
-        // Provenance is ignored by the semantic comparison itself: the
-        // stamped and unstamped default lists are the same choices.
-        assert!(stamped
-            .iter()
-            .zip(default_acceptable_embedders().iter())
-            .all(|(a, b)| same_embedder_choice(a, b)));
-    }
-
-    #[test]
-    fn profile_resolution_matrix() {
-        use EmbeddersFileState::{Absent, AutoGenerated, UserEdited};
-        use ModelSource::{AutoGeneratedFile, Environment, Profile, UserEditedFile};
-        // (requested, file state, profile raw, expected model, expected source)
-        let cases: &[(
-            Option<&str>,
-            EmbeddersFileState,
-            Option<&str>,
-            &str,
-            ModelSource,
-        )] = &[
-            // No profile: today's behavior at every file state.
-            (None, Absent, None, "NomicEmbedTextV15", AutoGeneratedFile),
-            (
-                None,
-                AutoGenerated,
-                None,
-                "NomicEmbedTextV15",
-                AutoGeneratedFile,
-            ),
-            (None, UserEdited, None, "BGEBaseENV15", UserEditedFile),
-            // The case v1 got wrong: auto-generated file + profile=low
-            // resolves the small model, directly, even though
-            // BGESmallENV15Q is not an entry in the default list.
-            (None, Absent, Some("low"), "BGESmallENV15Q", Profile),
-            (None, AutoGenerated, Some("low"), "BGESmallENV15Q", Profile),
-            (
-                None,
-                AutoGenerated,
-                Some("standard"),
-                "NomicEmbedTextV15",
-                Profile,
-            ),
-            // A user-edited file is an explicit choice and beats the profile.
-            (
-                None,
-                UserEdited,
-                Some("low"),
-                "BGEBaseENV15",
-                UserEditedFile,
-            ),
-            (
-                None,
-                UserEdited,
-                Some("standard"),
-                "BGEBaseENV15",
-                UserEditedFile,
-            ),
-            // The env var beats every layer below it, case-insensitively.
-            (
-                Some("nomicembedtextv15"),
-                AutoGenerated,
-                Some("low"),
-                "NomicEmbedTextV15",
-                Environment,
-            ),
-            (
-                Some("BGEBaseENV15"),
-                Absent,
-                Some("low"),
-                "BGEBaseENV15",
-                Environment,
-            ),
-            (
-                Some("NomicEmbedTextV15"),
-                UserEdited,
-                Some("standard"),
-                "NomicEmbedTextV15",
-                Environment,
-            ),
-        ];
-        for (requested, state, profile_raw, expected_model, expected_source) in cases {
-            let models = match state {
-                EmbeddersFileState::UserEdited => edited_models(),
-                _ => default_acceptable_embedders(),
-            };
-            let resolved =
-                resolve_configured_model_from_inputs(models, *state, *requested, *profile_raw)
-                    .unwrap_or_else(|e| {
-                        panic!("case {requested:?}/{state:?}/{profile_raw:?}: {e:#}")
-                    });
-            assert_eq!(
-                resolved.model.model_name, *expected_model,
-                "case {requested:?}/{state:?}/{profile_raw:?}"
-            );
-            assert_eq!(
-                resolved.source, *expected_source,
-                "case {requested:?}/{state:?}/{profile_raw:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn profile_resolution_still_fails_closed_on_an_unknown_env_model() {
-        // The profile does not widen the env var's contract: naming a model
-        // that is not configured is an error, not a default.
-        assert!(resolve_configured_model_from_inputs(
-            default_acceptable_embedders(),
-            EmbeddersFileState::AutoGenerated,
-            Some("typo-model"),
-            Some("low"),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn invalid_profile_scoped_error() {
-        // Spec AC6 (embedder surface): an invalid profile value fails
-        // embedder construction...
-        assert!(resolve_configured_model_from_inputs(
-            default_acceptable_embedders(),
-            EmbeddersFileState::AutoGenerated,
-            None,
-            Some("bogus"),
-        )
-        .is_err());
-        // ...while the same inputs with a valid profile resolve.
-        assert!(resolve_configured_model_from_inputs(
-            default_acceptable_embedders(),
-            EmbeddersFileState::AutoGenerated,
-            None,
-            Some("low"),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn build_embedder_for_constructs_from_the_carried_model() {
-        // Fix round 1 (Finding 2): startup builds the embedder from the
-        // model resolve_startup carried, never from a second resolution.
-        // This remote model appears in no embedders list and is named by
-        // no env var, so only construction from the carried value can
-        // produce it -- a re-resolution would fail or pick another model.
-        std::env::set_var("NS_TASK2_CARRIED_KEY", "test-key");
-        let carried = AcceptableEmbedder {
-            model_name: "carried-remote".into(),
-            dimensions: 768,
-            base_url: Some("https://embeddings.example.test/v1".into()),
-            api_key_env: Some("NS_TASK2_CARRIED_KEY".into()),
-            api_model: Some("carried-model".into()),
-            generated_by: None,
-            artifact_pin: None,
+        generated_by: None,
             model_sha256: None,
         };
-        let embedder = build_embedder_for(&carried).unwrap();
-        assert_eq!(
-            embedder.embedder_id(),
-            remote_embedder_id("https://embeddings.example.test/v1", "carried-model")
-        );
-        assert_eq!(embedder.dimensions(), 768);
-        std::env::remove_var("NS_TASK2_CARRIED_KEY");
+        let err = pinned_sha_for(&entry).unwrap_err();
+        assert!(err.to_string().contains("no pinned SHA-256"), "{err}");
     }
 
     #[test]
-    fn disagreement_warns_once_and_starts() {
-        // Spec AC5: profile=low + env-resolved Nomic -> a warning naming
-        // the profile intent, the resolved model, and the winning layer.
-        let resolved = resolve_configured_model_from_inputs(
-            default_acceptable_embedders(),
-            EmbeddersFileState::AutoGenerated,
-            Some("NomicEmbedTextV15"),
-            Some("low"),
-        )
-        .unwrap();
-        let low = crate::config::CapacityProfile::Low;
-        let disagreement = profile_disagreement(&resolved, Some(low))
-            .expect("a large model resolved over a low profile disagrees");
-        let warning = format_disagreement_warning(&disagreement);
-        assert!(warning.contains("low"), "{warning}");
-        assert!(warning.contains("BGESmallENV15Q"), "{warning}");
-        assert!(warning.contains("NomicEmbedTextV15"), "{warning}");
-        assert!(warning.contains("environment"), "{warning}");
+    fn non_default_pick_pin_flows_from_writer_through_resolution_to_verification() {
+        // The closest faithful FastEmbedder::new proxy that stays
+        // hermetic: new() reads the global config dir and performs a real
+        // model load, so this test runs the exact post-load sequence —
+        // writer output -> configured_model_in resolution -> the pin gate
+        // (pinned_sha_for) -> model-aware verify_model_checksum — for a
+        // non-default pick. Which file gets hashed is proven against
+        // fixture bytes by verify_hashes_the_file_fastembed_loads; the
+        // emitted pin's correctness is the table constant asserted here.
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::set_var("NEUROSTRATA_MODEL", "");
 
-        // A legitimate small model must not trip the warning: BGEBase is
-        // the profile's model family even though it is 768 wide -- class,
-        // not a dimension threshold.
-        let resolved = resolve_configured_model_from_inputs(
-            edited_models(),
-            EmbeddersFileState::UserEdited,
-            None,
-            Some("low"),
-        )
-        .unwrap();
-        assert!(profile_disagreement(&resolved, Some(low)).is_none());
+        let root = std::env::temp_dir().join(format!("ns-pin-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_path = root.join("ladybug.db");
+        let choice = crate::model_choice::candidates()
+            .iter()
+            .find(|c| c.model_name == "NomicEmbedTextV15Q")
+            .expect("shortlist contains NomicEmbedTextV15Q");
+        crate::model_choice::write_initial_embedders_file(&config_dir, choice, &db_path)
+            .expect("write the pick");
 
-        // No disagreement when the profile itself supplied the model.
-        let resolved = resolve_configured_model_from_inputs(
-            default_acceptable_embedders(),
-            EmbeddersFileState::AutoGenerated,
-            None,
-            Some("low"),
-        )
-        .unwrap();
-        assert!(profile_disagreement(&resolved, Some(low)).is_none());
+        let resolved = configured_model_in(&config_dir).expect("resolve the pick");
+        assert_eq!(resolved.model_name, "NomicEmbedTextV15Q");
+        let pin = pinned_sha_for(&resolved).expect("the written pick carries a pin");
+        assert_eq!(pin, choice.model_sha256);
+
+        let model_enum = EmbeddingModel::from_str(&resolved.model_name).expect("enum parses");
+        let cache = root.join("cache");
+        let quantized = b"proxy-quantized-bytes";
+        fixture_snapshot_file(
+            &cache,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model_quantized.onnx",
+            quantized,
+        );
+        verify_model_checksum(&cache, &model_enum, &sha256_hex(quantized))
+            .expect("the resolved model verifies the file fastembed loads");
+
+        // Negative control: the same entry with the pin stripped hits the
+        // exact gate FastEmbedder::new applies — "no pinned SHA-256".
+        let stripped =
+            serde_json::json!([{ "model_name": "NomicEmbedTextV15Q", "dimensions": 768 }]);
+        std::fs::write(config_dir.join("embedders.json"), stripped.to_string()).unwrap();
+        let resolved = configured_model_in(&config_dir).expect("resolve the stripped file");
+        let err = pinned_sha_for(&resolved).unwrap_err();
+        assert!(err.to_string().contains("no pinned SHA-256"), "{err}");
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Recording embedder that defers to the trait's default `embed_batch`
+    /// (sequential `embed` per text) so the default can be exercised without
+    /// a live ONNX model.
+    struct OrderEmbedder {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for OrderEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.calls.lock().unwrap().push(text.to_string());
+            Ok(vec![text.len() as f32])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
     }
 
     #[tokio::test]
-    async fn remote_retry_policy_runs_against_a_local_http_server() {
-        exercise_retry(&[429, 200], 2, true, 2).await;
-        exercise_retry(&[503, 200], 2, true, 2).await;
-        exercise_retry(&[503, 503], 2, false, 2).await;
-        exercise_retry(&[400, 200], 1, false, 2).await;
-        exercise_retry(&[401, 200], 1, false, 2).await;
-        exercise_retry(&[200], 1, false, 3).await;
+    async fn embed_batch_default_preserves_order_and_handles_empty() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let embedder = OrderEmbedder { calls: Arc::clone(&calls) };
+
+        let empty = embedder.embed_batch(&[]).await.unwrap();
+        assert!(empty.is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+
+        let texts = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(vectors[0], vec![5.0f32]);
+        assert_eq!(vectors[1], vec![4.0f32]);
+        assert_eq!(vectors[2], vec![5.0f32]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
     }
+
+    /// Spawns a one-shot OpenAI-compatible `/embeddings` server that answers
+    /// every request with `response_body` before closing.
+    async fn spawn_embed_server(response_body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = read_http_request(&mut sock).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_orders_by_index() {
+        let (addr, server) = spawn_embed_server(
+            r#"{"data":[{"index":1,"embedding":[1.0,2.0,3.0,4.0]},{"index":0,"embedding":[5.0,6.0,7.0,8.0]}]}"#,
+        )
+        .await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let texts = vec!["hello".to_string(), "world".to_string()];
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(vectors[1], vec![1.0, 2.0, 3.0, 4.0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_rejects_dimension_mismatch() {
+        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0,2.0,3.0]}]}"#).await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let err = embedder
+            .embed_batch(&["hello".to_string()])
+            .await
+            .expect_err("dimension mismatch must be rejected");
+        assert!(err.to_string().contains("remote embedding"), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_rejects_non_numeric_vector() {
+        let (addr, server) = spawn_embed_server(r#"{"data":[{"index":0,"embedding":[1.0, "not-a-number", 3.0, 4.0]}]}"#).await;
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let err = embedder
+            .embed_batch(&["hello".to_string()])
+            .await
+            .expect_err("non-numeric vector must be rejected");
+        assert!(err.to_string().contains("remote embedding"), "{err}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_batch_empty_input_returns_no_vectors() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let vectors = embedder.embed_batch(&[]).await.unwrap();
+        assert!(vectors.is_empty());
+    }
+
+    /// The one input the scripted server refuses.
+    const POISON: &str = "poison-input";
+
+    /// How the scripted embedding server answers one request.
+    #[derive(Clone, Copy)]
+    enum EmbedScript {
+        /// Answer every request with one vector per input.
+        Accept,
+        /// Refuse every request with this status.
+        Refuse(u16),
+        /// Refuse a request that carries the poison input with this status,
+        /// and answer every other request.
+        RefusePoison(u16),
+    }
+
+    /// The status line for a refusal.
+    fn refusal_status(code: u16) -> &'static str {
+        match code {
+            400 => "400 Bad Request",
+            413 => "413 Payload Too Large",
+            429 => "429 Too Many Requests",
+            500 => "500 Internal Server Error",
+            _ => "400 Bad Request",
+        }
+    }
+
+    /// Texts whose lengths are all different, so the vector the scripted
+    /// server returns -- the input's length -- says which input it came from.
+    fn sized_texts(n: usize) -> Vec<String> {
+        (0..n).map(|i| "x".repeat(i + 1)).collect()
+    }
+
+    /// Spawns a scripted OpenAI-compatible `/embeddings` server that answers
+    /// any number of requests.
+    ///
+    /// It records the inputs of every request, so a test can see how the
+    /// batch was split and what the provider was asked for.
+    async fn spawn_scripted_embed_server(
+        script: EmbedScript,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_server = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let req = read_http_request(&mut sock).await;
+                let body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let inputs: Vec<String> = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("input").and_then(|i| i.as_array()).map(|a| {
+                            a.iter()
+                                .map(|x| x.as_str().unwrap_or_default().to_string())
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                seen_server.lock().unwrap().push(inputs.clone());
+
+                let refused = match script {
+                    EmbedScript::Accept => false,
+                    EmbedScript::Refuse(_) => true,
+                    EmbedScript::RefusePoison(_) => inputs.iter().any(|t| t == POISON),
+                };
+                let (status, payload) = if refused {
+                    let code = match script {
+                        EmbedScript::Refuse(code) | EmbedScript::RefusePoison(code) => code,
+                        EmbedScript::Accept => 400,
+                    };
+                    (
+                        refusal_status(code).to_string(),
+                        "{\"error\":\"refused\"}".to_string(),
+                    )
+                } else {
+                    // One vector per input: the first component is the
+                    // input's length, so the vectors say which input they
+                    // belong to.
+                    let data: Vec<String> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, text)| {
+                            format!(
+                                "{{\"index\":{},\"embedding\":[{},1.0,2.0,3.0]}}",
+                                i,
+                                text.chars().count()
+                            )
+                        })
+                        .collect();
+                    (
+                        "200 OK".to_string(),
+                        format!("{{\"data\":[{}]}}", data.join(",")),
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    payload.len(),
+                    payload
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, server, seen)
+    }
+
+    fn scripted_embedder(addr: std::net::SocketAddr) -> RemoteEmbedder {
+        RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap()
+    }
+
+    /// The request split bounds both the number of inputs and the number of
+    /// characters a single request may carry, and it covers every input
+    /// exactly once, in order.
+    #[test]
+    fn remote_request_chunks_bound_the_inputs_and_the_characters() {
+        let texts = sized_texts(200);
+        let chunks = remote_request_chunks(&texts);
+        assert!(
+            chunks.len() >= 4,
+            "200 inputs cannot fit in fewer than four requests"
+        );
+        let mut covered = 0usize;
+        for (start, end) in &chunks {
+            assert_eq!(*start, covered, "the chunks cover the inputs in order");
+            assert!(
+                end - start <= REMOTE_EMBED_MAX_INPUTS,
+                "a request carries at most {} inputs, got {}",
+                REMOTE_EMBED_MAX_INPUTS,
+                end - start
+            );
+            let chars: usize = texts[*start..*end].iter().map(|t| t.chars().count()).sum();
+            assert!(
+                chars <= REMOTE_EMBED_MAX_CHARS || end - start == 1,
+                "a request carries at most {} characters, got {}",
+                REMOTE_EMBED_MAX_CHARS,
+                chars
+            );
+            covered = *end;
+        }
+        assert_eq!(covered, texts.len(), "every input is sent exactly once");
+
+        // The character bound splits a batch the input bound would keep in
+        // one piece.
+        let wide: Vec<String> = (0..100).map(|_| "x".repeat(1000)).collect();
+        let wide_chunks = remote_request_chunks(&wide);
+        assert!(
+            wide_chunks.len() >= 3,
+            "100k characters need several requests"
+        );
+        for (start, end) in &wide_chunks {
+            let chars: usize = wide[*start..*end].iter().map(|t| t.chars().count()).sum();
+            assert!(
+                chars <= REMOTE_EMBED_MAX_CHARS || end - start == 1,
+                "a request carries at most {} characters, got {}",
+                REMOTE_EMBED_MAX_CHARS,
+                chars
+            );
+        }
+
+        // A single input bigger than the bound cannot be split, so it goes
+        // alone rather than being cut in half.
+        let huge = vec!["x".repeat(REMOTE_EMBED_MAX_CHARS + 1)];
+        assert_eq!(remote_request_chunks(&huge), vec![(0, 1)]);
+    }
+
+    /// A batch larger than one request is split, every request stays inside
+    /// the bounds, and the vectors come back in input order.
+    #[tokio::test]
+    async fn remote_embedder_splits_a_large_batch_into_bounded_requests() {
+        let (addr, server, seen) = spawn_scripted_embed_server(EmbedScript::Accept).await;
+        let embedder = scripted_embedder(addr);
+        let texts = sized_texts(150);
+        let vectors = embedder.embed_batch(&texts).await.unwrap();
+        assert_eq!(vectors.len(), texts.len());
+        for (i, vector) in vectors.iter().enumerate() {
+            assert_eq!(
+                vector[0],
+                (i + 1) as f32,
+                "input {} keeps its place in the batch",
+                i
+            );
+        }
+        let requests = seen.lock().unwrap().clone();
+        assert!(
+            requests.len() >= 3,
+            "150 inputs need several requests, got {}",
+            requests.len()
+        );
+        for request in &requests {
+            assert!(
+                request.len() <= REMOTE_EMBED_MAX_INPUTS,
+                "a request carries at most {} inputs, got {}",
+                REMOTE_EMBED_MAX_INPUTS,
+                request.len()
+            );
+        }
+        let total: usize = requests.iter().map(|r| r.len()).sum();
+        assert_eq!(total, texts.len(), "every input is sent exactly once");
+        server.abort();
+    }
+
+    /// A provider that refuses one input does not cost the batch: the
+    /// refused input is reported as `None`, the rest of the batch lands, and
+    /// the order is untouched.
+    #[tokio::test]
+    async fn remote_embedder_degrades_a_refused_item_and_keeps_the_order() {
+        let (addr, server, seen) =
+            spawn_scripted_embed_server(EmbedScript::RefusePoison(413)).await;
+        let embedder = scripted_embedder(addr);
+        let texts = vec!["aa".to_string(), POISON.to_string(), "bb".to_string()];
+        let outcome = embedder.embed_batch_degradable(&texts).await.unwrap();
+        assert_eq!(outcome.embeddings.len(), 3);
+        assert!(outcome.embeddings[0].is_some(), "the first input lands");
+        assert!(
+            outcome.embeddings[1].is_none(),
+            "the refused input is reported, not dropped"
+        );
+        assert!(outcome.embeddings[2].is_some(), "the last input lands");
+        assert_eq!(outcome.embeddings[0].as_ref().unwrap()[0], 2.0);
+        assert_eq!(outcome.embeddings[2].as_ref().unwrap()[0], 2.0);
+        assert_eq!(outcome.warnings.len(), 1, "one refusal, one warning");
+        assert!(
+            outcome.warnings[0].contains("413"),
+            "the warning names the status: {}",
+            outcome.warnings[0]
+        );
+
+        // The refused request was halved on the way down.
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(
+            requests[0].len(),
+            3,
+            "the batch goes out as one request first"
+        );
+        assert!(
+            requests.len() >= 4,
+            "the refused request was halved down to single items, got {} requests",
+            requests.len()
+        );
+        server.abort();
+    }
+
+    /// The all-or-nothing contract is unchanged: `embed_batch` fails the
+    /// whole batch when the provider refuses an input.
+    #[tokio::test]
+    async fn remote_embedder_batch_stays_all_or_nothing() {
+        let (addr, server, _seen) =
+            spawn_scripted_embed_server(EmbedScript::RefusePoison(413)).await;
+        let embedder = scripted_embedder(addr);
+        let texts = vec!["aa".to_string(), POISON.to_string(), "bb".to_string()];
+        let err = embedder
+            .embed_batch(&texts)
+            .await
+            .expect_err("a refused input fails the batch");
+        assert!(
+            err.to_string().contains("refused"),
+            "the error names the refusal: {err}"
+        );
+        server.abort();
+    }
+
+    /// A batch of refused inputs degrades every one of them, and the reasons
+    /// are sampled: the summary keeps a bounded number of samples, not one
+    /// per refused input.
+    #[tokio::test]
+    async fn remote_embedder_caps_the_warning_samples() {
+        let (addr, server, _seen) =
+            spawn_scripted_embed_server(EmbedScript::RefusePoison(400)).await;
+        let embedder = scripted_embedder(addr);
+        let texts: Vec<String> = (0..12).map(|_| POISON.to_string()).collect();
+        let outcome = embedder.embed_batch_degradable(&texts).await.unwrap();
+        assert_eq!(outcome.embeddings.len(), texts.len());
+        assert!(
+            outcome.embeddings.iter().all(|e| e.is_none()),
+            "every refused input is reported"
+        );
+        assert_eq!(
+            outcome.warnings.len(),
+            REMOTE_EMBED_MAX_WARNING_SAMPLES,
+            "the warning samples are capped"
+        );
+        server.abort();
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- Task 4: IdleSession (opt-in idle unload of the local session) ----
 
@@ -2719,344 +2672,5 @@ mod tests {
             );
         }
     }
-
-    // ---- Task 9 (J29/J23): embedder identity & egress ----
-
-    /// A synthetic model artifact directory: the five files a real
-    /// fastembed snapshot carries, with stand-in bytes. The pin machinery
-    /// operates on file bytes, so no model download is needed.
-    fn synthetic_model_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("neurostrata-t9-{}-{}", tag, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for (name, bytes) in [
-            ("model.onnx", &b"onnx-graph-bytes-v1"[..]),
-            ("tokenizer.json", &b"{\"tokenizer\":true}"[..]),
-            ("config.json", &b"{\"architectures\":[\"BertModel\"]}"[..]),
-            (
-                "tokenizer_config.json",
-                &b"{\"tokenizer_class\":\"BertTokenizer\"}"[..],
-            ),
-            ("special_tokens_map.json", &b"{\"unk_token\":\"[UNK]\"}"[..]),
-        ] {
-            std::fs::write(dir.join(name), bytes).unwrap();
-        }
-        dir
-    }
-
-    /// The DR-7 pin construction, reimplemented on the test side so the
-    /// production computation is checked against an independent reading of
-    /// the spec: per-file SHA-256 over every file in the tree, walked
-    /// recursively; lines `"<file-sha256>  <relative-path>\n"` with
-    /// `/`-joined relative paths, sorted by relative path; the pin is the
-    /// SHA-256 hex of the concatenation. The PIN-CANDIDATE adoption record
-    /// is excluded, as in production.
-    fn spec_artifact_pin(dir: &Path) -> String {
-        use sha2::{Digest, Sha256};
-        let mut names: Vec<String> = Vec::new();
-        collect_spec_files(dir, dir, &mut names);
-        names.sort();
-        let mut listing = String::new();
-        for name in &names {
-            let bytes = std::fs::read(dir.join(name)).unwrap();
-            listing.push_str(&format!(
-                "{}  {}\n",
-                hex::encode(Sha256::digest(&bytes)),
-                name
-            ));
-        }
-        hex::encode(Sha256::digest(listing.as_bytes()))
-    }
-
-    fn collect_spec_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                collect_spec_files(root, &path, out);
-            } else if path.is_file() {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                if rel != "PIN-CANDIDATE" {
-                    out.push(rel);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn unknown_model_name_refuses_and_names_the_list() {
-        let err = resolve_embedding_model("DefinitelyNotAModel")
-            .expect_err("an unknown model name must refuse, not fall back")
-            .to_string();
-        assert!(
-            err.contains("DefinitelyNotAModel"),
-            "names the request: {err}"
-        );
-        assert!(
-            err.contains("NomicEmbedTextV15"),
-            "names the acceptable list: {err}"
-        );
-        assert!(
-            err.contains("BGEBaseENV15"),
-            "names the acceptable list: {err}"
-        );
-    }
-
-    #[test]
-    fn known_model_names_still_resolve() {
-        // Zero-change pin: every model the operator's embedders.json names
-        // today keeps resolving by name.
-        for name in ["NomicEmbedTextV15", "BGEBaseENV15", "BGESmallENV15Q"] {
-            assert!(resolve_embedding_model(name).is_ok(), "{name} resolves");
-        }
-    }
-
-    #[test]
-    fn pinned_model_with_wrong_hash_refuses() {
-        let dir = synthetic_model_dir("wrong-hash");
-        let wrong = "0".repeat(64);
-        let err = enforce_artifact_pin(&dir, Some(wrong.as_str()), "SyntheticModel")
-            .expect_err("a pin that does not match the artifact set must refuse")
-            .to_string();
-        assert!(err.contains("SyntheticModel"), "names the model: {err}");
-    }
-
-    #[test]
-    fn pinned_model_with_correct_hash_loads() {
-        let dir = synthetic_model_dir("correct-hash");
-        let pin = spec_artifact_pin(&dir);
-        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
-            .expect("a matching pin loads");
-    }
-
-    #[test]
-    fn swapped_tokenizer_file_refuses() {
-        // The anti-theater test: the pin covers the whole file set, so
-        // changing one non-graph file must refuse.
-        let dir = synthetic_model_dir("swapped-tokenizer");
-        let pin = spec_artifact_pin(&dir);
-        std::fs::write(dir.join("tokenizer.json"), b"{\"tokenizer\":false}").unwrap();
-        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
-            .expect_err("a swapped tokenizer.json must refuse");
-    }
-
-    #[test]
-    fn added_artifact_file_refuses() {
-        let dir = synthetic_model_dir("added-file");
-        let pin = spec_artifact_pin(&dir);
-        std::fs::write(dir.join("vocab.txt"), b"extra file").unwrap();
-        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
-            .expect_err("an additional file in the set must refuse");
-    }
-
-    #[test]
-    fn nested_artifact_file_is_covered_by_the_pin() {
-        // The operator's real snapshot layout nests the graph under an
-        // `onnx/` subdirectory. The pin must cover subdirectory files
-        // under their `/`-joined relative paths: a flat-only production
-        // walk would compute a different pin than the recursive spec
-        // reimplementation (failing the load below), and mutating the
-        // nested file must refuse.
-        let dir = synthetic_model_dir("nested-layout");
-        let onnx_dir = dir.join("onnx");
-        std::fs::create_dir_all(&onnx_dir).unwrap();
-        std::fs::write(onnx_dir.join("model.onnx"), b"nested-graph-bytes-v1").unwrap();
-        let pin = spec_artifact_pin(&dir);
-        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
-            .expect("a pin computed over the nested layout loads");
-        std::fs::write(onnx_dir.join("model.onnx"), b"nested-graph-bytes-v2").unwrap();
-        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
-            .expect_err("a swapped nested graph file must refuse");
-    }
-
-    #[test]
-    fn identical_recache_passes() {
-        let first = synthetic_model_dir("recache-a");
-        let pin = spec_artifact_pin(&first);
-        let second = synthetic_model_dir("recache-b");
-        enforce_artifact_pin(&second, Some(pin.as_str()), "SyntheticModel")
-            .expect("a byte-identical re-download verifies against the pin");
-    }
-
-    #[test]
-    fn unpinned_model_loads_and_records_hash() {
-        let dir = synthetic_model_dir("unpinned");
-        enforce_artifact_pin(&dir, None, "SyntheticModel").expect("an unpinned model loads");
-        let candidate = dir.join("PIN-CANDIDATE");
-        assert!(candidate.exists(), "the adoption record is written");
-        let recorded = std::fs::read_to_string(&candidate).unwrap();
-        assert_eq!(recorded.trim(), spec_artifact_pin(&dir));
-        // The recorded candidate, once adopted into embedders.json, verifies.
-        enforce_artifact_pin(&dir, Some(recorded.trim()), "SyntheticModel")
-            .expect("the recorded candidate verifies once adopted");
-    }
-
-    #[test]
-    fn embedders_json_pin_field_is_optional() {
-        // Zero-change pin: existing embedders.json files (no artifact_pin)
-        // parse unchanged, and a present pin round-trips.
-        let without: Vec<AcceptableEmbedder> =
-            serde_json::from_str(r#"[{"model_name":"NomicEmbedTextV15","dimensions":768}]"#)
-                .unwrap();
-        assert!(without[0].artifact_pin.is_none());
-        let with: Vec<AcceptableEmbedder> = serde_json::from_str(
-            r#"[{"model_name":"NomicEmbedTextV15","dimensions":768,"artifact_pin":"abc123"}]"#,
-        )
-        .unwrap();
-        assert_eq!(with[0].artifact_pin.as_deref(), Some("abc123"));
-    }
-
-    #[test]
-    fn remote_http_to_public_host_is_refused() {
-        let err = RemoteEmbedder::new(
-            "http://embeddings.example.com:8080".to_string(),
-            "test-key".to_string(),
-            "test-model".to_string(),
-            768,
-        )
-        .err()
-        .expect("plain http to a public host must refuse")
-        .to_string();
-        assert!(
-            err.contains("embeddings.example.com"),
-            "names the host: {err}"
-        );
-        assert!(err.contains("https"), "names the rule: {err}");
-        assert!(!err.contains("test-key"), "never names the key: {err}");
-    }
-
-    #[test]
-    fn remote_https_loads() {
-        let embedder = RemoteEmbedder::new(
-            "https://embeddings.example.com".to_string(),
-            "test-key".to_string(),
-            "test-model".to_string(),
-            768,
-        );
-        assert!(embedder.is_ok());
-    }
-
-    #[test]
-    fn remote_embedder_descriptor_is_resolved_not_unknown() {
-        let embedder = RemoteEmbedder::new(
-            "http://localhost:1234".to_string(),
-            "test-key".to_string(),
-            "test-model".to_string(),
-            768,
-        )
-        .unwrap();
-        let d = embedder.embedding_descriptor();
-        assert_eq!(d.provider, "openai-compatible");
-        assert_eq!(d.model, "test-model");
-        assert_eq!(d.dims, 768);
-        assert!(!d.compatible(&crate::traits::EmbeddingDescriptor::unknown()));
-    }
-
-    #[test]
-    fn build_embedder_falls_back_to_local() {
-        // When no remote config, should use local
-        // This tests the factory logic
-        let embedder = build_embedder();
-        assert!(embedder.is_ok());
-    }
-
-    #[test]
-    fn remote_http_to_loopback_loads() {
-        for url in ["http://127.0.0.1:8080", "http://[::1]:8080"] {
-            let embedder = RemoteEmbedder::new(
-                url.to_string(),
-                "test-key".to_string(),
-                "test-model".to_string(),
-                768,
-            );
-            assert!(embedder.is_ok(), "{url} is loopback http and loads");
-        }
-    }
-
-    #[test]
-    fn remote_url_without_host_is_refused() {
-        for url in ["http://", "not-a-url"] {
-            let embedder = RemoteEmbedder::new(
-                url.to_string(),
-                "test-key".to_string(),
-                "test-model".to_string(),
-                768,
-            );
-            assert!(embedder.is_err(), "{url} has no usable host and refuses");
-        }
-    }
-
-    #[tokio::test]
-    async fn remote_error_contains_status_not_body() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // A 500 is retryable and the client retries exactly once (see
-        // remote_retry_policy_runs_against_a_local_http_server, where the
-        // [503, 503] sequence is two requests), so an endpoint returning
-        // 500 answers both attempts. A one-shot server would drop the
-        // retry into a connection-refused transport error with no status,
-        // and the assertions below would be testing the fixture's
-        // absence, not the client's error.
-        std::thread::spawn(move || {
-            for _ in 0..2 {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    let body = "MARKER-SECRET-BODY";
-                    let response = format!(
-                        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-            }
-        });
-        let embedder = RemoteEmbedder::new(
-            format!("http://{addr}"),
-            "test-key".to_string(),
-            "test-model".to_string(),
-            8,
-        )
-        .unwrap();
-        let err = embedder
-            .embed("hello")
-            .await
-            .expect_err("a 500 response is an error")
-            .to_string();
-        assert!(err.contains("500"), "names the status: {err}");
-        assert!(
-            !err.contains("MARKER-SECRET-BODY"),
-            "never carries the response body: {err}"
-        );
-    }
-
-    #[test]
-    fn verify_model_checksum_fails_on_mismatch() {
-        let dir = std::env::temp_dir().join("ns-checksum-mismatch");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let model_path = dir.join("model.onnx");
-        std::fs::write(&model_path, b"not-the-model").unwrap();
-        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
-        assert!(err.to_string().contains("checksum mismatch"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn verify_model_checksum_fails_when_no_file() {
-        let dir = std::env::temp_dir().join("ns-checksum-missing");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
-        assert!(err.to_string().contains("model file not found"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
+

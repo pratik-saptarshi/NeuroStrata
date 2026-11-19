@@ -186,6 +186,14 @@ impl MeshOutbox {
         {
             return None;
         }
+        if payload.memory_type == "action_receipt"
+            && !crate::formal_kernel::is_action_memory_shareable(
+                crate::formal_kernel::ActionMemoryKind::ActionReceipt,
+                true,
+            )
+        {
+            return None;
+        }
         if !is_shareable_memory_type(&payload.memory_type) {
             return None;
         }
@@ -665,16 +673,16 @@ impl MeshOutbox {
                     continue;
                 }
 
-                // Check if mesh file exists.
-                let subdir = if payload.memory_type == "procedure" {
-                    "procedures"
-                } else {
-                    "memories"
-                };
-                let mesh_file = mesh_root
-                    .join(ns)
-                    .join(subdir)
-                    .join(format!("{}.json", sr.id));
+                // Check if mesh file exists (supporting UUIDv5 mapping for deterministic taxonomy IDs).
+                let subdir = if payload.memory_type == "procedure" { "procedures" } else { "memories" };
+                let mesh_id = crate::synaptic_mesh::worker::parse_or_derive_mesh_uuid(
+                    ns,
+                    &payload.memory_type,
+                    &sr.id,
+                )
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| sr.id.clone());
+                let mesh_file = mesh_root.join(ns).join(subdir).join(format!("{mesh_id}.json"));
                 if mesh_file.exists() {
                     continue;
                 }

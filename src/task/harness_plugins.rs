@@ -130,6 +130,106 @@ fn normalize_harness_name(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Absolute path for writing into harness config that another program will
+/// execute. dunce, not std: `std::fs::canonicalize` returns Windows'
+/// extended-length form (`\\?\C:\...`), which a shell mangles to `C:\?\C:\...`
+/// and Node then cannot open, so every hook fails with MODULE_NOT_FOUND.
+/// dunce yields the plain form wherever one exists and is a no-op elsewhere.
+fn plain_abs_path(path: &Path) -> String {
+    dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn path_basename(p: &str) -> Option<&str> {
+    p.rsplit(['/', '\\']).find(|s| !s.is_empty())
+}
+
+/// One spelling of a path for equality checks: the verbatim prefix dropped,
+/// `\` turned into `/`, and ASCII case folded when it starts with a drive
+/// letter (Windows compares paths case-insensitively). Plain string work, so
+/// Windows spellings compare the same way when the tests run on Unix.
+fn path_key(p: &str) -> String {
+    let p = match p.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => p.strip_prefix(r"\\?\").unwrap_or(p).to_string(),
+    };
+    let p = p.replace('\\', "/");
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        p.to_ascii_lowercase()
+    } else {
+        p
+    }
+}
+
+/// Whether two paths name the same file: equal [`path_key`]s, or, when the
+/// spellings differ but both exist, equal canonical forms. `path_key` folds
+/// ASCII case only, so this catches a case-only rename with non-ASCII letters
+/// (`Pröj` vs `PRÖJ`) on a case-insensitive volume, and 8.3 short names.
+/// This duplicates the comparison rule of a shared paths module
+/// (`relative_to_on_disk`) until one lands upstream; move it there then.
+fn same_path_on_disk(a: &str, b: &str) -> bool {
+    if path_key(a) == path_key(b) {
+        return true;
+    }
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether a hook's runner path may be pointed at the installer's runner:
+/// it already names the installer's own runner (in any spelling), or nothing
+/// exists there. A runner that exists anywhere else is someone's own install,
+/// and so is a path the shell expands (`$VAR`, `%VAR%`, `~`), which cannot be
+/// checked from here.
+fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) -> bool {
+    if path_key(old_path) == path_key(abs_runner) {
+        return true;
+    }
+    if old_path.contains(['$', '%']) || old_path.starts_with('~') {
+        return false;
+    }
+    // A relative runner is resolved by the hook's cwd, the project root.
+    let candidate = project_root.join(old_path);
+    if same_path_on_disk(&candidate.to_string_lossy(), abs_runner) {
+        return true;
+    }
+    // Only a definite "not found" counts as missing; an unreadable path is
+    // left alone.
+    matches!(candidate.try_exists(), Ok(false))
+}
+
+/// Rewrite only the path of an installer-generated runner command. A command
+/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
+/// matches the installer's runner, and whose runner is the installer's own or
+/// is missing, is ours to repair. A custom hook that merely carries the
+/// namespace environment variable, or runs a `cli-hook.mjs` installed
+/// elsewhere, is left untouched.
+fn repair_installer_hook_command(
+    command: &str,
+    namespace: &str,
+    abs_runner: &str,
+    project_root: &Path,
+) -> Option<String> {
+    let prefix = format!("NEUROSTRATA_NAMESPACE={namespace} node \"");
+    let rest = command.strip_prefix(&prefix)?;
+    let close = rest.find('"')?;
+    let old_path = &rest[..close];
+    let suffix = &rest[close + 1..];
+    // Windows separators are legal in a verbatim path even when the test
+    // that exercises this runs on Unix, so do not use platform Path parsing.
+    if path_basename(old_path) != path_basename(abs_runner) {
+        return None;
+    }
+    if !runner_is_replaceable(old_path, project_root, abs_runner) {
+        return None;
+    }
+    Some(format!("{prefix}{abs_runner}\"{suffix}"))
+}
+
 fn has_any_env(keys: &[&str]) -> bool {
     keys.iter()
         .any(|k| std::env::var_os(k).map(|v| !v.is_empty()).unwrap_or(false))
@@ -147,19 +247,9 @@ pub fn detect_harnesses(
 ) -> (Option<&'static str>, Vec<&'static str>) {
     let explicit = explicit_harness.and_then(normalize_harness_name);
 
-    let env_active = if has_any_env(&[
-        "OPENCODE",
-        "OPENCODE_PID",
-        "OPENCODE_SESSION",
-        "OPENCODE_CONFIG",
-    ]) {
+    let env_active = if has_any_env(&["OPENCODE", "OPENCODE_PID", "OPENCODE_SESSION", "OPENCODE_CONFIG"]) {
         Some("opencode")
-    } else if has_any_env(&[
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_PROJECT_DIR",
-        "ANTHROPIC_CLAUDE_CODE",
-    ]) {
+    } else if has_any_env(&["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "ANTHROPIC_CLAUDE_CODE"]) {
         Some("claude")
     } else if has_any_env(&["HERMES_AGENT", "HERMES_HOME", "HERMES_SESSION_ID"]) {
         Some("hermes")
@@ -187,53 +277,34 @@ pub fn detect_harnesses(
     }
 
     if project_root.join(".opencode").exists()
+        || project_root.join(".NeuroStrata/plugins/opencode").exists()
         || project_root.join("opencode.json").exists()
-        || home
-            .as_ref()
-            .map(|h| {
-                h.join(".config/opencode").exists() || h.join(".local/share/opencode").exists()
-            })
-            .unwrap_or(false)
+        || home.as_ref().map(|h| h.join(".config/opencode").exists() || h.join(".local/share/opencode").exists()).unwrap_or(false)
     {
         push_unique("opencode");
     }
     if project_root.join(".openclaw").exists()
-        || home
-            .as_ref()
-            .map(|h| h.join(".openclaw").exists())
-            .unwrap_or(false)
+        || home.as_ref().map(|h| h.join(".openclaw").exists()).unwrap_or(false)
     {
         push_unique("openclaw");
     }
     if project_root.join(".claude").exists()
-        || home
-            .as_ref()
-            .map(|h| h.join(".claude").exists())
-            .unwrap_or(false)
+        || home.as_ref().map(|h| h.join(".claude").exists()).unwrap_or(false)
     {
         push_unique("claude");
     }
     if project_root.join(".hermes").exists()
-        || home
-            .as_ref()
-            .map(|h| h.join(".hermes").exists())
-            .unwrap_or(false)
+        || home.as_ref().map(|h| h.join(".hermes").exists()).unwrap_or(false)
     {
         push_unique("hermes");
     }
     if project_root.join(".codex").exists()
-        || home
-            .as_ref()
-            .map(|h| h.join(".codex").exists())
-            .unwrap_or(false)
+        || home.as_ref().map(|h| h.join(".codex").exists()).unwrap_or(false)
     {
         push_unique("codex");
     }
     if project_root.join(".github/copilot").exists()
-        || home
-            .as_ref()
-            .map(|h| h.join(".config/gh").exists() || h.join(".config/github-copilot").exists())
-            .unwrap_or(false)
+        || home.as_ref().map(|h| h.join(".config/gh").exists() || h.join(".config/github-copilot").exists()).unwrap_or(false)
     {
         push_unique("github-cli");
     }
@@ -322,16 +393,8 @@ pub fn auto_install_detected_plugins(
             }
         }
 
-        let abs_dist = dist_index
-            .canonicalize()
-            .unwrap_or_else(|_| dist_index.clone())
-            .to_string_lossy()
-            .to_string();
-        let abs_runner = runner_path
-            .canonicalize()
-            .unwrap_or_else(|_| runner_path.clone())
-            .to_string_lossy()
-            .to_string();
+        let abs_dist = plain_abs_path(&dist_index);
+        let abs_runner = plain_abs_path(&runner_path);
 
         let wired_config = wire_harness_config(
             project_root,
@@ -469,17 +532,9 @@ fn sync_skills_and_agent_rules(
                     })
                     .collect::<Vec<&str>>()
                     .join("\n");
-                if replaced != content {
-                    Some(replaced)
-                } else {
-                    None
-                }
+                if replaced != content { Some(replaced) } else { None }
             } else if !content.contains(SUBAGENT_RULE_MARKER) && !content.contains("tools: false") {
-                Some(format!(
-                    "{}{}",
-                    content.trim_end(),
-                    SUBAGENT_GRAPH_FIRST_RULE_SNIPPET
-                ))
+                Some(format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET))
             } else {
                 None
             };
@@ -536,6 +591,8 @@ fn merge_claude_hook_event(
     }
 }
 
+
+
 fn wire_harness_config(
     project_root: &Path,
     namespace: &str,
@@ -560,10 +617,7 @@ fn wire_harness_config(
 
     match harness {
         "opencode" => {
-            if is_active
-                || project_root.join(".opencode").exists()
-                || project_root.join("opencode.json").exists()
-            {
+            if is_active || project_root.join(".opencode").exists() || project_root.join("opencode.json").exists() {
                 // 1. Write the thin OpenCode loader at .opencode/plugins/neurostrata.js
                 //    (creating .opencode/plugins/ if needed). The relative import
                 //    resolves from the loader file's location back to the bundled core.
@@ -574,99 +628,51 @@ fn wire_harness_config(
                 let _ = std::fs::create_dir_all(&plugins_dir);
                 let _ = std::fs::write(&loader_path, loader);
 
-                // 2. Always create or merge .opencode/opencode.json -> "plugins",
-                //    preserving every other key/entry.
-                let loader_rel = "./.NeuroStrata/plugins/opencode/dist/index.js";
+                // 2. Never insert the plugin path into opencode.json. If
+                //    `.opencode/opencode.json` exists, strip any legacy
+                //    file-path entries from "plugins"; if "plugins" becomes
+                //    empty, remove the key entirely. Clean configs are left
+                //    untouched (never created, never populated with the plugin path).
                 let oc_cfg = project_root.join(".opencode/opencode.json");
-                // Preserve the existing file on read/parse failure: only
-                // populate when the file is absent, or when it parses to a
-                // JSON object. A malformed or non-object existing file is left
-                // untouched (never overwritten with `{}`).
-                let mut doc: Value = json!({});
-                let mut write_doc = false;
                 if oc_cfg.exists() {
-                    if let Some(d) = std::fs::read_to_string(&oc_cfg)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    {
-                        if d.is_object() {
-                            doc = d;
-                            write_doc = true;
-                        }
-                    }
-                } else {
-                    write_doc = true;
-                }
-                if write_doc {
-                    if let Some(obj) = doc.as_object_mut() {
-                        let entry = obj.get("plugins");
-                        let (is_array, already_in_array, key_absent) = {
-                            let e = entry;
-                            (
-                                e.map(|v| v.is_array()).unwrap_or(false),
-                                e.and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter().any(|v| {
-                                            v.as_str().map(|s| s == loader_rel).unwrap_or(false)
-                                        })
-                                    })
-                                    .unwrap_or(false),
-                                entry.is_none(),
-                            )
-                        };
-                        if is_array && !already_in_array {
-                            obj.get_mut("plugins")
-                                .and_then(|v| v.as_array_mut())
-                                .unwrap()
-                                .push(json!(loader_rel));
-                        } else if key_absent {
-                            obj.insert("plugins".to_string(), json!([loader_rel]));
-                        }
-                    }
-                    let _ = write_json_if_changed(&oc_cfg, &doc);
-                }
-
-                // 3. Root opencode.json: only update if it already exists; never
-                //    create a root opencode.json (the loader lives in .opencode/).
-                let root_cfg = project_root.join("opencode.json");
-                if root_cfg.exists() {
-                    if let Ok(raw) = std::fs::read_to_string(&root_cfg) {
-                        if let Ok(mut root_doc) = serde_json::from_str::<Value>(&raw) {
-                            if let Some(obj) = root_doc.as_object_mut() {
-                                for key in ["plugins", "plugin"] {
-                                    let create_if_missing = key == "plugins";
-                                    // Inspect immutably first so no borrow is outstanding when we mutate.
-                                    let (is_array, already_in_array, key_absent) = {
-                                        let entry = obj.get(key);
-                                        (
-                                            entry.map(|v| v.is_array()).unwrap_or(false),
-                                            entry
-                                                .and_then(|v| v.as_array())
-                                                .map(|arr| {
-                                                    arr.iter().any(|v| {
-                                                        v.as_str()
-                                                            .map(|s| s == loader_rel)
-                                                            .unwrap_or(false)
-                                                    })
-                                                })
-                                                .unwrap_or(false),
-                                            entry.is_none(),
-                                        )
-                                    };
-                                    if is_array && !already_in_array {
-                                        obj.get_mut(key)
-                                            .and_then(|v| v.as_array_mut())
-                                            .unwrap()
-                                            .push(json!(loader_rel));
-                                    } else if create_if_missing && key_absent {
-                                        obj.insert(key.to_string(), json!([loader_rel]));
+                    if let Ok(raw) = std::fs::read_to_string(&oc_cfg) {
+                        if let Ok(mut doc) = serde_json::from_str::<Value>(&raw) {
+                            if let Some(obj) = doc.as_object_mut() {
+                                let mut changed = false;
+                                let mut remove_plugins = false;
+                                if let Some(plugins) =
+                                    obj.get_mut("plugins").and_then(|v| v.as_array_mut())
+                                {
+                                    let before = plugins.len();
+                                    plugins.retain(|v| {
+                                        v.as_str()
+                                            .map(|s| {
+                                                s != "./.NeuroStrata/plugins/opencode/dist/index.js"
+                                                    && s != ".NeuroStrata/plugins/opencode/dist/index.js"
+                                            })
+                                            .unwrap_or(true)
+                                    });
+                                    if plugins.len() != before {
+                                        changed = true;
+                                    }
+                                    if plugins.is_empty() {
+                                        remove_plugins = true;
                                     }
                                 }
+                                if remove_plugins {
+                                    obj.remove("plugins");
+                                    changed = true;
+                                }
+                                if changed {
+                                    let _ = write_json_if_changed(&oc_cfg, &doc);
+                                }
                             }
-                            let _ = write_json_if_changed(&root_cfg, &root_doc);
                         }
                     }
                 }
+
+                // Root opencode.json is intentionally never written here: the
+                // plugin path is never inserted into opencode.json.
 
                 // 3. Keep writing .opencode/neurostrata-plugin.json (the historical
                 //    plugin registration) unchanged.
@@ -687,10 +693,7 @@ fn wire_harness_config(
         "claude" => {
             if is_active || project_root.join(".claude").exists() {
                 let cfg_path = project_root.join(".claude/settings.local.json");
-                let cmd = format!(
-                    "NEUROSTRATA_NAMESPACE={} node \"{}\"",
-                    namespace, abs_runner
-                );
+                let cmd = format!("NEUROSTRATA_NAMESPACE={} node \"{}\"", namespace, abs_runner);
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -707,18 +710,18 @@ fn wire_harness_config(
                     write_doc = true;
                 }
                 if write_doc {
-                    // Merge into any pre-existing event arrays instead of the
-                    // old insert-only-if-absent behaviour, which silently
+                    // Merge into any pre-existing event arrays instead of
+                    // the insert-only-if-absent behaviour, which silently
                     // skipped registration whenever the user already had a
                     // `PreToolUse`/`Stop` array (even an empty one) while
                     // still reporting the config as wired.
                     //
-                    // Fail-honest on malformed shapes: a `hooks` value that is
-                    // not an object, or an event value that is not an array,
-                    // cannot be merged without destroying user data, so the
-                    // wiring reports `None` (not wired) and leaves the file
-                    // untouched instead of claiming a registration that did
-                    // not happen.
+                    // Fail-honest on malformed shapes: a `hooks` value that
+                    // is not an object, or an event value that is not an
+                    // array, cannot be merged without destroying user data,
+                    // so the wiring reports `None` (not wired) and leaves
+                    // the file untouched instead of claiming a registration
+                    // that did not happen.
                     let mut wired = false;
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks_shape_ok = match obj.get_mut("hooks") {
@@ -733,6 +736,96 @@ fn wire_harness_config(
                                 .get_mut("hooks")
                                 .and_then(|h| h.as_object_mut())
                                 .expect("hooks checked to be an object");
+                            // Repair commands written by an older installer
+                            // that embedded a Windows verbatim path, BEFORE
+                            // merging: repair normalizes our own existing
+                            // entry to the current command spelling, so the
+                            // merge dedup recognizes it instead of appending
+                            // a duplicate. Only rewrite our own hook
+                            // commands; user hooks, including ones that run
+                            // a cli-hook.mjs installed elsewhere, are left
+                            // untouched.
+                            for entries in h_obj.values_mut() {
+                                if let Some(arr) = entries.as_array_mut() {
+                                    for entry in arr {
+                                        if let Some(hooks) = entry
+                                            .get_mut("hooks")
+                                            .and_then(|v| v.as_array_mut())
+                                        {
+                                            for hook in hooks {
+                                                if let Some(command) =
+                                                    hook.get("command").and_then(|v| v.as_str())
+                                                {
+                                                    if let Some(repaired) =
+                                                        repair_installer_hook_command(
+                                                            command,
+                                                            namespace,
+                                                            abs_runner,
+                                                            project_root,
+                                                        )
+                                                    {
+                                                        hook["command"] =
+                                                            Value::String(repaired);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // A settings file whose hooks already run a
+                            // same-named runner from a location the
+                            // installer does not own (a custom runner
+                            // installed elsewhere) is user-managed: leave
+                            // it byte-identical instead of merging our
+                            // registration into it. Installer-shaped
+                            // commands pointing at the managed runner (or
+                            // a missing one) are ours and fall through to
+                            // the merge below.
+                            let installer_prefix =
+                                format!("NEUROSTRATA_NAMESPACE={} node \"", namespace);
+                            let has_custom_runner = h_obj.values().any(|entries| {
+                                entries.as_array().map(|arr| {
+                                    arr.iter().any(|entry| {
+                                        entry
+                                            .get("hooks")
+                                            .and_then(|h| h.as_array())
+                                            .map(|hs| {
+                                                hs.iter().any(|h| {
+                                                    h.get("command")
+                                                        .and_then(|c| c.as_str())
+                                                        .and_then(|command| {
+                                                            command
+                                                                .strip_prefix(
+                                                                    &installer_prefix,
+                                                                )
+                                                        })
+                                                        .and_then(|rest| {
+                                                            rest.find('"').map(|close| {
+                                                                &rest[..close]
+                                                            })
+                                                        })
+                                                        .map(|old_path| {
+                                                            path_basename(old_path)
+                                                                == path_basename(
+                                                                    abs_runner,
+                                                                )
+                                                                && !runner_is_replaceable(
+                                                                    old_path,
+                                                                    project_root,
+                                                                    abs_runner,
+                                                                )
+                                                        })
+                                                        .unwrap_or(false)
+                                                })
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                }).unwrap_or(false)
+                            });
+                            if has_custom_runner {
+                                return None;
+                            }
                             let pre_tool_use = merge_claude_hook_event(
                                 h_obj,
                                 "PreToolUse",
@@ -801,8 +894,7 @@ fn wire_harness_config(
         }
         "github-cli" => {
             if is_active || project_root.join(".github").exists() {
-                let cfg_path =
-                    project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
+                let cfg_path = project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
                 let doc = json!({
                     "id": "neurostrata-github-cli",
                     "namespace": namespace,
@@ -827,42 +919,327 @@ mod tests {
         let custom_agent_dir = tmp.path().join(".claude/agents");
         std::fs::create_dir_all(&custom_agent_dir).expect("create .claude/agents");
         let custom_agent_md = custom_agent_dir.join("custom-worker.md");
-        std::fs::write(
-            &custom_agent_md,
-            "# Custom Worker\n\n- Run assigned tasks.\n",
-        )
-        .expect("write custom-worker.md");
+        std::fs::write(&custom_agent_md, "# Custom Worker\n\n- Run assigned tasks.\n")
+            .expect("write custom-worker.md");
 
         let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
         assert_eq!(report["active_harness"], json!("claude"));
-        let installed = report["installed_plugins"]
-            .as_array()
-            .expect("installed array");
+        let installed = report["installed_plugins"].as_array().expect("installed array");
         assert!(!installed.is_empty());
-        assert!(tmp
-            .path()
-            .join(".NeuroStrata/plugins/claude/dist/index.js")
-            .exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/claude/dist/index.js").exists());
         assert!(tmp.path().join(".claude/settings.local.json").exists());
-        assert!(tmp
-            .path()
-            .join(".agents/skills/neurostrata/SKILL.md")
-            .exists());
-        assert!(tmp
-            .path()
-            .join(".agents/agents/NeuroStrata-Task.md")
-            .exists());
-        assert!(tmp
-            .path()
-            .join(".claude/skills/neurostrata/SKILL.md")
-            .exists());
-        assert!(tmp
-            .path()
-            .join(".claude/agents/NeuroStrata-Task.md")
-            .exists());
-        let patched =
-            std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
+        assert!(tmp.path().join(".agents/skills/neurostrata/SKILL.md").exists());
+        assert!(tmp.path().join(".agents/agents/NeuroStrata-Task.md").exists());
+        assert!(tmp.path().join(".claude/skills/neurostrata/SKILL.md").exists());
+        assert!(tmp.path().join(".claude/agents/NeuroStrata-Task.md").exists());
+        let patched = std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
         assert!(patched.contains("subagent_prompt_injection"));
+    }
+
+    #[test]
+    fn wired_paths_never_use_the_windows_extended_length_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner");
+        assert!(!runner.starts_with(r"\\?\"), "verbatim path leaked: {runner}");
+        let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+            .expect("settings.local.json");
+        assert!(!settings.contains(r"\\\\?\\"), "verbatim path in hook command");
+    }
+
+    #[test]
+    fn wired_paths_are_plain_for_every_harness() {
+        let cases = [
+            ("opencode", ".opencode/neurostrata-plugin.json"),
+            ("claude", ".claude/settings.local.json"),
+            ("hermes", ".hermes/plugins/neurostrata.json"),
+            ("codex", ".codex/plugins/neurostrata.json"),
+            ("openclaw", ".openclaw/plugins/neurostrata.json"),
+            ("github-cli", ".NeuroStrata/plugins/github-cli/copilot-extension.json"),
+        ];
+        for (harness, cfg_rel) in cases {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some(harness));
+            assert!(report["ok"].as_bool().unwrap_or(true), "{harness} install report");
+            let cfg = tmp.path().join(cfg_rel);
+            assert!(cfg.exists(), "{harness} config missing at {}", cfg.display());
+            let raw = std::fs::read_to_string(&cfg).expect("read harness config");
+            assert!(
+                !raw.contains(r"\\?\") && !raw.contains(r"\\\\?\\"),
+                "{harness} config leaked a verbatim path: {raw}"
+            );
+            let runner = report["installed_plugins"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|p| p.get("cli_hook_runner"))
+                .and_then(|v| v.as_str());
+            if let Some(runner) = runner {
+                assert!(!runner.starts_with(r"\\?\"), "{harness} runner is verbatim: {runner}");
+            }
+        }
+    }
+
+    #[test]
+    fn repairs_an_existing_verbatim_hook_command_without_touching_user_hooks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        assert_eq!(report["active_harness"], json!("claude"));
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        let raw = std::fs::read_to_string(&cfg).expect("read settings");
+        let mut doc: Value = serde_json::from_str(&raw).expect("parse settings");
+        let entries = doc["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .expect("PreToolUse array");
+        let ours = entries
+            .iter_mut()
+            .find(|entry| {
+                entry["hooks"]
+                    .as_array()
+                    .map(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .map(|c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \""))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("installer hook present");
+        let command = ours["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .to_string();
+        let open = command.find('"').expect("open quote");
+        let close = command[open + 1..].find('"').expect("close quote") + open + 1;
+        let old_path = &command[open + 1..close];
+        let basename = Path::new(old_path)
+            .file_name()
+            .expect("runner basename")
+            .to_string_lossy()
+            .to_string();
+        let verbatim = format!(r"\\?\C:\old\{}", basename);
+        ours["hooks"][0]["command"] = json!(format!(
+            "{}{}{}",
+            &command[..open + 1],
+            verbatim,
+            &command[close..]
+        ));
+        // A custom hook carrying the namespace variable but not using the
+        // installer's runner must survive verbatim.
+        entries.push(json!({
+            "matcher": "Bash",
+            "hooks": [{
+                "type": "command",
+                "command": "NEUROSTRATA_NAMESPACE=TestProj neurostrata-mcp task gate TestProj --strict"
+            }]
+        }));
+        entries.push(json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "echo user-hook" }]
+        }));
+        std::fs::write(&cfg, serde_json::to_string_pretty(&doc).unwrap())
+            .expect("write broken settings");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let raw = std::fs::read_to_string(&cfg).expect("read settings");
+        assert!(
+            raw.contains("neurostrata-mcp task gate TestProj --strict"),
+            "custom gate hook must be preserved: {raw}"
+        );
+        assert!(
+            raw.contains("echo user-hook"),
+            "user hook must be preserved: {raw}"
+        );
+        let doc: Value = serde_json::from_str(&raw).expect("parse settings");
+        let commands: Vec<&str> = doc["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array")
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert!(
+            commands.iter().all(|c| !c.contains(r"\\?\")),
+            "verbatim path survived repair: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \"")
+                    && c.ends_with('"')),
+            "our repaired hook is present: {commands:?}"
+        );
+    }
+
+    /// Settings whose PreToolUse, Stop and SessionStart hooks all run
+    /// `NEUROSTRATA_NAMESPACE=TestProj node "<runner>"`.
+    fn settings_with_runner(runner: &str) -> Value {
+        let cmd = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{runner}\"");
+        json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                    "hooks": [{ "type": "command", "command": cmd }]
+                }],
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": cmd }] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": cmd }] }]
+            }
+        })
+    }
+
+    fn hook_commands(cfg: &Path) -> Vec<String> {
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg).expect("read settings"))
+                .expect("parse settings");
+        doc["hooks"]
+            .as_object()
+            .expect("hooks object")
+            .values()
+            .flat_map(|entries| entries.as_array().cloned().unwrap_or_default())
+            .flat_map(|entry| entry["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|hook| hook["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn leaves_a_custom_existing_runner_outside_the_project_byte_identical() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".claude")).expect("create .claude");
+        let custom_dir = tmp.path().join("plugins-local/claude");
+        std::fs::create_dir_all(&custom_dir).expect("create custom plugin dir");
+        let custom_runner = custom_dir.join("cli-hook.mjs");
+        std::fs::write(&custom_runner, "// custom runner\n").expect("write custom runner");
+        // Forward slashes, the way a hand-written Windows hook usually spells it.
+        let runner = custom_runner.to_string_lossy().replace('\\', "/");
+        let cfg = project.join(".claude/settings.local.json");
+        let before = serde_json::to_string_pretty(&settings_with_runner(&runner)).unwrap();
+        std::fs::write(&cfg, &before).expect("write settings");
+
+        let _ = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let after = std::fs::read_to_string(&cfg).expect("read settings");
+        assert_eq!(after, before, "custom hook commands were rewritten");
+    }
+
+    #[test]
+    fn repairs_a_runner_path_that_no_longer_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        let gone = tmp.path().join("moved-away/cli-hook.mjs");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&gone.to_string_lossy())).unwrap(),
+        )
+        .expect("write settings");
+
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner");
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "missing runner not repaired: {commands:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repairs_the_installers_own_runner_in_verbatim_form() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        // First install puts the runner on disk and reports where it is.
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        assert!(Path::new(&abs_runner).exists(), "runner written: {abs_runner}");
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        let verbatim = format!(r"\\?\{abs_runner}");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&verbatim)).unwrap(),
+        )
+        .expect("write settings");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "own verbatim runner not repaired: {commands:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repairs_the_installers_own_runner_spelled_with_other_non_ascii_case() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("Pröj");
+        std::fs::create_dir_all(project.join(".claude")).expect("create .claude");
+        let report = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        assert!(abs_runner.contains("Pröj"), "runner under the project: {abs_runner}");
+        // Same file on a case-insensitive volume, but not equal after ASCII
+        // case folding.
+        let other_case = format!(r"\\?\{}", abs_runner.replace("Pröj", "PRÖJ"));
+        assert!(Path::new(&other_case).exists(), "volume is case-insensitive: {other_case}");
+        let cfg = project.join(".claude/settings.local.json");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_runner(&other_case)).unwrap(),
+        )
+        .expect("write settings");
+
+        let _ = auto_install_detected_plugins(&project, "TestProj", Some("claude"));
+        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "own runner in other case not repaired: {commands:?}");
+    }
+
+    #[test]
+    fn runner_is_replaceable_matches_the_installers_own_path_in_any_spelling() {
+        let own = r"C:\proj\.NeuroStrata\plugins\claude\cli-hook.mjs";
+        let root = Path::new(r"C:\proj");
+        for spelling in [
+            own,
+            r"\\?\C:\proj\.NeuroStrata\plugins\claude\cli-hook.mjs",
+            "C:/proj/.NeuroStrata/plugins/claude/cli-hook.mjs",
+            "c:/proj/.NeuroStrata/plugins/claude/cli-hook.mjs",
+            r"c:\PROJ\.neurostrata\plugins\claude\cli-hook.mjs",
+        ] {
+            assert!(runner_is_replaceable(spelling, root, own), "{spelling}");
+        }
+        assert_eq!(
+            path_key(r"\\?\UNC\server\share\cli-hook.mjs"),
+            path_key(r"\\server\share\cli-hook.mjs")
+        );
+
+        // An existing runner elsewhere is someone's own install.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let custom = tmp.path().join("cli-hook.mjs");
+        std::fs::write(&custom, "").expect("write custom runner");
+        let own_here = tmp.path().join("project/.NeuroStrata/plugins/claude/cli-hook.mjs");
+        assert!(!runner_is_replaceable(
+            &custom.to_string_lossy(),
+            &tmp.path().join("project"),
+            &own_here.to_string_lossy(),
+        ));
+        // Shell-expanded paths cannot be checked, so they are left alone.
+        for expanded in [
+            "$CLAUDE_PROJECT_DIR/hooks/cli-hook.mjs",
+            "%USERPROFILE%/hooks/cli-hook.mjs",
+            "~/hooks/cli-hook.mjs",
+        ] {
+            assert!(!runner_is_replaceable(expanded, tmp.path(), &own_here.to_string_lossy()), "{expanded}");
+        }
     }
 
     #[test]
@@ -875,10 +1252,7 @@ mod tests {
         let root_cfg = tmp.path().join("opencode.json");
         std::fs::write(
             &root_cfg,
-            serde_json::to_string_pretty(
-                &json!({ "plugins": ["./other.js"], "otherKey": "preserve" }),
-            )
-            .unwrap(),
+            serde_json::to_string_pretty(&json!({ "plugins": ["./other.js"], "otherKey": "preserve" })).unwrap(),
         )
         .expect("write root opencode.json");
 
@@ -886,95 +1260,121 @@ mod tests {
         assert_eq!(report["active_harness"], json!("opencode"));
 
         // Core plugin-core bundle must be present so relative imports resolve.
-        assert!(tmp
-            .path()
-            .join(".NeuroStrata/plugins/core/dist/index.js")
-            .exists());
-        assert!(tmp
-            .path()
-            .join(".NeuroStrata/plugins/core/package.json")
-            .exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/core/dist/index.js").exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/core/package.json").exists());
         // Opencode bundle + hook runner.
-        assert!(tmp
-            .path()
-            .join(".NeuroStrata/plugins/opencode/dist/index.js")
-            .exists());
-        assert!(tmp
-            .path()
-            .join(".NeuroStrata/plugins/opencode/cli-hook.mjs")
-            .exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/opencode/dist/index.js").exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/opencode/cli-hook.mjs").exists());
 
         // Thin loader wired into OpenCode.
         let loader = tmp.path().join(".opencode/plugins/neurostrata.js");
         assert!(loader.exists());
         let loader_src = std::fs::read_to_string(&loader).expect("read loader");
         assert!(
-            loader_src.contains(
-                "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"
-            ),
+            loader_src.contains("export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
             "loader re-exports default"
         );
         assert!(
-            loader_src
-                .contains("export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
+            loader_src.contains("export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
             "loader re-exports all"
         );
 
-        // .opencode/opencode.json always created/merged with the loader in "plugins".
+        // `.opencode/opencode.json` is never created or populated with the plugin path.
         let oc_cfg = tmp.path().join(".opencode/opencode.json");
-        assert!(oc_cfg.exists(), ".opencode/opencode.json must be created");
-        let oc_doc: Value = serde_json::from_str(
-            &std::fs::read_to_string(oc_cfg).expect("read .opencode/opencode.json"),
+        let oc_untouched = if oc_cfg.exists() {
+            match std::fs::read_to_string(&oc_cfg)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            {
+                Some(doc) => doc
+                    .get("plugins")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        !arr.iter().any(|v| {
+                            v.as_str()
+                                == Some("./.NeuroStrata/plugins/opencode/dist/index.js")
+                        })
+                    })
+                    .unwrap_or(true),
+                None => true,
+            }
+        } else {
+            true
+        };
+        assert!(oc_untouched, ".opencode/opencode.json must not contain the loader path");
+
+        // Root opencode.json is never written: existing entries preserved, loader path never inserted.
+        let root_doc: Value = serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
+            .expect("parse opencode.json");
+        let root_plugins = root_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
+        assert_eq!(root_plugins.len(), 1, "root opencode.json plugins: {root_plugins:?}");
+        assert_eq!(root_plugins[0].as_str(), Some("./other.js"));
+        assert!(!root_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")));
+        assert_eq!(root_doc.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
+    }
+
+    #[test]
+    fn opencode_wire_harness_config_removes_invalid_file_plugin_entry_and_installs_autoload_shim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let opencode_dir = root.join(".opencode");
+        std::fs::create_dir_all(&opencode_dir).expect("mkdir .opencode");
+        std::fs::write(
+            opencode_dir.join("opencode.json"),
+            r#"{
+  "plugins": [
+    "./.NeuroStrata/plugins/opencode/dist/index.js",
+    "custom-plugin-dir"
+  ]
+}"#,
         )
-        .expect("parse .opencode/opencode.json");
-        let oc_plugins = oc_doc
-            .get("plugins")
-            .and_then(|v| v.as_array())
-            .expect("plugins array");
+        .expect("seed opencode.json");
+
+        let wired = wire_harness_config(
+            root,
+            "TestProj",
+            "opencode",
+            true,
+            "./.NeuroStrata/plugins/opencode/dist/index.js",
+            "./.NeuroStrata/plugins/opencode/cli-hook.mjs",
+        );
+        assert!(wired.is_some(), "loader should be wired for opencode");
         assert!(
-            oc_plugins
-                .iter()
-                .any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
-            ".opencode/opencode.json plugins contains loader path: {oc_plugins:?}"
+            root.join(".opencode/plugins/neurostrata.js").is_file(),
+            "autoload shim written at .opencode/plugins/neurostrata.js"
         );
 
-        // Root opencode.json updated, preserving existing keys/entries (not created when absent,
-        // never clobbered when present).
-        let root_doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
-                .expect("parse opencode.json");
-        let root_plugins = root_doc
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(opencode_dir.join("opencode.json")).expect("read opencode.json"),
+        )
+        .expect("valid json");
+        // Invalid file-path entry stripped; valid entry preserved.
+        let plugins = parsed
             .get("plugins")
             .and_then(|v| v.as_array())
-            .expect("plugins array");
+            .expect("plugins array preserved for remaining entry");
+        assert_eq!(plugins.len(), 1, "plugins: {plugins:?}");
+        assert_eq!(plugins[0].as_str(), Some("custom-plugin-dir"));
+    }
+
+    #[test]
+    fn subagent_graph_first_rule_is_verifiable() {
+        let snippet = SUBAGENT_GRAPH_FIRST_RULE_SNIPPET;
         assert!(
-            root_plugins
-                .iter()
-                .any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
-            "root opencode.json plugins contains loader path"
+            snippet.contains("check whether its path and governing memory IDs"),
+            "snippet must use the verifiable path/governing-IDs predicate"
         );
         assert!(
-            root_plugins
-                .iter()
-                .any(|v| v.as_str() == Some("./other.js")),
-            "root opencode.json preserves existing plugins entries"
+            !snippet.contains("unless the parent prompt states"),
+            "snippet must not contain the unenforceable parent-prompt bypass"
         );
-        assert_eq!(
-            root_doc.get("otherKey").and_then(|v| v.as_str()),
-            Some("preserve")
+        assert!(
+            snippet.contains("memories_for_file"),
+            "snippet must still direct to memories_for_file"
         );
     }
 
-    // --- Round-13 P1 regression tests: claude hook merge into pre-existing
-    // settings.local.json event arrays (PR #35 thread PRRT_kwDOVS6VQM61K3fO).
 
-    fn seed_claude_settings(tmp: &tempfile::TempDir, doc: &Value) -> String {
-        let dir = tmp.path().join(".claude");
-        std::fs::create_dir_all(&dir).expect("create .claude");
-        let raw = serde_json::to_string_pretty(doc).unwrap();
-        std::fs::write(dir.join("settings.local.json"), &raw).expect("seed settings");
-        raw
-    }
 
     fn read_claude_settings(tmp: &tempfile::TempDir) -> Value {
         serde_json::from_str(
@@ -983,6 +1383,8 @@ mod tests {
         )
         .expect("parse settings")
     }
+
+
 
     fn expected_ns_command(tmp: &tempfile::TempDir) -> String {
         let runner = tmp.path().join(".NeuroStrata/plugins/claude/cli-hook.mjs");
@@ -994,12 +1396,16 @@ mod tests {
         format!("NEUROSTRATA_NAMESPACE=TestProj node \"{}\"", abs)
     }
 
+
+
     fn event_entries<'a>(doc: &'a Value, event: &str) -> &'a Vec<Value> {
         doc.get("hooks")
             .and_then(|h| h.get(event))
             .and_then(|v| v.as_array())
             .expect("event array")
     }
+
+
 
     fn count_ns_entries(entries: &[Value], cmd: &str) -> usize {
         entries
@@ -1016,6 +1422,8 @@ mod tests {
             .count()
     }
 
+
+
     fn claude_config_wired(report: &Value) -> &Value {
         report["installed_plugins"]
             .as_array()
@@ -1025,6 +1433,17 @@ mod tests {
             .map(|p| &p["config_wired"])
             .expect("claude entry")
     }
+
+
+
+    fn seed_claude_settings(tmp: &tempfile::TempDir, doc: &Value) -> String {
+        let dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&dir).expect("create .claude");
+        let raw = serde_json::to_string_pretty(doc).unwrap();
+        std::fs::write(dir.join("settings.local.json"), &raw).expect("seed settings");
+        raw
+    }
+
 
     #[test]
     fn claude_wiring_merges_into_empty_existing_pretooluse_array() {
@@ -1052,6 +1471,8 @@ mod tests {
         );
         assert_eq!(count_ns_entries(event_entries(&doc, "Stop"), &cmd), 1);
     }
+
+
 
     #[test]
     fn claude_wiring_appends_to_existing_pretooluse_preserving_unrelated() {
@@ -1083,6 +1504,8 @@ mod tests {
         assert_eq!(count_ns_entries(pre, &cmd), 1);
     }
 
+
+
     #[test]
     fn claude_wiring_merges_into_empty_existing_stop_array() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1101,6 +1524,8 @@ mod tests {
         assert_eq!(count_ns_entries(stop, &cmd), 1);
         assert_eq!(count_ns_entries(event_entries(&doc, "PreToolUse"), &cmd), 1);
     }
+
+
 
     #[test]
     fn claude_wiring_merges_into_nonempty_existing_stop_array() {
@@ -1127,6 +1552,8 @@ mod tests {
         );
         assert_eq!(count_ns_entries(stop, &cmd), 1);
     }
+
+
 
     #[test]
     fn claude_wiring_is_idempotent_across_repeated_runs() {
@@ -1161,6 +1588,8 @@ mod tests {
         );
         assert_eq!(stop.len(), 1);
     }
+
+
 
     #[test]
     fn claude_wiring_fresh_file_pin() {
@@ -1206,6 +1635,8 @@ mod tests {
         assert_eq!(count_ns_entries(event_entries(&doc2, "Stop"), &cmd2), 1);
     }
 
+
+
     #[test]
     fn claude_wiring_fails_honest_on_non_array_event_value() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1224,6 +1655,8 @@ mod tests {
         assert_eq!(after, seeded, "malformed settings file left untouched");
     }
 
+
+
     #[test]
     fn claude_wiring_fails_honest_on_non_object_hooks() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1239,22 +1672,5 @@ mod tests {
         let after = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
             .expect("read settings after");
         assert_eq!(after, seeded, "malformed settings file left untouched");
-    }
-
-    #[test]
-    fn subagent_graph_first_rule_is_verifiable() {
-        let snippet = SUBAGENT_GRAPH_FIRST_RULE_SNIPPET;
-        assert!(
-            snippet.contains("check whether its path and governing memory IDs"),
-            "snippet must use the verifiable path/governing-IDs predicate"
-        );
-        assert!(
-            !snippet.contains("unless the parent prompt states"),
-            "snippet must not contain the unenforceable parent-prompt bypass"
-        );
-        assert!(
-            snippet.contains("memories_for_file"),
-            "snippet must still direct to memories_for_file"
-        );
     }
 }

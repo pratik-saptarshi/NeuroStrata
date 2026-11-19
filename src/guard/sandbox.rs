@@ -34,35 +34,44 @@ pub const SANDBOX_IMAGE: &str =
 const SANDBOX_PIDS_LIMIT: &str = "256";
 const SANDBOX_MEMORY_LIMIT: &str = "512m";
 
-/// Arguments for the ephemeral evaluation container: --rm (ephemeral),
-/// --network=none (isolated), every capability dropped, DR-3 resource
-/// limits, the working directory mounted read-only at /workspace, a
-/// tmpfs scratch /tmp, payload via `sh -c`.
-fn run_args(cwd: &str, payload: &str) -> Vec<String> {
+/// Fixed CLI arguments for `podman run`, composed (Ruling 5) from both
+/// sides' hardenings. The shell payload is piped over `stdin` to `sh -s`
+/// rather than passed via `-c <payload>` on the process command line,
+/// preventing command-line injection (`rust/command-line-injection`) and
+/// keeping untrusted payloads out of host `argv` / `/proc/<pid>/cmdline`;
+/// the DR-3 resource limits (`--cap-drop=ALL`, pids, memory) bound what
+/// the evaluated payload can do once inside. Every other element: --rm
+/// (ephemeral), -i (stdin open for the payload), --network=none
+/// (isolated), the working directory mounted read-only at /workspace, a
+/// tmpfs scratch /tmp.
+fn sandbox_run_args(mount_arg: &str) -> Vec<String> {
     vec![
         "run".to_string(),
         "--rm".to_string(),
+        "-i".to_string(),
         "--network=none".to_string(),
         "--cap-drop=ALL".to_string(),
         format!("--pids-limit={}", SANDBOX_PIDS_LIMIT),
         format!("--memory={}", SANDBOX_MEMORY_LIMIT),
-        format!("-v={}:/workspace:ro", cwd),
+        mount_arg.to_string(),
         "--tmpfs=/tmp".to_string(),
         "-w=/workspace".to_string(),
         SANDBOX_IMAGE.to_string(),
         "sh".to_string(),
-        "-c".to_string(),
-        payload.to_string(),
+        "-s".to_string(),
     ]
 }
 
-/// The evaluation command: `run_args`, output piped for the verdict.
-/// kill_on_drop is load-bearing: `evaluate` waits under a timeout, and
-/// when the timeout fires the wait is dropped — without it, the
-/// container CLI and its container would be left running.
-fn sandbox_command(engine: &str, cwd: &str, payload: &str) -> Command {
+/// The evaluation command: `sandbox_run_args`, stdin/stdout/stderr
+/// piped for the payload stream and the verdict. kill_on_drop is
+/// load-bearing: `evaluate` waits under a timeout, and when the timeout
+/// fires the wait is dropped — without it, the container CLI and its
+/// container would be left running.
+fn sandbox_command(engine: &str, cwd: &str) -> Command {
+    let mount_arg = format!("-v={}:/workspace:ro", cwd);
     let mut cmd = Command::new(engine);
-    cmd.args(run_args(cwd, payload))
+    cmd.args(sandbox_run_args(&mount_arg))
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -81,14 +90,46 @@ pub fn probe_podman_available() -> bool {
 }
 
 pub struct SandboxEvaluator {
-    engine: String, // "podman" or "docker"
-    available: bool,
+    /// ("podman" or "none", available), detected on the first `evaluate`.
+    ///
+    /// Detection spawns `podman --version` (~200 ms on Windows). It used to
+    /// run in the constructor, and `neurostrata_guard_validate` builds a new
+    /// validator per call, so every call paid for it although the hook calls
+    /// with `use_sandbox: false` and never reaches `evaluate`.
+    engine: tokio::sync::OnceCell<(String, bool)>,
+    /// How many times `detect_engine` ran for this evaluator.
+    engine_probes: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for SandboxEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SandboxEvaluator {
-    pub async fn new() -> Self {
-        let (engine, available) = Self::detect_engine().await;
-        Self { engine, available }
+    pub fn new() -> Self {
+        Self {
+            engine: tokio::sync::OnceCell::new(),
+            engine_probes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// How many times this evaluator ran engine detection (0 until the first
+    /// `evaluate`, then 1).
+    pub fn engine_probe_count(&self) -> usize {
+        self.engine_probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn detected_engine(&self) -> (String, bool) {
+        self.engine
+            .get_or_init(|| async {
+                self.engine_probes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Self::detect_engine().await
+            })
+            .await
+            .clone()
     }
 
     async fn detect_engine() -> (String, bool) {
@@ -109,12 +150,12 @@ impl SandboxEvaluator {
         payload: &str,
         cwd: &str,
     ) -> anyhow::Result<ValidateVerdict> {
-        // Re-probe dynamically: `available` was computed once in the
-        // constructor, so Podman may have appeared (or gone) since. Probing
-        // again here keeps this check from contradicting the daemon's own
-        // live probe at the request boundary (TOCTOU).
-        let mut engine = self.engine.clone();
-        let mut available = self.available;
+        // Re-probe dynamically: `available` is computed once per evaluator
+        // (the daemon's /validate route keeps one for its whole life), so
+        // Podman may have appeared since. Probing again here keeps this check
+        // from contradicting the daemon's own live probe at the request
+        // boundary (TOCTOU).
+        let (mut engine, mut available) = self.detected_engine().await;
         if !available && probe_podman_available() {
             // detect_engine only ever selects podman, so a successful probe
             // is exactly the engine the constructor would have recorded.
@@ -164,11 +205,17 @@ impl SandboxEvaluator {
 
         let start = std::time::Instant::now();
 
-        // Command execution inside ephemeral container (see run_args)
-        let child = sandbox_command(&engine, &cwd_str, payload).spawn()?;
+        // Command execution inside ephemeral container (see
+        // sandbox_run_args): the payload streams over stdin to `sh -s`
+        // — never in argv — under the DR-3 resource limits.
+        let child = sandbox_command(&engine, &cwd_str).spawn()?;
 
         // Wait with a strict timeout (e.g., 5 seconds for inline guard)
-        let execution_result = timeout(Duration::from_secs(5), child.wait_with_output()).await;
+        let execution_result = timeout(
+            Duration::from_secs(5),
+            write_payload_and_wait(child, payload),
+        )
+        .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -232,6 +279,21 @@ impl SandboxEvaluator {
     }
 }
 
+async fn write_payload_and_wait(
+    mut child: tokio::process::Child,
+    payload: &str,
+) -> std::io::Result<std::process::Output> {
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let bytes = payload.as_bytes();
+        if stdin.write_all(bytes).await.is_ok() && !bytes.ends_with(b"\n") {
+            let _ = stdin.write_all(b"\n").await;
+        }
+        let _ = stdin.shutdown().await;
+    }
+    child.wait_with_output().await
+}
+
 /// UTF-8-safe tail slice: never splits a multi-byte codepoint, so indexing
 /// never panics (AJ-5).
 fn safe_utf8_suffix(s: &str, max_bytes: usize) -> &str {
@@ -252,11 +314,11 @@ mod tests {
     use std::time::Instant;
 
     fn args() -> Vec<String> {
-        run_args("/work/project", "echo hello")
+        sandbox_run_args("-v=/work/project:/workspace:ro")
     }
 
     #[test]
-    fn run_args_pin_image_by_digest() {
+    fn sandbox_run_args_pin_image_by_digest() {
         let a = args();
         assert!(
             a.iter().all(|x| !x.contains(":latest")),
@@ -281,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn run_args_drop_all_capabilities() {
+    fn sandbox_run_args_drop_all_capabilities() {
         let a = args();
         assert!(
             a.iter().any(|x| x == "--cap-drop=ALL"),
@@ -290,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn run_args_set_pid_and_memory_limits() {
+    fn sandbox_run_args_set_pid_and_memory_limits() {
         // DR-3 register values, ridden at their defaults.
         let a = args();
         assert!(
@@ -375,7 +437,7 @@ mod tests {
             std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let child = sandbox_command(engine.to_str().unwrap(), "/work/project", "ignored")
+        let child = sandbox_command(engine.to_str().unwrap(), "/work/project")
             .spawn()
             .expect("the stub engine spawns");
         let outcome = timeout(Duration::from_millis(500), child.wait_with_output()).await;
@@ -409,6 +471,63 @@ mod tests {
             !alive,
             "child pid {pid} survived the dropped timeout — the sandbox would leave the container running"
         );
+    }
+
+    #[test]
+    fn sandbox_run_args_streams_script_over_stdin_without_cli_payload() {
+        let args = sandbox_run_args("-v=/tmp/ws:/workspace:ro");
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--rm",
+                "-i",
+                "--network=none",
+                "--cap-drop=ALL",
+                "--pids-limit=256",
+                "--memory=512m",
+                "-v=/tmp/ws:/workspace:ro",
+                "--tmpfs=/tmp",
+                "-w=/workspace",
+                SANDBOX_IMAGE,
+                "sh",
+                "-s",
+            ]
+        );
+        assert!(
+            !args.iter().any(|x| x == "-c"),
+            "sandbox must read payload from stdin via `sh -s`, never `sh -c <payload>`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_payload_and_wait_streams_to_sh_stdin_and_preserves_status() {
+        let ok_child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh -s");
+        let ok_out = write_payload_and_wait(ok_child, "printf 'sandbox-ok'")
+            .await
+            .expect("wait sh -s");
+        assert!(ok_out.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok_out.stdout), "sandbox-ok");
+
+        let fail_child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn failing sh -s");
+        let fail_out = write_payload_and_wait(fail_child, "echo 'bad' >&2\nexit 7")
+            .await
+            .expect("wait failing sh -s");
+        assert_eq!(fail_out.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&fail_out.stderr).trim(), "bad");
     }
 
     #[test]
