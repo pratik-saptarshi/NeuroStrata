@@ -2666,6 +2666,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// B4 (PR #120 ruling): a changed re-import by the owner must carry the
+    /// prior head's role-object `visible_to` ACL forward verbatim — without
+    /// the carry-forward the new head's empty ACL would grant viewer to any
+    /// principal, silently making a restricted note world-readable.
+    #[tokio::test]
+    async fn b4_reimport_preserves_visible_to_acl() {
+        let root = std::env::temp_dir().join(format!("ns-b4-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_b4";
+        store.init(ns).await.expect("init");
+        let seeded_acl = serde_json::json!([{"principal": "alice", "role": "owner"}]);
+        let seeded_metadata = serde_json::json!({
+            "canonical_sha256": "stale-sentinel-b4",
+            "visible_to": seeded_acl.clone()
+        });
+        store
+            .upsert(
+                ns,
+                "note-1",
+                vec![0.0; 4],
+                seed_payload("alice", seeded_metadata),
+            )
+            .await
+            .expect("seed restricted prior head");
+        let mut changed = note("note-1", &[]);
+        changed.content = "changed body".to_string();
+        changed.canonical_sha256 = hex::encode(Sha256::digest(changed.content.as_bytes()));
+        std::fs::write(vault.join("note-1.md"), changed.to_markdown()).expect("write note");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: Some("alice".to_string()),
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1);
+        let (_, head) = store.get(ns, "note-1").await.unwrap().unwrap();
+        assert_eq!(
+            head.metadata["visible_to"], seeded_acl,
+            "new head must carry the prior head's ACL verbatim"
+        );
+        assert!(
+            !rebac::can_read_memory("mallory", &head.user_id, &head.metadata),
+            "stranger must not read the re-imported restricted head"
+        );
+        assert!(
+            rebac::can_read_memory("alice", &head.user_id, &head.metadata),
+            "owner must still read the re-imported restricted head"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Issue #297: the open that performs the write must itself refuse a
     /// symlink final component. The metadata precheck is deliberately
     /// bypassed here to model the TOCTOU window between that check and the
