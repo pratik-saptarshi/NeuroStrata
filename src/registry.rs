@@ -412,7 +412,11 @@ pub fn build_merged_registry_payload(
     let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
         registry_domain_entries(&existing_meta)
             .iter()
-            .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .filter_map(|e| {
+                e.get("slug")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect()
     } else {
         vec![]
@@ -448,9 +452,10 @@ pub fn build_merged_registry_payload(
         {
             let mut entries = registry_domain_entries(&existing_meta);
             for slug in &wanted_slugs {
-                if !entries.iter().any(|e| {
-                    e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str())
-                }) {
+                if !entries
+                    .iter()
+                    .any(|e| e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()))
+                {
                     entries.push(serde_json::json!({
                         "slug": slug,
                         "parent": serde_json::Value::Null,

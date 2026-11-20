@@ -785,7 +785,11 @@ async fn dispatch(
                         let ts = ts;
                         let name = name.clone();
                         tokio::spawn(async move {
-                            let ctx = SubscriberContext { store: store.as_ref(), namespace: &ns, ts };
+                            let ctx = SubscriberContext {
+                                store: store.as_ref(),
+                                namespace: &ns,
+                                ts,
+                            };
                             let retry = tokio::time::timeout(
                                 SUBSCRIBER_TIMEOUT * 4,
                                 AssertUnwindSafe(sub.handle(&event, &RecursionToken::new(), &ctx))
@@ -796,12 +800,18 @@ async fn dispatch(
                                 Ok(Ok(Ok(()))) => {}
                                 Ok(Ok(Err(err))) => {
                                     metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!(subscriber = name, "subscriber retry after timeout failed: {err:#}");
+                                    tracing::warn!(
+                                        subscriber = name,
+                                        "subscriber retry after timeout failed: {err:#}"
+                                    );
                                 }
                                 Ok(Err(payload)) => {
                                     metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
                                     let text = panic_text(payload.as_ref());
-                                    tracing::warn!(subscriber = name, "subscriber panicked on retry after timeout: {text}");
+                                    tracing::warn!(
+                                        subscriber = name,
+                                        "subscriber panicked on retry after timeout: {text}"
+                                    );
                                 }
                                 Err(_) => {
                                     tracing::warn!(
@@ -1308,7 +1318,11 @@ mod tests {
             flipped.load(Ordering::Acquire),
             "the retry under the extended budget landed the flip"
         );
-        assert_eq!(calls.load(Ordering::Acquire), 2, "first attempt plus exactly one retry");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "first attempt plus exactly one retry"
+        );
     }
 
     #[tokio::test]

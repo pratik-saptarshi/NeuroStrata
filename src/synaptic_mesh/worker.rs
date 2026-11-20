@@ -2630,7 +2630,10 @@ mod tests {
         assert_eq!(rep_b.applied, 0, "must not overwrite existing record: {rep_b:?}");
         assert_eq!(rep_b.conflicted, 1, "must record export conflict: {rep_b:?}");
         assert_eq!(rep_b.conflicted_ids, vec![derived_uuid.to_string()]);
-        assert!(outbox.pending().unwrap().is_empty(), "conflicted entry is consumed into overlay");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "conflicted entry is consumed into overlay"
+        );
 
         // Primary mesh file still holds Node A's record and provenance.
         let on_disk = stored_record(&mesh, &derived_uuid);
@@ -2645,6 +2648,9 @@ mod tests {
         let variant: MeshRecord =
             serde_json::from_str(&std::fs::read_to_string(&variant_path).unwrap()).unwrap();
         assert_eq!(variant.lifecycle.created_by, "node-b");
-        assert_eq!(variant.content, json!("Node B competing concept definition"));
+        assert_eq!(
+            variant.content,
+            json!("Node B competing concept definition")
+        );
     }
 }

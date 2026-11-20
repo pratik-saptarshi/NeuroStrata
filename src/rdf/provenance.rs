@@ -1,7 +1,7 @@
+use chrono::DateTime;
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use chrono::DateTime;
 
 pub const ALLOWED_ORIGINS: [&str; 4] = ["user", "agent", "system", "mesh"];
 pub const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
@@ -13,15 +13,12 @@ pub const PROV_WAS_INVALIDATED_BY: &str = "http://www.w3.org/ns/prov#wasInvalida
 /// `metadata.provenance` is used. JSON null counts as absent at both levels,
 /// so a null top-level field cannot shadow a populated nested one.
 fn resolve_field<'a>(metadata: &'a Value, key: &str) -> Option<&'a Value> {
-    metadata
-        .get(key)
-        .filter(|v| !v.is_null())
-        .or_else(|| {
-            metadata
-                .get("provenance")
-                .and_then(|p| p.get(key))
-                .filter(|v| !v.is_null())
-        })
+    metadata.get(key).filter(|v| !v.is_null()).or_else(|| {
+        metadata
+            .get("provenance")
+            .and_then(|p| p.get(key))
+            .filter(|v| !v.is_null())
+    })
 }
 
 fn resolve_str<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
@@ -351,23 +348,30 @@ impl EpistemicTier {
 ///     (source naming an owner/admin), not an arbitrary string;
 ///   * empirical_verified requires test/command/action receipt evidence
 ///     (source naming a receipt/test/command).
-pub fn validate_epistemic_metadata(metadata: &Value, agent_name: Option<&str>) -> Vec<ProvenanceWarning> {
+pub fn validate_epistemic_metadata(
+    metadata: &Value,
+    agent_name: Option<&str>,
+) -> Vec<ProvenanceWarning> {
     let mut warnings = Vec::new();
     let tier = EpistemicTier::classify(metadata, agent_name);
     // Every field below resolves through the same top-level-first rule. A
     // nested provenance block can satisfy a check, but cannot split a pair
     // (generated_by/verified_by) across levels to dodge self-verification.
-    let verified_by = resolve_str(metadata, "verified_by")
-        .filter(|s| !s.trim().is_empty());
+    let verified_by = resolve_str(metadata, "verified_by").filter(|s| !s.trim().is_empty());
     let source = resolved_source(metadata);
 
     match tier {
-        EpistemicTier::EmpiricalVerified | EpistemicTier::FormalVerified | EpistemicTier::HumanGoverned => {
+        EpistemicTier::EmpiricalVerified
+        | EpistemicTier::FormalVerified
+        | EpistemicTier::HumanGoverned => {
             if verified_by.is_none() {
                 warnings.push(ProvenanceWarning {
                     target: "metadata".to_string(),
                     field: "verified_by".to_string(),
-                    message: format!("verified tier '{}' requires nonempty verified_by", tier.as_str()),
+                    message: format!(
+                        "verified tier '{}' requires nonempty verified_by",
+                        tier.as_str()
+                    ),
                 });
             }
         }
@@ -525,7 +529,8 @@ pub fn memory_presentation(metadata: &Value) -> MemoryPresentation {
     let not_definition = presentation_field(metadata, "not_definition")
         .filter(|v| !v.is_null())
         .cloned();
-    let deprecation_banner = presentation_field(metadata, "deprecation").and_then(deprecation_banner);
+    let deprecation_banner =
+        presentation_field(metadata, "deprecation").and_then(deprecation_banner);
     MemoryPresentation {
         not_definition,
         deprecation_banner,
@@ -1007,7 +1012,10 @@ pub fn project_edge_rdf_star(
     });
     push_epistemic_assertion_quads(&mut quads, &assertion_subj, &graph_name, prov);
 
-    let mut warnings = validate_node_provenance(&format!("urn:neurostrata:edge:{}:{}:{}", namespace, relation, from), prov);
+    let mut warnings = validate_node_provenance(
+        &format!("urn:neurostrata:edge:{}:{}:{}", namespace, relation, from),
+        prov,
+    );
     // Edge assertions carry the same epistemic bundle as memory assertions,
     // so they must be judged by the same fail-closed invariants.
     let edge_metadata = serde_json::json!({
@@ -1270,27 +1278,45 @@ mod tests {
     #[test]
     fn epistemic_tier_classify_explicit_tiers() {
         let meta = json!({"epistemic_tier": "unverified_agent"});
-        assert_eq!(EpistemicTier::classify(&meta, Some("agent")), EpistemicTier::UnverifiedAgent);
+        assert_eq!(
+            EpistemicTier::classify(&meta, Some("agent")),
+            EpistemicTier::UnverifiedAgent
+        );
 
         let meta = json!({"epistemic_tier": "empirical_verified"});
-        assert_eq!(EpistemicTier::classify(&meta, Some("agent")), EpistemicTier::EmpiricalVerified);
+        assert_eq!(
+            EpistemicTier::classify(&meta, Some("agent")),
+            EpistemicTier::EmpiricalVerified
+        );
 
         let meta = json!({"epistemic_tier": "formal_verified"});
-        assert_eq!(EpistemicTier::classify(&meta, Some("agent")), EpistemicTier::FormalVerified);
+        assert_eq!(
+            EpistemicTier::classify(&meta, Some("agent")),
+            EpistemicTier::FormalVerified
+        );
 
         let meta = json!({"epistemic_tier": "human_governed"});
-        assert_eq!(EpistemicTier::classify(&meta, Some("agent")), EpistemicTier::HumanGoverned);
+        assert_eq!(
+            EpistemicTier::classify(&meta, Some("agent")),
+            EpistemicTier::HumanGoverned
+        );
     }
 
     #[test]
     fn epistemic_tier_classify_absence_defaults() {
         // Agent-generated without explicit tier => unverified_agent
         let meta = json!({});
-        assert_eq!(EpistemicTier::classify(&meta, Some("agent")), EpistemicTier::UnverifiedAgent);
+        assert_eq!(
+            EpistemicTier::classify(&meta, Some("agent")),
+            EpistemicTier::UnverifiedAgent
+        );
 
         // Non-agent without explicit tier => unverified (legacy)
         let meta = json!({});
-        assert_eq!(EpistemicTier::classify(&meta, None), EpistemicTier::Unverified);
+        assert_eq!(
+            EpistemicTier::classify(&meta, None),
+            EpistemicTier::Unverified
+        );
     }
 
     #[test]
@@ -1311,7 +1337,10 @@ mod tests {
     #[test]
     fn epistemic_tier_as_str() {
         assert_eq!(EpistemicTier::UnverifiedAgent.as_str(), "unverified_agent");
-        assert_eq!(EpistemicTier::EmpiricalVerified.as_str(), "empirical_verified");
+        assert_eq!(
+            EpistemicTier::EmpiricalVerified.as_str(),
+            "empirical_verified"
+        );
         assert_eq!(EpistemicTier::FormalVerified.as_str(), "formal_verified");
         assert_eq!(EpistemicTier::HumanGoverned.as_str(), "human_governed");
         assert_eq!(EpistemicTier::Unverified.as_str(), "unverified");
@@ -1347,7 +1376,9 @@ mod tests {
         });
         let w = validate_epistemic_metadata(&meta, Some("agent"));
         assert!(!w.is_empty(), "generated_by == verified_by should warn");
-        assert!(w.iter().any(|v| v.field == "verified_by" && v.message.contains("self-verification")));
+        assert!(w
+            .iter()
+            .any(|v| v.field == "verified_by" && v.message.contains("self-verification")));
 
         // Different values should pass
         let meta = json!({
@@ -1356,7 +1387,10 @@ mod tests {
             "verified_by": "agent-2"
         });
         let w = validate_epistemic_metadata(&meta, Some("agent"));
-        assert!(w.is_empty(), "different generated_by/verified_by should pass");
+        assert!(
+            w.is_empty(),
+            "different generated_by/verified_by should pass"
+        );
     }
 
     #[test]
@@ -1368,7 +1402,9 @@ mod tests {
         });
         let w = validate_epistemic_metadata(&meta, Some("agent"));
         assert!(!w.is_empty(), "missing certificate evidence should warn");
-        assert!(w.iter().any(|v| v.field == "source" && v.message.contains("formal-kernel")));
+        assert!(w
+            .iter()
+            .any(|v| v.field == "source" && v.message.contains("formal-kernel")));
 
         let meta = json!({
             "epistemic_tier": "formal_verified",
@@ -1388,7 +1424,9 @@ mod tests {
         });
         let w = validate_epistemic_metadata(&meta, Some("agent"));
         assert!(!w.is_empty(), "missing owner/admin evidence should warn");
-        assert!(w.iter().any(|v| v.field == "source" && v.message.contains("owner/admin")));
+        assert!(w
+            .iter()
+            .any(|v| v.field == "source" && v.message.contains("owner/admin")));
 
         let meta = json!({
             "epistemic_tier": "human_governed",
@@ -1408,7 +1446,9 @@ mod tests {
         });
         let w = validate_epistemic_metadata(&meta, Some("agent"));
         assert!(!w.is_empty(), "missing test/receipt evidence should warn");
-        assert!(w.iter().any(|v| v.field == "source" && v.message.contains("test/command/action")));
+        assert!(w
+            .iter()
+            .any(|v| v.field == "source" && v.message.contains("test/command/action")));
 
         let meta = json!({
             "epistemic_tier": "empirical_verified",
@@ -1508,7 +1548,8 @@ mod tests {
             !rendered.contains("fabricated") && !rendered.contains("unknown"),
             "no invented reason: {rendered}"
         );
-        let malformed = json!({"status": "deprecated", "superseded_by": "mem-9", "reason": {"nested": true}});
+        let malformed =
+            json!({"status": "deprecated", "superseded_by": "mem-9", "reason": {"nested": true}});
         let rendered = deprecation_banner(&malformed).expect("malformed reason never panics");
         assert!(
             rendered.starts_with("[DEPRECATED — SUPERSEDED BY mem-9:"),
@@ -1533,7 +1574,10 @@ mod tests {
             presentation.deprecation_banner.as_deref(),
             Some("[DEPRECATED — SUPERSEDED BY mem-11: retired]")
         );
-        assert_eq!(presentation.not_definition, Some(json!("not for production")));
+        assert_eq!(
+            presentation.not_definition,
+            Some(json!("not for production"))
+        );
         assert_eq!(
             decorate_content("legacy body", &metadata),
             "[DEPRECATED — SUPERSEDED BY mem-11: retired]\nNOT DEFINITION: not for production\nlegacy body"
@@ -1746,11 +1790,10 @@ mod tests {
                 .iter()
                 .any(|x| x.field == "stale_after")
         );
-        assert!(validate_epistemic_metadata(
-            &json!({"stale_after": "2026-01-01T00:00:00Z"}),
-            None
-        )
-        .is_empty());
+        assert!(
+            validate_epistemic_metadata(&json!({"stale_after": "2026-01-01T00:00:00Z"}), None)
+                .is_empty()
+        );
         assert!(validate_epistemic_metadata(&json!({"stale_after": 1700000000}), None).is_empty());
     }
 
@@ -1758,7 +1801,10 @@ mod tests {
     fn stale_after_parse_rejects_negative_and_overflow_epochs() {
         assert_eq!(stale_after_parse(&json!(-1), 100), None);
         assert_eq!(stale_after_parse(&json!("-1"), 100), None);
-        assert_eq!(stale_after_parse(&json!("99999999999999999999999"), 100), None);
+        assert_eq!(
+            stale_after_parse(&json!("99999999999999999999999"), 100),
+            None
+        );
         assert_eq!(stale_after_parse(&json!("0"), 100), Some(true));
         assert_eq!(stale_after_parse(&json!(0), 100), Some(true));
     }
@@ -1831,9 +1877,7 @@ mod tests {
             project_memory_rdf_star("ns", "m1", &payload, crate::rdf::types::Tier::Domain, 1);
         assert!(warnings.is_empty(), "{warnings:?}");
         let assertion = memory_assertion_iri("ns", "m1", "memory", 0, 1);
-        let on_assertion = |q: &Quad| {
-            matches!(&q.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == assertion)
-        };
+        let on_assertion = |q: &Quad| matches!(&q.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == assertion);
         for (pred, expected) in [
             ("generatedBy", "agent-1"),
             ("verifiedBy", "test@abc"),
@@ -1850,9 +1894,9 @@ mod tests {
                 q.object
             );
         }
-        assert!(quads.iter().any(|q| {
-            on_assertion(q) && q.predicate.as_str() == ns_predicate("notDefinition")
-        }));
+        assert!(quads
+            .iter()
+            .any(|q| { on_assertion(q) && q.predicate.as_str() == ns_predicate("notDefinition") }));
         let first = serialize_rdf_star(&quads, "trig-star", false).expect("valid trig-star");
         let second = serialize_rdf_star(&quads, "trig-star", false).expect("valid trig-star");
         assert_eq!(first, second, "projection must be deterministic");
@@ -1876,7 +1920,13 @@ mod tests {
             not_definition: Some(json!(["not a rule"])),
         };
         let (quads, warnings) = project_edge_rdf_star(
-            "ns", "a", "GOVERNS", "b", &prov, None, GraphName::DefaultGraph,
+            "ns",
+            "a",
+            "GOVERNS",
+            "b",
+            &prov,
+            None,
+            GraphName::DefaultGraph,
         );
         assert!(
             warnings
@@ -1885,9 +1935,7 @@ mod tests {
             "edge epistemic validation must run: {warnings:?}"
         );
         let assertion = edge_assertion_iri("ns", "GOVERNS", "a", "b", 1, 1, None);
-        let on_assertion = |q: &Quad| {
-            matches!(&q.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == assertion)
-        };
+        let on_assertion = |q: &Quad| matches!(&q.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == assertion);
         for pred in [
             "generatedBy",
             "verifiedBy",
@@ -1897,8 +1945,7 @@ mod tests {
         ] {
             assert!(
                 quads.iter().any(|q| {
-                    on_assertion(q)
-                        && q.predicate.as_str() == format!("urn:neurostrata:ns#{pred}")
+                    on_assertion(q) && q.predicate.as_str() == format!("urn:neurostrata:ns#{pred}")
                 }),
                 "edge assertion missing quad for {pred}"
             );

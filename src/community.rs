@@ -465,7 +465,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_communities_with_resolution_async_matches_sync_partition() -> anyhow::Result<()> {
+    async fn detect_communities_with_resolution_async_matches_sync_partition() -> anyhow::Result<()>
+    {
         let edges = vec![
             ("c1".to_string(), "c2".to_string(), 1.0),
             ("c2".to_string(), "c3".to_string(), 1.0),

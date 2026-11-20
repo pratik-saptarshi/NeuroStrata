@@ -120,7 +120,11 @@ pub fn retention_gate(receipt_exists: bool) -> bool {
     // Budget verified over the rolling evidence windows (the degenerate
     // empty window reads as 0.0, which must always verify — the gate never
     // fails on "no evidence yet"), not assertedly "passing" on broken inputs.
-    retention_gate_with(receipt_exists, current_p95_plan_ms(), current_p95_upsert_ms())
+    retention_gate_with(
+        receipt_exists,
+        current_p95_plan_ms(),
+        current_p95_upsert_ms(),
+    )
 }
 
 /// The gate decision over explicit p95 values. Split out so the decision can
