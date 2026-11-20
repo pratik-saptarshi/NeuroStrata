@@ -15206,10 +15206,11 @@ mod tests {
     #[tokio::test]
     async fn related_resolves_file_seed_across_absolute_and_relative_spellings() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let store: Arc<dyn VectorStore> = Arc::new(
+        let store_concrete = Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(&tmp.path().join("db"), 4)
                 .expect("open temp database"),
         );
+        let store: Arc<dyn VectorStore> = store_concrete.clone();
         store.init("ns").await.expect("init namespace");
 
         let mut p = payload("pub fn demo() {}");
@@ -15217,8 +15218,12 @@ mod tests {
         p.memory_type = "structural".to_string();
         p.agent_name = Some("a".to_string());
         p.metadata = serde_json::json!({"locations":[{"path":"src/lib.rs"}]});
-        store
-            .upsert("ns", "file:src/lib.rs", vec![0.0; 4], p)
+        // The `file:`-spelled node is seeded as a pre-existing row,
+        // bypassing the store-boundary id validation (which postdates
+        // such rows): `related` resolution must resolve file nodes that
+        // already exist in a store, whatever writer put them there.
+        store_concrete
+            .seed_legacy_memory_for_test("ns", "file:src/lib.rs", vec![0.0; 4], p)
             .await
             .expect("seed file node");
 

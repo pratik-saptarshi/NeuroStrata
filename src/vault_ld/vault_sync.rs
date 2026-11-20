@@ -2325,15 +2325,20 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ns-col-{}", uuid::Uuid::new_v4()));
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).expect("create vault");
-        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+        let store_concrete = std::sync::Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
                 .expect("temp store"),
         );
+        let store: std::sync::Arc<dyn VectorStore> = store_concrete.clone();
         let ns = "vault_collision";
         store.init(ns).await.expect("init");
+        // The separator-bearing ids are seeded as legacy rows, bypassing
+        // the store-boundary id validation (which postdates such rows):
+        // export must flatten separator-bearing ids that already exist
+        // in a store, whatever writer put them there.
         for id in ["a/b", "a:b", r"a\b"] {
-            store
-                .upsert(
+            store_concrete
+                .seed_legacy_memory_for_test(
                     ns,
                     id,
                     vec![0.0; 4],
@@ -2381,7 +2386,8 @@ mod tests {
             .count();
         assert_eq!(md_count, 1, "only one file may be written");
 
-        // Re-import into a fresh store + namespace: count must match export.
+        // Re-import into a fresh store + namespace: the exported legacy
+        // note's separator-bearing id must be refused at the boundary.
         let fresh_ns = "vault_collision_reimport";
         let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(&root.join("db2"), 4)
@@ -2406,8 +2412,30 @@ mod tests {
         )
         .await
         .expect("reimport");
-        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
-        assert_eq!(imported.notes_imported, 1);
+        // The single exported file is the sort-first id's note (`a/b`);
+        // its separator-bearing id is refused at the store boundary on
+        // re-import, reported per-note, and never silently landed.
+        assert_eq!(imported.notes_imported, 0, "{:?}", imported);
+        assert!(!imported.success, "{:?}", imported);
+        assert_eq!(imported.errors.len(), 1, "{:?}", imported.errors);
+        assert!(
+            imported.errors[0].contains("Failed to upsert a/b"),
+            "{:?}",
+            imported.errors
+        );
+        assert!(
+            imported.errors[0].contains("ERROR [ID]"),
+            "{:?}",
+            imported.errors
+        );
+        assert!(
+            fresh_store
+                .get(fresh_ns, "a/b")
+                .await
+                .expect("get reimported id")
+                .is_none(),
+            "the refused id must not land in the fresh store"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
