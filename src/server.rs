@@ -16522,6 +16522,7 @@ mod tests {
             &["probe".to_string()],
             None,
         )
+        .await
         .unwrap();
         let outbox_dir = outbox_dir_for(mesh.root());
         let outbox = Outbox::open(&outbox_dir).unwrap();
@@ -16687,6 +16688,7 @@ mod tests {
                 .unwrap();
             let report =
                 crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-source-test")
+                    .await
                     .unwrap();
             assert_eq!(report.applied, 1, "{case}: rule must pass the publish gate");
             let emitted = std::fs::read_to_string(
@@ -16983,6 +16985,7 @@ mod tests {
             &["probe".to_string()],
             None,
         )
+        .await
         .unwrap();
         let outbox = crate::synaptic_mesh::outbox::Outbox::open(
             &crate::synaptic_mesh::outbox::outbox_dir_for(mesh.root()),
@@ -17003,7 +17006,9 @@ mod tests {
             })
             .unwrap();
         let report =
-            crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author").unwrap();
+            crate::synaptic_mesh::worker::drain_once(&outbox, &mesh, "node-author")
+                .await
+                .unwrap();
         assert_eq!(report.applied, 1, "the shareable rule is published: {report:?}");
         let text = std::fs::read_to_string(
             mesh.root().join("probe").join("memories").join(format!("{id}.json")),
