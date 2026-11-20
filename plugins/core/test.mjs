@@ -146,7 +146,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, taskCandidates: 0, memoriesForFilePaths: [], guardArgs: [], taskListArgs: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -209,6 +209,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_task_list") {
             counters.taskList++;
+            counters.taskListArgs.push(params.arguments ?? {});
             respond({
               content: [
                 {
@@ -221,8 +222,14 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
             });
             return;
           }
+          if (name === "neurostrata_task_candidates") {
+            counters.taskCandidates++;
+            respond({ content: [{ type: "text", text: JSON.stringify({ recorded: true }) }] });
+            return;
+          }
           if (name === "neurostrata_guard_validate") {
             counters.guardValidate++;
+            counters.guardArgs.push(params.arguments ?? {});
             // `guardReject` may be a boolean or a getter, so a test can flip the
             // verdict between two calls against the same mock daemon.
             const reject = typeof guardReject === "function" ? guardReject() : guardReject;
@@ -2643,5 +2650,546 @@ describe("daemon memory advisory (#140)", () => {
     assert.equal(extractDaemonMemoryAdvisory(text, 10_000_001), null);
     resetAdvisoryStateForTesting();
     assert.notEqual(extractDaemonMemoryAdvisory(text, 10_000_002), null);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Session/worktree Breath isolation + read-only shell exemption (RED-first)
+// ──────────────────────────────────────────────────────────────────────
+
+describe("regression: variable-valued Code Mode task IDs / notes", () => {
+  it("treats a claim with a variable id and literal session as claimed without a literal id", () => {
+    const out = inspectCodeModeExecution(
+      'const created = await tools.neurostrata.neurostrata_task_create({ namespace: "ns" });\nawait tools.neurostrata.neurostrata_task_claim({ id: created.id, session_id: "ses_123" });',
+    );
+    assert.equal(out.id, undefined);
+    assert.equal(out.sessionId, "ses_123");
+    assert.equal(out.taskClaimed, true);
+    assert.equal(out.taskCompleted, false);
+  });
+
+  it("treats a claim with both id and session_id as variable expressions as claimed", () => {
+    const out = inspectCodeModeExecution(
+      "await tools.neurostrata.neurostrata_task_claim({ id: created.id, session_id: ctx.sessionID });",
+    );
+    assert.equal(out.id, undefined);
+    assert.equal(out.sessionId, undefined);
+    assert.equal(out.taskClaimed, true);
+  });
+
+  it("does not treat explicit undefined/null id as a claim key", () => {
+    const undef = inspectCodeModeExecution(
+      'neurostrata_task_claim({ id: undefined, session_id: "ses-1" });',
+    );
+    assert.ok(!undef.taskClaimed, "explicit undefined id is not a claim");
+    const nil = inspectCodeModeExecution(
+      'neurostrata_task_claim({ id: null, session_id: "ses-1" });',
+    );
+    assert.ok(!nil.taskClaimed, "explicit null id is not a claim");
+  });
+
+  it("detects template-literal and variable notes on task_update", () => {
+    const tpl = inspectCodeModeExecution(
+      'await tools.neurostrata.neurostrata_task_update({ id: task.id, note: `Breath: ${step}` });',
+    );
+    assert.equal(tpl.taskUpdated, true);
+    assert.equal(tpl.note, "");
+    const variable = inspectCodeModeExecution(
+      "await tools.neurostrata.neurostrata_task_update({ id: task.id, note: summary });",
+    );
+    assert.equal(variable.note, "");
+    const none = inspectCodeModeExecution(
+      "await tools.neurostrata.neurostrata_task_update({ id: task.id, priority: 2 });",
+    );
+    assert.equal(none.note, undefined);
+  });
+
+  it("clears stale activeTaskId on a variable-id claim in execute.before and PreToolUse", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      let beforeHandler;
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "clear-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+        tool: {
+          hook: async (name, cb) => {
+            if (name === "execute.before") beforeHandler = cb;
+          },
+        },
+        hooks: {},
+      });
+      await beforeHandler({
+        tool: "execute",
+        input: { code: 'neurostrata_task_claim({ id: "stale-task", session_id: "ses-fresh" })' },
+      });
+      assert.equal(getTrackingState().activeTaskId, "stale-task");
+      assert.equal(getTrackingState().activeSessionId, "ses-fresh");
+
+      await beforeHandler({
+        tool: "execute",
+        input: { code: "neurostrata_task_claim({ id: created.id, session_id: ses.id })" },
+      });
+      assert.equal(getTrackingState().activeTaskId, null, "stale task id cleared so daemon re-resolves");
+      assert.equal(getTrackingState().activeSessionId, "ses-fresh", "known session preserved");
+
+      await beforeHandler({
+        tool: "execute",
+        input: { code: 'neurostrata_task_claim({ id: "stale-2", session_id: "ses-fresh" })' },
+      });
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "execute",
+        tool_input: { code: "neurostrata_task_claim({ id: created.id, session_id: ses.id })" },
+      });
+      assert.equal(getTrackingState().activeTaskId, null, "PreToolUse clears stale task id too");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("resolveActiveTaskFromDaemon session/worktree scoping", () => {
+  const root = process.cwd();
+
+  async function withDaemon(tasks, fn) {
+    const { server, url, counters } = await createMockDaemonServer({ returnTask: tasks });
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "scope-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      return await fn(counters);
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  }
+
+  async function seedSession(sessionId) {
+    await handleHookEvent({
+      hook_event_name: "PreToolUse",
+      tool_name: "neurostrata_task_claim",
+      tool_input: { id: `seed-${sessionId}`, session_id: sessionId },
+    });
+  }
+
+  it("prefers session+worktree exact match over other in_progress tasks", async () => {
+    const tasks = [
+      { id: "foreign-same-worktree", session_id: "ses-other", worktree: root, status: "in_progress", subagent_prompt_injection: "FOREIGN" },
+      { id: "same-session-other-worktree", session_id: "ses-mine", worktree: "/tmp/other-wt", status: "in_progress", subagent_prompt_injection: "SAME_SESSION" },
+      { id: "exact", session_id: "ses-mine", worktree: root, status: "in_progress", subagent_prompt_injection: "EXACT" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      const res = await resolveActiveTaskFromDaemon("scope-ns");
+      assert.equal(res.taskId, "exact", "session+worktree exact match wins");
+      assert.equal(res.promptInjection, "EXACT");
+      assert.equal(getTrackingState().activeSessionId, "ses-mine");
+      for (const t of tasks) {
+        assert.ok(cachedTaskInjection.has(t.id), `injection cached for every task: ${t.id}`);
+      }
+    });
+  });
+
+  it("prefers a session match over a worktree-only match", async () => {
+    const tasks = [
+      { id: "foreign-same-worktree", session_id: "ses-other", worktree: root, status: "in_progress" },
+      { id: "same-session", session_id: "ses-mine", worktree: "/tmp/other-wt", status: "in_progress" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      const res = await resolveActiveTaskFromDaemon("scope-ns");
+      assert.equal(res.taskId, "same-session", "session specificity outranks worktree specificity");
+    });
+  });
+
+  it("never lets a fallback task from a different session hijack a known session", async () => {
+    const tasks = [
+      { id: "foreign-1", session_id: "ses-other", status: "in_progress" },
+      { id: "foreign-2", session_id: "ses-another", status: "in_progress" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      await resolveActiveTaskFromDaemon("scope-ns");
+      assert.equal(getTrackingState().activeSessionId, "ses-mine", "known session preserved on fallback");
+    });
+  });
+
+  it("honors an explicit preferredTaskId across sessions and adopts its session", async () => {
+    const tasks = [
+      { id: "mine", session_id: "ses-mine", worktree: root, status: "in_progress" },
+      { id: "preferred", session_id: "ses-preferred", worktree: "/tmp/other-wt", status: "in_progress", subagent_prompt_injection: "PREFERRED" },
+    ];
+    await withDaemon(tasks, async () => {
+      await seedSession("ses-mine");
+      const res = await resolveActiveTaskFromDaemon("scope-ns", "preferred");
+      assert.equal(res.taskId, "preferred");
+      assert.equal(res.sessionId, "ses-preferred");
+      assert.equal(getTrackingState().activeSessionId, "ses-preferred", "explicit preference may adopt a session");
+    });
+  });
+});
+
+describe("isZeroActionExemptShellPayload (read-only / verification commands)", () => {
+  async function exempt() {
+    const mod = await import("./dist/index.js");
+    assert.equal(typeof mod.isZeroActionExemptShellPayload, "function", "helper exported from dist");
+    return mod.isZeroActionExemptShellPayload;
+  }
+
+  it("accepts only shell action types and rejects non-shell tools", async () => {
+    const f = await exempt();
+    for (const t of ["bash", "Bash", "shell", "command", "exec"]) {
+      assert.equal(f(t, "git status"), true, `${t} allowed`);
+    }
+    for (const t of ["write", "read", "execute", ""]) {
+      assert.equal(f(t, "git status"), false, `${t} rejected`);
+    }
+  });
+
+  it("allows read-only git subcommands and rejects write-capable ones", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "git status", "git status --short", "git log --oneline -5", "git diff HEAD~1",
+      "git show HEAD", "git rev-parse --show-toplevel", "git fetch --dry-run",
+      "git -C /tmp/repo status", "git --no-pager log -1", "git --git-dir=/x/.git log -1",
+      "git -P status", "git --no-optional-locks status", "git stash list", "git stash show stash@{0}",
+      "git branch --show-current", "git branch -a", "git branch --list",
+    ]) {
+      assert.equal(f("bash", cmd), true, `allow: ${cmd}`);
+    }
+    for (const cmd of [
+      "git stash pop", "git branch -D topic", "git diff --output=/tmp/x", "git diff -O file",
+      "git diff --ext-diff", "git log --exec echo", "git commit -m x",
+    ]) {
+      assert.equal(f("bash", cmd), false, `reject: ${cmd}`);
+    }
+  });
+
+  it("allows neurostrata-mcp read-only task/doc-gate/mesh-status commands", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "neurostrata-mcp task list",
+      "neurostrata-mcp task gate NeuroStrata --strict",
+      "neurostrata-mcp doc-gate check",
+      "neurostrata-mcp synaptic-mesh status",
+    ]) {
+      assert.equal(f("shell", cmd), true, `allow: ${cmd}`);
+    }
+    assert.equal(f("shell", "neurostrata-mcp synaptic-mesh sync"), false);
+    assert.equal(f("shell", "neurostrata-mcp ingest /tmp/x"), false);
+  });
+
+  it("allows verification command families (cargo, gh, node, receipt scripts, rustc)", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "cargo test --workspace", "cargo +nightly clippy", "cargo check", "cargo --version",
+      "gh pr view 42", "gh pr checks", "gh issue list", "gh run watch 7",
+      "gh api repos/owner/repo", "node --test plugins/core/test.mjs", "node ./tools/run-test.mjs",
+      "bash scripts/gate-receipt.sh", "./check-include-str-targets.sh", "rustc --version", "rustc -V",
+    ]) {
+      assert.equal(f("exec", cmd), true, `allow: ${cmd}`);
+    }
+    for (const cmd of [
+      "cargo build", "cargo fmt", "gh pr create", "gh api -X POST repos/x", "gh api --method DELETE repos/x",
+      "gh api -f key=value repos/x", "node build.js", "bash scripts/cleanup.sh", "rustc src/main.rs",
+    ]) {
+      assert.equal(f("exec", cmd), false, `reject: ${cmd}`);
+    }
+  });
+
+  it("unwraps JSON command payloads and rejects substitutions, redirection, and mixed chains", async () => {
+    const f = await exempt();
+    assert.equal(f("bash", JSON.stringify({ command: "git status" })), true);
+    assert.equal(f("bash", JSON.stringify({ cmd: "cargo test" })), true);
+    assert.equal(f("bash", JSON.stringify({ command: "echo 1" })), false);
+    assert.equal(f("bash", JSON.stringify({})), false);
+    assert.equal(f("bash", "git status && rm -rf /tmp/x"), false, "all segments must be exempt");
+    assert.equal(f("bash", "git status; git log -1"), true, "all-exempt chain allowed");
+    assert.equal(f("bash", "git status | grep foo"), false, "grep is not exempt");
+    assert.equal(f("bash", "echo $(whoami)"), false);
+    assert.equal(f("bash", "echo `date`"), false);
+    assert.equal(f("bash", "git status > out.txt"), false);
+    assert.equal(f("bash", "cat < in.txt"), false);
+    assert.equal(f("bash", "   "), false);
+  });
+});
+
+describe("guard_validate cwd/worktree propagation + shell mutation exemption", () => {
+  it("propagates caller cwd/worktree and does not count read-only shell commands as mutations", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      let beforeHandler;
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "guard-cwd-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: {
+          hook: async (name, cb) => {
+            if (name === "execute.before") beforeHandler = cb;
+          },
+        },
+        hooks: {},
+      });
+
+      const before = getTrackingState().mutationsSinceNote;
+      await beforeHandler({
+        tool: "bash",
+        input: { command: "git status", cwd: "/caller/repo", worktree: "/caller/custom-wt" },
+      });
+      const guard = counters.guardArgs.at(-1);
+      assert.equal(guard.cwd, "/caller/repo", "caller cwd forwarded");
+      assert.equal(guard.worktree, "/caller/custom-wt", "caller worktree forwarded");
+      assert.equal(guard.action_type, "bash");
+      assert.equal(counters.guardValidate, 1, "guard still called for exempt shell command");
+      assert.equal(getTrackingState().mutationsSinceNote, before, "read-only command does not count");
+
+      await beforeHandler({ tool: "bash", input: { command: "echo 1" } });
+      assert.equal(getTrackingState().mutationsSinceNote, before + 1, "non-exempt command still counts");
+      const guard2 = counters.guardArgs.at(-1);
+      assert.equal(guard2.cwd, process.cwd(), "cwd defaults to project root");
+      assert.equal(guard2.worktree, process.cwd(), "worktree defaults to cwd");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("handleHookEvent forwards cwd/worktree and exempts read-only shell commands", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "guard-hook-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      const before = getTrackingState().mutationsSinceNote;
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: {
+          command: "node --test plugins/core/test.mjs",
+          cwd: "/caller/repo",
+          worktree: "/caller/custom-wt",
+        },
+      });
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+      const guard = counters.guardArgs.at(-1);
+      assert.equal(guard.cwd, "/caller/repo");
+      assert.equal(guard.worktree, "/caller/custom-wt");
+      assert.equal(guard.action_type, "Bash");
+      assert.equal(getTrackingState().mutationsSinceNote, before, "verification command does not count");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// nb9q: plugin guard / subagent / tool-output-intent performance fixes
+// ──────────────────────────────────────────────────────────────────────
+
+describe("nb9q FIX1: zero-action shell segments in the mutating guard", () => {
+  async function exempt() {
+    const mod = await import("./dist/index.js");
+    return mod.isZeroActionExemptShellPayload;
+  }
+
+  it("classifies read-only, verification and publish commands as exempt", async () => {
+    const f = await exempt();
+    for (const cmd of [
+      "git status", "git diff HEAD~1", "git log --oneline -5", "git show HEAD",
+      "git rev-parse --show-toplevel", "cargo test", "cargo check", "cargo clippy",
+      "cargo metadata --format-version 1", "gh pr view 42", "gh pr list", "gh pr diff 42",
+      "gh pr checks", "node --test plugins/core/test.mjs", "rustc --version",
+      "neurostrata-mcp task list", "git push", "git push origin main",
+      "git pull --rebase", "git fetch origin",
+    ]) {
+      assert.equal(f("bash", cmd), true, `exempt: ${cmd}`);
+    }
+    for (const cmd of [
+      "rm -rf /tmp/x", "git reset --hard HEAD", "git commit -m x", "cargo build",
+      "git push --force", "git push -f", "git push -fv origin main", "git push -vf",
+      "git push -uf", "git push origin +main", "git push --mirror", "git push --delete origin main",
+      "git push --prune", "git push --force-with-lease", "git push --force-with-lease=origin", "git status &",
+    ]) {
+      assert.equal(f("bash", cmd), false, `mutating: ${cmd}`);
+    }
+    assert.equal(f("bash", "git status && git diff"), true, "chained read-only stays exempt");
+    const mod = await import("./dist/index.js");
+    for (const tool of ["exec_command", "run_shell_command", "run_command", "execute_command", "terminal", "gh_exec", "execute", "mcp_execute"]) {
+      assert.equal(mod.isReadOnlyInspectionTool(tool), true, `read-only inspection: ${tool}`);
+    }
+  });
+
+  it("publishes exactly one default export from every adapter bundle", () => {
+    for (const harness of ["opencode", "claude", "codex", "hermes", "openclaw", "github-cli"]) {
+      for (const ext of ["js", "d.ts"]) {
+        const src = readFileSync(new URL(`../${harness}/dist/index.${ext}`, import.meta.url), "utf8");
+        const count = (src.match(/export default /g) || []).length;
+        assert.equal(count, 1, `${harness} dist/index.${ext} must declare exactly one default export`);
+      }
+    }
+  });
+
+  it("passes is_mutating=false to the guard for exempt shells, true for mutating ones", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    let beforeHandler;
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-guard", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async (name, cb) => { if (name === "execute.before") beforeHandler = cb; } },
+        hooks: {},
+      });
+      for (const cmd of ["git status --short", "cargo test --test lean_parity_test", "git push origin main", "git pull --rebase"]) {
+        await beforeHandler({ tool: "bash", input: { command: cmd } });
+        assert.equal(counters.guardArgs.at(-1).is_mutating, false, `guard is_mutating=false: ${cmd}`);
+      }
+      for (const cmd of ["rm -rf /tmp/x", "git reset --hard HEAD"]) {
+        await beforeHandler({ tool: "bash", input: { command: cmd } });
+        assert.equal(counters.guardArgs.at(-1).is_mutating, true, `guard is_mutating=true: ${cmd}`);
+      }
+      await beforeHandler({ tool: "write", input: { path: "x", content: "y" } });
+      assert.equal(counters.guardArgs.at(-1).is_mutating, true, "write tool stays mutating");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("post-task-complete git push is not blocked by the no-claimed-task guard", async () => {
+    // Guard rejects any action that still claims to be mutating. After task
+    // completion there is no active task, so a genuine mutating push would be
+    // rejected (the Lock 2 / Push Catch-22). Exempt publish commands must pass
+    // is_mutating=false and therefore be allowed.
+    const { server, url, counters } = await createMockDaemonServer({
+      returnTask: [],
+      guardReject: () => (counters.guardArgs.at(-1)?.is_mutating === true),
+    });
+    let beforeHandler;
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-push", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async (name, cb) => { if (name === "execute.before") beforeHandler = cb; } },
+        hooks: {},
+      });
+      await beforeHandler({ tool: "neurostrata_task_complete", input: { id: "task-z" } });
+      const out = await handleHookEvent({
+        hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git push" },
+      });
+      assert.equal(out.hookSpecificOutput.permissionDecision, "allow", "git push allowed after task_complete");
+      assert.equal(counters.guardArgs.at(-1).is_mutating, false);
+      assert.equal(getTrackingState().activeTaskId, null, "no active task remains");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("nb9q FIX2: subagent-aware, harness-aware graph-first injection", () => {
+  it("exports the agent/harness detectors", async () => {
+    const mod = await import("./dist/index.js");
+    assert.equal(typeof mod.isReadOnlySubagentAgent, "function");
+    assert.equal(typeof mod.resolveSubagentAgentId, "function");
+    assert.equal(typeof mod.detectCodeMode, "function");
+    assert.equal(mod.isReadOnlySubagentAgent("checker"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("checker-free"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("reviewer"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("explore"), true);
+    assert.equal(mod.isReadOnlySubagentAgent("general"), false);
+    assert.equal(mod.isReadOnlySubagentAgent("build"), false);
+    assert.equal(mod.resolveSubagentAgentId({ agent: "checker", prompt: "x" }), "checker");
+    assert.equal(mod.resolveSubagentAgentId({ subagent_type: "explore", prompt: "x" }), "explore");
+    assert.equal(mod.resolveSubagentAgentId({ subagent: "reviewer", prompt: "x" }), "reviewer");
+  });
+
+  it("createHarnessPlugin harness name drives Code Mode detection", async () => {
+    const mod = await import("./dist/index.js");
+    mod.createHarnessPlugin("p", "OpenCode");
+    assert.equal(mod.detectCodeMode(), true, "OpenCode is a Code-Mode harness");
+    mod.createHarnessPlugin("p", "Claude Code");
+    assert.equal(mod.detectCodeMode(), false, "Claude is not Code Mode");
+  });
+
+  it("read-only agents get a skip note, not a bare MCP tool-call directive", () => {
+    const h = buildSubagentContextHeader("ns", "t", undefined, { agentId: "checker" });
+    assert.ok(h.includes("Read-Only Subagent"));
+    assert.equal(h.includes("neurostrata_memories_for_file"), false, "no bare MCP directive");
+    assert.equal(h.includes("neurostrata_task_update"), false);
+    const review = buildSubagentContextHeader("ns", "t", undefined, { agentId: "reviewer" });
+    assert.ok(review.includes("Read-Only Subagent"));
+  });
+
+  it("Code Mode harnesses reference execute + tools.neurostrata.*", () => {
+    const h = buildSubagentContextHeader("ns", "t", undefined, { codeMode: true });
+    assert.ok(h.includes("Graph-First Lookup Rule"));
+    assert.ok(h.includes("tools.neurostrata.memories_for_file"));
+    assert.ok(h.includes("execute"));
+  });
+
+  it("default injection keeps the original bare MCP directive", () => {
+    const h = buildSubagentContextHeader("ns", "t");
+    assert.ok(h.includes("Graph-First Lookup Rule"));
+    assert.ok(h.includes("neurostrata_memories_for_file"));
+  });
+
+  it("enrichAndInjectSubagentPrompt detects the agent id from tool args", async () => {
+    const { server, url } = await createMockDaemonServer();
+    const target = { prompt: "review the diff", subagent_type: "checker" };
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-sub", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 2000 },
+        tool: { hook: async () => {} }, hooks: {},
+      });
+      assert.equal(await enrichAndInjectSubagentPrompt(target, "nb9q-sub", "t"), true);
+      assert.ok(target.prompt.includes("Read-Only Subagent"));
+      assert.equal(target.prompt.includes("neurostrata_memories_for_file"), false);
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("nb9q FIX3: no task-intent intake from read-only tool output", () => {
+  it("execute.after on grep/read output with TODO: posts no candidates; real turns still do", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler;
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "nb9q-intent", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 2000 },
+        tool: { hook: async (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+      });
+      for (const tool of ["grep", "Grep", "read", "read_file", "bash", "shell", "exec_command", "run_shell_command", "execute", "mcp_execute"]) {
+        await afterHandler({
+          name: tool, sessionID: "ses", args: {}, status: "completed",
+          result: { content: "TODO: deferred cleanup", output: "TODO: deferred cleanup" },
+        });
+      }
+      assert.equal(counters.taskCandidates, 0, "read-only tool output posts no intake candidates");
+
+      // A non-inspection tool result still feeds the intake ledger.
+      await afterHandler({
+        name: "write", sessionID: "ses", args: {}, status: "completed",
+        result: { content: "TODO: real obligation", output: "TODO: real obligation" },
+      });
+      assert.ok(counters.taskCandidates > 0, "non-inspection output still posts candidates");
+
+      // The pure extractor still recognizes a genuine user/assistant turn.
+      assert.ok(extractTurnCandidates({ role: "user", content: "TODO: real user turn" }).length > 0);
+    } finally {
+      server.close();
+      resetModuleState();
+    }
   });
 });

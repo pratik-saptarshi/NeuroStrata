@@ -236,4 +236,10 @@ export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Con
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
 export declare function initialize(ctx: OpenClawPluginContext): Promise<void>;
+declare const _default: {
+    id: string;
+    setup: typeof initialize;
+    initialize: typeof initialize;
+};
+export default _default;
 //# sourceMappingURL=index.d.ts.map

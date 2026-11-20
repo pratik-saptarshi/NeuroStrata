@@ -223,8 +223,15 @@ export declare const TOOL_CLASSIFICATION: {
 };
 export declare function isFileTouchTool(name: string): boolean;
 export declare function isMutatingTool(name: string): boolean;
+export declare function isReadOnlyInspectionTool(name: string): boolean;
 export declare function isSubagentTool(name: string): boolean;
 export declare function isCodeExecTool(name: string): boolean;
+/**
+ * True only for shell tools whose payload is provably read-only/verification.
+ * JSON payloads are unwrapped via `command`/`cmd`; substitutions, redirection
+ * and chains containing any mutating segment fail closed.
+ */
+export declare function isZeroActionExemptShellPayload(actionType: string, payloadOrCommand: string): boolean;
 export interface CodeModeInspection {
     id?: string;
     sessionId?: string;
@@ -276,8 +283,17 @@ export declare function confirmPrefetchDelivery(namespace: string, filePath: str
 export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
 export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
-export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string): string;
-export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string): boolean;
+export declare function isReadOnlySubagentAgent(agentId?: string | null): boolean;
+/** Resolve the subagent agent id from the fields harnesses use to name it. */
+export declare function resolveSubagentAgentId(target: Record<string, unknown>): string | undefined;
+/** Code-Mode harnesses (OpenCode V2) expose MCP via `execute` + tools.neurostrata.*. */
+export declare function detectCodeMode(ctx?: any, cfg?: PluginConfig): boolean;
+export interface SubagentHeaderOptions {
+    agentId?: string | null;
+    codeMode?: boolean;
+}
+export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): string;
+export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): boolean;
 export declare function extractRepoFilePaths(promptText: string): string[];
 export declare const cachedTaskInjection: Map<string, string | null>;
 export declare const cachedSubagentPromptByTask: Map<string, string | null>;

@@ -1612,7 +1612,62 @@ pub struct LadybugStore {
     /// file has.
     census_reads: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
+    form_scans: Arc<FormScanCounts>,
+    #[cfg(test)]
     test_cleanup_dir: Option<TestCleanupDir>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FormScanCounts {
+    exact: std::sync::atomic::AtomicUsize,
+    directory: std::sync::atomic::AtomicUsize,
+    metadata: std::sync::atomic::AtomicUsize,
+    exact_failures: std::sync::Mutex<HashSet<String>>,
+    fail_shared_metadata: std::sync::atomic::AtomicBool,
+    clock: std::sync::Mutex<Option<FormScanClock>>,
+}
+
+#[cfg(test)]
+struct FormScanClock {
+    now: i64,
+    advance_after_edges_for: &'static str,
+}
+
+#[cfg(test)]
+impl FormScanCounts {
+    fn check_exact<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let failures = self.exact_failures.lock().unwrap();
+        if let Some(path) = paths.into_iter().find(|path| failures.contains(*path)) {
+            anyhow::bail!("injected exact-file query failure for {path:?}");
+        }
+        Ok(())
+    }
+
+    fn finish_edges(&self, path: &str) {
+        if let Some(clock) = self.clock.lock().unwrap().as_mut() {
+            if path == clock.advance_after_edges_for {
+                clock.now += 1;
+            }
+        }
+    }
+
+    fn metadata_now(&self) -> i64 {
+        self.clock
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(|| chrono::Utc::now().timestamp(), |clock| clock.now)
+    }
+
+    fn take(&self) -> (usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.exact.swap(0, Relaxed),
+            self.directory.swap(0, Relaxed),
+            self.metadata.swap(0, Relaxed),
+        )
+    }
 }
 
 impl LadybugStore {
@@ -4760,6 +4815,32 @@ impl LadybugStore {
         Self::with_system_config(local_path, dimensions, cfg)
     }
 
+    /// Test-only: replace a row's metadata exactly as given, bypassing the
+    /// write-path topology canonicalization. Reconstructs pre-#251 legacy
+    /// rows so revert comparisons can be exercised against raw state.
+    #[cfg(test)]
+    pub(crate) async fn overwrite_row_metadata_for_test(
+        &self,
+        namespace: &str,
+        id: &str,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let metadata = serde_json::to_string(&metadata)?;
+        self.write_with_deadline("test raw metadata overwrite", move |conn| {
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&id),
+                escape_ladybug_string(&metadata)
+            );
+            conn.query(&query)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         // Test harnesses opt into the bounded test configuration by env so the
         // same constructor path serves both production and test binaries.
@@ -4882,6 +4963,8 @@ impl LadybugStore {
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            form_scans: Arc::default(),
             #[cfg(test)]
             test_cleanup_dir: None,
         })
@@ -6068,7 +6151,9 @@ fn plan_hygiene_row(
         let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let usable = crate::traits::has_source(&meta) && src != "N/A";
         if !usable {
-            let val = if !loc.is_empty() && loc != "N/A" {
+            // `source` is published to mesh peers and exported, so an
+            // absolute location (the author's machine) is not copied there.
+            let val = if !loc.is_empty() && loc != "N/A" && !crate::paths::is_absolute_any(loc) {
                 loc.clone()
             } else {
                 "legacy-rule".to_string()
@@ -10768,7 +10853,7 @@ impl VectorStore for LadybugStore {
                         _ => (None, None),
                     };
                     let evidence_id = match (&file, &content_hash) {
-                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.len().min(12)]),
+                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.floor_char_boundary(12)]),
                         (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
                         _ => id.clone(),
                     };
@@ -12766,6 +12851,12 @@ fn is_active_id(id: &str, active_gens: &std::collections::HashSet<u64>) -> bool 
     }
 }
 
+#[derive(Default)]
+struct FileFormTargets {
+    files: Vec<String>,
+    matches: Vec<(String, GraphMatchKind)>,
+}
+
 /// Discovers the target nodes a query can match: the exact file node, the
 /// exact symbol nodes (when a symbol is named), and the ancestor directory
 /// nodes (when `include_ancestors`). The lookups are location-scoped Cypher
@@ -12774,34 +12865,60 @@ fn is_active_id(id: &str, active_gens: &std::collections::HashSet<u64>) -> bool 
 fn discover_candidates(
     conn: &Connection,
     safe_ns: &str,
-    path: &str,
+    paths: &[String],
     symbol: Option<&str>,
     include_ancestors: bool,
     active_gens: &std::collections::HashSet<u64>,
-) -> Result<(Vec<String>, Vec<(String, GraphMatchKind)>)> {
-    let mut file_ids: Vec<String> = Vec::new();
-    let mut candidates: Vec<(String, GraphMatchKind)> = Vec::new();
+    #[cfg(test)] scans: &FormScanCounts,
+) -> Result<Vec<FileFormTargets>> {
+    let mut targets: Vec<_> = paths.iter().map(|_| FileFormTargets::default()).collect();
 
     // The file node and its symbol nodes share `location = path`: the file's
     // logical path is the path itself, a symbol's is `path#kind:name@hash`.
-    let safe_path = escape_ladybug_string(path);
-    let query = format!(
-        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id",
-        safe_ns, safe_path
-    );
+    let path_indices: HashMap<_, _> = paths.iter().map(String::as_str).zip(0..).collect();
+    let query = if let [path] = paths {
+        let safe_path = escape_ladybug_string(path);
+        format!("MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location = '{safe_path}' RETURN m.id")
+    } else {
+        let locations = paths
+            .iter()
+            .map(|path| format!("'{}'", escape_ladybug_string(path)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location IN [{locations}] RETURN m.id, m.location")
+    };
+    #[cfg(test)]
+    scans.check_exact(paths.iter().map(String::as_str))?;
     let mut rows = conn.query(&query)?;
+    #[cfg(test)]
+    scans
+        .exact
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
         if !is_active_id(&id, active_gens) {
             continue;
         }
+        let index = if paths.len() == 1 {
+            0
+        } else {
+            let lbug::Value::String(location) = &row[1] else {
+                continue;
+            };
+            let Some(&index) = path_indices.get(location.as_str()) else {
+                continue;
+            };
+            index
+        };
+        let path = &paths[index];
+        let form = &mut targets[index];
         let logical = crate::parser::ingest::logical_path_of(&id);
         if logical == path {
-            file_ids.push(id.clone());
-            candidates.push((id.clone(), GraphMatchKind::ExactFile));
+            form.files.push(id.clone());
+            form.matches.push((id, GraphMatchKind::ExactFile));
         } else if let Some(sym) = symbol {
             if is_symbol_of(logical, path, sym) {
-                candidates.push((id.clone(), GraphMatchKind::ExactSymbol));
+                form.matches.push((id, GraphMatchKind::ExactSymbol));
             }
         }
     }
@@ -12812,19 +12929,26 @@ fn discover_candidates(
             safe_ns
         );
         let mut rows = conn.query(&dir_query)?;
+        #[cfg(test)]
+        scans
+            .directory
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while let Some(row) = rows.next() {
             let id = format!("{}", row[0]);
             if !is_active_id(&id, active_gens) {
                 continue;
             }
             let location = format!("{}", row[1]);
-            if is_ancestor_of(&location, path) {
-                candidates.push((id.clone(), GraphMatchKind::AncestorDirectory));
+            for (path, form) in paths.iter().zip(&mut targets) {
+                if is_ancestor_of(&location, path) {
+                    form.matches
+                        .push((id.clone(), GraphMatchKind::AncestorDirectory));
+                }
             }
         }
     }
 
-    Ok((file_ids, candidates))
+    Ok(targets)
 }
 
 /// The `memory_type IN [...]` condition of a type-scoped query, or `None`
@@ -12842,26 +12966,29 @@ fn memory_type_condition(memory_types: &[String]) -> Option<String> {
     Some(format!("m.memory_type IN [{}]", list))
 }
 
-/// The metadata fallback: a memory whose `metadata.governs` declares the path
-/// (or an ancestor) but whose edge never materialised -- e.g. the declaration
-/// predates the stub behaviour, or the target is outside the ingested tree.
+struct MetadataFallbackRow {
+    id: String,
+    content: String,
+    memory_type: String,
+    metadata: Value,
+    declared_paths: Vec<String>,
+    access_count: i64,
+}
+
+/// Read the metadata declarations once. Their retirement is evaluated in each
+/// form's fallback stage, after that form's edge reads.
 ///
 /// The query is scoped to the memory types asked for (rules/facts/procedures
 /// by default), so the ingested AST bulk -- file/symbol/directory rows, which
 /// never carry a `governs` declaration -- is never scanned.
-///
-/// The ids of the hits it found are collected in `fallback_ids`: they are the
-/// rows whose fan-out the census still has to read.
-fn add_metadata_fallback_conn(
+fn read_metadata_fallback_rows(
     conn: &Connection,
     safe_ns: &str,
-    hits: &mut Vec<MemoryHit>,
-    path: &str,
-    include_ancestors: bool,
     memory_types: &[String],
     active_gens: &std::collections::HashSet<u64>,
-    fallback_ids: &mut std::collections::HashSet<String>,
-) -> Result<()> {
+    #[cfg(test)] shared: bool,
+    #[cfg(test)] scans: &FormScanCounts,
+) -> Result<Vec<MetadataFallbackRow>> {
     // An empty `memory_types` means "no type filter" (the trait contract), so
     // the type condition is omitted entirely; a non-empty list is pushed into
     // the WHERE clause so only those rows are read.
@@ -12873,8 +13000,20 @@ fn add_metadata_fallback_conn(
         "MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.memory_type, m.metadata",
         where_clause
     );
-    let now = chrono::Utc::now().timestamp();
+    #[cfg(test)]
+    if shared
+        && scans
+            .fail_shared_metadata
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        anyhow::bail!("injected shared metadata query failure");
+    }
     let mut rows = conn.query(&query)?;
+    #[cfg(test)]
+    scans
+        .metadata
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut declarations = Vec::new();
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
         // A superseded tree declares nothing to the reader, the same way the
@@ -12882,8 +13021,6 @@ fn add_metadata_fallback_conn(
         if !is_active_id(&id, active_gens) {
             continue;
         }
-        let content = format!("{}", row[1]);
-        let memory_type = format!("{}", row[2]);
         let metadata_str = format!("{}", row[3]);
         let metadata: Value = match serde_json::from_str(&metadata_str) {
             Ok(v) => v,
@@ -12894,40 +13031,62 @@ fn add_metadata_fallback_conn(
                 Value::Null
             }
         };
-        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
-        {
+        if is_archived(&metadata) || is_mesh_conflicting(&metadata) {
             continue;
         }
-        let governs = match metadata.get("governs") {
-            Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
-            _ => continue,
+        let Some(Value::Array(governs)) = metadata.get("governs") else {
+            continue;
         };
-        for declared in governs {
-            let normalized = crate::parser::ingest::normalize_node_path(declared);
-            let matched =
-                normalized == path || (include_ancestors && is_ancestor_of(&normalized, path));
-            if matched {
-                let access_count = metadata
-                    .get("access_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                fallback_ids.insert(id.clone());
-                hits.push(MemoryHit {
-                    id,
-                    memory_type,
-                    content,
-                    match_kind: GraphMatchKind::MetadataFallback,
-                    access_count,
-                    explanation: format!("declares governs {}", normalized),
-                    metadata,
-                    conceptual_bridges: Vec::new(),
-                    linked_files: 0,
-                });
-                break;
-            }
-        }
+        let declared_paths = governs
+            .iter()
+            .filter_map(Value::as_str)
+            .map(crate::parser::ingest::normalize_node_path)
+            .collect();
+        let access_count = metadata
+            .get("access_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        declarations.push(MetadataFallbackRow {
+            id,
+            content: format!("{}", row[1]),
+            memory_type: format!("{}", row[2]),
+            metadata,
+            declared_paths,
+            access_count,
+        });
     }
-    Ok(())
+    Ok(declarations)
+}
+
+fn add_metadata_fallback_hits(
+    declarations: &[MetadataFallbackRow],
+    path: &str,
+    include_ancestors: bool,
+    now: i64,
+    form: &mut FileFormHits,
+) {
+    for row in declarations {
+        if is_retired_at(&row.metadata, now) {
+            continue;
+        }
+        let Some(declared) = row.declared_paths.iter().find(|declared| {
+            *declared == path || (include_ancestors && is_ancestor_of(declared, path))
+        }) else {
+            continue;
+        };
+        form.fallback_ids.insert(row.id.clone());
+        form.hits.push(MemoryHit {
+            id: row.id.clone(),
+            memory_type: row.memory_type.clone(),
+            content: row.content.clone(),
+            match_kind: GraphMatchKind::MetadataFallback,
+            access_count: row.access_count,
+            explanation: format!("declares governs {declared}"),
+            metadata: row.metadata.clone(),
+            conceptual_bridges: Vec::new(),
+            linked_files: 0,
+        });
+    }
 }
 
 /// The most memory ids one `linked_files` census query of the oracle carries.
@@ -13301,124 +13460,77 @@ impl OntologyStore for LadybugStore {
     }
 }
 
-#[async_trait::async_trait]
-impl GraphRead for LadybugStore {
-    async fn memories_for_file(
+/// The result of a per-logical-file, multi-form memory retrieval.
+///
+/// `candidate_truncated` reports that at least one spelling's raw candidate
+/// pool exceeded the per-form safety budget before the global merge, so the
+/// answer may not include every candidate the spelling matched.
+#[derive(Debug, Clone, Default)]
+pub struct MultiFormMemoryRetrieval {
+    pub hits: Vec<crate::graph_read::memories_for_file::MemoryHit>,
+    pub candidate_truncated: bool,
+}
+
+#[cfg(test)]
+static BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn reset_bridge_enrichment_counter_for_tests() {
+    BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub fn bridge_enrichment_counter_for_tests() -> usize {
+    BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Safety budget on raw candidates collected from a single spelling before the
+/// global merge ranks and caps them. Prevents one high-fan-out spelling from
+/// monopolizing the candidate pool when many forms are queried.
+const MAX_RAW_CANDIDATES_PER_FORM: usize = 1024;
+
+#[derive(Default)]
+struct FileFormHits {
+    hits: Vec<MemoryHit>,
+    census: LinkedFilesCensus,
+    census_active: HashMap<String, ActiveGenerations>,
+    fallback_ids: HashSet<String>,
+}
+
+type RawFileFormHits = (Vec<MemoryHit>, bool);
+
+fn rank_and_cap_file_form(mut form: FileFormHits, exclude_ids: &[String]) -> RawFileFormHits {
+    // Drop exclusions before they can crowd out a live hit at either cap.
+    if !exclude_ids.is_empty() {
+        form.hits.retain(|hit| !exclude_ids.contains(&hit.id));
+    }
+    dedup_hits(&mut form.hits);
+    for hit in &mut form.hits {
+        hit.linked_files = form.census.count(&hit.id);
+    }
+    crate::graph_read::memories_for_file::rank_hits(&mut form.hits);
+    let truncated = form.hits.len() > MAX_RAW_CANDIDATES_PER_FORM;
+    form.hits.truncate(MAX_RAW_CANDIDATES_PER_FORM);
+    (form.hits, truncated)
+}
+
+impl LadybugStore {
+    /// Populate conceptual bridges on an already-ranked, capped hit set.
+    ///
+    /// Kept separate from candidate collection so a multi-form query enriches
+    /// the merged, per-logical-file result exactly once rather than once per
+    /// spelling.
+    async fn enrich_conceptual_bridges(
         &self,
         namespace: &str,
-        source: Option<&str>,
-        path: &str,
-        symbol: Option<&str>,
-        include_ancestors: bool,
-        memory_types: &[String],
-        exclude_ids: &[String],
-        limit: usize,
-    ) -> Result<Vec<MemoryHit>> {
-        let namespace = namespace.to_string();
-        let path = crate::parser::ingest::normalize_node_path(path);
-        let symbol = symbol.map(|s| s.to_string());
-        let memory_types = memory_types.to_vec();
-        let exclude_ids = exclude_ids.to_vec();
-        let limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
-        let source = source.map(|s| s.to_string());
-
-        let ns = namespace.clone();
-        let path_c = path.clone();
-        let sym_c = symbol.clone();
-        let types = memory_types.clone();
-        let census_reads = self.census_reads.clone();
-
-        let (mut hits, census) = self
-            .with_conn(move |conn| {
-                let safe_ns = escape_ladybug_string(&ns);
-
-                // A source key pins the query to that source's active
-                // generation; `None` keeps every published generation (the
-                // same set `list` reads).
-                let active_gens: std::collections::HashSet<u64> = match &source {
-                    Some(s) => {
-                        let g = active_generation_of_source(conn, &ns, s);
-                        if g > 0 {
-                            [g].into_iter().collect()
-                        } else {
-                            std::collections::HashSet::new()
-                        }
-                    }
-                    None => active_generations_of(conn, &ns),
-                };
-
-                let (file_ids, candidates) = discover_candidates(
-                    conn,
-                    &safe_ns,
-                    &path_c,
-                    sym_c.as_deref(),
-                    include_ancestors,
-                    &active_gens,
-                )?;
-
-                // The census is folded into the candidate queries: every hit
-                // comes back with its own fan-out, so the `linked_files` count
-                // costs no query of its own.
-                let mut census = LinkedFilesCensus::default();
-                let mut census_active: std::collections::HashMap<String, ActiveGenerations> =
-                    std::collections::HashMap::new();
-                // The rows the metadata fallback finds: their fan-out is read
-                // in one query after the scan.
-                let mut fallback_ids: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut hits = graph_hits_from_edges(
-                    conn,
-                    &ns,
-                    &candidates,
-                    &file_ids,
-                    &types,
-                    &mut census,
-                    &mut census_active,
-                )?;
-
-                add_metadata_fallback_conn(
-                    conn,
-                    &safe_ns,
-                    &mut hits,
-                    &path_c,
-                    include_ancestors,
-                    &types,
-                    &active_gens,
-                    &mut fallback_ids,
-                )?;
-
-                // The hits no edge query reached -- the metadata fallback --
-                // still need their fan-out read, and they read it all in one
-                // query: the total work does not grow with the number of
-                // fallback hits.
-                let reads = read_fallback_fan_out(
-                    conn,
-                    &safe_ns,
-                    &types,
-                    &fallback_ids,
-                    &mut census,
-                    &mut census_active,
-                )?;
-                census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
-
-                Ok((hits, census))
-            })
-            .await?;
-
-        // Exclusion happens before the limit is applied, so an excluded hit
-        // never crowds out a live one.
-        if !exclude_ids.is_empty() {
-            hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
+        hits: &mut [crate::graph_read::memories_for_file::MemoryHit],
+    ) {
+        #[cfg(test)]
+        if !hits.is_empty() {
+            BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::server::context_plan_benchmark_instrumentation::record_bridge_enrichment_pass();
         }
-
-        dedup_hits(&mut hits);
-        // The census counts are exact and independent of the limit, so they
-        // are applied to the hits that survive the exclusion and the dedup.
-        for hit in hits.iter_mut() {
-            hit.linked_files = census.count(&hit.id);
-        }
-        crate::graph_read::memories_for_file::rank_hits(&mut hits);
-        hits.truncate(limit);
 
         // Populate conceptual_bridges: for each seed hit, find up to 2
         // 2-hop cross-domain bridges via 1-hop via nodes whose domain
@@ -13440,7 +13552,7 @@ impl GraphRead for LadybugStore {
             .collect();
             if let Ok(related) = self
                 .related(
-                    &namespace,
+                    namespace,
                     &hit.id,
                     &relations_vec,
                     crate::graph_read::related::Direction::Both,
@@ -13474,7 +13586,7 @@ impl GraphRead for LadybugStore {
                     .collect();
                     if let Ok(related2) = self
                         .related(
-                            &namespace,
+                            namespace,
                             via_id,
                             &relations_vec,
                             crate::graph_read::related::Direction::Both,
@@ -13497,7 +13609,7 @@ impl GraphRead for LadybugStore {
                                 continue;
                             }
                             if let Ok(Some((_, target_payload))) =
-                                self.get(&namespace, &target_node.id).await
+                                self.get(namespace, &target_node.id).await
                             {
                                 let is_normative = matches!(
                                     target_payload.memory_type.as_str(),
@@ -13562,8 +13674,302 @@ impl GraphRead for LadybugStore {
             }
             hit.conceptual_bridges = bridges;
         }
+    }
 
-        Ok(hits)
+    /// Collect raw candidate hits for one normalized spelling, without applying
+    /// the caller's `limit` and without conceptual-bridge enrichment. Both are
+    /// deferred to the global merge in `memories_for_file_forms`.
+    #[allow(clippy::too_many_arguments)]
+    async fn raw_memories_for_single_form(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        normalized_path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+    ) -> Result<RawFileFormHits> {
+        self.raw_memories_for_forms(
+            namespace,
+            source,
+            vec![normalized_path.to_string()],
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+        )
+        .await?
+        .pop()
+        .expect("one result for the single form")
+    }
+
+    /// Share discovery and metadata scans, retaining one edge/census result
+    /// and candidate budget per form. An outer error means the shared work
+    /// failed and individual queries can be retried on fresh connections.
+    #[allow(clippy::too_many_arguments)]
+    async fn raw_memories_for_forms(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        paths: Vec<String>,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+    ) -> Result<Vec<Result<RawFileFormHits>>> {
+        let ns = namespace.to_string();
+        let sym_c = symbol.map(|s| s.to_string());
+        let types = memory_types.to_vec();
+        let source = source.map(|s| s.to_string());
+        let census_reads = self.census_reads.clone();
+        let checkpoints = self.checkpoints.clone();
+        #[cfg(test)]
+        let scans = self.form_scans.clone();
+
+        let form_hits = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns);
+                let explain_form_error = |error| {
+                    stop_checkpoints_after_pool_failure(conn, &checkpoints, &error, false);
+                    explain_engine_error(error)
+                };
+
+                // A source key pins the query to that source's active
+                // generation; `None` keeps every published generation (the
+                // same set `list` reads).
+                let active_gens: std::collections::HashSet<u64> = match &source {
+                    Some(s) => {
+                        let g = active_generation_of_source(conn, &ns, s);
+                        if g > 0 {
+                            [g].into_iter().collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        }
+                    }
+                    None => active_generations_of(conn, &ns),
+                };
+
+                let targets = discover_candidates(
+                    conn,
+                    &safe_ns,
+                    &paths,
+                    sym_c.as_deref(),
+                    include_ancestors,
+                    &active_gens,
+                    #[cfg(test)]
+                    &scans,
+                )?;
+
+                // Complete each form's time-sensitive reads in their original
+                // order. Cache the declarations at the first fallback stage.
+                #[cfg(test)]
+                let shared = paths.len() > 1;
+                let mut declarations = None;
+                let mut form_hits = Vec::with_capacity(paths.len());
+                for (path, targets) in paths.iter().zip(targets) {
+                    let mut form = FileFormHits::default();
+                    form.hits = match graph_hits_from_edges(
+                        conn,
+                        &ns,
+                        &targets.matches,
+                        &targets.files,
+                        &types,
+                        &mut form.census,
+                        &mut form.census_active,
+                    ) {
+                        Ok(hits) => hits,
+                        Err(error) => {
+                            form_hits.push(Err(explain_form_error(error)));
+                            continue;
+                        }
+                    };
+                    #[cfg(not(test))]
+                    let now = chrono::Utc::now().timestamp();
+                    #[cfg(test)]
+                    let now = {
+                        scans.finish_edges(path);
+                        scans.metadata_now()
+                    };
+                    let rows = match &mut declarations {
+                        Some(rows) => rows,
+                        slot @ None => slot.insert(read_metadata_fallback_rows(
+                            conn,
+                            &safe_ns,
+                            &types,
+                            &active_gens,
+                            #[cfg(test)]
+                            shared,
+                            #[cfg(test)]
+                            &scans,
+                        )?),
+                    };
+                    add_metadata_fallback_hits(rows, path, include_ancestors, now, &mut form);
+
+                    // Edge hits carry their own fan-out. Read the metadata
+                    // hits' fan-out before starting the next form's edges.
+                    let result = read_fallback_fan_out(
+                        conn,
+                        &safe_ns,
+                        &types,
+                        &form.fallback_ids,
+                        &mut form.census,
+                        &mut form.census_active,
+                    )
+                    .map(|reads| {
+                        census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
+                        form
+                    })
+                    .map_err(explain_form_error);
+                    form_hits.push(result);
+                }
+                Ok(form_hits)
+            })
+            .await?;
+
+        Ok(form_hits
+            .into_iter()
+            .map(|result| result.map(|form| rank_and_cap_file_form(form, exclude_ids)))
+            .collect())
+    }
+
+    /// Retrieve memories for every distinct logical form of one file as a
+    /// single logical query: collect raw candidates per form, merge/rank/dedup
+    /// globally, cap to the caller's limit, then enrich bridges exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn memories_for_file_forms(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        forms: &[String],
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<MultiFormMemoryRetrieval> {
+        let mut hits: Vec<crate::graph_read::memories_for_file::MemoryHit> = Vec::new();
+        let mut candidate_truncated = false;
+        let mut any_success = false;
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut seen_paths = HashSet::new();
+        let (originals, paths): (Vec<_>, Vec<_>) = forms
+            .iter()
+            .filter_map(|form| {
+                let path = crate::parser::ingest::normalize_node_path(form);
+                if !seen_paths.insert(path.clone()) {
+                    return None;
+                }
+                // The context-plan benchmark counts distinct logical forms.
+                // Physical scans and retries are counted at their query sites.
+                #[cfg(test)]
+                crate::server::context_plan_benchmark_instrumentation::record_store_memory_multiform_op(
+                );
+                Some((form, path))
+            })
+            .unzip();
+
+        let mut batched = if paths.len() > 1 {
+            match self
+                .raw_memories_for_forms(
+                    namespace,
+                    source,
+                    paths.clone(),
+                    symbol,
+                    include_ancestors,
+                    memory_types,
+                    exclude_ids,
+                )
+                .await
+            {
+                Ok(results) => Some(results.into_iter()),
+                Err(error) => {
+                    tracing::warn!("shared memories_for_file query failed, retrying forms individually: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        for (form, path) in originals.into_iter().zip(paths) {
+            let result = match &mut batched {
+                Some(results) => results.next().expect("one result per form"),
+                None => {
+                    self.raw_memories_for_single_form(
+                        namespace,
+                        source,
+                        &path,
+                        symbol,
+                        include_ancestors,
+                        memory_types,
+                        exclude_ids,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok((batch, truncated)) => {
+                    any_success = true;
+                    candidate_truncated |= truncated;
+                    hits.extend(batch);
+                }
+                Err(e) => {
+                    tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+
+        if !any_success {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+
+        // Global merge: rank the whole candidate pool, dedup by id keeping the
+        // best-ranked occurrence, then cap to the caller's limit.
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert(h.id.clone()));
+        let effective_limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+        hits.truncate(effective_limit);
+
+        // One enrichment pass over the final per-logical-file hit set.
+        self.enrich_conceptual_bridges(namespace, &mut hits).await;
+
+        Ok(MultiFormMemoryRetrieval {
+            hits,
+            candidate_truncated,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl GraphRead for LadybugStore {
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        self.memories_for_file_forms(
+            namespace,
+            source,
+            &[path.to_string()],
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+            limit,
+        )
+        .await
+        .map(|r| r.hits)
     }
 
     async fn related(
@@ -13614,14 +14020,14 @@ impl GraphRead for LadybugStore {
         let seed_c = seed.clone();
         let rels = relations.clone();
 
-        let (nodes, edges, generation) = self
+        let (nodes, edges, generation, resolved_seed_id) = self
             .with_conn(move |conn| {
                 fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops, &policy, &expanded_set)
             })
             .await?;
 
         Ok(crate::graph_read::related::graph_read_related(
-            &seed,
+            &resolved_seed_id,
             &nodes,
             &edges,
             &relations,
@@ -13632,6 +14038,151 @@ impl GraphRead for LadybugStore {
             generation,
             cursor,
         ))
+    }
+}
+
+impl LadybugStore {
+    /// Resolve a caller-supplied file-path seed (expanded into every spelling
+    /// it may be stored under) to exactly one active node id in `namespace`.
+    /// Deterministic: form order first, then priority rank, then id lexical.
+    pub async fn resolve_canonical_file_seed_id(
+        &self,
+        namespace: &str,
+        forms: &[String],
+    ) -> Result<Option<String>> {
+        let namespace = namespace.to_string();
+        let forms = forms.to_vec();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let active_gens = active_generations_of(conn, &namespace);
+            let now = chrono::Utc::now().timestamp();
+
+            let parse_meta = |raw: &str| -> Value {
+                match serde_json::from_str(raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !raw.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                }
+            };
+
+            let visible = |id: &str, metadata: &Value| -> bool {
+                is_active_id(id, &active_gens)
+                    && !is_archived(metadata)
+                    && !is_retired_at(metadata, now)
+                    && !is_mesh_conflicting(metadata)
+                    && !crate::registry::is_registry_row(metadata)
+            };
+
+            let location_matches = |metadata: &Value, norm: &str| -> bool {
+                if norm.is_empty() {
+                    return false;
+                }
+                let matches_path = |p: &str| {
+                    crate::parser::ingest::normalize_node_path(p) == norm
+                };
+                metadata
+                    .get("relative_path")
+                    .and_then(|v| v.as_str())
+                    .map(matches_path)
+                    .unwrap_or(false)
+                    || metadata
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(matches_path)
+                        .unwrap_or(false)
+                    || metadata
+                        .get("locations")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter().any(|loc| {
+                                loc.get("path")
+                                    .and_then(|v| v.as_str())
+                                    .map(matches_path)
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+            };
+
+            for form in &forms {
+                let norm = crate::parser::ingest::normalize_node_path(form);
+                let mut rows: Vec<(String, String, Value)> = Vec::new();
+
+                // (a) exact id / file:-prefixed id / location matches.
+                let direct_q = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{ns}' AND (m.id = '{form}' OR m.id = '{norm}' OR m.id = 'file:{form}' OR m.id = 'file:{norm}' OR m.location = '{form}' OR m.location = '{norm}') RETURN m.id, m.memory_type, m.location, m.metadata",
+                    ns = safe_ns,
+                    form = escape_ladybug_string(form),
+                    norm = escape_ladybug_string(&norm),
+                );
+                let result = conn.query(&direct_q)?;
+                for row in result {
+                    let id = format!("{}", row[0]);
+                    let memory_type = format!("{}", row[1]);
+                    let metadata = parse_meta(&format!("{}", row[3]));
+                    rows.push((id, memory_type, metadata));
+                }
+
+                // (b) memories storing the path only in metadata (empty
+                // `location` column): narrow the CONTAINS prefilter to rows
+                // whose parsed metadata actually carries the normalized path.
+                if !norm.is_empty() {
+                    let meta_q = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{ns}' AND m.metadata CONTAINS '{norm}' RETURN m.id, m.memory_type, m.location, m.metadata",
+                        ns = safe_ns,
+                        norm = escape_ladybug_string(&norm),
+                    );
+                    let result = conn.query(&meta_q)?;
+                    for row in result {
+                        let id = format!("{}", row[0]);
+                        let memory_type = format!("{}", row[1]);
+                        let metadata = parse_meta(&format!("{}", row[3]));
+                        if location_matches(&metadata, &norm) {
+                            rows.push((id, memory_type, metadata));
+                        }
+                    }
+                }
+
+                let mut seen = std::collections::HashSet::new();
+                let candidates: Vec<(String, u8)> = rows
+                    .into_iter()
+                    .filter(|(id, _, metadata)| visible(id, metadata))
+                    .filter_map(|(id, memory_type, _)| {
+                        if !seen.insert(id.clone()) {
+                            return None;
+                        }
+                        let rank = if id.as_str() == form.as_str() || id.as_str() == norm.as_str() {
+                            0
+                        } else if memory_type == "file" {
+                            1
+                        } else if memory_type == "structural"
+                            || id.as_str() == format!("file:{}", form).as_str()
+                            || id.as_str() == format!("file:{}", norm).as_str()
+                        {
+                            2
+                        } else if memory_type == "code_ast" || memory_type == "symbol" {
+                            3
+                        } else {
+                            4
+                        };
+                        Some((id, rank))
+                    })
+                    .collect();
+
+                if let Some((best, _)) = candidates
+                    .into_iter()
+                    .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+                {
+                    return Ok(Some(best));
+                }
+            }
+            Ok(None)
+        })
+        .await
     }
 }
 
@@ -13656,6 +14207,7 @@ fn fetch_related_subgraph(
     Vec<crate::graph_read::related::NodeSpec>,
     Vec<crate::graph_read::related::EdgeSpec>,
     u64,
+    String,
 )> {
     use crate::graph_read::related::{EdgeSpec, NodeSpec};
 
@@ -13787,8 +14339,11 @@ fn fetch_related_subgraph(
     }
 
     let Some(seed_id) = seed_id else {
-        return Ok((Vec::new(), Vec::new(), generation));
+        return Ok((Vec::new(), Vec::new(), generation, seed.to_string()));
     };
+    // The seed may have matched by `location`; pass the resolved node id on so
+    // the pure traversal's `node_map.get(seed)` still finds its own root node.
+    let resolved_seed_id = seed_id.clone();
 
     // BFS out to `max_hops`, fetching both orientations (the pure traversal
     // reapplies the direction allowlist). Only same-namespace neighbours are
@@ -13936,7 +14491,7 @@ fn fetch_related_subgraph(
     }
 
     let nodes: Vec<NodeSpec> = nodes.into_values().collect();
-    Ok((nodes, edges, generation))
+    Ok((nodes, edges, generation, resolved_seed_id))
 }
 
 impl LadybugStore {
@@ -15783,6 +16338,698 @@ eurostrata\src\daemon.rs",
         store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
         store
+    }
+
+    const SCAN_FORM_A: &str = "src/l'ib.rs";
+    const SCAN_FORM_B: &str = "/tmp/ns-scan/src/l'ib.rs";
+
+    fn create_form_scan_row(
+        conn: &Connection,
+        id: &str,
+        kind: &str,
+        location: &str,
+        metadata: Value,
+    ) -> Result<()> {
+        conn.query(&format!(
+            "CREATE (:Memory {{id: '{}', namespace: 'probe', content: '{}', memory_type: '{kind}', location: '{}', metadata: '{}'}})",
+            escape_ladybug_string(id), escape_ladybug_string(id),
+            escape_ladybug_string(location), escape_ladybug_string(&metadata.to_string()),
+        ))?;
+        Ok(())
+    }
+
+    fn create_form_scan_edge(conn: &Connection, from: &str, to: &str, edge: &str) -> Result<()> {
+        conn.query(&format!(
+            "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:{edge}]->(b)",
+            escape_ladybug_string(from),
+            escape_ladybug_string(to),
+        ))?;
+        Ok(())
+    }
+
+    async fn seed_form_scan_fixture(store: &LadybugStore) {
+        store
+            .with_conn(|conn| {
+                for (id, kind, location, metadata) in [
+                    ("probe::src/l'ib.rs", "file", SCAN_FORM_A, json!({})),
+                    (
+                        "probe::/tmp/ns-scan/src/l'ib.rs",
+                        "file",
+                        SCAN_FORM_B,
+                        json!({}),
+                    ),
+                    ("probe::src", "directory", "src", json!({})),
+                    (
+                        "probe::/tmp/ns-scan/src",
+                        "directory",
+                        "/tmp/ns-scan/src",
+                        json!({}),
+                    ),
+                    ("exact-a", "rule", "", json!({})),
+                    ("exact-b", "rule", "", json!({})),
+                    ("directory-a", "rule", "", json!({})),
+                    ("directory-b", "rule", "", json!({})),
+                    ("fallback-a", "fact", "", json!({"governs": [SCAN_FORM_A]})),
+                    ("fallback-b", "fact", "", json!({"governs": [SCAN_FORM_B]})),
+                ] {
+                    create_form_scan_row(conn, id, kind, location, metadata)?;
+                }
+                for (from, to) in [
+                    ("exact-a", "probe::src/l'ib.rs"),
+                    ("exact-b", "probe::/tmp/ns-scan/src/l'ib.rs"),
+                    ("directory-a", "probe::src"),
+                    ("directory-b", "probe::/tmp/ns-scan/src"),
+                ] {
+                    create_form_scan_edge(conn, from, to, "GOVERNS")?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_runs_one_physical_scan_set() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let types = ["rule".to_string(), "fact".to_string()];
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let duplicates = [SCAN_FORM_A.to_string(), "./src\\l'ib.rs/".to_string()];
+        for (forms, ancestors, expected_ids, baseline_counts, batched_counts) in [
+            (
+                forms.as_slice(),
+                true,
+                &[
+                    "exact-a",
+                    "exact-b",
+                    "directory-a",
+                    "directory-b",
+                    "fallback-a",
+                    "fallback-b",
+                ][..],
+                (2, 2, 2),
+                (1, 1, 1),
+            ),
+            (
+                forms.as_slice(),
+                false,
+                &["exact-a", "exact-b", "fallback-a", "fallback-b"][..],
+                (2, 0, 2),
+                (1, 0, 1),
+            ),
+            (&[][..], true, &[][..], (0, 0, 0), (0, 0, 0)),
+            (
+                duplicates.as_slice(),
+                true,
+                &["exact-a", "directory-a", "fallback-a"][..],
+                (1, 1, 1),
+                (1, 1, 1),
+            ),
+        ] {
+            per_form_retrieval_baseline(&store, None, forms, None, ancestors, &types, &[], 20)
+                .await
+                .unwrap();
+            assert_eq!(store.form_scans.take(), baseline_counts);
+            let result = store
+                .memories_for_file_forms("probe", None, forms, None, ancestors, &types, &[], 20)
+                .await
+                .unwrap();
+            let ids: Vec<_> = result.hits.iter().map(|hit| hit.id.as_str()).collect();
+            assert_eq!(ids, expected_ids);
+            assert_eq!(store.form_scans.take(), batched_counts);
+        }
+    }
+
+    // Keep the baseline's per-form reads and ordered merge as an oracle for
+    // the batched public entry point.
+    #[allow(clippy::too_many_arguments)]
+    async fn per_form_retrieval_baseline(
+        store: &LadybugStore,
+        source: Option<&str>,
+        forms: &[String],
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        types: &[String],
+        exclude: &[String],
+        limit: usize,
+    ) -> Result<MultiFormMemoryRetrieval> {
+        let mut normalized_forms = HashSet::new();
+        let mut out = MultiFormMemoryRetrieval::default();
+        let mut first_error = None;
+        let mut any_success = false;
+        for form in forms {
+            let path = crate::parser::ingest::normalize_node_path(form);
+            if !normalized_forms.insert(path.clone()) {
+                continue;
+            }
+            match store
+                .raw_memories_for_single_form(
+                    "probe",
+                    source,
+                    &path,
+                    symbol,
+                    include_ancestors,
+                    types,
+                    exclude,
+                )
+                .await
+            {
+                Ok((hits, truncated)) => {
+                    any_success = true;
+                    out.hits.extend(hits);
+                    out.candidate_truncated |= truncated;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let (false, Some(error)) = (any_success, first_error) {
+            return Err(error);
+        }
+        crate::graph_read::memories_for_file::rank_hits(&mut out.hits);
+        let mut seen = HashSet::new();
+        out.hits.retain(|hit| seen.insert(hit.id.clone()));
+        out.hits
+            .truncate(limit.min(crate::graph_read::memories_for_file::MAX_LIMIT));
+        store
+            .enrich_conceptual_bridges("probe", &mut out.hits)
+            .await;
+        Ok(out)
+    }
+
+    // The serialized hits contain every field except the ranking-only census.
+    fn observable_form_retrieval(
+        result: Result<MultiFormMemoryRetrieval>,
+    ) -> Result<String, String> {
+        let result = result.map_err(|error| format!("{error:#}"))?;
+        let census: Vec<_> = result.hits.iter().map(|hit| hit.linked_files).collect();
+        Ok(serde_json::to_string(&(result.hits, census, result.candidate_truncated)).unwrap())
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_hits_and_filters() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        store
+            .with_conn(|conn| {
+                for (id, kind, location, metadata) in [
+                    (
+                        "probe::src/l'ib.rs#function:entry@1",
+                        "symbol",
+                        SCAN_FORM_A,
+                        json!({}),
+                    ),
+                    (
+                        "probe::2::/tmp/ns-scan/src/l'ib.rs",
+                        "file",
+                        SCAN_FORM_B,
+                        json!({}),
+                    ),
+                    (
+                        "probe::2::fallback-scoped",
+                        "fact",
+                        "",
+                        json!({"governs": [SCAN_FORM_B]}),
+                    ),
+                    ("exact-scoped", "rule", "", json!({})),
+                    ("symbol-rule", "rule", "", json!({})),
+                    ("bridge-via", "file", "aux.rs", json!({})),
+                    (
+                        "bridge-target",
+                        "procedure",
+                        "",
+                        json!({"domain": ["runtime"]}),
+                    ),
+                    (
+                        "fallback-either",
+                        "fact",
+                        "",
+                        json!({"governs": ["./src", SCAN_FORM_A, SCAN_FORM_B]}),
+                    ),
+                ] {
+                    create_form_scan_row(conn, id, kind, location, metadata)?;
+                }
+                for (from, to, edge) in [
+                    (
+                        "exact-scoped",
+                        "probe::2::/tmp/ns-scan/src/l'ib.rs",
+                        "GOVERNS",
+                    ),
+                    ("exact-b", "probe::2::/tmp/ns-scan/src/l'ib.rs", "GOVERNS"),
+                    (
+                        "symbol-rule",
+                        "probe::src/l'ib.rs#function:entry@1",
+                        "GOVERNS",
+                    ),
+                    (
+                        "probe::src/l'ib.rs",
+                        "probe::src/l'ib.rs#function:entry@1",
+                        "CONTAINS",
+                    ),
+                    ("exact-a", "bridge-via", "RELATES_TO"),
+                    ("fallback-a", "bridge-via", "RELATES_TO"),
+                    ("bridge-via", "bridge-target", "RELATES_TO"),
+                ] {
+                    create_form_scan_edge(conn, from, to, edge)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-b", 2)
+            .await
+            .unwrap();
+
+        let forward = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let reverse = [SCAN_FORM_B.to_string(), SCAN_FORM_A.to_string()];
+        let rules = ["rule".to_string()];
+        let facts = ["fact".to_string()];
+        let excluded = ["exact-a".to_string()];
+        for (forms, source, types, exclude, explanation) in [
+            (
+                &forward,
+                None,
+                &[][..],
+                &[][..],
+                Some("declares governs src".to_string()),
+            ),
+            (
+                &reverse,
+                None,
+                &[][..],
+                &[][..],
+                Some(format!("declares governs {SCAN_FORM_B}")),
+            ),
+            (&forward, Some("source-a"), &rules[..], &excluded[..], None),
+            (
+                &forward,
+                Some("source-a"),
+                &facts[..],
+                &[][..],
+                Some("declares governs src".to_string()),
+            ),
+        ] {
+            let baseline = per_form_retrieval_baseline(
+                &store,
+                source,
+                forms,
+                Some("entry"),
+                true,
+                types,
+                exclude,
+                20,
+            )
+            .await
+            .unwrap();
+            let find_hit = |id: &str| baseline.hits.iter().find(|hit| hit.id == id);
+            assert_eq!(
+                find_hit("fallback-either").map(|hit| &hit.explanation),
+                explanation.as_ref()
+            );
+            if source.is_none() {
+                assert_eq!(
+                    find_hit("symbol-rule").unwrap().match_kind,
+                    GraphMatchKind::ExactSymbol
+                );
+                assert_eq!(find_hit("exact-a").unwrap().linked_files, 2);
+                assert_eq!(find_hit("fallback-a").unwrap().linked_files, 1);
+                assert!(find_hit("exact-a")
+                    .unwrap()
+                    .conceptual_bridges
+                    .iter()
+                    .any(|bridge| {
+                        bridge.via_id == "bridge-via" && bridge.target_id == "bridge-target"
+                    }));
+                assert!(find_hit("exact-scoped").is_some());
+                assert!(find_hit("probe::2::fallback-scoped").is_some());
+            } else {
+                assert!(baseline.hits.iter().all(|hit| hit.memory_type == types[0]));
+                assert!(find_hit("exact-a").is_none());
+                assert!(find_hit("exact-scoped").is_none());
+                assert!(find_hit("probe::2::fallback-scoped").is_none());
+            }
+            let actual = store
+                .memories_for_file_forms(
+                    "probe",
+                    source,
+                    forms,
+                    Some("entry"),
+                    true,
+                    types,
+                    exclude,
+                    20,
+                )
+                .await;
+            assert_eq!(
+                observable_form_retrieval(actual),
+                observable_form_retrieval(Ok(baseline))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_retirement_boundary() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let start = 1_800_000_000;
+        let valid_to = start + 1;
+        store
+            .with_conn(move |conn| {
+                for (id, path) in [
+                    ("retiring-first", SCAN_FORM_A),
+                    ("retiring-second", SCAN_FORM_B),
+                ] {
+                    create_form_scan_row(
+                        conn,
+                        id,
+                        "fact",
+                        "",
+                        json!({"governs": [path], "valid_to": valid_to}),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Both reads start at the same second. The second form's edge stage
+        // ends at the retirement boundary, before its metadata evaluation.
+        let reset_clock = || {
+            *store.form_scans.clock.lock().unwrap() = Some(FormScanClock {
+                now: start,
+                advance_after_edges_for: SCAN_FORM_B,
+            });
+        };
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let types = ["fact".to_string()];
+        reset_clock();
+        let baseline =
+            per_form_retrieval_baseline(&store, None, &forms, None, false, &types, &[], 20)
+                .await
+                .unwrap();
+        assert!(baseline.hits.iter().any(|hit| hit.id == "retiring-first"));
+        assert!(!baseline.hits.iter().any(|hit| hit.id == "retiring-second"));
+        assert_eq!(store.form_scans.take(), (2, 0, 2));
+
+        reset_clock();
+        let actual = store
+            .memories_for_file_forms("probe", None, &forms, None, false, &types, &[], 20)
+            .await;
+        assert_eq!(store.form_scans.take(), (1, 0, 1));
+        assert_eq!(
+            observable_form_retrieval(actual),
+            observable_form_retrieval(Ok(baseline))
+        );
+    }
+
+    async fn seed_form_cap_rows(
+        store: &LadybugStore,
+        path: &'static str,
+        prefix: &'static str,
+        count: usize,
+    ) {
+        store.with_conn(move |conn| {
+            let metadata = escape_ladybug_string(&json!({"governs": [path]}).to_string());
+            conn.query(&format!(
+                "UNWIND range(1, {count}) AS n CREATE (:Memory {{id: '{prefix}' + string(n), namespace: 'probe', content: 'cap fixture', memory_type: 'fact', location: '', metadata: '{metadata}'}})"
+            ))?;
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_candidate_caps() {
+        let store = retired_test_store().await;
+        let types = ["fact".to_string()];
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        seed_form_cap_rows(&store, SCAN_FORM_A, "cap-a-", 520).await;
+        seed_form_cap_rows(&store, SCAN_FORM_B, "cap-b-", 520).await;
+
+        for exceeds_per_form_cap in [false, true] {
+            if exceeds_per_form_cap {
+                seed_form_cap_rows(&store, SCAN_FORM_B, "cap-extra-", 505).await;
+            }
+            let a = store
+                .raw_memories_for_single_form("probe", None, SCAN_FORM_A, None, false, &types, &[])
+                .await
+                .unwrap();
+            let b = store
+                .raw_memories_for_single_form("probe", None, SCAN_FORM_B, None, false, &types, &[])
+                .await
+                .unwrap();
+            assert_eq!((a.0.len(), a.1), (520, false));
+            assert_eq!(
+                (b.0.len(), b.1),
+                if exceeds_per_form_cap {
+                    (1_024, true)
+                } else {
+                    (520, false)
+                }
+            );
+            assert!(a.0.iter().all(|hit| hit.id.starts_with("cap-a-")));
+            assert!(b
+                .0
+                .iter()
+                .all(|hit| hit.id.starts_with("cap-b-") || hit.id.starts_with("cap-extra-")));
+
+            let baseline =
+                per_form_retrieval_baseline(&store, None, &forms, None, false, &types, &[], 20)
+                    .await
+                    .unwrap();
+            assert_eq!(baseline.candidate_truncated, exceeds_per_form_cap);
+            assert_eq!(baseline.hits.len(), 20);
+            let actual = store
+                .memories_for_file_forms("probe", None, &forms, None, false, &types, &[], 20)
+                .await;
+            assert_eq!(
+                observable_form_retrieval(actual),
+                observable_form_retrieval(Ok(baseline))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_failures_and_empty_input() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let forms = [SCAN_FORM_B.to_string(), SCAN_FORM_A.to_string()];
+        for (
+            forms,
+            failed,
+            first_error,
+            fail_metadata,
+            baseline_counts,
+            batched_counts,
+            expected_ids,
+        ) in [
+            (
+                forms.as_slice(),
+                &[SCAN_FORM_B][..],
+                None,
+                false,
+                (1, 1, 1),
+                (1, 1, 1),
+                &["exact-a", "directory-a", "fallback-a"][..],
+            ),
+            (
+                forms.as_slice(),
+                &[SCAN_FORM_A, SCAN_FORM_B][..],
+                Some(SCAN_FORM_B),
+                false,
+                (0, 0, 0),
+                (0, 0, 0),
+                &[][..],
+            ),
+            (
+                &[][..],
+                &[SCAN_FORM_A, SCAN_FORM_B][..],
+                None,
+                false,
+                (0, 0, 0),
+                (0, 0, 0),
+                &[][..],
+            ),
+            // Discovery succeeded once as a batch before the shared metadata
+            // failure. Both forms must replay individually after that error.
+            (
+                forms.as_slice(),
+                &[][..],
+                None,
+                true,
+                (2, 2, 2),
+                (3, 3, 2),
+                &[
+                    "exact-a",
+                    "exact-b",
+                    "directory-a",
+                    "directory-b",
+                    "fallback-a",
+                    "fallback-b",
+                ][..],
+            ),
+        ] {
+            *store.form_scans.exact_failures.lock().unwrap() =
+                failed.iter().map(|path| path.to_string()).collect();
+            store
+                .form_scans
+                .fail_shared_metadata
+                .store(fail_metadata, std::sync::atomic::Ordering::Relaxed);
+            let baseline =
+                per_form_retrieval_baseline(&store, None, forms, None, true, &[], &[], 20).await;
+            match first_error {
+                Some(path) => assert_eq!(
+                    baseline.as_ref().unwrap_err().to_string(),
+                    format!("injected exact-file query failure for {path:?}")
+                ),
+                None => {
+                    let out = baseline.as_ref().unwrap();
+                    let ids: Vec<_> = out.hits.iter().map(|hit| hit.id.as_str()).collect();
+                    assert_eq!(ids, expected_ids);
+                    assert!(!out.candidate_truncated);
+                }
+            }
+            assert_eq!(store.form_scans.take(), baseline_counts);
+            let actual = store
+                .memories_for_file_forms("probe", None, forms, None, true, &[], &[], 20)
+                .await;
+            assert_eq!(
+                observable_form_retrieval(actual),
+                observable_form_retrieval(baseline)
+            );
+            assert_eq!(store.form_scans.take(), batched_counts);
+        }
+    }
+
+    /// Per-logical-file retrieval must rank the GLOBAL candidate pool, not each
+    /// spelling in isolation: a high-value hit from a later form outranks the
+    /// low-value hits an earlier form would have used to fill a per-form limit.
+    #[tokio::test]
+    async fn memories_for_file_forms_preserves_global_best_hit_across_form_cutoff_boundary() {
+        let form_a = "src/lib.rs";
+        let form_b = "/tmp/ns-v1190-project/src/lib.rs";
+        let dir = std::env::temp_dir().join(format!("ns-v1190-forms-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.init("ns").await.expect("init namespace");
+
+        for id in ["hit-a1", "hit-a2", "hit-a3"] {
+            let mtype = if id == "hit-a3" {
+                "structural"
+            } else {
+                "symbol"
+            };
+            store
+                .upsert(
+                    "ns",
+                    id,
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        mtype,
+                        "agent",
+                        json!({"governs": [form_a], "locations": [{"path": form_a}]}),
+                    ),
+                )
+                .await
+                .expect("seed form_a hit");
+        }
+        store
+            .upsert(
+                "ns",
+                "best-rule-b1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"governs": [form_b], "locations": [{"path": form_b}]}),
+                ),
+            )
+            .await
+            .expect("seed form_b rule");
+
+        let out = store
+            .memories_for_file_forms(
+                "ns",
+                None,
+                &[form_a.to_string(), form_b.to_string()],
+                None,
+                false,
+                &[],
+                &[],
+                2,
+            )
+            .await
+            .expect("multi-form retrieval");
+
+        assert!(
+            out.hits.iter().any(|h| h.id == "best-rule-b1"),
+            "global best rule must survive the per-form cutoff: {:?}",
+            out.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(out.hits.len() <= 2, "global limit is 2");
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            out.hits.iter().all(|h| seen.insert(h.id.clone())),
+            "hits are globally deduped"
+        );
+    }
+
+    /// Bridge enrichment runs once on the merged per-logical-file hit set, not
+    /// once per spelling -- the counter must read exactly 1 for two forms.
+    #[tokio::test]
+    async fn memories_for_file_forms_enriches_bridges_once_per_logical_file() {
+        reset_bridge_enrichment_counter_for_tests();
+        let form_a = "src/lib.rs";
+        let form_b = "/tmp/ns-v1190-project/src/lib.rs";
+        let forms = vec![form_a.to_string(), form_b.to_string()];
+        let dir = std::env::temp_dir().join(format!("ns-v1190-bridges-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.init("ns").await.expect("init namespace");
+
+        store
+            .upsert(
+                "ns",
+                "seed-1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({"governs": [form_a], "locations": [{"path": form_a}]}),
+                ),
+            )
+            .await
+            .expect("seed seed-1");
+        store
+            .upsert(
+                "ns",
+                "seed-2",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"governs": [form_b], "locations": [{"path": form_b}]}),
+                ),
+            )
+            .await
+            .expect("seed seed-2");
+
+        let out = store
+            .memories_for_file_forms("ns", None, &forms, None, false, &[], &[], 10)
+            .await
+            .expect("ok");
+
+        assert!(!out.hits.is_empty(), "at least one seed hit is returned");
+        assert_eq!(
+            bridge_enrichment_counter_for_tests(),
+            1,
+            "bridge enrichment runs once per logical file, not once per form"
+        );
     }
 
     /// Composite Recommendation #11: the first embedding descriptor recorded
@@ -23297,6 +24544,75 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    async fn assert_f6_evidence_id_hash(hash_field: &str, hash: &str, expected: &str) {
+        let store = retired_test_store().await;
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        store
+            .upsert(
+                "probe",
+                "target-node",
+                v.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let mut metadata = json!({
+            "governs": ["target-node"],
+            "absolute_path": "src/a.rs",
+            "source": "src/a.rs"
+        });
+        metadata[hash_field] = json!(hash);
+        let mut declarer = retired_test_payload("rule", "agent", metadata);
+        declarer.location = "src/a.rs".to_string();
+        declarer.location_lines = "3-4".to_string();
+        store
+            .upsert("probe", "declaring-rule", v, declarer)
+            .await
+            .expect("persist declaration and its resolved edge");
+
+        let evidence_ids = store
+            .with_conn(|conn| {
+                let rows = conn.query(
+                    "MATCH (a:Memory {id: 'declaring-rule'})-[r:GOVERNS]->(b:Memory {id: 'target-node'}) RETURN r.evidence_id",
+                )?;
+                Ok(rows.map(|row| format!("{}", row[0])).collect::<Vec<_>>())
+            })
+            .await
+            .unwrap();
+        assert_eq!(evidence_ids, vec![expected.to_string()]);
+
+        let (_, payload) = store
+            .get("probe", "declaring-rule")
+            .await
+            .unwrap()
+            .expect("persisted declaration");
+        let sources = payload.metadata["edge_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["evidence_id"], expected);
+        assert_eq!(sources[0]["content_hash"], hash);
+        assert_eq!(sources[0]["file"], "src/a.rs");
+        assert_eq!(sources[0]["line_start"], 3);
+        assert_eq!(sources[0]["line_end"], 4);
+    }
+
+    #[tokio::test]
+    async fn test_f6_evidence_id_hash_multibyte_byte_cap() {
+        let hash = "abcdefghijkérest";
+        assert!(!hash.is_char_boundary(12));
+        assert_f6_evidence_id_hash("file_sha256", hash, "src/a.rs:3-4:abcdefghijk").await;
+    }
+
+    #[tokio::test]
+    async fn test_f6_evidence_id_hash_long_ascii_unchanged() {
+        assert_f6_evidence_id_hash(
+            "span_sha256",
+            "0123456789abcdef0123456789abcdef",
+            "src/a.rs:3-4:0123456789ab",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn test_f13_dangling_edges_and_f18_shape_warnings() {
         let dir = std::env::temp_dir().join(format!("ns-f13-f18-{}", uuid::Uuid::new_v4()));
@@ -23401,6 +24717,47 @@ eurostrata\src\daemon.rs",
             Some(&json!({ "kind": "release-run", "ref": "v1.16.0" })),
             "the repair must not overwrite an object source with a string"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `source` is published to mesh peers, so the repair fills a missing one
+    /// from the row's location only when that location is relative. An
+    /// absolute one names the author's machine (Windows or POSIX).
+    #[tokio::test]
+    async fn repair_hygiene_never_copies_an_absolute_location_into_source() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-abs-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        for (id, location) in [
+            ("rule-windows", r"C:\Users\src-leak-sentinel\proj\src\lib.rs"),
+            ("rule-posix", "/home/src-leak-sentinel/proj/src/lib.rs"),
+            ("rule-relative", "src/lib.rs"),
+        ] {
+            let rule = MemoryPayload {
+                location: location.to_string(),
+                ..retired_test_payload("rule", "agent", json!({}))
+            };
+            store.upsert("probe", id, v.clone(), rule).await.unwrap();
+        }
+
+        store.repair_namespace_hygiene("probe").await.unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let source = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.payload.metadata.get("source").cloned())
+        };
+        assert_eq!(source("rule-windows"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-posix"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-relative"), Some(json!("src/lib.rs")));
+        // Neither absolute location (Windows nor POSIX) may leak a host path.
+        for id in ["rule-windows", "rule-posix", "rule-relative"] {
+            let s = source(id).and_then(|v| v.as_str().map(str::to_string)).unwrap();
+            assert!(!s.contains("src-leak-sentinel"), "{id} leaked a host path");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

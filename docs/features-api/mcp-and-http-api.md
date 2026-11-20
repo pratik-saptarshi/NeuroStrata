@@ -2,13 +2,15 @@
 
 ## Core Memory & Graph Retrieval Tools
 
-- `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight.
-- `neurostrata_search_memory` — query memory contents via vector + graph RAG.
+- `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight. For a `rule`, an omitted or blank `metadata.source` is backfilled with the resolver's project-relative spelling when a root places the location (`project_root`, else the registered root, else the nearest `.git`), otherwise exactly `"agent"`. An explicit caller-supplied source is never overwritten. Because `source` is published to mesh peers and exported, this implicit source never holds an absolute local path that names the author's machine.
+- `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution, including root-equal prefixes that match in-root relative and absolute paths).
 - `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).
 - `neurostrata_supersede_memory` — replace active version with new one atomically.
 - `neurostrata_memories_for_file` — inspect governing memories for a given path/file.
-- `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`).
-- `neurostrata_diff_tour` — diff tour between versions.
+- `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`; accepts optional `project_root`, resolves multi-form file seeds to one canonical in-namespace file node before single traversal, and returns additive `resolved_seed` metadata).
+- `neurostrata_diff_tour` — diff tour between versions (separates caller-facing display paths from internal multi-form lookup paths and records canonical project-relative paths in the Graph-First session ledger).
+- `neurostrata_locate` — locate structural code symbols and governing rules (resolves `path_prefix` against optional `project_root` and the namespace's cached `registry_root` across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
+- `neurostrata_insights` — evaluate and track architectural insights (accepts optional `project_root`; resolves `path_prefix` dynamically at `snapshot`/`series` time for `lexical` and `ast_calls` insights across relative and absolute stored spellings, failing closed on unresolvable absolute prefixes).
 - `neurostrata_ingest_directory` — ingest a directory into the property graph.
 - `neurostrata_ingest_bounded` — ontology-scoped bounded RDF classification + ingest (Capability F). Inputs: `namespace`, `domain`, `candidates` (all required), optional `principal`, `user_id`, `reason`. Each candidate carries `subject`, `class`, `predicate` and an `object` that is either `{"iri": "<absolute-iri>"}` or `{"literal": {"value": "...", "datatype"?: "<iri>", "language"?: "<tag>"}}`. The requested `domain` is normalized before the governed class/predicate closure is selected under a fixed finite query budget; `governs_class` is exact-match only, so invented IRIs that collapse onto a slug are rejected. Finite caps apply to candidate count (256), IRI length (2048 bytes) and literal length (65536 bytes). The emitted Turtle and the `MemoryPayload` are SHACL-validated before any write; any violation, unknown/empty domain, budget exhaustion, ungoverned class/predicate, malformed term or cap breach fails closed with `{"ok": false, "error": ...}` and zero writes. A successful call commits exactly one idempotent batch memory (`bounded-ingest-<sha256>`) and returns `{"ok": true, "id", "namespace", "domain", "triple_count", "turtle"}`. A ReBAC namespace write gate (`can_write_namespace` on the resolved principal) protects the write; there is no permissive opt-out and no CLI/daemon surface for this tool.
 - `neurostrata_append_log` — append conversational transcript log entries.
@@ -30,7 +32,11 @@
 - `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2).
 - `neurostrata_task_validate` — advisory gate report for a task.
 - `neurostrata_procedure_perform` — fire a recurring procedure.
-- `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate).
+- `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate). `neurostrata-1e14`: force-push flags and destructive remote operations (`-f` in any short bundle such as `-vf`/`-uf`, `--force`, `--force-with-lease[=<ref>]`, `+<refspec>`, `--mirror`, `--delete`, `--prune`) are never exempt — both the plugin and daemon classifiers reject them so remote-history rewrites still require an active task.
+
+Active-task resolution is session/worktree scoped: when the daemon returns several `in_progress` tasks, resolution prefers an explicit `preferredTaskId`, then a task whose `session_id` and `worktree` both match the caller's session and project root, then a session-only match, then a worktree-only match, and only then any in-progress task. A fallback task owned by a different session does not overwrite an already known `activeSessionId`.
+
+`neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory.
 
 ## Code Intelligence & SCIP Call-Graph Tools
 
