@@ -1526,7 +1526,11 @@ pub struct LadybugStore {
     /// Whether init() confirmed the derived `pk` column on the Memory
     /// table. Identity operations key on pk when this holds and fall
     /// back to (namespace, id) property matching when it does not.
-    pk_ready: std::sync::atomic::AtomicBool,
+    /// Behind an `Arc` so the LockedUnknown stamp handle shares this
+    /// exact flag: the stamp step's width reconcile can drop the
+    /// grafted column, and its re-graft re-truths the flag inside the
+    /// same writer's turn (B1).
+    pk_ready: Arc<std::sync::atomic::AtomicBool>,
     identity_audit: std::sync::Mutex<RowIdentityAudit>,
     db: Arc<Database>,
     dirty: Dirty,
@@ -4638,6 +4642,11 @@ struct LockedUnknownStamp {
     serving: Option<crate::traits::EmbeddingDescriptor>,
     embed_config_dir: PathBuf,
     dimensions: usize,
+    /// The store's shared pk flag (B1): this handle's width leg can
+    /// drop the grafted `pk` column, so its re-graft result is stored
+    /// here — the same flag the store's `pk_ready()` reads — inside
+    /// the same writer's turn.
+    pk_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LockedUnknownStamp {
@@ -4714,6 +4723,21 @@ impl LockedUnknownStamp {
             create_node_table,
             create_rel_tables,
         )?;
+        // B1: the width leg above drops and recreates the Memory
+        // table from `memory_table_ddl` on a width mismatch, and that
+        // DDL has no `pk` column — the recreated table loses the
+        // derived pk column init grafted, while the store's
+        // `pk_ready` kept asserting it (pk-keyed upsert/get then
+        // failed with "Cannot find property pk"). Re-graft
+        // unconditionally inside this same writer's turn — the graft
+        // is idempotent (probe hits, backfill finds no stale rows on
+        // an engine-attested empty table) — and store its result into
+        // the shared flag, so the flag asserts exactly what the
+        // catalog holds: graft failed -> `false`, and the store falls
+        // back to its legacy (namespace, id) matching mode.
+        let pk_ready = graft_pk_column(conn, false);
+        self.pk_ready
+            .store(pk_ready, std::sync::atomic::Ordering::Release);
         if attested_empty {
             self.stamp_pristine_identity();
         }
@@ -5004,7 +5028,7 @@ impl LadybugStore {
             local_path,
             dimensions,
             path_aliases,
-            pk_ready: std::sync::atomic::AtomicBool::new(false),
+            pk_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_audit: std::sync::Mutex::new(RowIdentityAudit::default()),
             db: Arc::new(db),
             dirty: Dirty::default(),
@@ -5146,6 +5170,7 @@ impl LadybugStore {
             serving: self.serving_descriptor(),
             embed_config_dir: self.embed_config_dir.clone(),
             dimensions: self.dimensions,
+            pk_ready: Arc::clone(&self.pk_ready),
         }
     }
 
@@ -9565,6 +9590,106 @@ fn memory_table_ddl(dimensions: usize) -> (String, [&'static str; 5]) {
     )
 }
 
+/// Graft the derived `pk` column onto the Memory table (the fork's
+/// Task 7 re-plan, merged form): the merged Memory table keeps the
+/// upstream PRIMARY KEY (id); the derived pk (namespace, id) rides as
+/// a plain column, so pk-keyed operations (get, relocate,
+/// publication) key on it exactly as they do against a natively
+/// pk-keyed table. A fresh table gains the column here; an existing
+/// table gains it by ALTER plus backfill below. Returns whether the
+/// column is present at exit. If the column cannot be provided, the
+/// store continues in legacy (namespace, id) matching mode (pk_ready
+/// stays false) and says so on stderr.
+///
+/// Extracted statement-for-statement from init's schema closure
+/// (B1): any path that drops and recreates the Memory table from
+/// `memory_table_ddl` — which has no `pk` column — must re-graft
+/// inside the same writer's turn, or `pk_ready` asserts a column the
+/// catalog no longer has. The width reconciliations inside init's
+/// closure run before the closure's graft by construction, so their
+/// ordering assumption is exactly this helper being called after
+/// them there; the LockedUnknown stamp step calls it after its own
+/// width reconcile (see `LockedUnknownStamp::attest_and_stamp`).
+fn graft_pk_column(conn: &Connection, created_fresh: bool) -> bool {
+    let mut pk_ready = false;
+    if created_fresh {
+        match conn.query("ALTER TABLE Memory ADD pk STRING DEFAULT ''") {
+            Ok(_) => pk_ready = true,
+            Err(e) => {
+                eprintln!(
+                    "[neurostrata:identity-audit] could not add the derived pk column to the new Memory table ({}) - continuing in legacy (namespace, id) matching mode",
+                    e
+                );
+            }
+        }
+    } else if conn.query("MATCH (m:Memory) RETURN m.pk LIMIT 1").is_ok() {
+        pk_ready = true;
+    } else {
+        match conn.query("ALTER TABLE Memory ADD pk STRING DEFAULT ''") {
+            Ok(_) => pk_ready = true,
+            Err(e) => {
+                eprintln!(
+                    "[neurostrata:identity-audit] could not add the derived pk column to the existing Memory table ({}) - continuing in legacy (namespace, id) matching mode",
+                    e
+                );
+            }
+        }
+    }
+
+    if pk_ready {
+        let mut stale: Vec<(String, String, String)> = Vec::new();
+        if let Ok(mut rows) = conn
+            .query("MATCH (m:Memory) WHERE m.namespace IS NOT NULL RETURN m.id, m.namespace, m.pk")
+        {
+            while let Some(row) = rows.next() {
+                let row_id = format!("{}", row[0]);
+                let row_ns = format!("{}", row[1]);
+                let row_pk = format!("{}", row[2]);
+                let derived = memory_pk(&row_ns, &row_id);
+                if row_pk != derived {
+                    stale.push((row_id, row_ns, derived));
+                }
+            }
+        }
+        let mut backfilled = 0usize;
+        let mut unfixable = 0usize;
+        for (row_id, row_ns, derived) in &stale {
+            let applied = (|| -> std::result::Result<(), lbug::Error> {
+                let mut stmt = conn.prepare(
+                    "MATCH (m:Memory) WHERE m.id = $id AND m.namespace = $ns SET m.pk = $pk",
+                )?;
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("id", lbug::Value::String(row_id.clone())),
+                        ("ns", lbug::Value::String(row_ns.clone())),
+                        ("pk", lbug::Value::String(derived.clone())),
+                    ],
+                )?;
+                Ok(())
+            })();
+            if applied.is_ok() {
+                backfilled += 1;
+            } else {
+                unfixable += 1;
+            }
+        }
+        if backfilled > 0 {
+            eprintln!(
+                "[neurostrata:identity-audit] backfilled the derived pk on {} Memory row(s)",
+                backfilled
+            );
+        }
+        if unfixable > 0 {
+            eprintln!(
+                "[neurostrata:identity-audit] {} Memory row(s) carry a pk that does not match their (namespace, id) and could not be rewritten in place",
+                unfixable
+            );
+        }
+    }
+    pk_ready
+}
+
 /// The raw catalog facts the two width reconciliations consult
 /// (#83): exactly what the engine returned. `embedding` is the
 /// `embedding` property's catalog type cell (None when the table has
@@ -10422,91 +10547,12 @@ impl VectorStore for LadybugStore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = audit;
 
             // Derived-pk column (the fork's Task 7 re-plan, merged
-            // form): the merged Memory table keeps the upstream
-            // PRIMARY KEY (id); the derived pk (namespace, id) rides
-            // as a plain column, so pk-keyed operations (get,
-            // relocate, publication) key on it exactly as they do
-            // against a natively pk-keyed table. A fresh table gains
-            // the column here; an existing table gains it by ALTER
-            // plus backfill below. If the column cannot be provided,
-            // the store continues in legacy (namespace, id) matching
-            // mode (pk_ready stays false) and says so on stderr.
-            let mut pk_ready = false;
-            if created_fresh {
-                match conn.query("ALTER TABLE Memory ADD pk STRING DEFAULT ''") {
-                    Ok(_) => pk_ready = true,
-                    Err(e) => {
-                        eprintln!(
-                            "[neurostrata:identity-audit] could not add the derived pk column to the new Memory table ({}) - continuing in legacy (namespace, id) matching mode",
-                            e
-                        );
-                    }
-                }
-            } else if conn.query("MATCH (m:Memory) RETURN m.pk LIMIT 1").is_ok() {
-                pk_ready = true;
-            } else {
-                match conn.query("ALTER TABLE Memory ADD pk STRING DEFAULT ''") {
-                    Ok(_) => pk_ready = true,
-                    Err(e) => {
-                        eprintln!(
-                            "[neurostrata:identity-audit] could not add the derived pk column to the existing Memory table ({}) - continuing in legacy (namespace, id) matching mode",
-                            e
-                        );
-                    }
-                }
-            }
-
-            if pk_ready {
-                let mut stale: Vec<(String, String, String)> = Vec::new();
-                if let Ok(mut rows) = conn.query(
-                    "MATCH (m:Memory) WHERE m.namespace IS NOT NULL RETURN m.id, m.namespace, m.pk",
-                ) {
-                    while let Some(row) = rows.next() {
-                        let row_id = format!("{}", row[0]);
-                        let row_ns = format!("{}", row[1]);
-                        let row_pk = format!("{}", row[2]);
-                        let derived = memory_pk(&row_ns, &row_id);
-                        if row_pk != derived {
-                            stale.push((row_id, row_ns, derived));
-                        }
-                    }
-                }
-                let mut backfilled = 0usize;
-                let mut unfixable = 0usize;
-                for (row_id, row_ns, derived) in &stale {
-                    let applied = (|| -> std::result::Result<(), lbug::Error> {
-                        let mut stmt = conn.prepare(
-                            "MATCH (m:Memory) WHERE m.id = $id AND m.namespace = $ns SET m.pk = $pk",
-                        )?;
-                        conn.execute(
-                            &mut stmt,
-                            vec![
-                                ("id", lbug::Value::String(row_id.clone())),
-                                ("ns", lbug::Value::String(row_ns.clone())),
-                                ("pk", lbug::Value::String(derived.clone())),
-                            ],
-                        )?;
-                        Ok(())
-                    })();
-                    if applied.is_ok() {
-                        backfilled += 1;
-                    } else {
-                        unfixable += 1;
-                    }
-                }
-                if backfilled > 0 {
-                    eprintln!(
-                        "[neurostrata:identity-audit] backfilled the derived pk on {} Memory row(s)",
-                        backfilled
-                    );
-                }
-                if unfixable > 0 {
-                    eprintln!(
-                        "[neurostrata:identity-audit] {} Memory row(s) carry a pk that does not match their (namespace, id) and could not be rewritten in place",
-                        unfixable
-                    );
-                }
-            }
+            // form): grafted by `graft_pk_column` (see its doc for the
+            // semantics and the re-graft obligation B1 places on any
+            // drop/recreate path). The width reconciliations above run
+            // before this graft in the same closure, so a drop there
+            // is followed by a graft.
+            let pk_ready = graft_pk_column(conn, created_fresh);
             pk_ready_flag_in_closure.store(pk_ready, std::sync::atomic::Ordering::Release);
 
             // RDF projection (Phase 1): idempotent migration for DBs created before
@@ -28477,6 +28523,87 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn b1_fastpath_reattest_regrafts_pk_after_width_recreate() {
+        // B1 (PR #120 panel blocker): the schema-ready fast path's
+        // LockedUnknown re-attestation reconciles a width mismatch by
+        // dropping and recreating the Memory table from
+        // `memory_table_ddl`, which has no `pk` column — the recreated
+        // table lost the derived pk column init had grafted, while
+        // `pk_ready` kept asserting it, so pk-keyed upsert/get failed
+        // with "Cannot find property pk". The stamp step must re-graft
+        // pk inside the same writer's turn as the drop/recreate.
+        let previous = without_model_env();
+        let fx = store_state_fixture("b1-fastpath-reattest-pk", "ModelA");
+
+        // The pre-sidecar store: schema at FLOAT[4] created by a
+        // non-serving open, so no sidecar exists and the next
+        // construction classifies LockedUnknown.
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        // The store under test opens at width 8 over the FLOAT[4]
+        // table with serving unbound: init grafts pk and latches
+        // schema_ready, but no width reconciliation runs (the
+        // LockedUnknown upgrade candidate needs serving bound).
+        let store = LadybugStore::for_testing(&fx.db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        assert!(matches!(
+            store.cached_store_state(),
+            CachedStoreState::LockedUnknown
+        ));
+        store.init("probe").await.expect("first init");
+        assert!(store.pk_ready(), "init grafted the derived pk column");
+        assert_eq!(physical_embedding_width(&store).await, Some(4));
+        assert!(
+            pk_column_present(&store).await,
+            "pk present in the catalog after the first init"
+        );
+
+        // Late bind: serving at width 8, matching the configured
+        // descriptor at this store's width. Re-entering init takes
+        // the schema-ready fast path, whose re-attestation drops and
+        // recreates the empty table at FLOAT[8].
+        store.set_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+        store
+            .init("probe")
+            .await
+            .expect("fast-path re-attestation init");
+        assert_eq!(
+            physical_embedding_width(&store).await,
+            Some(8),
+            "the re-attestation recreated the table at the serving width"
+        );
+        assert!(
+            pk_column_present(&store).await,
+            "pk_present=false after re-attestation: the width recreate dropped the grafted pk column and nothing re-grafted it"
+        );
+        assert!(store.pk_ready(), "pk_ready stays catalog-true");
+
+        // The two operations that binder-failed in the desynced state.
+        store
+            .upsert("probe", "m1", vec![0.1; 8], store_state_payload())
+            .await
+            .expect("upsert after re-attestation");
+        let (_, landed) = store
+            .get("probe", "m1")
+            .await
+            .expect("get after re-attestation")
+            .expect("the upserted row is readable");
+        assert_eq!(landed.content, store_state_payload().content);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
     async fn schema_ready_fast_path_retries_locked_unknown_upgrade_and_migrates_data_bearing() {
         // #91, #81: the schema-ready fast path used to return
         // before the LockedUnknown upgrade could run, so a store
@@ -28998,6 +29125,25 @@ eurostrata\src\daemon.rs",
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
+    }
+
+    /// Whether the engine's catalog reports a `pk` property on the
+    /// Memory table of an already-open store.
+    async fn pk_column_present(store: &LadybugStore) -> bool {
+        store
+            .with_conn(|conn| {
+                let mut present = false;
+                for row in conn.query("CALL table_info('Memory') RETURN *")? {
+                    if let Some(lbug::Value::String(name)) = row.get(1) {
+                        if name == "pk" {
+                            present = true;
+                        }
+                    }
+                }
+                Ok(present)
+            })
+            .await
+            .expect("read the Memory catalog")
     }
 
     /// The physical width of `Memory.embedding` as the engine's
