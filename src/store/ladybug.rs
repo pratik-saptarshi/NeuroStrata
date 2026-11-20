@@ -42759,7 +42759,7 @@ fn edge_provenance_fields(id: &str, payload: &MemoryPayload) -> EdgeProvenanceFi
             "{}:{}:{}",
             f,
             payload.location_lines.trim(),
-            &h[..h.len().min(12)]
+            &h[..h.floor_char_boundary(12)]
         ),
         (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
         _ => id.to_string(),
