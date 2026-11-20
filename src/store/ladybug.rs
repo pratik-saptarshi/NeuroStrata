@@ -36414,6 +36414,234 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn b2_batch_write_refuses_quarantined_row_byte_identical() {
+        let path = std::env::temp_dir().join(format!("ns-b2-quar-{}", uuid::Uuid::new_v4()));
+        // Seed one NULL-namespace row with distinctive values in every
+        // column and no namespace claim in its metadata, then drop the
+        // store so the reopen runs init's audit and quarantines it.
+        {
+            let seed_store = LadybugStore::for_testing(&path, 4).expect("open temp database");
+            seed_store.init("probe").await.expect("create the schema");
+            let pk = "seed-pk:b2-quarantined".to_string();
+            let create = "CREATE (m:Memory {pk: $pk, id: 'b2-quarantined', content: 'quarantined content', user_id: 'original-user', memory_type: 'note', agent_name: 'original-agent', location: 'src/original.rs', location_lines: '1-9', metadata: '{\"marker\":\"b2-quarantine\",\"nested\":[1,2,3]}', embedding: [0.5,0.25,0.125,1.5]})".to_string();
+            seed_store
+                .with_conn(move |conn| {
+                    let mut stmt = conn.prepare(&create)?;
+                    conn.execute(&mut stmt, vec![("pk", lbug::Value::String(pk))])?;
+                    Ok(())
+                })
+                .await
+                .expect("seed a null-namespace row");
+            assert_eq!(
+                t7_count_where(&seed_store, "m.namespace IS NULL").await,
+                1,
+                "the seeded row is null-namespace before the audit"
+            );
+        }
+        let store = LadybugStore::for_testing(&path, 4).expect("reopen the store");
+        store.init("probe").await.expect("init must not be blocked");
+
+        let snapshot_query = "MATCH (m:Memory) WHERE m.id = 'b2-quarantined' RETURN m.pk, m.id, m.namespace, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata, m.embedding";
+        let before: Vec<String> = store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(snapshot_query)?;
+                let cols = rows
+                    .next()
+                    .map(|row| {
+                        (0..11)
+                            .map(|i| format!("{}", row[i]))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+                Ok(cols)
+            })
+            .await
+            .expect("snapshot the quarantined row");
+        assert_eq!(before.len(), 11, "snapshot reads every column");
+
+        let mut payload = t7_payload("overwrite attempt");
+        payload.user_id = "other-user".to_string();
+        payload.memory_type = "fact".to_string();
+        payload.metadata = json!({"marker": "overwrite"});
+        let batch = crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: vec![crate::rdf::action::StagedMemoryWrite {
+                id: "b2-quarantined".to_string(),
+                vector: vec![9.0, 8.0, 7.0, 6.0],
+                payload,
+            }],
+            edge_deltas: Vec::new(),
+        };
+        let res = store.commit_action_batch("any-ns", batch).await;
+        assert!(
+            res.is_err(),
+            "a batch write to a quarantined id must refuse"
+        );
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("quarantined"),
+            "refusal names the quarantine: {err}"
+        );
+
+        let after: Vec<String> = store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(snapshot_query)?;
+                let cols = rows
+                    .next()
+                    .map(|row| {
+                        (0..11)
+                            .map(|i| format!("{}", row[i]))
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+                Ok(cols)
+            })
+            .await
+            .expect("re-read the quarantined row");
+        assert_eq!(
+            after, before,
+            "the quarantined row stays byte-identical after the refused batch write"
+        );
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'b2-quarantined'").await,
+            1,
+            "no forked second row with the quarantined id"
+        );
+    }
+
+    #[tokio::test]
+    async fn b2_batch_write_does_not_persist_synthesized_edge_sources() {
+        let dir = std::env::temp_dir().join(format!("ns-b2-f6-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let target = retired_test_payload("fact", "agent", json!({}));
+        store
+            .upsert("probe", "target-node", v.clone(), target)
+            .await
+            .unwrap();
+
+        let mut declarer = retired_test_payload(
+            "rule",
+            "agent",
+            json!({
+                "governs": ["target-node"],
+                "absolute_path": "src/domain.rs",
+                "file_sha256": "deadbeefcafe"
+            }),
+        );
+        declarer.location = "src/domain.rs".to_string();
+        declarer.location_lines = "10-25".to_string();
+        store
+            .upsert("probe", "declaring-rule", v.clone(), declarer)
+            .await
+            .unwrap();
+
+        let (view_vec, view_payload) = store
+            .get("probe", "declaring-rule")
+            .await
+            .unwrap()
+            .expect("declaring-rule exists");
+        assert!(
+            view_payload
+                .metadata
+                .get("edge_sources")
+                .and_then(|v| v.as_array())
+                .map_or(false, |a| !a.is_empty()),
+            "the get view must carry synthesized edge_sources, so the test is non-vacuous"
+        );
+
+        let batch = crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: vec![crate::rdf::action::StagedMemoryWrite {
+                id: "declaring-rule".to_string(),
+                vector: view_vec,
+                payload: view_payload,
+            }],
+            edge_deltas: Vec::new(),
+        };
+        store
+            .commit_action_batch("probe", batch)
+            .await
+            .expect("batch write of a get-view payload must land");
+
+        let (stored_metadata, stored_pk) = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (m:Memory) WHERE m.id = 'declaring-rule' RETURN m.metadata, m.pk",
+                )?;
+                let row = rows.next().expect("stored row");
+                Ok((format!("{}", row[0]), format!("{}", row[1])))
+            })
+            .await
+            .expect("read the stored row");
+        let stored_json: Value =
+            serde_json::from_str(&stored_metadata).expect("stored metadata is JSON");
+        assert!(
+            stored_json.get("edge_sources").is_none(),
+            "stored metadata must not persist synthesized edge_sources: {stored_metadata}"
+        );
+        assert_eq!(
+            stored_pk,
+            memory_pk("probe", "declaring-rule"),
+            "the batch write stamps the derived pk"
+        );
+
+        let (_, fetched) = store
+            .get("probe", "declaring-rule")
+            .await
+            .unwrap()
+            .expect("declaring-rule still exists");
+        assert!(
+            fetched.metadata.get("edge_sources").is_some(),
+            "get still synthesizes edge_sources at read time"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn b2_batch_write_refuses_invalid_row_pre_write() {
+        let store = t7_store().await;
+        let batch = crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: vec![crate::rdf::action::StagedMemoryWrite {
+                id: "b2-valid-id".to_string(),
+                vector: vec![0.0; 4],
+                payload: t7_payload("nope"),
+            }],
+            edge_deltas: Vec::new(),
+        };
+        let res = store.commit_action_batch("bad ns", batch).await;
+        assert!(res.is_err(), "an invalid namespace must be refused");
+        assert!(
+            res.err().unwrap().to_string().contains("NAMESPACE"),
+            "refusal names the namespace rule"
+        );
+
+        let batch = crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: vec![crate::rdf::action::StagedMemoryWrite {
+                id: "bad\u{0}id".to_string(),
+                vector: vec![0.0; 4],
+                payload: t7_payload("nope"),
+            }],
+            edge_deltas: Vec::new(),
+        };
+        let res = store.commit_action_batch("probe", batch).await;
+        assert!(res.is_err(), "a NUL-bearing id must be refused");
+        assert!(
+            res.err().unwrap().to_string().contains("NUL"),
+            "refusal names the NUL rule"
+        );
+        assert_eq!(
+            t7_count_where(&store, "m.content = 'nope'").await,
+            0,
+            "refused batch writes land nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn audit_at_init_never_blocks_open() {
         let path = std::env::temp_dir().join(format!("ns-t7-init-{}", uuid::Uuid::new_v4()));
         {
@@ -40810,16 +41038,28 @@ impl LadybugStore {
         use crate::rdf::action::{ActionError, EdgeMutationOp, ExpectedHead};
 
         let ns = namespace.to_string();
-        if ns.trim().is_empty() {
-            return Err(ActionError::Storage(
-                "namespace must be non-empty".to_string(),
-            ));
-        }
         self.guard_first_write()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         self.check_data_bearing_identity()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
 
+        // Task-7 validation (B2): the batch leg carries the same store
+        // boundary as `upsert`. The namespace is validated once here and
+        // every write is validated by `validate_action_row` before the
+        // transaction opens, so a doomed batch lands nothing. This
+        // subsumes the former lone empty-namespace check.
+        reject_nul("namespace", &ns).map_err(|e| ActionError::Storage(e.to_string()))?;
+        crate::domain::validate_namespace(&ns).map_err(ActionError::Storage)?;
+        if ns.trim().is_empty() {
+            return Err(ActionError::Storage(
+                "namespace must be non-empty".to_string(),
+            ));
+        }
+        for w in &batch.writes {
+            validate_action_row(&ns, &w.id, &w.payload)?;
+        }
+
+        let pk_ready = self.pk_ready();
         let first_write_flip = self.first_write_flip();
         let now_ts = crate::rdf::action::current_action_timestamp();
         let ontology = self.get_ontology(&ns);
@@ -40838,6 +41078,15 @@ impl LadybugStore {
                     &mut w.payload.metadata,
                     now_ts,
                 );
+            }
+            // F6 (owner ruling 2026-11-07): `edge_sources` is a system-owned,
+            // read-time-synthesized key - it is never persisted. Drop any
+            // incoming value (a get-view payload handed back by a
+            // read-modify-write producer) before the lexical doc and the
+            // staged write both derive from the payload, exactly as
+            // `upsert` does.
+            if let Some(obj) = w.payload.metadata.as_object_mut() {
+                obj.remove("edge_sources");
             }
             if w.payload.memory_type == "action_type"
                 || w.payload.memory_type == "thesis"
@@ -41207,6 +41456,7 @@ impl LadybugStore {
                             &w.vector,
                             &w.payload,
                             now_ts,
+                            pk_ready,
                         )
                         .map_err(|e| ActionError::Storage(e.to_string()))?;
                         writes_done += 1;
@@ -41378,6 +41628,45 @@ fn action_batch_fail_map() -> &'static std::sync::Mutex<std::collections::HashMa
     MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Task-7 validation for one action-batch row (B2): exactly the checks
+/// `upsert` performs at the store boundary, with the same message texts,
+/// surfaced on the batch leg's storage-error channel. Called pre-flight
+/// from `commit_action_batch` for every staged write, before the
+/// transaction opens.
+fn validate_action_row(
+    namespace: &str,
+    id: &str,
+    payload: &MemoryPayload,
+) -> std::result::Result<(), crate::rdf::action::ActionError> {
+    use crate::rdf::action::ActionError;
+
+    reject_nul("namespace", namespace).map_err(|e| ActionError::Storage(e.to_string()))?;
+    reject_nul("id", id).map_err(|e| ActionError::Storage(e.to_string()))?;
+    crate::domain::validate_namespace(namespace).map_err(ActionError::Storage)?;
+    crate::domain::validate_id(id).map_err(ActionError::Storage)?;
+    reject_nul("content", &payload.content).map_err(|e| ActionError::Storage(e.to_string()))?;
+    reject_nul("user_id", &payload.user_id).map_err(|e| ActionError::Storage(e.to_string()))?;
+    reject_nul("memory_type", &payload.memory_type)
+        .map_err(|e| ActionError::Storage(e.to_string()))?;
+    if let Some(agent_name) = &payload.agent_name {
+        reject_nul("agent_name", agent_name).map_err(|e| ActionError::Storage(e.to_string()))?;
+    }
+    reject_nul("location", &payload.location).map_err(|e| ActionError::Storage(e.to_string()))?;
+    reject_nul("location_lines", &payload.location_lines)
+        .map_err(|e| ActionError::Storage(e.to_string()))?;
+    if value_contains_nul(&payload.metadata) {
+        return Err(ActionError::Storage(
+            "ERROR [NUL]: NUL byte in metadata is refused at the store boundary".to_string(),
+        ));
+    }
+    if namespace.trim().is_empty() {
+        return Err(ActionError::Storage(
+            "namespace must be non-empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn conn_upsert_action_row(
     conn: &Connection,
     namespace: &str,
@@ -41385,8 +41674,28 @@ fn conn_upsert_action_row(
     vector: &[f32],
     payload: &MemoryPayload,
     edge_now: i64,
+    pk_ready: bool,
 ) -> Result<()> {
     let safe_id = escape_ladybug_string(id);
+    // A quarantined row (NULL namespace, per init's audit) must not be
+    // forked into a second identity by this write: refuse loudly and
+    // leave the row byte-identical for an operator to repair. The
+    // caller's transaction rolls back on this error, so the whole batch
+    // lands nothing. (Verbatim from `upsert`'s write closure.)
+    let mut held = conn.query(&format!(
+        "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace IS NULL RETURN count(m)",
+        safe_id
+    ))?;
+    let held_count = held
+        .next()
+        .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0))
+        .unwrap_or(0);
+    if held_count > 0 {
+        anyhow::bail!(
+            "write refused: id '{}' is held by a quarantined row (NULL namespace) — the quarantine is repaired by an operator, not by forking the id into a second row",
+            id
+        );
+    }
     let safe_ns = escape_ladybug_string(namespace);
     let safe_content = escape_ladybug_string(&payload.content);
     let safe_user_id = escape_ladybug_string(&payload.user_id);
@@ -41412,13 +41721,27 @@ fn conn_upsert_action_row(
             .join(",")
     );
 
-    let insert_query = format!(
-        "MERGE (m:Memory {{id: '{}'}})
-         ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-         ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
-        safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-        safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
-    );
+    // Pk stamp (B2): when init confirmed the derived pk column, supply
+    // it in both branches exactly as `upsert` does; in legacy mode the
+    // property is omitted entirely.
+    let safe_pk = escape_ladybug_string(&memory_pk(namespace, id));
+    let insert_query = if pk_ready {
+        format!(
+            "MERGE (m:Memory {{id: '{}'}})
+             ON CREATE SET m.pk = '{}', m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
+             ON MATCH SET m.pk = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+            safe_id, safe_pk, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
+            safe_pk, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+        )
+    } else {
+        format!(
+            "MERGE (m:Memory {{id: '{}'}})
+             ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
+             ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+            safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
+            safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+        )
+    };
     conn.query(&insert_query)?;
 
     for edge in edge_specs(&payload.metadata) {
