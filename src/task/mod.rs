@@ -17,8 +17,8 @@ pub mod wiring;
 
 use crate::formal_kernel::{evaluate_claim_decision, KernelClaimDecision};
 use crate::judgment::DeduplicationChecker;
-use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use crate::store::LadybugStore;
+use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use intake::undisposed_high_confidence_obligations;
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
@@ -255,6 +255,8 @@ pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
         "task_type": field("task_type"),
         "assignee": field("assignee"),
         "session_id": field("session_id"),
+        "branch": field("branch"),
+        "worktree": field("worktree"),
         "labels": field("labels"),
         "blocked_by": field("blocked_by"),
         "description": field("description"),
@@ -480,14 +482,8 @@ fn scan_for_task_update(title: &str, metadata: &Value) -> Option<String> {
 }
 
 /// Memory types treated as normative (governing constraints) for reserved slots.
-const NORMATIVE_MEMORY_TYPES: &[&str] = &[
-    "rule",
-    "fact",
-    "decision",
-    "procedure",
-    "thesis",
-    "concept",
-];
+const NORMATIVE_MEMORY_TYPES: &[&str] =
+    &["rule", "fact", "decision", "procedure", "thesis", "concept"];
 /// Memory types treated as structural evidence anchors.
 const STRUCTURAL_MEMORY_TYPES: &[&str] = &["code_ast", "doc_section"];
 /// Max normative memories reserved in `auto_retrieved_context`.
@@ -497,7 +493,13 @@ const MAX_STRUCTURAL_ANCHORS: usize = 3;
 /// Max cross-domain conceptual bridges emitted per task context.
 const MAX_CONCEPTUAL_BRIDGES: usize = 2;
 /// Relations traversed when synthesising 2-hop conceptual bridges.
-const BRIDGE_RELATIONS: &[&str] = &["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
+const BRIDGE_RELATIONS: &[&str] = &[
+    "GOVERNS",
+    "CONTAINS",
+    "RELATES_TO",
+    "EXTRACTED_FROM",
+    "DEPENDS_ON",
+];
 
 fn is_normative_memory(memory_type: &str) -> bool {
     NORMATIVE_MEMORY_TYPES.contains(&memory_type)
@@ -799,13 +801,17 @@ pub async fn build_task_graph_context(
     // Partition the retrieved items into reserved normative memories and structural anchors.
     let normative_memories: Vec<Value> = hits_json
         .iter()
-        .filter(|h| is_normative_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .filter(|h| {
+            is_normative_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or(""))
+        })
         .take(MAX_NORMATIVE_MEMORIES)
         .cloned()
         .collect();
     let structural_anchors: Vec<Value> = hits_json
         .iter()
-        .filter(|h| is_structural_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .filter(|h| {
+            is_structural_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or(""))
+        })
         .take(MAX_STRUCTURAL_ANCHORS)
         .cloned()
         .collect();
@@ -935,13 +941,14 @@ async fn synthesize_conceptual_bridges(
                 // The via is whichever endpoint sits at hop 1; the target is the
                 // other endpoint (the edge may be stored in either orientation
                 // under Direction::Both, so do not assume edge.source is the via).
-                let (via_id, target_id) = if hop1_ids.contains(a) && b != seed_id && !hop1_ids.contains(b) {
-                    (a, b)
-                } else if hop1_ids.contains(b) && a != seed_id && !hop1_ids.contains(a) {
-                    (b, a)
-                } else {
-                    continue;
-                };
+                let (via_id, target_id) =
+                    if hop1_ids.contains(a) && b != seed_id && !hop1_ids.contains(b) {
+                        (a, b)
+                    } else if hop1_ids.contains(b) && a != seed_id && !hop1_ids.contains(a) {
+                        (b, a)
+                    } else {
+                        continue;
+                    };
                 if seen_targets.contains(target_id) {
                     continue;
                 }
@@ -954,13 +961,12 @@ async fn synthesize_conceptual_bridges(
                 }
                 // Fetch the target row so its full metadata (domain, tags,
                 // governs, location) is available for token extraction.
-                let target_metadata = if let Ok(Some((_, payload))) =
-                    ladybug.get(namespace, target_id).await
-                {
-                    payload.metadata
-                } else {
-                    Value::Null
-                };
+                let target_metadata =
+                    if let Ok(Some((_, payload))) = ladybug.get(namespace, target_id).await {
+                        payload.metadata
+                    } else {
+                        Value::Null
+                    };
                 let target_location = target_metadata
                     .get("location")
                     .and_then(|v| v.as_str())
@@ -982,8 +988,7 @@ async fn synthesize_conceptual_bridges(
                     }
                 }
                 seen_targets.insert(target_id.to_string());
-                let why_connected =
-                    format!("{} -> {} -> {}", seed_id, via_id, target_id);
+                let why_connected = format!("{} -> {} -> {}", seed_id, via_id, target_id);
                 bridges.push(json!({
                     "id": target_node.id,
                     "memory_type": target_node.memory_type,
@@ -1042,6 +1047,47 @@ pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f6
     }
 }
 
+#[cfg(test)]
+static RECORDED_GRAPH_QUERIES: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(String, String, String)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub fn clear_recorded_graph_queries_for_tests() {
+    let mutex = RECORDED_GRAPH_QUERIES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut guard) = mutex.lock() {
+        guard.clear();
+    }
+}
+
+#[cfg(test)]
+pub fn recorded_graph_queries_for_tests() -> Vec<(String, String, String)> {
+    let mutex = RECORDED_GRAPH_QUERIES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    mutex.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Resolve a caller directory (which may be a subdirectory of a Git worktree)
+/// to its enclosing worktree/project root so `.NeuroStrata/active_session.json`
+/// and `.NeuroStrata/session_queries.json` are always read and written at the
+/// worktree root rather than a nested subdirectory.
+pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(wt) = gate::GateScope::capture(dir).worktree {
+        return std::path::PathBuf::from(wt);
+    }
+    let mut cur = if dir.is_dir() {
+        Some(dir)
+    } else {
+        dir.parent()
+    };
+    while let Some(d) = cur {
+        if d.join(".git").exists() || d.join(".NeuroStrata").exists() {
+            return d.to_path_buf();
+        }
+        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    dir.to_path_buf()
+}
+
 /// Record a graph or memory lookup against any active `in_progress` task in
 /// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
 /// root is known.
@@ -1051,7 +1097,27 @@ pub async fn record_graph_query(
     tool_name: &str,
     query_hint: &str,
 ) {
+    record_graph_query_with_root(store, namespace, tool_name, query_hint, None).await;
+}
+
+/// Like [`record_graph_query`], but prefers an explicit caller root
+/// (`project_root` / `worktree` / `cwd`) or an absolute `query_hint`'s enclosing
+/// git worktree over the shared namespace registry row's `project_root`.
+pub async fn record_graph_query_with_root(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
+) {
     let ns = crate::server::resolve_namespace(store, namespace).await;
+    #[cfg(test)]
+    {
+        let mutex = RECORDED_GRAPH_QUERIES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        if let Ok(mut guard) = mutex.lock() {
+            guard.push((ns.clone(), tool_name.to_string(), query_hint.to_string()));
+        }
+    }
     // This runs on every graph-first lookup. It used to list the WHOLE
     // namespace each time (+50 to +300 MB per call in the daemon log); name only the rows it needs: the task rows, the
     // registry row by its fixed id, and directory rows only when the registry
@@ -1060,23 +1126,50 @@ pub async fn record_graph_query(
         return;
     };
     let now = chrono::Utc::now().timestamp();
-    let entry_str = format!(
-        "{}:{}",
-        tool_name,
-        query_hint.chars().take(80).collect::<String>()
-    );
-    let mut project_root: Option<String> = None;
-    if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
-        if crate::registry::is_registry_row(&registry.metadata) {
-            if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
-                project_root = Some(p.to_string());
+    let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
+    let mut project_root: Option<String> = caller_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            resolve_session_root_dir(std::path::Path::new(s))
+                .to_string_lossy()
+                .into_owned()
+        });
+    if project_root.is_none() {
+        let hint_path = std::path::Path::new(query_hint);
+        if hint_path.is_absolute() {
+            let mut cur = if hint_path.is_dir() {
+                Some(hint_path)
+            } else {
+                hint_path.parent()
+            };
+            while let Some(dir) = cur {
+                if dir.join(".git").exists() || dir.join(".NeuroStrata").exists() {
+                    project_root = Some(dir.to_string_lossy().to_string());
+                    break;
+                }
+                cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+            }
+        }
+    }
+    if project_root.is_none() {
+        if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
+            if crate::registry::is_registry_row(&registry.metadata) {
+                if let Some(p) = registry.metadata.get("project_root").and_then(|v| v.as_str()) {
+                    project_root = Some(p.to_string());
+                }
             }
         }
     }
     if project_root.is_none() {
         if let Ok(dirs) = store.list(&ns, None, Some("directory")).await {
             for d in &dirs {
-                if let Some(p) = d.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
+                if let Some(p) = d
+                    .payload
+                    .metadata
+                    .get("absolute_path")
+                    .and_then(|v| v.as_str())
+                {
                     if std::path::Path::new(p).join(".git").exists() {
                         project_root = Some(p.to_string());
                         break;
@@ -1399,16 +1492,17 @@ async fn resolve_task_scope(
     let daemon_root = crate::daemon::resolve_project_root();
 
     let mut candidates = Vec::new();
-    if let Some(r) = explicit_root {
-        candidates.push(r);
-    }
-    if let Some(r) = registry_root {
-        if !candidates.contains(&r) {
-            candidates.push(r);
+    if let Some(ref r) = explicit_root {
+        candidates.push(r.clone());
+    } else {
+        if let Some(r) = registry_root {
+            if !candidates.contains(&r) {
+                candidates.push(r);
+            }
         }
-    }
-    if !candidates.contains(&daemon_root) {
-        candidates.push(daemon_root.clone());
+        if !candidates.contains(&daemon_root) {
+            candidates.push(daemon_root.clone());
+        }
     }
 
     let mut chosen_root = candidates
@@ -1428,12 +1522,12 @@ async fn resolve_task_scope(
         scope.branch = Some(explicit_branch.to_string());
     }
     if scope.worktree.is_none() {
-        if let Some(explicit_wt) = arg_str(args, "worktree") {
-            let wt_path = std::path::PathBuf::from(explicit_wt);
-            let canonical = wt_path
+        if let Some(ref explicit_wt) = explicit_root {
+            let root_dir = resolve_session_root_dir(explicit_wt);
+            let canonical = root_dir
                 .canonicalize()
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| explicit_wt.to_string());
+                .unwrap_or_else(|_| root_dir.to_string_lossy().into_owned());
             scope.worktree = Some(canonical);
         }
     }
@@ -1491,7 +1585,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let mut age: Option<i64> = None;
     if from == Status::InProgress && !same_session {
         let now = chrono::Utc::now().timestamp();
-        age = gate::age_secs(task.payload.metadata.get("task"), &["updated_at", "created_at"], now);
+        age = gate::age_secs(
+            task.payload.metadata.get("task"),
+            &["updated_at", "created_at"],
+            now,
+        );
         if age.is_none() {
             tracing::warn!(
                 "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
@@ -1646,19 +1744,40 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     {
         return e;
     }
-    let rid = crate::registry::registry_row_id(&namespace);
-    if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
-        if let Some(pr) = reg_p.metadata.get("project_root").and_then(|v| v.as_str()) {
-            let golden = collect_golden_rules(&store, &namespace, None).await;
-            persist_active_session_file(
-                std::path::Path::new(pr),
-                &namespace,
-                &golden,
-                Some((&id, &task.payload)),
-            );
+    // Write active_session.json into the caller's own worktree, not the global
+    // registry root: explicit worktree/project_root/cwd wins; otherwise use the
+    // registry project_root. Never fall back to daemon_root here -- a worktree
+    // caller without a registry root must not write into the daemon checkout.
+    let explicit_root = arg_str(&args, "worktree")
+        .or_else(|| arg_str(&args, "project_root"))
+        .or_else(|| arg_str(&args, "cwd"))
+        .map(std::path::PathBuf::from);
+    let session_root = if let Some(ref exp) = explicit_root {
+        scope
+            .worktree
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(resolve_session_root_dir(exp)))
+    } else {
+        let rid = crate::registry::registry_row_id(&namespace);
+        if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
+            reg_p
+                .metadata
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(std::path::PathBuf::from)
+        } else {
+            None
         }
+    };
+    if let Some(root) = session_root {
+        let golden = collect_golden_rules(&store, &namespace, None).await;
+        persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
     }
-    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
+    let event_id = arg_str(&args, "event_id")
+        .unwrap_or(&format!("claim-{}", id))
+        .to_string();
     {
         let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         let binding = crate::task::receipt::Receipt::capture(&id, &scope_root);
@@ -2229,7 +2348,8 @@ pub async fn handle_task_complete(
 
     // M3: optional inline follow_up_tasks. Validate everything before any
     // mutation so a bad entry cannot leave the parent half-completed.
-    let mut follow_up_specs: Vec<(String, Option<String>, String, i64, Vec<String>)> = Vec::new();
+    type FollowUpSpec = (String, Option<String>, String, i64, Vec<String>);
+    let mut follow_up_specs: Vec<FollowUpSpec> = Vec::new();
 
     // Task intent enforcement: reject if intent markers present without follow_up_tasks or task ID citation
     let mut full_text = String::new();
@@ -2344,7 +2464,7 @@ pub async fn handle_task_complete(
     let intake_store = store.as_intake_store();
     if let Some(intake) = intake_store {
         let obligations =
-            undisposed_high_confidence_obligations(&*intake, &namespace, None, Some(id.as_str()))
+            undisposed_high_confidence_obligations(intake, &namespace, None, Some(id.as_str()))
                 .await
                 .unwrap_or_default();
         if !obligations.is_empty() {
@@ -2503,9 +2623,7 @@ pub async fn handle_task_complete(
             if !meta
                 .get("extracted_from")
                 .and_then(|v| v.as_array())
-                .map_or(false, |arr| {
-                    arr.iter().any(|t| t.as_str() == Some(id.as_str()))
-                })
+                .is_some_and(|arr| arr.iter().any(|t| t.as_str() == Some(id.as_str())))
             {
                 match meta.get_mut("extracted_from") {
                     None => meta["extracted_from"] = json!([id.as_str()]),
@@ -3359,7 +3477,7 @@ case "$ROOT" in
 esac
 fold_case() {
     if [ "$FOLD" = "1" ]; then
-        printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'
+        printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
     else
         printf '%s' "$1"
     fi
@@ -3380,6 +3498,14 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
             *) StagedFiles+=("$file") ;;
         esac
     done < <(git diff --name-only -z 2>/dev/null)
+fi
+
+# ── Project quality gate (optional; only when the project ships a runner) ────
+# When scripts/check-staged-quality.sh exists it runs the project's staged
+# formatting/lint checks. Any nonzero exit aborts the hook before the ledger
+# is written, so a failed quality gate never records a lookup.
+if [ -f "$ROOT/scripts/check-staged-quality.sh" ]; then
+    bash "$ROOT/scripts/check-staged-quality.sh" || exit $?
 fi
 
 # ── Path normalization for ledger matching ─────────────────────────────────
@@ -3648,7 +3774,7 @@ with open(ledger, "w") as f:
         printf '%s\n' "${MissingFiles[@]}" > "$FILELIST"
         export FILELIST
         TMP=$(mktemp)
-        awk '
+        if awk '
           function json_escape(s,    i, n, c, out) {
             out = ""
             n = length(s)
@@ -3750,7 +3876,11 @@ with open(ledger, "w") as f:
             print "  ]"
             print "}"
           }
-        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
+        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER"; then
+            :
+        else
+            rm -f "$TMP"
+        fi
         rm -f "$FILELIST"
     fi
 fi
@@ -3854,21 +3984,18 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
         if pc_content.contains("NeuroStrata pre-commit hook")
             && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK
+            && std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
+            && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
         {
-            if std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
-                && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
-            {
-                set_executable(&pre_commit_target);
-            }
+            set_executable(&pre_commit_target);
         }
     }
     let repo_scripts_hooks = root.join("scripts/hooks");
     if repo_scripts_hooks.is_dir() {
         let repo_pc = repo_scripts_hooks.join("pre-commit");
-        let needs_repo_pc = std::fs::read_to_string(&repo_pc)
-            .map(|c| c != SCAFFOLDED_PRE_COMMIT_HOOK)
-            .unwrap_or(true);
-        if needs_repo_pc && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+        // The repo-side hook is tracked. Only seed it when absent: an older
+        // binary must never clobber a newer checked-in hook or local edits.
+        if !repo_pc.exists() && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
             set_executable(&repo_pc);
         }
     }
@@ -4317,7 +4444,7 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
         }
         scan.language_counts.push((lang.to_string(), *n));
     }
-    scan.language_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    scan.language_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
     // Manifest-detected languages with no counted files sort last, keeping the
     // order meaningful for everything suggested_rules derives from it.
     scan.languages.sort_by_key(|l| {
@@ -5456,6 +5583,28 @@ mod tests {
         }
     }
 
+    /// The pre-commit hook is authored twice: the checked-in file the installer
+    /// copies into `.git/hooks`, and the copy embedded in the binary for fresh
+    /// projects. If the two drift, an installed project runs a different gate
+    /// than the one reviewed in the repository — so they must stay byte-identical,
+    /// and both must delegate to the project's staged-quality runner when one
+    /// exists.
+    #[test]
+    fn pre_commit_hook_sources_stay_byte_identical() {
+        let checked_in = include_str!("../../scripts/hooks/pre-commit");
+        if SCAFFOLDED_PRE_COMMIT_HOOK != checked_in {
+            panic!(
+                "embedded pre-commit hook ({} bytes) differs from scripts/hooks/pre-commit ({} bytes)",
+                SCAFFOLDED_PRE_COMMIT_HOOK.len(),
+                checked_in.len()
+            );
+        }
+        assert!(
+            checked_in.contains("scripts/check-staged-quality.sh"),
+            "the pre-commit hook must delegate to the project's staged-quality runner"
+        );
+    }
+
     /// A store whose `namespace` already holds one rule, so the namespace
     /// exists for task_create's existence check.
     async fn store_with_namespace(namespace: &str) -> Arc<dyn VectorStore> {
@@ -6576,26 +6725,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn claim_stamps_the_current_branch_and_worktree() {
+    #[test]
+    fn claim_stamps_the_current_branch_and_worktree() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
 
-        let reply = handle_task_claim(
-            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
-            store.clone(),
-        )
-        .await;
-        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            let reply = handle_task_claim(
+                json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+                store.clone(),
+            )
+            .await;
+            assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!(expected.worktree)
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!(expected.worktree)
+            );
+        });
     }
 
     #[tokio::test]
@@ -6672,6 +6824,168 @@ mod tests {
     }
 
     #[test]
+    fn task_summary_exposes_branch_and_worktree() {
+        let payload = MemoryPayload {
+            content: "scoped work".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "task": {
+                    "status": "in_progress",
+                    "branch": "feature/scope",
+                    "worktree": "/wt/scope",
+                }
+            }),
+        };
+        let summary = task_summary("neurostrata-test", &payload);
+        assert_eq!(summary["branch"], json!("feature/scope"));
+        assert_eq!(summary["worktree"], json!("/wt/scope"));
+    }
+
+    #[tokio::test]
+    async fn task_list_includes_branch_and_worktree() {
+        let store = store_with_namespace("MyProj").await;
+        let id = "task-scope-fields";
+        let vector = StubEmbedder.embed("scope fields").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                id,
+                vector,
+                MemoryPayload {
+                    content: "scope fields".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "task": {
+                            "status": "in_progress",
+                            "branch": "feature/scope",
+                            "worktree": "/wt/scope",
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let list: Value = serde_json::from_str(
+            &handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await,
+        )
+        .unwrap();
+        assert_eq!(list["tasks"][0]["branch"], json!("feature/scope"));
+        assert_eq!(list["tasks"][0]["worktree"], json!("/wt/scope"));
+    }
+
+    #[tokio::test]
+    async fn claim_writes_active_session_to_explicit_cwd_not_registry_root() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "project_root": dir_a.path().to_string_lossy().to_string()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let id = create_task(&store, "MyProj", "scope me", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent",
+                "session_id": "ses_wt",
+                "cwd": dir_b.path().to_string_lossy().to_string(),
+            }),
+            store.clone(),
+        )
+        .await;
+
+        let b_session = dir_b.path().join(".NeuroStrata").join("active_session.json");
+        let a_session = dir_a.path().join(".NeuroStrata").join("active_session.json");
+        assert!(
+            b_session.exists(),
+            "active_session.json must be written in the explicit cwd dir_b"
+        );
+        assert!(
+            !a_session.exists(),
+            "must not write into the registry project_root dir_a"
+        );
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(&b_session).unwrap()).unwrap();
+        assert_eq!(body["task_id"], json!(id));
+
+        let expected_wt = dir_b
+            .path()
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| dir_b.path().to_string_lossy().into_owned());
+        let (_, claimed_payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(
+            claimed_payload.metadata["task"]["worktree"],
+            json!(expected_wt),
+            "non-git explicit cwd must bind task worktree to dir_b rather than falling through to registry_root or daemon_root"
+        );
+        assert_eq!(
+            claimed_payload.metadata["task"]["branch"],
+            Value::Null,
+            "non-git explicit cwd without branch arg must not inherit daemon_root branch"
+        );
+
+        // When the proxy runs from a subdirectory of a Git worktree, `cwd` is
+        // that subdirectory, while `active_session.json` must still be written
+        // at the worktree root so plugin readers at the project root find it.
+        let wt_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt_dir.path().join(".git")).unwrap();
+        let nested_cwd = wt_dir.path().join("crates").join("sub");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        let id2 = create_task(&store, "MyProj", "scope nested cwd", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id2,
+                "assignee": "agent",
+                "session_id": "ses_nested",
+                "cwd": nested_cwd.to_string_lossy().to_string(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let root_session = wt_dir.path().join(".NeuroStrata").join("active_session.json");
+        let nested_session = nested_cwd.join(".NeuroStrata").join("active_session.json");
+        assert!(
+            root_session.exists(),
+            "active_session.json must be written at the enclosing worktree root"
+        );
+        assert!(
+            !nested_session.exists(),
+            "active_session.json must not be stranded in a nested subdirectory"
+        );
+    }
+
+    #[test]
     fn zero_action_exempt_shell_payload_allows_git_push_and_rejects_mutations() {
         assert!(crate::server::is_zero_action_exempt_shell_payload(
             "bash",
@@ -6689,6 +7003,23 @@ mod tests {
             "bash",
             "neurostrata-mcp task gate NeuroStrata --strict"
         ));
+        for force_push in [
+            "git push --force",
+            "git push -f",
+            "git push -fv origin main",
+            "git push -vf",
+            "git push -uf",
+            "git push origin +main",
+            "git push --mirror",
+            "git push --delete origin main",
+            "git push --prune",
+            "git push --force-with-lease=origin",
+        ] {
+            assert!(
+                !crate::server::is_zero_action_exempt_shell_payload("bash", force_push),
+                "force-push must still require an active task: {force_push}"
+            );
+        }
         assert!(!crate::server::is_zero_action_exempt_shell_payload(
             "bash",
             "git commit -m 'mutate history'"
@@ -6795,45 +7126,48 @@ mod tests {
         assert_eq!(task_meta["session_id"], json!("ses_other"));
     }
 
-    #[tokio::test]
-    async fn task_update_claim_stamps_scope_for_the_strict_gate() {
+    #[test]
+    fn task_update_claim_stamps_scope_for_the_strict_gate() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
 
-        let reply = handle_task_update(
-            json!({
-                "namespace": "MyProj",
-                "id": id,
-                "status": "in_progress",
-                "assignee": "agent-a",
-                "session_id": "ses_a"
-            }),
-            emb(),
-            store.clone(),
-        )
-        .await;
-        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            let reply = handle_task_update(
+                json!({
+                    "namespace": "MyProj",
+                    "id": id,
+                    "status": "in_progress",
+                    "assignee": "agent-a",
+                    "session_id": "ses_a"
+                }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+            assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
 
-        let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
-            .await
-            .unwrap();
-        assert!(same_scope
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
-        let independent = gate::GateScope {
-            branch: Some("feature/independent".to_string()),
-            worktree: Some("/repo/independent".to_string()),
-        };
-        let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
-            .await
-            .unwrap();
-        assert!(!other_scope
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
+            let same_scope = gate::run_scoped(&store, "MyProj", Some(&expected))
+                .await
+                .unwrap();
+            assert!(same_scope
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"));
+            let independent = gate::GateScope {
+                branch: Some("feature/independent".to_string()),
+                worktree: Some("/repo/independent".to_string()),
+            };
+            let other_scope = gate::run_scoped(&store, "MyProj", Some(&independent))
+                .await
+                .unwrap();
+            assert!(!other_scope
+                .violations
+                .iter()
+                .any(|v| v.kind == "in_progress"));
+        });
     }
 
     #[tokio::test]
@@ -6980,67 +7314,70 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
+    #[test]
+    fn same_session_reclaim_backfills_missing_legacy_attribution_and_preserves_existing() {
         let _env_guard = crate::daemon::project_root_env_test_lock();
-        let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the work", 2).await;
-        let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = store_with_namespace("MyProj").await;
+            let id = create_task(&store, "MyProj", "the work", 2).await;
+            let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
 
-        handle_task_claim(args.clone(), store.clone()).await;
+            handle_task_claim(args.clone(), store.clone()).await;
 
-        // Simulate a legacy row: attribution dropped, claim intact.
-        let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]
-            .as_object_mut()
-            .unwrap()
-            .remove("branch");
-        payload.metadata["task"]
-            .as_object_mut()
-            .unwrap()
-            .remove("worktree");
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            // Simulate a legacy row: attribution dropped, claim intact.
+            let expected = gate::GateScope::capture(&crate::daemon::resolve_project_root());
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("branch");
+            payload.metadata["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("worktree");
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
 
-        let backfill = handle_task_claim(args.clone(), store.clone()).await;
-        assert!(
-            backfill.contains("already claimed by this session"),
-            "{}",
-            backfill
-        );
+            let backfill = handle_task_claim(args.clone(), store.clone()).await;
+            assert!(
+                backfill.contains("already claimed by this session"),
+                "{}",
+                backfill
+            );
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(
-            payload.metadata["task"]["branch"],
-            json!(expected.branch),
-            "legacy branch attribution must be backfilled"
-        );
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!(expected.worktree),
-            "legacy worktree attribution must be backfilled"
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(
+                payload.metadata["task"]["branch"],
+                json!(expected.branch),
+                "legacy branch attribution must be backfilled"
+            );
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!(expected.worktree),
+                "legacy worktree attribution must be backfilled"
+            );
 
-        // Idempotency: an already-attributed row keeps its exact attribution.
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]["branch"] = json!("legacy/branch");
-        payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            // Idempotency: an already-attributed row keeps its exact attribution.
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]["branch"] = json!("legacy/branch");
+            payload.metadata["task"]["worktree"] = json!("/legacy/worktree");
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
 
-        let again = handle_task_claim(args, store.clone()).await;
-        assert!(
-            again.contains("already claimed by this session"),
-            "{}",
-            again
-        );
+            let again = handle_task_claim(args, store.clone()).await;
+            assert!(
+                again.contains("already claimed by this session"),
+                "{}",
+                again
+            );
 
-        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
-        assert_eq!(
-            payload.metadata["task"]["worktree"],
-            json!("/legacy/worktree"),
-            "existing attribution must not be overwritten"
-        );
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            assert_eq!(payload.metadata["task"]["branch"], json!("legacy/branch"));
+            assert_eq!(
+                payload.metadata["task"]["worktree"],
+                json!("/legacy/worktree"),
+                "existing attribution must not be overwritten"
+            );
+        });
     }
 
     #[tokio::test]
@@ -7176,7 +7513,7 @@ mod tests {
                 confidence: Some(0.9),
                 source_span: None,
                 provenance: Some(
-                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap(),
                 ),
                 extractor_fingerprint: None,
             })
@@ -7197,7 +7534,10 @@ mod tests {
             err.starts_with("BLOCKED (Lock 2 — Task Obligation)"),
             "wrong message: {err}"
         );
-        assert!(err.contains("Fix login bug"), "names obligation title: {err}");
+        assert!(
+            err.contains("Fix login bug"),
+            "names obligation title: {err}"
+        );
         assert!(
             err.contains("neurostrata_task_candidates action: \"resolve\""),
             "names resolve action: {err}"
@@ -7236,7 +7576,7 @@ mod tests {
                 confidence: Some(0.9),
                 source_span: None,
                 provenance: Some(
-                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap(),
                 ),
                 extractor_fingerprint: None,
             })
@@ -9658,9 +9998,11 @@ mod tests {
             metadata: json!({}),
         };
         let (ctx, prompt) =
-            build_task_graph_context(&store, "probe", "task-1", &vec![0.0f32; 4], &payload).await;
+            build_task_graph_context(&store, "probe", "task-1", &[0.0f32; 4], &payload).await;
 
-        let obj = ctx.as_object().expect("auto_retrieved_context is an object");
+        let obj = ctx
+            .as_object()
+            .expect("auto_retrieved_context is an object");
         for key in [
             "query",
             "items",
@@ -9680,7 +10022,8 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("normative_memories is an array");
         assert!(
-            nm.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-rule-m1")),
+            nm.iter()
+                .any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-rule-m1")),
             "M1 rule must be in normative_memories: {nm:?}"
         );
         assert!(
@@ -9693,17 +10036,27 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("structural_anchors is an array");
         assert!(
-            sa.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-file-b")),
+            sa.iter()
+                .any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-file-b")),
             "file B must be in structural_anchors: {sa:?}"
         );
-        assert!(sa.len() <= MAX_STRUCTURAL_ANCHORS, "structural_anchors within cap: {sa:?}");
+        assert!(
+            sa.len() <= MAX_STRUCTURAL_ANCHORS,
+            "structural_anchors within cap: {sa:?}"
+        );
 
         let cb = obj
             .get("conceptual_bridges")
             .and_then(|v| v.as_array())
             .expect("conceptual_bridges is an array");
-        assert!(!cb.is_empty(), "conceptual_bridges should be non-empty: {cb:?}");
-        assert!(cb.len() <= MAX_CONCEPTUAL_BRIDGES, "conceptual_bridges within cap: {cb:?}");
+        assert!(
+            !cb.is_empty(),
+            "conceptual_bridges should be non-empty: {cb:?}"
+        );
+        assert!(
+            cb.len() <= MAX_CONCEPTUAL_BRIDGES,
+            "conceptual_bridges within cap: {cb:?}"
+        );
         let bridge = cb.first().expect("at least one bridge");
         assert_eq!(
             bridge.get("id").and_then(|v| v.as_str()),
@@ -9711,7 +10064,10 @@ mod tests {
             "bridge target must be M1: {bridge:?}"
         );
         assert!(
-            bridge.get("why_connected").and_then(|v| v.as_str()).is_some(),
+            bridge
+                .get("why_connected")
+                .and_then(|v| v.as_str())
+                .is_some(),
             "bridge carries why_connected: {bridge:?}"
         );
 
@@ -9719,7 +10075,10 @@ mod tests {
             prompt.contains("### Cross-Domain Bridges"),
             "prompt has Cross-Domain Bridges section: {prompt}"
         );
-        assert!(prompt.contains("mem-rule-m1"), "prompt references M1: {prompt}");
+        assert!(
+            prompt.contains("mem-rule-m1"),
+            "prompt references M1: {prompt}"
+        );
     }
 
     #[tokio::test]
@@ -9735,7 +10094,8 @@ mod tests {
                 "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8",
                 vec![0.9f32; 4],
                 MemoryPayload {
-                    content: "RULE: The user has a strong preference AGAINST using Python.".to_string(),
+                    content: "RULE: The user has a strong preference AGAINST using Python."
+                        .to_string(),
                     user_id: "owner".to_string(),
                     memory_type: "fact".to_string(),
                     agent_name: None,
@@ -9776,7 +10136,7 @@ mod tests {
             metadata: json!({}),
         };
         let (ctx, prompt) =
-            build_task_graph_context(&store, "probe", "task-1", &vec![0.1f32; 4], &payload).await;
+            build_task_graph_context(&store, "probe", "task-1", &[0.1f32; 4], &payload).await;
 
         assert!(
             prompt.contains("bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8")
@@ -9791,7 +10151,9 @@ mod tests {
             .as_array()
             .expect("auto_retrieved_context.golden_rules array");
         assert!(
-            golden.iter().any(|g| g["id"] == "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8"),
+            golden
+                .iter()
+                .any(|g| g["id"] == "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8"),
             "golden_rules must include global rule: {golden:?}"
         );
         assert!(

@@ -225,6 +225,7 @@ fn exact_match_predicates_match_exactly_and_nothing_else() {
         memory_types: vec!["fact".to_string()],
         fact_shape: None,
         path_prefix: None,
+        path_prefix_forms: Vec::new(),
         exclude_stale: false,
         include_code_ast: false,
     };
@@ -241,6 +242,7 @@ fn exact_match_predicates_match_exactly_and_nothing_else() {
         memory_types: vec![],
         fact_shape: None,
         path_prefix: None,
+        path_prefix_forms: Vec::new(),
         exclude_stale: false,
         include_code_ast: true,
     };
