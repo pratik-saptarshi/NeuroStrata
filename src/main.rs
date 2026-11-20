@@ -5300,6 +5300,35 @@ mod tests {
         }
     }
 
+    /// An embedder serving ModelA at the fixture width: the positive
+    /// control counterpart to `FallbackModelBEmbedder`, mirroring its
+    /// descriptor shape with the model the B9 seed store records.
+    struct FallbackModelAEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for FallbackModelAEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.1, 0.2, 0.3, 0.4])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embedder_id(&self) -> &str {
+            "ModelA"
+        }
+        fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+            crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }
+        }
+    }
+
     /// Regression test for issue #75 (Codex finding T6 on PR #66): the
     /// daemon-stopped fallback `add` on a store recorded pristine
     /// under the default model, after the user configured a different
@@ -5727,6 +5756,301 @@ mod tests {
             Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
             None => std::env::remove_var("NEUROSTRATA_MODEL"),
         }
+    }
+
+    /// B9 (T5): the fallback `Commands::VaultSync` arm builds a live
+    /// embedder and hands it to `handle_vault_sync`; it must bind the
+    /// store's serving descriptor to that embedder first, exactly as
+    /// the sibling fallback arms do. Without the bind the store stays
+    /// unbound, `check_data_bearing_identity` passes vacuously, and a
+    /// vault import into a data-bearing store recorded under a
+    /// different model (same width included) silently lands freshly
+    /// embedded vectors from the wrong model. The arms are not
+    /// invocable through `run()`, so this test replays the arm's
+    /// call sequence at the seam: bind, then `handle_vault_sync`
+    /// import. The wiring guard below proves the arm itself binds.
+    #[tokio::test]
+    async fn b9_vault_sync_import_into_data_bearing_store_refuses_mismatched_bound_embedder() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-b9-mismatch-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let db_path = root.join("ladybug.db");
+        let ns = "vault_b9";
+
+        // Seed a data-bearing store recorded under ModelA: one upsert
+        // flips the sidecar to has_data under ModelA's descriptor.
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init(ns).await.expect("seed init");
+        seed.upsert(
+            ns,
+            "b9-seed-row",
+            vec![0.1, 0.2, 0.3, 0.4],
+            payload("seed row recorded under ModelA"),
+        )
+        .await
+        .expect("seed upsert");
+        drop(seed);
+        let sidecar_content =
+            std::fs::read_to_string(crate::model_choice::store_state_path(&db_path))
+                .expect("sidecar exists");
+        let sidecar: serde_json::Value = serde_json::from_str(&sidecar_content).unwrap();
+        assert_eq!(sidecar["has_data"], serde_json::json!(true));
+        assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
+
+        // A one-note vault on disk, written directly as Markdown.
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut note = crate::vault_ld::VaultNote {
+            id: "b9-imported-note".to_string(),
+            rdf_type: "yaml:fact".to_string(),
+            context: crate::vault_ld::YAML_LD_CONTEXT.to_string(),
+            epistemic_tier: "fact".to_string(),
+            canonical_sha256: String::new(),
+            related: Vec::new(),
+            content: "a note imported by the fallback vault sync".to_string(),
+        };
+        note.canonical_sha256 = note.fingerprint();
+        std::fs::write(vault.join("b9-imported-note.md"), note.to_markdown()).unwrap();
+
+        // Reopen unbound, exactly as the fallback group constructs its
+        // store, then replay the arm's fixed sequence: build the
+        // configured (ModelB) embedder, bind its descriptor, dispatch.
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        bind_fallback_serving_descriptor(&vector_store, &embedder);
+        let principal: Option<String> = None;
+        let args = serde_json::json!({
+            "action": "import",
+            "namespace": ns,
+            "vault_path": vault.to_string_lossy(),
+            "output_dir": vault.to_string_lossy(),
+            "principal": principal,
+        });
+        let response = crate::vault_ld::vault_sync::handle_vault_sync(
+            &args,
+            vector_store.clone(),
+            embedder,
+            Some(root.clone()),
+            None,
+        )
+        .await;
+        let out: crate::vault_ld::vault_sync::VaultImportResult =
+            serde_json::from_str(&response).expect("valid import result");
+        assert!(
+            !out.success,
+            "the mismatched import must be refused: {out:?}"
+        );
+        assert_eq!(out.notes_imported, 0);
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("refusing to open a store that has recorded data")),
+            "the refusal names the data-bearing identity check: {:?}",
+            out.errors
+        );
+        assert!(
+            vector_store
+                .get(ns, "b9-imported-note")
+                .await
+                .expect("get the imported note")
+                .is_none(),
+            "no vector from the wrong model lands"
+        );
+        let (_, seed_row) = vector_store
+            .get(ns, "b9-seed-row")
+            .await
+            .expect("get the seed row")
+            .expect("the seed row exists");
+        assert_eq!(seed_row.content, "seed row recorded under ModelA");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// B9 positive control: the same arm sequence with the embedder
+    /// matching the store's recorded model imports normally — the
+    /// bind must refuse only a genuine identity mismatch, never
+    /// vault import under a correct binding.
+    #[tokio::test]
+    async fn b9_vault_sync_import_with_matching_bound_embedder_succeeds() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-b9-matching-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let db_path = root.join("ladybug.db");
+        let ns = "vault_b9";
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init(ns).await.expect("seed init");
+        seed.upsert(
+            ns,
+            "b9-seed-row",
+            vec![0.1, 0.2, 0.3, 0.4],
+            payload("seed row recorded under ModelA"),
+        )
+        .await
+        .expect("seed upsert");
+        drop(seed);
+
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut note = crate::vault_ld::VaultNote {
+            id: "b9-imported-note".to_string(),
+            rdf_type: "yaml:fact".to_string(),
+            context: crate::vault_ld::YAML_LD_CONTEXT.to_string(),
+            epistemic_tier: "fact".to_string(),
+            canonical_sha256: String::new(),
+            related: Vec::new(),
+            content: "a note imported by the fallback vault sync".to_string(),
+        };
+        note.canonical_sha256 = note.fingerprint();
+        std::fs::write(vault.join("b9-imported-note.md"), note.to_markdown()).unwrap();
+
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelAEmbedder);
+        bind_fallback_serving_descriptor(&vector_store, &embedder);
+        let principal: Option<String> = None;
+        let args = serde_json::json!({
+            "action": "import",
+            "namespace": ns,
+            "vault_path": vault.to_string_lossy(),
+            "output_dir": vault.to_string_lossy(),
+            "principal": principal,
+        });
+        let response = crate::vault_ld::vault_sync::handle_vault_sync(
+            &args,
+            vector_store.clone(),
+            embedder,
+            Some(root.clone()),
+            None,
+        )
+        .await;
+        let out: crate::vault_ld::vault_sync::VaultImportResult =
+            serde_json::from_str(&response).expect("valid import result");
+        assert!(out.success, "the matching import must succeed: {out:?}");
+        assert_eq!(out.notes_imported, 1);
+        let (_, imported) = vector_store
+            .get(ns, "b9-imported-note")
+            .await
+            .expect("get the imported note")
+            .expect("the imported note exists");
+        assert_eq!(
+            imported.content,
+            "a note imported by the fallback vault sync"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// B9 wiring guard (source-level): the `Commands::VaultSync` arm
+    /// in this file binds the serving descriptor before it dispatches
+    /// to `handle_vault_sync`. The search is scoped to the arm's own
+    /// slice so neither the sibling arms' binds nor this test's own
+    /// literals can satisfy it; the start pattern carries a real
+    /// newline so it cannot match this test's escaped literal either.
+    #[test]
+    fn b9_vault_sync_arm_binds_serving_descriptor_before_handle_vault_sync() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("read src/main.rs");
+        let start = src
+            .find("Commands::VaultSync {\n")
+            .expect("the VaultSync arm exists");
+        let rest = &src[start..];
+        let end = rest
+            .find("Commands::NormalizeMetadata")
+            .expect("the next arm exists");
+        let arm = &rest[..end];
+        let bind = arm
+            .find("bind_fallback_serving_descriptor(&vector_store, &embedder);")
+            .expect("the VaultSync arm binds the serving descriptor");
+        let dispatch = arm
+            .find("handle_vault_sync(")
+            .expect("the VaultSync arm dispatches to handle_vault_sync");
+        assert!(
+            bind < dispatch,
+            "the bind precedes the handle_vault_sync dispatch"
+        );
     }
 
     fn restore_copy_fixture(
@@ -9787,6 +10111,7 @@ async fn run() -> anyhow::Result<()> {
                             "principal": principal,
                         });
                         let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
                         let response = handle_vault_sync(
                             &args,
                             vector_store.clone(),
