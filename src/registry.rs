@@ -399,6 +399,101 @@ pub async fn check_domain(
     Err(rejection(namespace, &still_missing[0], &cached))
 }
 
+/// Build an updated `domain_registry` `MemoryPayload` merging `new_slugs` into `existing_meta`
+/// while preserving any existing v2 domain entries and unrelated metadata keys.
+pub fn build_merged_registry_payload(
+    namespace: &str,
+    existing_meta: Option<&Value>,
+    new_slugs: &[String],
+) -> MemoryPayload {
+    let existing_meta = existing_meta
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
+        registry_domain_entries(&existing_meta)
+            .iter()
+            .filter_map(|e| {
+                e.get("slug")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    let is_v2 = existing_meta
+        .get("domain_registry")
+        .and_then(|r| r.get("version"))
+        .and_then(|v| v.as_u64())
+        == Some(2)
+        || existing_meta
+            .get("domain_registry")
+            .and_then(|r| r.get("domains"))
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().any(|v| v.is_object()))
+            .unwrap_or(false);
+
+    let mut wanted_slugs = merge(&existing_domains_slugs, new_slugs);
+    let v1_slugs = registry_domains(&existing_meta);
+    wanted_slugs = merge(&wanted_slugs, &v1_slugs);
+
+    let mut meta = existing_meta.clone();
+    if !meta.is_object() {
+        meta = serde_json::json!({});
+    }
+    if let Some(obj) = meta.as_object_mut() {
+        if is_v2
+            || obj
+                .get("domain_registry")
+                .and_then(|r| r.get("domains"))
+                .and_then(|d| d.as_array())
+                .map(|a| a.iter().any(|v| v.is_object()))
+                .unwrap_or(false)
+        {
+            let mut entries = registry_domain_entries(&existing_meta);
+            for slug in &wanted_slugs {
+                if !entries
+                    .iter()
+                    .any(|e| e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()))
+                {
+                    entries.push(serde_json::json!({
+                        "slug": slug,
+                        "parent": serde_json::Value::Null,
+                        "aliases": [],
+                        "concept_iri": serde_json::Value::Null,
+                    }));
+                }
+            }
+            entries.sort_by(|a, b| {
+                let sa = a.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                let sb = b.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                sa.cmp(sb)
+            });
+            let v2meta = registry_metadata_v2(&entries);
+            if let Some(dr) = v2meta.get("domain_registry").cloned() {
+                obj.insert("domain_registry".to_string(), dr);
+            }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+        } else {
+            let v1meta = registry_metadata(&wanted_slugs);
+            if let Some(dr) = v1meta.get("domain_registry").cloned() {
+                obj.insert("domain_registry".to_string(), dr);
+            }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+        }
+    }
+
+    MemoryPayload {
+        content: registry_content(namespace),
+        user_id: "system".to_string(),
+        memory_type: "fact".to_string(),
+        agent_name: None,
+        location: String::new(),
+        location_lines: String::new(),
+        metadata: meta,
+    }
+}
+
 /// Read-merge-write the registry under a process-wide mutex (the guard is held
 /// across awaits, so this is a `tokio` mutex). `None` on success; `Some(warning)`
 /// when the cache did not stick -- the write it belongs to has already been
@@ -723,6 +818,37 @@ pub async fn cache_project_root(
     }
 }
 
+/// The `project_root` cached on the namespace's registry row by
+/// [`cache_project_root`]. A missing row or field is `Ok(None)`; a failed
+/// store read is an error, so a caller can tell "no root" from "unknown".
+pub async fn cached_project_root(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> anyhow::Result<Option<String>> {
+    #[cfg(test)]
+    crate::server::context_plan_benchmark_instrumentation::record_registry_root_read();
+
+    Ok(
+        match store
+            .get(namespace, &registry_row_id(namespace))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read cached project_root for namespace '{namespace}': {e}"
+                )
+            })? {
+            Some((_, payload)) if is_registry_row(&payload.metadata) => payload
+                .metadata
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            _ => None,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +889,185 @@ mod tests {
         })));
         assert!(!is_registry_row(&serde_json::json!({ "domain": "auth" })));
         assert!(!is_registry_row(&serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn cached_project_root_treats_missing_or_invalid_metadata_as_none() {
+        use crate::guard::testkit::MockStore;
+        use crate::traits::VectorStore;
+        use std::sync::Arc;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+
+        // No registry row at all -> Ok(None).
+        assert_eq!(
+            cached_project_root(&store, "ns")
+                .await
+                .expect("missing row ok"),
+            None
+        );
+
+        // A registry row whose `project_root` is blank -> Ok(None).
+        store
+            .upsert(
+                "ns",
+                &registry_row_id("ns"),
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "domain_registry": { "domains": [] },
+                        "project_root": "   ",
+                    }),
+                },
+            )
+            .await
+            .expect("upsert registry row");
+        assert_eq!(
+            cached_project_root(&store, "ns")
+                .await
+                .expect("blank root ok"),
+            None
+        );
+
+        // A valid, non-blank root is trimmed and returned.
+        store
+            .upsert(
+                "ns",
+                &registry_row_id("ns"),
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "domain_registry": { "domains": [] },
+                        "project_root": "  /work/project  ",
+                    }),
+                },
+            )
+            .await
+            .expect("upsert registry row with root");
+        assert_eq!(
+            cached_project_root(&store, "ns")
+                .await
+                .expect("valid root ok"),
+            Some("/work/project".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_project_root_propagates_store_read_error() {
+        use crate::guard::testkit::MockStore;
+        use crate::traits::{AsAny, UpsertReport, VectorStore};
+        use std::sync::Arc;
+
+        struct ErrStore {
+            inner: Arc<MockStore>,
+        }
+        impl AsAny for ErrStore {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        #[async_trait::async_trait]
+        impl VectorStore for ErrStore {
+            async fn init(&self, ns: &str) -> anyhow::Result<()> {
+                self.inner.init(ns).await
+            }
+            async fn upsert(
+                &self,
+                ns: &str,
+                id: &str,
+                v: Vec<f32>,
+                p: MemoryPayload,
+            ) -> anyhow::Result<UpsertReport> {
+                self.inner.upsert(ns, id, v, p).await
+            }
+            async fn search(
+                &self,
+                ns: &str,
+                v: Vec<f32>,
+                l: usize,
+                it: bool,
+                ia: bool,
+            ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+                self.inner.search(ns, v, l, it, ia).await
+            }
+            async fn delete(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+                self.inner.delete(ns, id).await
+            }
+            async fn clear_ingested(&self, ns: &str) -> anyhow::Result<()> {
+                self.inner.clear_ingested(ns).await
+            }
+            async fn relink_edges(&self, ns: &str, sk: &str) -> anyhow::Result<usize> {
+                self.inner.relink_edges(ns, sk).await
+            }
+            async fn list(
+                &self,
+                ns: &str,
+                u: Option<&str>,
+                mt: Option<&str>,
+            ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+                self.inner.list(ns, u, mt).await
+            }
+            async fn get(
+                &self,
+                ns: &str,
+                id: &str,
+            ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+                if id == registry_row_id(ns) {
+                    Err(anyhow::anyhow!("boom-read"))
+                } else {
+                    self.inner.get(ns, id).await
+                }
+            }
+            async fn relocate(
+                &self,
+                id: &str,
+                from: &str,
+                to: &str,
+            ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+                self.inner.relocate(id, from, to).await
+            }
+            async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+                self.inner.list_namespaces().await
+            }
+            async fn export_graph(
+                &self,
+                ir: bool,
+                ia: bool,
+                pc: &std::collections::HashMap<String, std::path::PathBuf>,
+                ao: Option<&crate::source_context::ScopedAnchorOverride>,
+            ) -> anyhow::Result<serde_json::Value> {
+                self.inner.export_graph(ir, ia, pc, ao).await
+            }
+            async fn increment_access_count(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+                self.inner.increment_access_count(ns, id).await
+            }
+            async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+                self.inner.export_database(dir).await
+            }
+            async fn checkpoint(&self) -> anyhow::Result<()> {
+                self.inner.checkpoint().await
+            }
+        }
+
+        let store: Arc<dyn VectorStore> = Arc::new(ErrStore {
+            inner: Arc::new(MockStore::new()),
+        });
+        let err = cached_project_root(&store, "ns")
+            .await
+            .expect_err("store read must fail closed");
+        assert!(err.to_string().contains("boom-read"));
     }
 
     // --- F15 (neurostrata-hs23) Domain DAG and aliases ---
