@@ -83,6 +83,7 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 
 ## 6. Global Infrastructure & Tooling Constraints
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
+- **Rust quality gate:** pushes touching Rust sources or manifests run `scripts/rust-quality-gate.sh` via the pre-push hook (fmt/clippy deltas + audit delta; never blocks on legacy baseline). Policy: `docs/SECDEVOPS-CHECKLIST.md`. Bypass only with `RUST_QUALITY_SKIP=1` (logged).
 - **Data Formats:** ALWAYS prefer strict JSON and JSON Schema over YAML, TOML, or their derivatives.
 - **Non-Interactive Shells:** ALWAYS use non-interactive flags (e.g., `cp -f`, `rm -rf`, `apt-get -y`) to avoid hanging the agent on confirmation prompts.
 
