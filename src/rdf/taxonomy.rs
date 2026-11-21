@@ -5880,6 +5880,11 @@ mod tests {
             2,
             "limit=2 must cap the total emitted nodes across the forest at 2"
         );
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["slug"], "tree-child");
     }
 
     #[tokio::test]
