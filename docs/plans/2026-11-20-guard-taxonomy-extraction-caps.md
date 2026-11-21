@@ -98,6 +98,20 @@ below.
   `limit` = maximum number of nodes emitted across the whole forest.
   Absent parameter = current unbounded behaviour. Values are honoured
   as given (no silent clamping beyond what the type enforces).
+- **R6 (verification venue: CI).** Local builds of this tree are
+  blocked: the tree pins `ort-sys 2.0.0-rc.15`, whose build script
+  downloads ONNX Runtime 1.31.0 from `cdn.pyke.io`, which returns
+  HTTP 403 through this environment's egress (reproduced 2026-11-20;
+  the only cached ONNX Runtime here is 1.28.0, for rc.13). Per the
+  owner's standing acceptance (PR #106 precedent), **CI is the
+  verification venue** for the Rust tasks: implementers write tests
+  first and record, per test, the current-code line that makes it
+  fail on the unmodified tree (RED basis — the panel's first-hand
+  mechanism verification stands behind each), then implement;
+  GREEN is established by CI on the PR, and Stage 6 iterates there.
+  Local gates that DO run: `rustfmt` parse-check on edited files
+  (copies, to avoid reformatting), and the full local TDD loop for
+  the plugin task (node, no ort involvement).
 - **R5 (C3 route).** Debug-log unknown fields in the handler (the
   panel's "cheaper and safer" route), NOT `deny_unknown_fields`
   (field-name drift + MCP routing keys make strict rejection a
@@ -121,11 +135,11 @@ Files: `src/guard/validator.rs` (`extract_shell_commands`, tests mod).
     raw payload).
   - A JSON object that DOES yield commands behaves exactly as before
     (existing tests cover; add an explicit pin if missing).
-- [ ] Run the new tests: confirm RED on the unmodified extractor.
+- [ ] Record the RED basis: for each new test, the current-code line that makes it fail on the unmodified extractor (R6 — CI is the verification venue).
 - [ ] Implement: in `extract_shell_commands`, when the JSON-object
   path (including the `args` join) yields no command strings, return
   `vec![payload.to_string()]` instead of the empty vec.
-- [ ] Run the full `guard::validator` test module: GREEN, including
+- [ ] `rustfmt` parse-check the edited file (on a copy); full `guard::validator` module GREEN is established by CI (R6), including
   all pre-existing prose/pin tests.
 - [ ] Commit: `fix(guard): fall back to raw payload when JSON shell extraction is empty`
 
@@ -158,7 +172,7 @@ Files: `src/guard/validator.rs`
   - Prose pins: the existing
     `write_and_edit_json_payloads_ignore_prose_mentions_of_banned_language`
     test and siblings still pass unchanged.
-- [ ] Confirm RED on the unmodified extractor.
+- [ ] Record the RED basis per test (R6).
 - [ ] Implement:
   - Replace the top-level + one-level extraction with a bounded
     recursive walk over the decoded `Value` (depth ≤ 3 below the
@@ -181,7 +195,7 @@ Files: `src/guard/validator.rs`
     intended, change it with the justification recorded in the
     commit message (the panel ruled that behaviour a false-block
     bug, B4) — do not silently delete coverage.
-- [ ] Full `guard::validator` module GREEN.
+- [ ] `rustfmt` parse-check; module GREEN via CI (R6).
 - [ ] Commit: `fix(guard): recursive bounded file-mutation extraction; first-line-only patch shebangs`
 
 TDD check script: as Task 1, asserting the new B test names pass.
@@ -202,7 +216,7 @@ script's header instructions).
 - [ ] Write a failing test: a strict-mode hook/tool invocation whose
   tool input is a raw patch string results in `guard_validate`
   receiving the raw patch text as `payload` (not `"{}"`).
-- [ ] Confirm RED.
+- [ ] Record the RED basis per test (R6).
 - [ ] Implement: at both call sites, when the raw tool input (or the
   `input` candidate) is a non-empty string, use that string as the
   payload; otherwise keep `JSON.stringify(firstRecord(...))`.
@@ -228,13 +242,13 @@ Files: `src/rdf/taxonomy.rs` (`execute_compare`, tests mod).
   64 slugs / 32 axes proceeds past the cap check (fails later on
   unknown concepts, or succeeds on a seeded store — assert it is
   NOT the cap error).
-- [ ] Confirm RED.
+- [ ] Record the RED basis per test (R6).
 - [ ] Implement: after `validate_strict_slug_vec` for `slugs` and
   for caller-supplied `req.axes`, return
   `Err(format!("... exceeds maximum of 64 concept slugs"))` /
   `32 evaluation axes` in the existing error style. Axes derived
   from the thesis or score union are store-bounded and NOT capped.
-- [ ] Taxonomy test module GREEN.
+- [ ] `rustfmt` parse-check; taxonomy module GREEN via CI (R6).
 - [ ] Commit: `fix(taxonomy): cap compare slugs at 64 and axes at 32`
 
 ### Task 5 — C2 + C3: `execute_tree` honours `limit`/`max_hops`; handler logs unknown fields (fork #124, C2+C3)
@@ -254,7 +268,7 @@ Files: `src/rdf/taxonomy.rs` (`execute_tree`, `build_tree_node`),
     behaviour — the log line is the deliverable; test that the
     unknown-field computation returns the unknown names for a
     sample payload, as a pure helper).
-- [ ] Confirm RED.
+- [ ] Record the RED basis per test (R6).
 - [ ] Implement:
   - `build_tree_node` gains depth and a shared node budget
     (R4 semantics); `execute_tree` threads `req.max_hops` /
@@ -267,7 +281,7 @@ Files: `src/rdf/taxonomy.rs` (`execute_tree`, `build_tree_node`),
     idiom already used in the handler's module. No behaviour
     change; conversion path untouched (refuted alert #21 site —
     semantics preserved).
-- [ ] Affected test modules GREEN.
+- [ ] `rustfmt` parse-checks; affected modules GREEN via CI (R6).
 - [ ] Commit: `fix(taxonomy): honour tree limit/max_hops; log unknown request fields`
 
 ### Task 6 — Plan + PR hygiene
