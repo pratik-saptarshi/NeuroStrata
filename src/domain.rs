@@ -288,16 +288,206 @@ mod tests {
         assert!(err.contains("a b"), "{err}");
     }
 
+    fn test_bitemporal_facet_materialization_and_retraction() {
+        let mut meta = serde_json::json!({"enforcement": "ENFORCED"});
+        materialize_facets_bitemporal("rule", &mut meta, 100);
+        let facets = meta.get("facets").unwrap().as_array().unwrap();
+        assert!(facets
+            .iter()
+            .any(|v| v.as_str().unwrap() == "enforced-rule"));
+        let bt = meta.get("facets_bitemporal").unwrap().as_array().unwrap();
+        assert!(bt.len() == 1);
+        let entry: serde_json::Value = bt[0].clone();
+        assert_eq!(
+            entry.get("facet").unwrap().as_str().unwrap(),
+            "enforced-rule"
+        );
+        assert_eq!(entry.get("inferred").unwrap().as_bool().unwrap(), true);
+        assert!(entry.get("valid_to").unwrap().is_null());
+        assert_eq!(entry.get("valid_from").unwrap().as_i64().unwrap(), 100);
+
+        // Remove enforcement and re-run at now+10
+        meta.as_object_mut().unwrap().remove("enforcement");
+        materialize_facets_bitemporal("rule", &mut meta, 110);
+        let bt2 = meta.get("facets_bitemporal").unwrap().as_array().unwrap();
+        assert_eq!(bt2.len(), 1);
+        let entry2: serde_json::Value = bt2[0].clone();
+        assert_eq!(entry2.get("valid_to").unwrap().as_i64().unwrap(), 110);
+        let facets2 = meta.get("facets").unwrap().as_array().unwrap();
+        assert!(!facets2
+            .iter()
+            .any(|v| v.as_str().unwrap() == "enforced-rule"));
+
+        // Manual facets should remain
+        meta.as_object_mut().unwrap().insert(
+            "facets".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("manual".to_string())]),
+        );
+        meta.as_object_mut().unwrap().remove("enforcement");
+        materialize_facets_bitemporal("rule", &mut meta, 120);
+        let facets3 = meta.get("facets").unwrap().as_array().unwrap();
+        assert!(facets3.iter().any(|v| v.as_str().unwrap() == "manual"));
+
+        // Retract inferred facets
+        meta.as_object_mut().unwrap().insert(
+            "enforcement".to_string(),
+            serde_json::Value::String("ENFORCED".to_string()),
+        );
+        materialize_facets_bitemporal("rule", &mut meta, 125);
+        retract_inferred_facets(&mut meta, 130);
+        let bt3 = meta.get("facets_bitemporal").unwrap().as_array().unwrap();
+        assert!(bt3
+            .iter()
+            .all(|v| v.get("valid_to").unwrap().as_i64().is_some()));
+        assert_eq!(
+            bt3.last().unwrap().get("valid_to").unwrap().as_i64(),
+            Some(130)
+        );
+    }
+
+    #[test]
+    fn test_f10_detect_conflicts_contradictory_and_near_duplicate() {
+        use crate::traits::{MemoryPayload, SearchResult};
+        fn make(id: &str, mem_type: &str, content: &str, meta: serde_json::Value) -> SearchResult {
+            SearchResult {
+                id: id.to_string(),
+                score: 1.0,
+                payload: MemoryPayload {
+                    content: content.to_string(),
+                    user_id: "u".to_string(),
+                    memory_type: mem_type.to_string(),
+                    agent_name: None,
+                    location: "test".to_string(),
+                    location_lines: "1".to_string(),
+                    metadata: meta,
+                },
+                evidence: None,
+            }
+        }
+        // (a) Contradictory pair on same location
+        let a = make(
+            "a1",
+            "rule",
+            "must use TLS",
+            serde_json::json!({"location":"loc1","enforcement":"ENFORCED"}),
+        );
+        let b = make(
+            "b1",
+            "rule",
+            "must not use TLS",
+            serde_json::json!({"location":"loc1","enforcement":"NOT_ENFORCED"}),
+        );
+        let conflicts = detect_conflicts(&[a, b]);
+        assert!(!conflicts.is_empty());
+        // (b) Near-duplicate non-conflict (same polarity, not contradictory)
+        let c = make(
+            "c1",
+            "rule",
+            "always validate tokens",
+            serde_json::json!({"location":"loc2","enforcement":"ENFORCED"}),
+        );
+        let d = make(
+            "d1",
+            "rule",
+            "always validate tokens on ingress",
+            serde_json::json!({"location":"loc2","enforcement":"ENFORCED"}),
+        );
+        let conflicts2 = detect_conflicts(&[c, d]);
+        assert!(conflicts2.is_empty());
+        // (c) Word-boundary: node/note/notification/canonical don't trigger "no" or "not"
+        let e = make(
+            "e1",
+            "rule",
+            "notification canonical",
+            serde_json::json!({"location":"loc3"}),
+        );
+        let f = make(
+            "f1",
+            "rule",
+            "node note notification",
+            serde_json::json!({"location":"loc3"}),
+        );
+        let conflicts3 = detect_conflicts(&[e, f]);
+        assert!(conflicts3.is_empty());
+        // (d) Expired and archived rows are ignored
+        let g = make(
+            "g1",
+            "rule",
+            "old rule",
+            serde_json::json!({"location":"loc4","valid_to":0,"archived":true}),
+        );
+        let h = make(
+            "h1",
+            "rule",
+            "new rule",
+            serde_json::json!({"location":"loc4","enforcement":"ENFORCED","valid_to":9999999999_i64}),
+        );
+        let conflicts4 = detect_conflicts(&[g, h]);
+        assert!(conflicts4.is_empty());
+        // (e) Unrelated rules sharing broad file location but no topic overlap -> no conflict
+        let mut r1 = make(
+            "r1",
+            "rule",
+            "Never use docker containers",
+            serde_json::json!({"location":"AGENTS.md"}),
+        );
+        r1.payload.location = "AGENTS.md".to_string();
+        let mut r2 = make(
+            "r2",
+            "rule",
+            "Always use absolute file paths",
+            serde_json::json!({"location":"AGENTS.md"}),
+        );
+        r2.payload.location = "AGENTS.md".to_string();
+        assert!(detect_conflicts(&[r1, r2]).is_empty());
+        // Unrelated rules sharing broad topology anchor (component+target_system) but no topic overlap -> no conflict
+        let u1 = make(
+            "u1",
+            "rule",
+            "Never expose internal tokens",
+            serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}),
+        );
+        let u2 = make(
+            "u2",
+            "rule",
+            "Always validate JSON schema inputs",
+            serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}),
+        );
+        assert!(detect_conflicts(&[u1, u2]).is_empty());
+        // Same topic + topology anchor with opposing negation -> conflict
+        let s1 = make(
+            "s1",
+            "rule",
+            "Never cache auth tokens in server",
+            serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}),
+        );
+        let s2 = make(
+            "s2",
+            "rule",
+            "Always cache auth tokens in server",
+            serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}),
+        );
+        assert!(!detect_conflicts(&[s1, s2]).is_empty());
+    }
+
     /// The all-pairs scan detect_conflicts used before it precomputed per-row
     /// data, kept verbatim as the reference the current version must match.
-    fn detect_conflicts_reference(memories: &[crate::traits::SearchResult]) -> Vec<(String, Vec<String>)> {
+    fn detect_conflicts_reference(
+        memories: &[crate::traits::SearchResult],
+    ) -> Vec<(String, Vec<String>)> {
         let now = chrono::Utc::now().timestamp();
         let active: Vec<&crate::traits::SearchResult> = memories
             .iter()
             .filter(|m| {
-                if crate::registry::is_registry_row(&m.payload.metadata) { return false; }
-                if crate::synaptic_mesh::conflict::is_conflicting(&m.payload) { return false; }
-                if crate::handlers::archive_memory::is_archived(&m.payload) { return false; }
+                if crate::registry::is_registry_row(&m.payload.metadata) {
+                    return false;
+                }
+                if crate::synaptic_mesh::conflict::is_conflicting(&m.payload) {
+                    return false;
+                }
+                if crate::handlers::archive_memory::is_archived(&m.payload) {
+                    return false;
+                }
                 match m.payload.metadata.get("valid_to") {
                     None => true,
                     Some(v) => v.is_null() || v.as_i64().unwrap_or(0) > now,
@@ -308,16 +498,25 @@ mod tests {
         let mut out = Vec::new();
         for i in 0..active.len() {
             let a = active[i];
-            if a.payload.memory_type != "rule" && a.payload.memory_type != "fact" { continue; }
+            if a.payload.memory_type != "rule" && a.payload.memory_type != "fact" {
+                continue;
+            }
             let mut disputed_with = Vec::new();
             for j in 0..active.len() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let b = active[j];
-                if b.payload.memory_type != "rule" && b.payload.memory_type != "fact" { continue; }
+                if b.payload.memory_type != "rule" && b.payload.memory_type != "fact" {
+                    continue;
+                }
                 let loc_a = a.payload.location.trim();
                 let loc_b = b.payload.location.trim();
                 let valid_loc = !loc_a.is_empty()
-                    && !matches!(loc_a.to_ascii_lowercase().as_str(), "n/a" | "none" | "unknown" | "global");
+                    && !matches!(
+                        loc_a.to_ascii_lowercase().as_str(),
+                        "n/a" | "none" | "unknown" | "global"
+                    );
                 let same_loc = valid_loc && loc_a == loc_b;
                 let topo_a = a.payload.metadata.get("topology");
                 let topo_b = b.payload.metadata.get("topology");
@@ -326,16 +525,23 @@ mod tests {
                         let same_anchor = ta.get("component") == tb.get("component")
                             && ta.get("target_system") == tb.get("target_system")
                             && (ta.get("component").is_some() || ta.get("target_system").is_some());
-                        if !same_anchor { (false, false) } else {
+                        if !same_anchor {
+                            (false, false)
+                        } else {
                             let chan_diff = ta.get("channel") != tb.get("channel");
-                            let cred_diff = ta.get("credential_boundary") != tb.get("credential_boundary");
+                            let cred_diff =
+                                ta.get("credential_boundary") != tb.get("credential_boundary");
                             (true, chan_diff || cred_diff)
                         }
                     }
                     _ => (false, false),
                 };
                 let tokens = |s: &str| -> std::collections::BTreeSet<String> {
-                    s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(|t| t.to_string()).collect()
+                    s.to_lowercase()
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_string())
+                        .collect()
                 };
                 let ta = tokens(&a.payload.content);
                 let tb = tokens(&b.payload.content);
@@ -344,19 +550,57 @@ mod tests {
                 let sim = inter as f64 / union as f64;
                 let high_cosine = sim >= 0.85;
 
-                if !same_loc && !same_topo_anchor && !high_cosine { continue; }
+                if !same_loc && !same_topo_anchor && !high_cosine {
+                    continue;
+                }
 
-                let enf_a = a.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
-                let enf_b = b.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
+                let enf_a = a
+                    .payload
+                    .metadata
+                    .get("enforcement")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let enf_b = b
+                    .payload
+                    .metadata
+                    .get("enforcement")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let opposing_enf = (enf_a == "ENFORCED" && enf_b == "NOT_ENFORCED")
                     || (enf_a == "NOT_ENFORCED" && enf_b == "ENFORCED");
 
-                let dec_a = a.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
-                let dec_b = b.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
-                let a_attempt_failed = a.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
-                let b_attempt_failed = b.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
-                let opposing_dec = (dec_a == "accepted" && (dec_b == "withdrawn" || dec_b == "superseded" || b_attempt_failed))
-                    || (dec_b == "accepted" && (dec_a == "withdrawn" || dec_a == "superseded" || a_attempt_failed));
+                let dec_a = a
+                    .payload
+                    .metadata
+                    .get("decision")
+                    .and_then(|d| d.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let dec_b = b
+                    .payload
+                    .metadata
+                    .get("decision")
+                    .and_then(|d| d.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let a_attempt_failed = a
+                    .payload
+                    .metadata
+                    .get("attempt")
+                    .and_then(|x| x.get("outcome"))
+                    .and_then(|v| v.as_str())
+                    == Some("failed");
+                let b_attempt_failed = b
+                    .payload
+                    .metadata
+                    .get("attempt")
+                    .and_then(|x| x.get("outcome"))
+                    .and_then(|v| v.as_str())
+                    == Some("failed");
+                let opposing_dec = (dec_a == "accepted"
+                    && (dec_b == "withdrawn" || dec_b == "superseded" || b_attempt_failed))
+                    || (dec_b == "accepted"
+                        && (dec_a == "withdrawn" || dec_a == "superseded" || a_attempt_failed));
 
                 let neg_tokens = ["not", "never", "no", "don't", "cannot", "must not"];
                 let ca = a.payload.content.to_lowercase();
@@ -413,7 +657,13 @@ mod tests {
         }
     }
 
-    fn row(id: String, mem_type: &str, location: &str, content: String, metadata: Value) -> crate::traits::SearchResult {
+    fn row(
+        id: String,
+        mem_type: &str,
+        location: &str,
+        content: String,
+        metadata: Value,
+    ) -> crate::traits::SearchResult {
         crate::traits::SearchResult {
             id,
             score: 1.0,
@@ -436,10 +686,29 @@ mod tests {
     /// text, duplicate ids, and rows the filters must drop.
     fn varied_fixture(seed: u64, n: usize) -> Vec<crate::traits::SearchResult> {
         let mut rng = Rng(seed);
-        let types = ["rule", "rule", "rule", "fact", "fact", "task", "procedure", "directory"];
+        let types = [
+            "rule",
+            "rule",
+            "rule",
+            "fact",
+            "fact",
+            "task",
+            "procedure",
+            "directory",
+        ];
         let locations = [
-            "src/a.rs", " src/a.rs ", "src/b.rs", "AGENTS.md", "", "  ", "N/A", "none", "Unknown",
-            "GLOBAL", "global ", "test",
+            "src/a.rs",
+            " src/a.rs ",
+            "src/b.rs",
+            "AGENTS.md",
+            "",
+            "  ",
+            "N/A",
+            "none",
+            "Unknown",
+            "GLOBAL",
+            "global ",
+            "test",
         ];
         let topologies = [
             Value::Null,
@@ -468,15 +737,28 @@ mod tests {
             "a",
             "",
         ];
-        let negations = ["not", "never", "no", "don't", "cannot", "must not", "Never", "NOT", "nothing", "notation"];
-        let extras = ["really", "strictly", "tokens", "server", "mcp", "always", "now", "café", "x86"];
+        let negations = [
+            "not", "never", "no", "don't", "cannot", "must not", "Never", "NOT", "nothing",
+            "notation",
+        ];
+        let extras = [
+            "really", "strictly", "tokens", "server", "mcp", "always", "now", "café", "x86",
+        ];
         (0..n)
             .map(|k| {
-                let id = if rng.below(25) == 0 { "dup".to_string() } else { format!("r{k}") };
+                let id = if rng.below(25) == 0 {
+                    "dup".to_string()
+                } else {
+                    format!("r{k}")
+                };
                 let mem_type = *rng.pick(&types);
                 let location = *rng.pick(&locations);
-                let mut words: Vec<String> =
-                    rng.pick(&templates).split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
+                let mut words: Vec<String> = rng
+                    .pick(&templates)
+                    .split(' ')
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 match rng.below(6) {
                     0 => words.insert(rng.below(words.len() + 1), rng.pick(&negations).to_string()),
                     1 if !words.is_empty() => {
@@ -492,35 +774,79 @@ mod tests {
                     meta.insert("topology".into(), rng.pick(&topologies).clone());
                 }
                 match rng.below(5) {
-                    0 => { meta.insert("enforcement".into(), "ENFORCED".into()); }
-                    1 => { meta.insert("enforcement".into(), "NOT_ENFORCED".into()); }
-                    2 => { meta.insert("enforcement".into(), 5.into()); }
+                    0 => {
+                        meta.insert("enforcement".into(), "ENFORCED".into());
+                    }
+                    1 => {
+                        meta.insert("enforcement".into(), "NOT_ENFORCED".into());
+                    }
+                    2 => {
+                        meta.insert("enforcement".into(), 5.into());
+                    }
                     _ => {}
                 }
                 match rng.below(7) {
-                    0 => { meta.insert("decision".into(), serde_json::json!({"status": "accepted"})); }
-                    1 => { meta.insert("decision".into(), serde_json::json!({"status": "withdrawn"})); }
-                    2 => { meta.insert("decision".into(), serde_json::json!({"status": "superseded"})); }
-                    3 => { meta.insert("decision".into(), "accepted".into()); }
+                    0 => {
+                        meta.insert("decision".into(), serde_json::json!({"status": "accepted"}));
+                    }
+                    1 => {
+                        meta.insert(
+                            "decision".into(),
+                            serde_json::json!({"status": "withdrawn"}),
+                        );
+                    }
+                    2 => {
+                        meta.insert(
+                            "decision".into(),
+                            serde_json::json!({"status": "superseded"}),
+                        );
+                    }
+                    3 => {
+                        meta.insert("decision".into(), "accepted".into());
+                    }
                     _ => {}
                 }
                 match rng.below(5) {
-                    0 => { meta.insert("attempt".into(), serde_json::json!({"outcome": "failed"})); }
-                    1 => { meta.insert("attempt".into(), serde_json::json!({"outcome": "ok"})); }
+                    0 => {
+                        meta.insert("attempt".into(), serde_json::json!({"outcome": "failed"}));
+                    }
+                    1 => {
+                        meta.insert("attempt".into(), serde_json::json!({"outcome": "ok"}));
+                    }
                     _ => {}
                 }
                 match rng.below(20) {
-                    0 => { meta.insert("valid_to".into(), 0.into()); }
-                    1 => { meta.insert("valid_to".into(), Value::Null); }
-                    2 => { meta.insert("valid_to".into(), 9_999_999_999_i64.into()); }
-                    3 => { meta.insert("valid_to".into(), "soon".into()); }
-                    4 => { meta.insert("archived".into(), true.into()); }
-                    5 => { meta.insert("archived".into(), "true".into()); }
-                    6 => { meta.insert("mesh".into(), serde_json::json!({"conflict": true})); }
-                    7 => { meta.insert("domain_registry".into(), serde_json::json!({"domains": []})); }
+                    0 => {
+                        meta.insert("valid_to".into(), 0.into());
+                    }
+                    1 => {
+                        meta.insert("valid_to".into(), Value::Null);
+                    }
+                    2 => {
+                        meta.insert("valid_to".into(), 9_999_999_999_i64.into());
+                    }
+                    3 => {
+                        meta.insert("valid_to".into(), "soon".into());
+                    }
+                    4 => {
+                        meta.insert("archived".into(), true.into());
+                    }
+                    5 => {
+                        meta.insert("archived".into(), "true".into());
+                    }
+                    6 => {
+                        meta.insert("mesh".into(), serde_json::json!({"conflict": true}));
+                    }
+                    7 => {
+                        meta.insert("domain_registry".into(), serde_json::json!({"domains": []}));
+                    }
                     _ => {}
                 }
-                let metadata = if rng.below(40) == 0 { serde_json::json!("not an object") } else { Value::Object(meta) };
+                let metadata = if rng.below(40) == 0 {
+                    serde_json::json!("not an object")
+                } else {
+                    Value::Object(meta)
+                };
                 row(id, mem_type, location, content, metadata)
             })
             .collect()
@@ -579,10 +905,17 @@ mod tests {
         let started = std::time::Instant::now();
         let conflicts = detect_conflicts(&rows);
         let elapsed = started.elapsed();
-        eprintln!("detect_conflicts: {} rows, {} flagged, {elapsed:?}", rows.len(), conflicts.len());
+        eprintln!(
+            "detect_conflicts: {} rows, {} flagged, {elapsed:?}",
+            rows.len(),
+            conflicts.len()
+        );
         // Generous on purpose: an unoptimized debug build must pass on a slow
         // runner. The per-pair re-tokenizing version took minutes here.
-        assert!(elapsed < std::time::Duration::from_secs(30), "took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "took {elapsed:?}"
+        );
     }
 
     /// Prints the before/after timing on the large set. Ignored by default
@@ -1115,11 +1448,17 @@ struct ConflictRow<'a> {
 }
 
 impl<'a> ConflictRow<'a> {
-    fn new(m: &'a crate::traits::SearchResult, interner: &mut std::collections::HashMap<String, u32>) -> Self {
+    fn new(
+        m: &'a crate::traits::SearchResult,
+        interner: &mut std::collections::HashMap<String, u32>,
+    ) -> Self {
         let meta = &m.payload.metadata;
         let loc = m.payload.location.trim();
         let location = (!loc.is_empty()
-            && !matches!(loc.to_ascii_lowercase().as_str(), "n/a" | "none" | "unknown" | "global"))
+            && !matches!(
+                loc.to_ascii_lowercase().as_str(),
+                "n/a" | "none" | "unknown" | "global"
+            ))
         .then_some(loc);
         let topology = meta.get("topology");
         let topo_get = |key: &str| topology.and_then(|t| t.get(key));
@@ -1148,7 +1487,10 @@ impl<'a> ConflictRow<'a> {
             topo_anchor,
             topo_channel: topo_get("channel"),
             topo_credential_boundary: topo_get("credential_boundary"),
-            enforcement: meta.get("enforcement").and_then(|v| v.as_str()).unwrap_or(""),
+            enforcement: meta
+                .get("enforcement")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
             decision_status: meta
                 .get("decision")
                 .and_then(|d| d.get("status"))
@@ -1172,7 +1514,8 @@ impl<'a> ConflictRow<'a> {
 /// at least `|a| + |b| - upper`, and f64 division is monotonic, so the
 /// computed bound is never below the computed similarity.
 fn token_jaccard_at_least(a: &[u32], b: &[u32], floor: f64) -> Option<f64> {
-    let below_floor = |upper: usize| (upper as f64 / (a.len() + b.len() - upper).max(1) as f64) < floor;
+    let below_floor =
+        |upper: usize| (upper as f64 / (a.len() + b.len() - upper).max(1) as f64) < floor;
     let (mut i, mut j, mut inter) = (0, 0, 0usize);
     let (mut missing_a, mut missing_b) = (0usize, 0usize);
     if below_floor(a.len().min(b.len())) {
@@ -1223,7 +1566,8 @@ fn conflict_pair(a: &ConflictRow, b: &ConflictRow) -> bool {
 
     // Topology facts: same anchor with differing channel/cred boundary -> conflict.
     if same_topo_anchor
-        && (a.topo_channel != b.topo_channel || a.topo_credential_boundary != b.topo_credential_boundary)
+        && (a.topo_channel != b.topo_channel
+            || a.topo_credential_boundary != b.topo_credential_boundary)
     {
         return true;
     }
@@ -1233,8 +1577,10 @@ fn conflict_pair(a: &ConflictRow, b: &ConflictRow) -> bool {
             || (a.enforcement == "NOT_ENFORCED" && b.enforcement == "ENFORCED");
         // opposing decision status; attempt outcome on the *other* row
         let (dec_a, dec_b) = (a.decision_status, b.decision_status);
-        let opposing_dec = (dec_a == "accepted" && (dec_b == "withdrawn" || dec_b == "superseded" || b.attempt_failed))
-            || (dec_b == "accepted" && (dec_a == "withdrawn" || dec_a == "superseded" || a.attempt_failed));
+        let opposing_dec = (dec_a == "accepted"
+            && (dec_b == "withdrawn" || dec_b == "superseded" || b.attempt_failed))
+            || (dec_b == "accepted"
+                && (dec_a == "withdrawn" || dec_a == "superseded" || a.attempt_failed));
         if opposing_enf || opposing_dec {
             return true;
         }
@@ -1301,7 +1647,12 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
     rows.iter()
         .zip(disputed)
         .filter(|(_, with)| !with.is_empty())
-        .map(|(row, with)| (row.id.to_string(), with.into_iter().map(|j| rows[j].id.to_string()).collect()))
+        .map(|(row, with)| {
+            (
+                row.id.to_string(),
+                with.into_iter().map(|j| rows[j].id.to_string()).collect(),
+            )
+        })
         .collect()
 }
 

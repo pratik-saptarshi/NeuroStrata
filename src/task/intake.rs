@@ -366,9 +366,15 @@ pub fn create_candidates_from_intents(
                 "task".to_string()
             }
         });
-        let kind = request.kind.clone().unwrap_or_else(|| "task_obligation".to_string());
+        let kind = request
+            .kind
+            .clone()
+            .unwrap_or_else(|| "task_obligation".to_string());
         let provenance = request.provenance.clone().or_else(|| {
-            request.source_span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone()))
+            request
+                .source_span
+                .as_ref()
+                .and_then(|v| ProvenanceSpan::from_value(v.clone()))
         });
         return vec![IntakeCandidate {
             id: generate_candidate_id(namespace, receipt_id, 0),
@@ -387,9 +393,10 @@ pub fn create_candidates_from_intents(
             category: request.category.clone(),
             payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
             confidence: request.confidence,
-            source_span: request.source_span.clone().or_else(|| {
-                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
-            }),
+            source_span: request
+                .source_span
+                .clone()
+                .or_else(|| Some(serde_json::json!({"start": 0, "end": request.text.len()}))),
             provenance,
             extractor_fingerprint: request
                 .extractor_fingerprint
@@ -414,9 +421,15 @@ pub fn create_candidates_from_intents(
                 None
             }
         });
-        let kind = request.kind.clone().unwrap_or_else(|| "task_obligation".to_string());
+        let kind = request
+            .kind
+            .clone()
+            .unwrap_or_else(|| "task_obligation".to_string());
         let provenance = request.provenance.clone().or_else(|| {
-            request.source_span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone()))
+            request
+                .source_span
+                .as_ref()
+                .and_then(|v| ProvenanceSpan::from_value(v.clone()))
         });
         candidates.push(IntakeCandidate {
             id: generate_candidate_id(namespace, receipt_id, 0),
@@ -430,14 +443,18 @@ pub fn create_candidates_from_intents(
             cas_version: 1,
             created_at: now.clone(),
             updated_at: now,
-            candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+            candidate_kind: request
+                .candidate_kind
+                .clone()
+                .unwrap_or_else(|| "task".to_string()),
             kind,
             category: request.category.clone(),
             payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
             confidence: request.confidence,
-            source_span: request.source_span.clone().or_else(|| {
-                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
-            }),
+            source_span: request
+                .source_span
+                .clone()
+                .or_else(|| Some(serde_json::json!({"start": 0, "end": request.text.len()}))),
             provenance,
             extractor_fingerprint: request
                 .extractor_fingerprint
@@ -464,9 +481,13 @@ pub fn create_candidates_from_intents(
                 .extractor_fingerprint
                 .clone()
                 .or_else(|| Some(format!("lexical-intent:{}", intent.marker)));
-            let kind = request.kind.clone().unwrap_or_else(|| "task_obligation".to_string());
+            let kind = request
+                .kind
+                .clone()
+                .unwrap_or_else(|| "task_obligation".to_string());
             let provenance = request.provenance.clone().or_else(|| {
-                span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone()))
+                span.as_ref()
+                    .and_then(|v| ProvenanceSpan::from_value(v.clone()))
             });
             candidates.push(IntakeCandidate {
                 id: generate_candidate_id(namespace, receipt_id, i),
@@ -480,7 +501,10 @@ pub fn create_candidates_from_intents(
                 cas_version: 1,
                 created_at: now.clone(),
                 updated_at: now,
-                candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+                candidate_kind: request
+                    .candidate_kind
+                    .clone()
+                    .unwrap_or_else(|| "task".to_string()),
                 kind,
                 category: request.category.clone(),
                 payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
@@ -533,12 +557,8 @@ pub async fn undisposed_high_confidence_obligations(
         .filter(|c| c.kind == "task_obligation")
         .filter(|c| {
             c.confidence.unwrap_or(0.0) >= 0.85
-                || c
-                    .provenance
-                    .as_ref()
-                    .is_some_and(|p| p.confidence >= 0.85)
-                || c
-                    .source_span
+                || c.provenance.as_ref().is_some_and(|p| p.confidence >= 0.85)
+                || c.source_span
                     .as_ref()
                     .and_then(|s| s.get("confidence"))
                     .and_then(|v| v.as_f64())
@@ -694,17 +714,32 @@ mod tests {
     #[test]
     fn test_provenance_span_from_value_invalid() {
         assert!(ProvenanceSpan::from_value(serde_json::json!(42)).is_none());
-        assert!(ProvenanceSpan::from_value(serde_json::json!(["a","b"])).is_none());
+        assert!(ProvenanceSpan::from_value(serde_json::json!(["a", "b"])).is_none());
     }
 
     #[test]
     fn test_category_to_kind() {
-        assert_eq!(category_to_kind(&Some("fact".to_string())), CandidateKind::Fact);
-        assert_eq!(category_to_kind(&Some("decision".to_string())), CandidateKind::Decision);
-        assert_eq!(category_to_kind(&Some("rule_candidate".to_string())), CandidateKind::Rule);
-        assert_eq!(category_to_kind(&Some("rule".to_string())), CandidateKind::Rule);
+        assert_eq!(
+            category_to_kind(&Some("fact".to_string())),
+            CandidateKind::Fact
+        );
+        assert_eq!(
+            category_to_kind(&Some("decision".to_string())),
+            CandidateKind::Decision
+        );
+        assert_eq!(
+            category_to_kind(&Some("rule_candidate".to_string())),
+            CandidateKind::Rule
+        );
+        assert_eq!(
+            category_to_kind(&Some("rule".to_string())),
+            CandidateKind::Rule
+        );
         assert_eq!(category_to_kind(&None), CandidateKind::Task);
-        assert_eq!(category_to_kind(&Some("weird".to_string())), CandidateKind::Task);
+        assert_eq!(
+            category_to_kind(&Some("weird".to_string())),
+            CandidateKind::Task
+        );
     }
 
     #[tokio::test]
@@ -721,46 +756,87 @@ mod tests {
         store.init("obl-ns").await.expect("create schema");
         let intake = store.as_intake_store().expect("intake store");
         let ns = "obl-ns";
-        let prov = json!({"turn_id": "t1", "role": "user", "evidence_quote": "fix it", "confidence": 0.9});
+        let prov =
+            json!({"turn_id": "t1", "role": "user", "evidence_quote": "fix it", "confidence": 0.9});
 
         // high-conf user obligation -> should be returned
-        intake.create_receipt(crate::task::intake::CreateReceiptRequest {
-            namespace: ns.to_string(), source_kind: SourceKind::Tool,
-            source_revision: "r1".to_string(), source_digest: "d1".to_string(),
-            text: "obligation one".to_string(), title: Some("Fix login".to_string()),
-            description: None, candidate_kind: None, kind: Some("task_obligation".to_string()),
-            category: None, payload: None, confidence: Some(0.9),
-            source_span: None, provenance: Some(serde_json::from_value::<ProvenanceSpan>(prov.clone()).unwrap()),
-            extractor_fingerprint: None,
-        }).await.expect("create receipt 1");
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: ns.to_string(),
+                source_kind: SourceKind::Tool,
+                source_revision: "r1".to_string(),
+                source_digest: "d1".to_string(),
+                text: "obligation one".to_string(),
+                title: Some("Fix login".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.9),
+                source_span: None,
+                provenance: Some(serde_json::from_value::<ProvenanceSpan>(prov.clone()).unwrap()),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create receipt 1");
 
         // low confidence -> excluded
-        let low_prov = json!({"turn_id": "t2", "role": "user", "evidence_quote": "meh", "confidence": 0.5});
-        intake.create_receipt(crate::task::intake::CreateReceiptRequest {
-            namespace: ns.to_string(), source_kind: SourceKind::Tool,
-            source_revision: "r2".to_string(), source_digest: "d2".to_string(),
-            text: "obligation two".to_string(), title: Some("Low conf".to_string()),
-            description: None, candidate_kind: None, kind: Some("task_obligation".to_string()),
-            category: None, payload: None, confidence: Some(0.5),
-            source_span: None, provenance: Some(serde_json::from_value::<ProvenanceSpan>(low_prov).unwrap()),
-            extractor_fingerprint: None,
-        }).await.expect("create receipt 2");
+        let low_prov =
+            json!({"turn_id": "t2", "role": "user", "evidence_quote": "meh", "confidence": 0.5});
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: ns.to_string(),
+                source_kind: SourceKind::Tool,
+                source_revision: "r2".to_string(),
+                source_digest: "d2".to_string(),
+                text: "obligation two".to_string(),
+                title: Some("Low conf".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.5),
+                source_span: None,
+                provenance: Some(serde_json::from_value::<ProvenanceSpan>(low_prov).unwrap()),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create receipt 2");
 
         // different role (assistant) -> excluded
         let asst_prov = json!({"turn_id": "t3", "role": "assistant", "evidence_quote": "no", "confidence": 0.99});
-        intake.create_receipt(crate::task::intake::CreateReceiptRequest {
-            namespace: ns.to_string(), source_kind: SourceKind::Tool,
-            source_revision: "r3".to_string(), source_digest: "d3".to_string(),
-            text: "obligation three".to_string(), title: Some("Assistant".to_string()),
-            description: None, candidate_kind: None, kind: Some("task_obligation".to_string()),
-            category: None, payload: None, confidence: Some(0.99),
-            source_span: None, provenance: Some(serde_json::from_value::<ProvenanceSpan>(asst_prov).unwrap()),
-            extractor_fingerprint: None,
-        }).await.expect("create receipt 3");
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: ns.to_string(),
+                source_kind: SourceKind::Tool,
+                source_revision: "r3".to_string(),
+                source_digest: "d3".to_string(),
+                text: "obligation three".to_string(),
+                title: Some("Assistant".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.99),
+                source_span: None,
+                provenance: Some(serde_json::from_value::<ProvenanceSpan>(asst_prov).unwrap()),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create receipt 3");
 
         let got = undisposed_high_confidence_obligations(&*intake, ns, None, None)
-            .await.expect("query obligations");
-        assert_eq!(got.len(), 1, "only the high-conf user obligation: {:?}", got);
+            .await
+            .expect("query obligations");
+        assert_eq!(
+            got.len(),
+            1,
+            "only the high-conf user obligation: {:?}",
+            got
+        );
         assert_eq!(got[0].title, "Fix login");
     }
 
@@ -987,19 +1063,42 @@ pub async fn handle_intake(args: Value, store: Arc<dyn crate::traits::VectorStor
         _ => return "ERROR: 'text' is required and cannot be empty.".to_string(),
     };
 
-    let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let candidate_kind =
-        args.get("candidate_kind").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let kind = args.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let candidate_kind = args
+        .get("candidate_kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let kind = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let payload = args.get("payload").cloned();
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
     let source_span = args.get("source_span").cloned();
-    let provenance = args.get("provenance").cloned()
+    let provenance = args
+        .get("provenance")
+        .cloned()
         .and_then(|v| serde_json::from_value::<ProvenanceSpan>(v).ok())
-        .or_else(|| source_span.as_ref().and_then(|v| ProvenanceSpan::from_value(v.clone())));
-    let extractor_fingerprint = args.get("extractor_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string());
+        .or_else(|| {
+            source_span
+                .as_ref()
+                .and_then(|v| ProvenanceSpan::from_value(v.clone()))
+        });
+    let extractor_fingerprint = args
+        .get("extractor_fingerprint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Downcast to IntakeStore
     let intake_store = store.as_intake_store();

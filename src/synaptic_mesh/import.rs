@@ -62,7 +62,14 @@ pub const IMPORT_CURSOR_SCHEMA_VERSION: &str = "synaptic-mesh-import-cursor/v1";
 /// definitions). `action_receipt` and `structural` records are strictly
 /// node-local and never travel; anything unknown (future vocabulary) is
 /// rejected at import (hard error), never applied, never crash.
-const SHAREABLE_MEMORY_TYPES: [&str; 6] = ["rule", "fact", "procedure", "action_type", "thesis", "concept"];
+const SHAREABLE_MEMORY_TYPES: [&str; 6] = [
+    "rule",
+    "fact",
+    "procedure",
+    "action_type",
+    "thesis",
+    "concept",
+];
 
 /// Runtime procedure counters are strictly local (spec §"Record format":
 /// "they never leave the node"). A shared record carrying ANY of these keys
@@ -1192,9 +1199,7 @@ fn classify_merge(
     match kernel {
         crate::formal_kernel::KernelMergeDecision::Apply => MergeDecision::Apply,
         crate::formal_kernel::KernelMergeDecision::ApplyCombinationArchiveEdit => {
-            MergeDecision::ApplyCombination(
-                "archive + edit; edited content stays archived",
-            )
+            MergeDecision::ApplyCombination("archive + edit; edited content stays archived")
         }
         crate::formal_kernel::KernelMergeDecision::Skip => MergeDecision::Skip,
         crate::formal_kernel::KernelMergeDecision::RefuseTombstoneWins => {
@@ -1204,9 +1209,7 @@ fn classify_merge(
             MergeDecision::Refuse("superseded; rejected stale restore".to_string())
         }
         crate::formal_kernel::KernelMergeDecision::RefuseIllegalTransition => {
-            MergeDecision::Refuse(format!(
-                "illegal transition {local_state} -> {cand_state}"
-            ))
+            MergeDecision::Refuse(format!("illegal transition {local_state} -> {cand_state}"))
         }
         crate::formal_kernel::KernelMergeDecision::ConflictTwoReplacements => {
             MergeDecision::Conflict("two different replacements")
@@ -1275,7 +1278,11 @@ pub fn classify_merge_parity_tag(
         patch: None,
     };
     let local_superseded_by = if local_state == LifecycleState::Superseded {
-        Some(if same_superseded_by { PARITY_REPLACED_BY_A } else { PARITY_REPLACED_BY_B })
+        Some(if same_superseded_by {
+            PARITY_REPLACED_BY_A
+        } else {
+            PARITY_REPLACED_BY_B
+        })
     } else {
         None
     };
@@ -1560,10 +1567,16 @@ async fn apply_one(
         Err(e) => return Disposition::Ignored(format!("store read failed for {id}: {e}")),
     };
 
-    let existing_update_id = existing.as_ref().and_then(|(_, payload)| mesh_update_id_of(&payload.metadata));
+    let existing_update_id = existing
+        .as_ref()
+        .and_then(|(_, payload)| mesh_update_id_of(&payload.metadata));
     let same_update_id = existing_update_id.as_deref() == Some(&record.update_id.to_string());
 
-    match evaluate_import_precheck(existing.is_some(), existing_update_id.is_some(), same_update_id) {
+    match evaluate_import_precheck(
+        existing.is_some(),
+        existing_update_id.is_some(),
+        same_update_id,
+    ) {
         KernelImportPrecheck::SkipSameUpdateId => return Disposition::Skipped,
         KernelImportPrecheck::RefusePrivateSovereign => {
             return Disposition::Ignored(format!(
@@ -1577,132 +1590,127 @@ async fn apply_one(
     // Mesh-owned row at another revision: gate the transition.
     if let Some((vector, payload)) = existing {
         let accepted = existing_update_id.as_deref().unwrap();
-                let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata)
-                else {
-                    return Disposition::Ignored(format!(
-                        "mesh row {id} has unreadable lifecycle provenance"
-                    ));
-                };
-                // Tracked-stale-bundle guard (issue #44, Gate G2 option
-                // (a)): a bundle-only candidate on a DIFF pass whose
-                // UUIDv7 update_id predates the accepted revision would
-                // otherwise pass `classify_merge` as a plain forward edit
-                // and silently roll the live row back. The guard is
-                // deliberately narrow — bundle route only, diff pass
-                // only (full-tree passes stay concurrent/conflicted),
-                // both sides live and in the SAME state (transitions and
-                // combinations are untouched), content actually
-                // differing, and both update_ids UUIDv7 with the
-                // candidate STRICTLY older (millisecond comparison;
-                // ties and any non-v7 id leave it inert).
-                if from_bundle && !concurrent {
-                    let both_live_same_state = matches!(
-                        local_state,
-                        LifecycleState::Active | LifecycleState::Archived
-                    ) && record.lifecycle.state == local_state;
-                    if both_live_same_state && payload.content != content_text(&record) {
-                        let accepted_v7 = Uuid::parse_str(&accepted)
-                            .ok()
-                            .and_then(|u| update_id_v7_millis(&u));
-                        let candidate_v7 = update_id_v7_millis(&record.update_id);
-                        if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7)
-                        {
-                            if candidate_ts < accepted_ts {
-                                return Disposition::Ignored(format!(
+        let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata) else {
+            return Disposition::Ignored(format!(
+                "mesh row {id} has unreadable lifecycle provenance"
+            ));
+        };
+        // Tracked-stale-bundle guard (issue #44, Gate G2 option
+        // (a)): a bundle-only candidate on a DIFF pass whose
+        // UUIDv7 update_id predates the accepted revision would
+        // otherwise pass `classify_merge` as a plain forward edit
+        // and silently roll the live row back. The guard is
+        // deliberately narrow — bundle route only, diff pass
+        // only (full-tree passes stay concurrent/conflicted),
+        // both sides live and in the SAME state (transitions and
+        // combinations are untouched), content actually
+        // differing, and both update_ids UUIDv7 with the
+        // candidate STRICTLY older (millisecond comparison;
+        // ties and any non-v7 id leave it inert).
+        if from_bundle && !concurrent {
+            let both_live_same_state = matches!(
+                local_state,
+                LifecycleState::Active | LifecycleState::Archived
+            ) && record.lifecycle.state == local_state;
+            if both_live_same_state && payload.content != content_text(&record) {
+                let accepted_v7 = Uuid::parse_str(&accepted)
+                    .ok()
+                    .and_then(|u| update_id_v7_millis(&u));
+                let candidate_v7 = update_id_v7_millis(&record.update_id);
+                if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7) {
+                    if candidate_ts < accepted_ts {
+                        return Disposition::Ignored(format!(
                                     "{id}: stale bundle revision refused — candidate update_id {} predates accepted {accepted}",
                                     record.update_id
                                 ));
-                            }
-                        }
                     }
                 }
-                match classify_merge(
-                    local_state,
-                    local_superseded_by,
-                    &payload.content,
+            }
+        }
+        match classify_merge(
+            local_state,
+            local_superseded_by,
+            &payload.content,
+            &record,
+            concurrent,
+        ) {
+            MergeDecision::Skip => return Disposition::Skipped,
+            MergeDecision::Refuse(reason) => {
+                return Disposition::Ignored(format!("{id}: {reason}"));
+            }
+            MergeDecision::Conflict(reason) => {
+                // Preserve the candidate, register the overlay, and
+                // annotate the EXISTING row (content untouched) with
+                // the suppression marker.
+                if let Err(e) = conflict::register_conflict(
+                    root,
+                    &namespace,
+                    &id,
+                    &record.update_id.to_string(),
+                    reason,
+                    ConflictKind::Unresolved,
                     &record,
-                    concurrent,
                 ) {
-                    MergeDecision::Skip => return Disposition::Skipped,
-                    MergeDecision::Refuse(reason) => {
-                        return Disposition::Ignored(format!("{id}: {reason}"));
-                    }
-                    MergeDecision::Conflict(reason) => {
-                        // Preserve the candidate, register the overlay, and
-                        // annotate the EXISTING row (content untouched) with
-                        // the suppression marker.
-                        if let Err(e) = conflict::register_conflict(
-                            root,
-                            &namespace,
-                            &id,
-                            &record.update_id.to_string(),
-                            reason,
-                            ConflictKind::Unresolved,
-                            &record,
-                        ) {
-                            return Disposition::Ignored(format!(
-                                "conflict overlay write failed for {id}: {e}"
-                            ));
-                        }
-                        if let Err(e) =
-                            annotate_conflicting(&store, &namespace, &id, &vector, &payload, reason)
-                                .await
-                        {
-                            return Disposition::Ignored(format!(
-                                "conflict marker write failed for {id}: {e}"
-                            ));
-                        }
-                        return Disposition::Conflicted(id);
-                    }
-                    MergeDecision::SupersedeWinsPreserveEdit => {
-                        return preserve_superseded_edit(
-                            root,
-                            mesh_id,
-                            &id,
-                            &namespace,
-                            local_state,
-                            &payload,
-                            &record,
-                            store,
-                            emb,
-                            import_trust,
-                            head_signature,
-                            signature_disposition,
-                        )
-                        .await;
-                    }
-                    MergeDecision::ApplyCombination(reason) => {
-                        // Edited content stays archived. The edited content
-                        // is whichever side is ACTIVE (they edited; we
-                        // archived, or vice-versa).
-                        let edited = if local_state == LifecycleState::Archived {
-                            content_text(&record)
-                        } else {
-                            payload.content.clone()
-                        };
-                        return match apply_effective(
-                            root,
-                            mesh_id,
-                            &id,
-                            &namespace,
-                            &record,
-                            store,
-                            emb,
-                            ApplyShape::ArchivedCombination { edited },
-                            Some(import_trust),
-                            head_signature,
-                            signature_disposition,
-                        )
-                        .await
-                        {
-                            Disposition::Applied => {
-                                Disposition::AppliedCombination(reason.to_string())
-                            }
-                            other => other,
-                        };
-                    }
-                    MergeDecision::Apply => {}
+                    return Disposition::Ignored(format!(
+                        "conflict overlay write failed for {id}: {e}"
+                    ));
                 }
+                if let Err(e) =
+                    annotate_conflicting(&store, &namespace, &id, &vector, &payload, reason).await
+                {
+                    return Disposition::Ignored(format!(
+                        "conflict marker write failed for {id}: {e}"
+                    ));
+                }
+                return Disposition::Conflicted(id);
+            }
+            MergeDecision::SupersedeWinsPreserveEdit => {
+                return preserve_superseded_edit(
+                    root,
+                    mesh_id,
+                    &id,
+                    &namespace,
+                    local_state,
+                    &payload,
+                    &record,
+                    store,
+                    emb,
+                    import_trust,
+                    head_signature,
+                    signature_disposition,
+                )
+                .await;
+            }
+            MergeDecision::ApplyCombination(reason) => {
+                // Edited content stays archived. The edited content
+                // is whichever side is ACTIVE (they edited; we
+                // archived, or vice-versa).
+                let edited = if local_state == LifecycleState::Archived {
+                    content_text(&record)
+                } else {
+                    payload.content.clone()
+                };
+                return match apply_effective(
+                    root,
+                    mesh_id,
+                    &id,
+                    &namespace,
+                    &record,
+                    store,
+                    emb,
+                    ApplyShape::ArchivedCombination { edited },
+                    Some(import_trust),
+                    head_signature,
+                    signature_disposition,
+                )
+                .await
+                {
+                    Disposition::Applied => Disposition::AppliedCombination(reason.to_string()),
+                    other => other,
+                };
+            }
+            MergeDecision::Apply => {}
+        }
     }
 
     apply_effective(
@@ -6182,13 +6190,26 @@ mod tests {
         // Superseded local + archived candidate + content edit → preserve edit.
         let archived_cand = record_at(Uuid::new_v4(), LifecycleState::Archived, None, "edited");
         assert_eq!(
-            classify_merge(LifecycleState::Superseded, Some(u1), "orig", &archived_cand, true),
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(u1),
+                "orig",
+                &archived_cand,
+                true
+            ),
             MergeDecision::SupersedeWinsPreserveEdit
         );
         // Archived local + superseded candidate + content edit → preserve edit.
-        let superseded_cand = record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "orig");
+        let superseded_cand =
+            record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "orig");
         assert_eq!(
-            classify_merge(LifecycleState::Archived, None, "edited", &superseded_cand, true),
+            classify_merge(
+                LifecycleState::Archived,
+                None,
+                "edited",
+                &superseded_cand,
+                true
+            ),
             MergeDecision::SupersedeWinsPreserveEdit
         );
         // Same content on a retired id is a stale restore: refused, never applied.
@@ -6236,35 +6257,83 @@ mod tests {
             "supersede_wins_preserve_edit"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Tombstoned, true, false, false),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Tombstoned,
+                true,
+                false,
+                false
+            ),
             "apply"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Archived, true, true, true),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Archived,
+                true,
+                true,
+                true
+            ),
             "apply_combination_archive_edit"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Superseded, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Superseded,
+                true,
+                false,
+                true
+            ),
             "skip"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Tombstoned, LifecycleState::Active, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Tombstoned,
+                LifecycleState::Active,
+                true,
+                false,
+                true
+            ),
             "refuse_tombstone_wins"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Archived, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Archived,
+                true,
+                false,
+                true
+            ),
             "refuse_stale_restore"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Superseded, LifecycleState::Superseded, false, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Superseded,
+                false,
+                false,
+                true
+            ),
             "conflict_two_replacements"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Archived, true, false, true),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Archived,
+                true,
+                false,
+                true
+            ),
             "conflict_restore_archive"
         );
         assert_eq!(
-            classify_merge_parity_tag(LifecycleState::Active, LifecycleState::Active, true, true, true),
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Active,
+                true,
+                true,
+                true
+            ),
             "conflict_incompatible_edits"
         );
     }

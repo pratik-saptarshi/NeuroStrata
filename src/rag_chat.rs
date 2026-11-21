@@ -641,7 +641,7 @@ mod tests {
             },
             evidence: None,
         };
-        let mut v = vec![a.clone(), b.clone()];
+        let mut v = [a.clone(), b.clone()];
         v.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
         assert_eq!(v[0].id, "a");
     }

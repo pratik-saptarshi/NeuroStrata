@@ -2214,12 +2214,9 @@ async fn handle_http_data_connector(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
-    let body = crate::server::handle_data_connector(
-        &req,
-        state.vector_store.clone(),
-        state.bus.clone(),
-    )
-    .await;
+    let body =
+        crate::server::handle_data_connector(&req, state.vector_store.clone(), state.bus.clone())
+            .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
@@ -2234,10 +2231,7 @@ async fn handle_http_vault_sync(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<
-    (
-        [(axum::http::header::HeaderName, &'static str); 1],
-        String,
-    ),
+    ([(axum::http::header::HeaderName, &'static str); 1], String),
     (axum::http::StatusCode, String),
 > {
     let vault_path = req
@@ -3179,7 +3173,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(initialized.status(), axum::http::StatusCode::ACCEPTED);
-        assert_eq!(initialized.text().await.unwrap(), "", "a notification is not answered");
+        assert_eq!(
+            initialized.text().await.unwrap(),
+            "",
+            "a notification is not answered"
+        );
 
         let ping = authed
             .post(format!("{base}/mcp"))

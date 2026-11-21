@@ -880,12 +880,8 @@ impl ContradictionQueue {
         reason: &str,
         queued_at: i64,
     ) -> Result<bool> {
-        let key = |r: &QueuedContradiction| {
-            (
-                r.target_memory_id.clone(),
-                r.action_receipt_id.clone(),
-            )
-        };
+        let key =
+            |r: &QueuedContradiction| (r.target_memory_id.clone(), r.action_receipt_id.clone());
         let wanted = (
             target_memory_id.to_string(),
             action_receipt_id.map(|s| s.to_string()),
@@ -930,11 +926,17 @@ mod contradiction_queue_tests {
     fn enqueue_is_durable_and_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let q = ContradictionQueue::new(tmp.path());
-        assert!(q.enqueue("rule-1", Some("receipt-9"), "revert", 100).unwrap());
+        assert!(q
+            .enqueue("rule-1", Some("receipt-9"), "revert", 100)
+            .unwrap());
         // Duplicate delivery (same target + receipt) must not append again.
-        assert!(!q.enqueue("rule-1", Some("receipt-9"), "revert", 100).unwrap());
+        assert!(!q
+            .enqueue("rule-1", Some("receipt-9"), "revert", 100)
+            .unwrap());
         // Different receipt or target is a genuinely new request.
-        assert!(q.enqueue("rule-1", Some("receipt-10"), "revert", 101).unwrap());
+        assert!(q
+            .enqueue("rule-1", Some("receipt-10"), "revert", 101)
+            .unwrap());
         assert!(q.enqueue("rule-2", None, "failed attempt", 102).unwrap());
         let pending = q.pending().unwrap();
         assert_eq!(pending.len(), 3);
@@ -986,7 +988,10 @@ mod contradiction_queue_tests {
             .into_iter()
             .map(|h| h.join().unwrap() as usize)
             .sum();
-        assert_eq!(appended, 1, "only one concurrent same-key enqueue may append");
+        assert_eq!(
+            appended, 1,
+            "only one concurrent same-key enqueue may append"
+        );
         let q = ContradictionQueue::new(&root);
         assert_eq!(q.pending().unwrap().len(), 1);
     }
@@ -996,7 +1001,9 @@ mod contradiction_queue_tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("learning").join("nested");
         let q = ContradictionQueue::new(&nested);
-        assert!(q.enqueue("rule-durable", Some("receipt-2"), "why", 5).unwrap());
+        assert!(q
+            .enqueue("rule-durable", Some("receipt-2"), "why", 5)
+            .unwrap());
         assert!(nested.exists(), "parent directory must be created durably");
         let q2 = ContradictionQueue::new(&nested);
         let pending = q2.pending().unwrap();

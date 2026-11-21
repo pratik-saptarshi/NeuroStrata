@@ -673,10 +673,7 @@ fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
     // filter and the per-hit veto cannot disagree and starve a page slot.
     match as_of {
         None => doc.valid_to.map_or(true, |v| v > now),
-        Some(ts) => {
-            doc.valid_from.unwrap_or(0) <= ts
-                && doc.valid_to.map_or(true, |v| ts < v)
-        }
+        Some(ts) => doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.map_or(true, |v| ts < v),
     }
 }
 

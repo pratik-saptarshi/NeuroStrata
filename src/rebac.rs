@@ -534,35 +534,92 @@ mod tests {
     #[test]
     fn can_write_namespace_rejects_blank_namespace() {
         let (_dir, store) = namespace_gate_store();
-        assert!(!can_write_namespace(&store, "", None), "empty namespace, no principal");
-        assert!(!can_write_namespace(&store, "", Some("")), "empty namespace, empty principal");
-        assert!(!can_write_namespace(&store, "", Some("admin")), "empty namespace, admin");
-        assert!(!can_write_namespace(&store, "", Some("alice")), "empty namespace, owner namesake");
-        assert!(!can_write_namespace(&store, "   ", None), "spaces namespace");
-        assert!(!can_write_namespace(&store, "  ", Some("  ")), "spaces namespace, spaces principal");
-        assert!(!can_write_namespace(&store, "\t\n", Some("\t\n")), "control-whitespace match");
-        assert!(!can_write_namespace(&store, "  ", Some("admin")), "spaces namespace, admin");
+        assert!(
+            !can_write_namespace(&store, "", None),
+            "empty namespace, no principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("")),
+            "empty namespace, empty principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("admin")),
+            "empty namespace, admin"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("alice")),
+            "empty namespace, owner namesake"
+        );
+        assert!(
+            !can_write_namespace(&store, "   ", None),
+            "spaces namespace"
+        );
+        assert!(
+            !can_write_namespace(&store, "  ", Some("  ")),
+            "spaces namespace, spaces principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "\t\n", Some("\t\n")),
+            "control-whitespace match"
+        );
+        assert!(
+            !can_write_namespace(&store, "  ", Some("admin")),
+            "spaces namespace, admin"
+        );
     }
 
     #[test]
     fn can_write_namespace_rejects_blank_principal() {
         let (_dir, store) = namespace_gate_store();
-        assert!(!can_write_namespace(&store, "ns", Some("")), "empty principal");
-        assert!(!can_write_namespace(&store, "ns", Some("   ")), "spaces principal");
-        assert!(!can_write_namespace(&store, "ns", Some("\t")), "tab principal");
-        assert!(!can_write_namespace(&store, "  ", Some("")), "blank namespace, empty principal");
-        assert!(!can_write_namespace(&store, "", Some("   ")), "empty namespace, spaces principal");
+        assert!(
+            !can_write_namespace(&store, "ns", Some("")),
+            "empty principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some("   ")),
+            "spaces principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some("\t")),
+            "tab principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "  ", Some("")),
+            "blank namespace, empty principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("   ")),
+            "empty namespace, spaces principal"
+        );
     }
 
     #[test]
     fn can_write_namespace_preserves_non_blank_behavior() {
         let (_dir, store) = namespace_gate_store();
-        assert!(can_write_namespace(&store, "ns", Some("admin")), "admin bypass preserved");
-        assert!(can_write_namespace(&store, "ns", Some("ns")), "namesake convention preserved");
-        assert!(!can_write_namespace(&store, "ns", Some("bob")), "stranger denied");
-        assert!(!can_write_namespace(&store, "ns", None), "absent principal denied");
-        assert!(can_write_namespace(&store, " ns ", Some(" ns ")), "non-blank whitespace namesake kept");
-        assert!(!can_write_namespace(&store, "ns", Some(" ns ")), "exact match only, no trim-spoof");
+        assert!(
+            can_write_namespace(&store, "ns", Some("admin")),
+            "admin bypass preserved"
+        );
+        assert!(
+            can_write_namespace(&store, "ns", Some("ns")),
+            "namesake convention preserved"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some("bob")),
+            "stranger denied"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", None),
+            "absent principal denied"
+        );
+        assert!(
+            can_write_namespace(&store, " ns ", Some(" ns ")),
+            "non-blank whitespace namesake kept"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some(" ns ")),
+            "exact match only, no trim-spoof"
+        );
     }
 
     #[test]
@@ -574,10 +631,30 @@ mod tests {
                 {"principal": "dave-owner", "role": "owner"}
             ]
         });
-        assert!(!can_execute_action_on_row("bob-viewer", "alice", "editor", &meta));
-        assert!(can_execute_action_on_row("carol-editor", "alice", "editor", &meta));
-        assert!(!can_execute_action_on_row("carol-editor", "alice", "owner", &meta));
-        assert!(can_execute_action_on_row("dave-owner", "alice", "owner", &meta));
+        assert!(!can_execute_action_on_row(
+            "bob-viewer",
+            "alice",
+            "editor",
+            &meta
+        ));
+        assert!(can_execute_action_on_row(
+            "carol-editor",
+            "alice",
+            "editor",
+            &meta
+        ));
+        assert!(!can_execute_action_on_row(
+            "carol-editor",
+            "alice",
+            "owner",
+            &meta
+        ));
+        assert!(can_execute_action_on_row(
+            "dave-owner",
+            "alice",
+            "owner",
+            &meta
+        ));
         assert!(can_execute_action_on_row("alice", "alice", "owner", &meta));
         assert!(can_execute_action_on_row("admin", "alice", "owner", &meta));
     }

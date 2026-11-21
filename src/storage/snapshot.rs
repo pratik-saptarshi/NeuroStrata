@@ -795,8 +795,14 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
     }
     let manifest_str = fs::read_to_string(&manifest_path)?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
-    let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
-    let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let format = manifest
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
         return Err(SnapshotError::InvalidManifest(format!(
             "unsupported snapshot: expected format={} version={} (legacy version {} is also readable), got format={:?} version={:?}",
@@ -907,9 +913,7 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
             )));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SnapshotError::MissingFile(
-                "ladybug.store".into(),
-            ));
+            return Err(SnapshotError::MissingFile("ladybug.store".into()));
         }
         Err(e) => return Err(SnapshotError::Io(e)),
     }
@@ -1134,8 +1138,14 @@ pub fn select_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>
                 continue;
             }
         };
-        let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
-        let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let format = manifest
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let version = manifest
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         if format != SNAPSHOT_FORMAT || !snapshot_version_supported(version) {
             continue;
         }
@@ -1804,7 +1814,8 @@ mod tests {
         // Setting a time needs write access on Windows.
         let file = File::options().write(true).open(&wal).unwrap();
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
-        file.set_times(fs::FileTimes::new().set_modified(future)).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(future))
+            .unwrap();
         drop(file);
 
         assert_eq!(
@@ -1898,7 +1909,9 @@ mod tests {
                 message.contains("coordinated") && message.contains("boolean"),
                 "the refusal names the field and its type: {message}"
             ),
-            other => panic!("a version 2 manifest with a non-boolean coordinated must be rejected: {other:?}"),
+            other => panic!(
+                "a version 2 manifest with a non-boolean coordinated must be rejected: {other:?}"
+            ),
         }
     }
 
@@ -1925,7 +1938,9 @@ mod tests {
                 message.contains("coordinated") && message.contains("boolean"),
                 "the refusal names the field and its type: {message}"
             ),
-            other => panic!("a version 1 manifest with a non-boolean coordinated must be rejected: {other:?}"),
+            other => panic!(
+                "a version 1 manifest with a non-boolean coordinated must be rejected: {other:?}"
+            ),
         }
     }
 
@@ -1946,10 +1961,17 @@ mod tests {
         .unwrap();
         write_checksums(&d).unwrap();
 
-        let report = verify_snapshot(&d).expect("an uncoordinated snapshot still verifies its bytes");
+        let report =
+            verify_snapshot(&d).expect("an uncoordinated snapshot still verifies its bytes");
         assert!(report.integrity_ok, "the bytes match their checksums");
-        assert!(!report.valid, "an uncoordinated snapshot is not fully valid");
-        assert!(!report.coordinated, "the verdict reports it as uncoordinated");
+        assert!(
+            !report.valid,
+            "an uncoordinated snapshot is not fully valid"
+        );
+        assert!(
+            !report.coordinated,
+            "the verdict reports it as uncoordinated"
+        );
         assert_eq!(
             report.provenance, PROVENANCE_UNVERIFIED,
             "an uncoordinated snapshot records the unverified provenance"

@@ -187,8 +187,7 @@ mod tests {
             "application/json",
             body,
         ));
-        let result =
-            remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "   ").await;
+        let result = remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "   ").await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.unwrap()[0]["id"], "m1");
         let request = task.await.unwrap().to_lowercase();
@@ -210,8 +209,7 @@ mod tests {
             "text/plain",
             "gone",
         ));
-        let result =
-            remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "t").await;
+        let result = remote_list(&format!("http://127.0.0.1:{}", addr.port()), "ns", "t").await;
         let err = result.expect_err("a 404 cannot be a JSON decode path");
         assert!(err.contains("HTTP 404"), "got: {err}");
         let request = task.await.unwrap().to_lowercase();
