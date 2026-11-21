@@ -12,6 +12,85 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Field names accepted by `TaxonomyRequest` (src/rdf/taxonomy.rs): every
+/// struct field name plus every serde alias (`operation` also accepts
+/// `action`, `aliases` also accepts `alt_labels`, `related_concepts` also
+/// accepts `related`). This list is maintained by hand against the struct
+/// definition and can drift when fields are added or renamed there —
+/// drift only weakens the unknown-field debug log below (a new field
+/// would be reported as unknown until this list is updated); it never
+/// changes request handling.
+const KNOWN_TAXONOMY_FIELDS: &[&str] = &[
+    "access_policy",
+    "action",
+    "adjacent_domains",
+    "aliases",
+    "alt_labels",
+    "axes",
+    "broader",
+    "comparable_implementations",
+    "concept_iri",
+    "content",
+    "contrasts_with",
+    "core_pillars",
+    "current_limitations",
+    "definition",
+    "deprecation",
+    "direction",
+    "domain",
+    "eligibility",
+    "evaluation_axes",
+    "evaluation_scores",
+    "evidence_refs",
+    "extracted_from",
+    "frontier_opportunities",
+    "governs",
+    "implemented_interfaces",
+    "limit",
+    "linked_action_types",
+    "locations",
+    "max_hops",
+    "mission",
+    "namespace",
+    "non_goals",
+    "not_definition",
+    "operation",
+    "pref_label",
+    "primary_domain",
+    "principal",
+    "query",
+    "realization_status",
+    "references",
+    "related",
+    "related_concepts",
+    "related_to",
+    "root_slug",
+    "slug",
+    "slugs",
+    "top_k",
+    "topic",
+    "tradeoffs",
+    "visible_to",
+];
+
+/// Top-level keys of `arguments` that `TaxonomyRequest` does not recognise.
+/// `TaxonomyRequest` defaults every field, so unknown keys are silently
+/// dropped by the `from_value` conversion; this helper exists only to make
+/// those drops visible in the debug log (fork #124, C3). Returns the sorted
+/// unknown names for an object payload, and an empty vec otherwise.
+pub fn unknown_taxonomy_fields(arguments: &Value) -> Vec<String> {
+    let Some(obj) = arguments.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|k| !KNOWN_TAXONOMY_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 /// Synchronously tee a taxonomy mutation pulse into the project's durable
 /// SynapticMesh outbox when running in CLI fallback mode (`bus == None`).
 pub async fn tee_taxonomy_pulse_to_project_outbox(
@@ -90,6 +169,14 @@ pub async fn handle_taxonomy_with_auth_and_bus(
         })
         .to_string();
     };
+
+    let unknown_fields = unknown_taxonomy_fields(arguments);
+    if !unknown_fields.is_empty() {
+        tracing::debug!(
+            "taxonomy request carries unknown fields that will be ignored: {}",
+            unknown_fields.join(", ")
+        );
+    }
 
     let mut req: TaxonomyRequest = match serde_json::from_value(arguments.clone()) {
         Ok(r) => r,
@@ -195,5 +282,46 @@ pub async fn handle_taxonomy_with_auth_and_bus(
             "error": err,
         })
         .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_fields_returns_sorted_unknown_names_only() {
+        let args = json!({
+            "namespace": "demo",
+            "operation": "tree",
+            "max_hops": 2,
+            "action": "tree",
+            "alt_labels": ["x"],
+            "zz_typo_field": true,
+            "bogus_key": 1,
+        });
+        assert_eq!(
+            unknown_taxonomy_fields(&args),
+            vec!["bogus_key".to_string(), "zz_typo_field".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_fields_empty_for_all_known_payload() {
+        let args = json!({
+            "namespace": "demo",
+            "operation": "compare",
+            "slugs": ["a", "b"],
+            "axes": ["determinism"],
+            "related": ["c"],
+        });
+        assert!(unknown_taxonomy_fields(&args).is_empty());
+    }
+
+    #[test]
+    fn unknown_fields_empty_for_non_object() {
+        assert!(unknown_taxonomy_fields(&json!("tree")).is_empty());
+        assert!(unknown_taxonomy_fields(&json!(["operation"])).is_empty());
+        assert!(unknown_taxonomy_fields(&Value::Null).is_empty());
     }
 }

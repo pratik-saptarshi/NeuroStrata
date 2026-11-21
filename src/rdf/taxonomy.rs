@@ -2061,18 +2061,33 @@ fn build_tree_node(
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
     visited: &mut BTreeSet<String>,
+    depth: usize,
+    max_hops: Option<usize>,
+    budget: &mut usize,
 ) -> Option<TaxonomyTreeNode> {
+    if *budget == 0 {
+        return None;
+    }
     if !visited.insert(slug.to_string()) {
         return None;
     }
     let c = concepts.get(slug)?;
+    *budget -= 1;
     let mut children = Vec::new();
-    for child_slug in &c.narrower {
-        if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
-            if let Some(child_node) =
-                build_tree_node(child_slug, concepts, allowed_set, visited)
-            {
-                children.push(child_node);
+    if max_hops.map_or(true, |h| depth < h) {
+        for child_slug in &c.narrower {
+            if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
+                if let Some(child_node) = build_tree_node(
+                    child_slug,
+                    concepts,
+                    allowed_set,
+                    visited,
+                    depth + 1,
+                    max_hops,
+                    budget,
+                ) {
+                    children.push(child_node);
+                }
             }
         }
     }
@@ -2157,10 +2172,17 @@ async fn execute_tree(
 
     let mut visited = BTreeSet::new();
     let mut roots = Vec::new();
+    let mut budget = req.limit.unwrap_or(usize::MAX);
     for r_slug in root_slugs {
-        if let Some(node) =
-            build_tree_node(&r_slug, &view.concepts, &allowed_slugs, &mut visited)
-        {
+        if let Some(node) = build_tree_node(
+            &r_slug,
+            &view.concepts,
+            &allowed_slugs,
+            &mut visited,
+            0,
+            req.max_hops,
+            &mut budget,
+        ) {
             roots.push(node);
         }
     }
@@ -5719,5 +5741,176 @@ mod tests {
         .expect("compare at exactly 32 axes must succeed");
         assert_eq!(cmp["operation"], "compare");
         assert_eq!(cmp["axis_matrix"].as_object().unwrap().len(), 32);
+    }
+
+    // ── C2 (fork #124): execute_tree honours limit / max_hops ──
+
+    /// Seeds a 3-level chain: tree-root -> tree-child -> tree-grandchild.
+    async fn seed_three_level_chain(store: &LadybugStore, embedder: &DummyEmbedder, ns: &str) {
+        for (slug, label, broader) in [
+            ("tree-root", "Tree Root", None),
+            ("tree-child", "Tree Child", Some("tree-root")),
+            ("tree-grandchild", "Tree Grandchild", Some("tree-child")),
+        ] {
+            execute_taxonomy(
+                store,
+                embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(format!("Definition for {label}")),
+                    broader: broader.map(|b| vec![b.to_string()]),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed chain concept");
+        }
+    }
+
+    fn count_tree_nodes(nodes: &[Value]) -> usize {
+        nodes
+            .iter()
+            .map(|n| 1 + n["children"].as_array().map_or(0, |c| count_tree_nodes(c)))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn tree_max_hops_one_truncates_grandchildren() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-max-hops-one-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=1");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["slug"], "tree-child");
+        assert!(
+            children[0]["children"]
+                .as_array()
+                .expect("child children array")
+                .is_empty(),
+            "max_hops=1 must emit depth-1 nodes with no children (grandchild absent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_max_hops_zero_returns_roots_without_children() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-max-hops-zero-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(0),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=0");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        assert!(
+            roots[0]["children"]
+                .as_array()
+                .expect("root children array")
+                .is_empty(),
+            "max_hops=0 must emit roots with empty children"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_limit_two_caps_total_nodes_across_forest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-limit-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                limit: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with limit=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(
+            count_tree_nodes(roots),
+            2,
+            "limit=2 must cap the total emitted nodes across the forest at 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_without_caps_returns_all_three_levels() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-uncapped-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("uncapped tree");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(count_tree_nodes(roots), 3);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        assert_eq!(roots[0]["children"][0]["slug"], "tree-child");
+        assert_eq!(
+            roots[0]["children"][0]["children"][0]["slug"],
+            "tree-grandchild"
+        );
     }
 }
