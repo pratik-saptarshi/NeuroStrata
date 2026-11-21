@@ -16,6 +16,10 @@ pub struct GuardValidator {
     namespace: String,
 }
 
+// Shared bounds for both extraction walks (`collect_string_values` and `walk_file_mutation_value`).
+const EXTRACTION_MAX_DEPTH: usize = 3;
+const EXTRACTION_MAX_NODES: usize = 512;
+
 impl GuardValidator {
     pub async fn new(
         store: Arc<dyn VectorStore>,
@@ -458,7 +462,7 @@ impl GuardValidator {
                 }
             }
             serde_json::Value::Object(map) => {
-                if depth < 3 {
+                if depth < EXTRACTION_MAX_DEPTH {
                     for (k, v) in map {
                         Self::walk_file_mutation_value(
                             v,
@@ -475,7 +479,7 @@ impl GuardValidator {
                 }
             }
             serde_json::Value::Array(items) => {
-                if depth < 3 {
+                if depth < EXTRACTION_MAX_DEPTH {
                     for v in items {
                         Self::walk_file_mutation_value(v, None, depth + 1, budget, paths, shebangs);
                         if *budget == 0 {
@@ -497,7 +501,7 @@ impl GuardValidator {
                 value,
                 serde_json::Value::Object(_) | serde_json::Value::Array(_)
             ) {
-                let mut budget = 512usize;
+                let mut budget = EXTRACTION_MAX_NODES;
                 Self::walk_file_mutation_value(
                     &value,
                     None,
@@ -573,7 +577,7 @@ impl GuardValidator {
                 }
             }
             serde_json::Value::Object(map) => {
-                if depth < 3 {
+                if depth < EXTRACTION_MAX_DEPTH {
                     for v in map.values() {
                         Self::collect_string_values(v, depth + 1, budget, out);
                         if *budget == 0 {
@@ -583,7 +587,7 @@ impl GuardValidator {
                 }
             }
             serde_json::Value::Array(items) => {
-                if depth < 3 {
+                if depth < EXTRACTION_MAX_DEPTH {
                     for v in items {
                         Self::collect_string_values(v, depth + 1, budget, out);
                         if *budget == 0 {
@@ -627,7 +631,7 @@ impl GuardValidator {
                 // a surface: the banned command sits inside a quoted
                 // token there, which the surface builder excludes.)
                 let mut surfaces = Vec::new();
-                let mut budget = 512usize;
+                let mut budget = EXTRACTION_MAX_NODES;
                 Self::collect_string_values(&value, 0, &mut budget, &mut surfaces);
                 if surfaces.is_empty() {
                     // No string values at all (e.g. `{"command": 42}`):
@@ -1855,6 +1859,60 @@ mod tests {
         assert!(
             !GuardValidator::matches_trigger("rm -rf", "bash", &payload),
             "a string beyond the 512-node budget must not fire the rule"
+        );
+    }
+
+    /// Stage 3 finding F2: the file-mutation walk is depth-bounded --
+    /// the object carrying `path` sits 4 edges below the root, beyond
+    /// the walk's depth, so its target is not harvested. Without the
+    /// depth bound the walk reaches it and harvests `deep.py`.
+    #[test]
+    fn file_mutation_walk_respects_depth_bound() {
+        let payload = serde_json::json!({
+            "a": {"b": {"c": {"d": {"path": "deep.py"}}}}
+        })
+        .to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            !paths.contains(&"deep.py".to_string()),
+            "a path beyond the depth bound must not be harvested: {paths:?}"
+        );
+        assert!(paths.is_empty(), "no paths must be harvested: {paths:?}");
+    }
+
+    /// Stage 3 finding F2: the file-mutation walk is node-budget-bounded.
+    /// Node counting (budget decrements on entry to each visited node,
+    /// root counts 1): root = 1 and each `kNNN` entry costs 2 nodes
+    /// (its object plus its `path` string), so the `kNNN` entries
+    /// alone total 601 nodes including the root, well over the 512
+    /// budget. In visit order the budget reaches 0 on the object
+    /// under `k255` (node 512: 1 + 255 * 2 + 1), its string is never
+    /// visited, and every later key including `zzz_last` is
+    /// unreached. Without the budget, `target.py` is harvested.
+    #[test]
+    fn file_mutation_walk_respects_node_budget() {
+        let mut map = serde_json::Map::new();
+        for i in 0..300 {
+            map.insert(
+                format!("k{:03}", i),
+                serde_json::json!({"path": format!("k{:03}.py", i)}),
+            );
+        }
+        map.insert(
+            "zzz_last".to_string(),
+            serde_json::json!({"path": "target.py"}),
+        );
+        let payload = serde_json::Value::Object(map).to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            paths.contains(&"k000.py".to_string()),
+            "an early entry must be harvested, proving the walk ran: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"target.py".to_string()),
+            "a path beyond the 512-node budget must not be harvested: {paths:?}"
         );
     }
 }
