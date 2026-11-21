@@ -43,6 +43,12 @@ const CONTENT_KEYS: &[&str] = &[
     "new_source",
 ];
 const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
+// Modelled edit-text fields carrying the text being REPLACED. They are
+// not content keys (no shebang is harvested from text being removed),
+// but they are modelled payload fields, so the patch-marker scan must
+// skip them like every other modelled key: an edit whose old text
+// quotes a patch example is not itself a patch.
+const OLD_TEXT_KEYS: &[&str] = &["oldString", "old_string"];
 
 impl GuardValidator {
     pub async fn new(
@@ -424,7 +430,11 @@ impl GuardValidator {
     /// go through patch extraction. Every other string value is scanned
     /// for patch markers (ruling R3) -- scanning the decoded value is
     /// what makes the exec-bridge shape work, since the patch's
-    /// newlines are `\n`-escaped in the raw JSON text. All object/array
+    /// newlines are `\n`-escaped in the raw JSON text. The marker scan
+    /// skips every modelled key (path, content, patch and old-text
+    /// keys): those values already have their own handling above, and
+    /// treating their contents as patches false-harvests targets from
+    /// quoted patch examples in file content or edit text. All object/array
     /// values are recursed into regardless of key. Prose discipline is
     /// preserved: arbitrary strings are never treated as paths, and
     /// only content-key first lines become shebangs.
@@ -442,7 +452,12 @@ impl GuardValidator {
         *budget -= 1;
         match value {
             serde_json::Value::String(s) => {
-                let is_patch_key = key_hint.is_some_and(|k| PATCH_KEYS.contains(&k));
+                let is_modelled_key = key_hint.is_some_and(|k| {
+                    PATH_KEYS.contains(&k)
+                        || CONTENT_KEYS.contains(&k)
+                        || PATCH_KEYS.contains(&k)
+                        || OLD_TEXT_KEYS.contains(&k)
+                });
                 match key_hint {
                     Some(k) if PATH_KEYS.contains(&k) => {
                         paths.push(s.trim().to_lowercase());
@@ -455,7 +470,7 @@ impl GuardValidator {
                     }
                     _ => {}
                 }
-                if !is_patch_key
+                if !is_modelled_key
                     && (s.contains("*** Update File:")
                         || s.contains("*** Add File:")
                         || s.contains("+++ "))
@@ -2054,6 +2069,66 @@ mod tests {
         assert!(
             shebangs.contains(&"/usr/bin/env python3".to_string()),
             "the root content shebang must survive edits budget starvation: {shebangs:?}"
+        );
+    }
+
+    /// Codex P2 (PR #129): the R3 marker scan over-fires on modelled
+    /// content fields. Writing README.md whose content quotes a patch
+    /// example ("*** Add File: example.py") harvested example.py as a
+    /// mutation target, false-blocking documentation writes under
+    /// extension rules. RED basis on the unmodified tree: the walk's
+    /// String branch ran the marker scan on every non-patch-key string,
+    /// including `content` values already handled as content.
+    /// Reproduced standalone (/tmp/sim2_resolved.rs): paths contained
+    /// both "readme.md" and "example.py".
+    #[test]
+    fn file_mutation_write_content_patch_example_yields_only_real_target() {
+        let payload = serde_json::json!({
+            "path": "README.md",
+            "content": "Example:\n*** Add File: example.py\n+print(1)\n"
+        })
+        .to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert_eq!(
+            paths,
+            vec!["readme.md".to_string()],
+            "content quoting a patch example must not yield patch targets: {paths:?}"
+        );
+    }
+
+    /// Codex P2 (PR #129): the same over-fire via modelled edit text.
+    /// An edit whose old_string (or newString) quotes a patch example
+    /// must not yield patch-derived targets; the only target is the
+    /// file being edited. Reproduced standalone (/tmp/sim2_resolved.rs)
+    /// for both spellings: paths contained "example.py".
+    #[test]
+    fn file_mutation_edit_text_patch_example_yields_no_patch_targets() {
+        let payload = serde_json::json!({
+            "file_path": "README.md",
+            "old_string": "before\n*** Add File: example.py\n+print(1)\n",
+            "new_string": "after"
+        })
+        .to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert_eq!(
+            paths,
+            vec!["readme.md".to_string()],
+            "old_string quoting a patch example must not yield patch targets: {paths:?}"
+        );
+
+        let payload = serde_json::json!({
+            "file_path": "README.md",
+            "newString": "docs:\n*** Add File: example.py\n+print(1)\n"
+        })
+        .to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert_eq!(
+            paths,
+            vec!["readme.md".to_string()],
+            "newString quoting a patch example must not yield patch targets: {paths:?}"
         );
     }
 }
