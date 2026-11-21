@@ -98,6 +98,23 @@ below.
   `limit` = maximum number of nodes emitted across the whole forest.
   Absent parameter = current unbounded behaviour. Values are honoured
   as given (no silent clamping beyond what the type enforces).
+- **R7 (Task 1 fix shape — amended during execution).** The originally
+  prescribed one-line fallback (`vec![payload.to_string()]`) does NOT
+  discharge defect A at verdict level: the shell matcher only matches
+  command-position surfaces, and in the raw JSON text the banned
+  command sits inside a quoted token, which the surface builder
+  excludes — proven by the Task 1 implementer's standalone simulation
+  of the verbatim matcher functions (raw-JSON fallback: `rm -rf` /
+  `curl` shapes still do not fire). Amended fix (the verdict §7
+  "longer term" suggestion, adopted now): on empty extraction, fall
+  back to the payload's **decoded string values**, collected
+  recursively at bounded depth, as the command surfaces; if the
+  object carries no string values at all (`{"command": 42}`), fall
+  back to `vec![payload.to_string()]`. Still confined to
+  `extract_shell_commands`; no parse changes, no matcher changes.
+  The fork-A filing's "same verdict as the raw string" regression
+  requirement is met by this shape and could not be met by the
+  one-line shape.
 - **R6 (verification venue: CI).** Local builds of this tree are
   blocked: the tree pins `ort-sys 2.0.0-rc.15`, whose build script
   downloads ONNX Runtime 1.31.0 from `cdn.pyke.io`, which returns
@@ -136,9 +153,16 @@ Files: `src/guard/validator.rs` (`extract_shell_commands`, tests mod).
   - A JSON object that DOES yield commands behaves exactly as before
     (existing tests cover; add an explicit pin if missing).
 - [ ] Record the RED basis: for each new test, the current-code line that makes it fail on the unmodified extractor (R6 — CI is the verification venue).
-- [ ] Implement: in `extract_shell_commands`, when the JSON-object
-  path (including the `args` join) yields no command strings, return
-  `vec![payload.to_string()]` instead of the empty vec.
+- [ ] Implement (as amended by R7): in `extract_shell_commands`,
+  when the JSON-object path (including the `args` join) yields no
+  command strings, fall back to the payload's decoded string values
+  collected recursively at bounded depth (depth ≤ 3, node budget
+  shared with Task 2's walk constants where practical); if there
+  are no string values, return `vec![payload.to_string()]`. Check
+  the existing shell prose pin
+  (`shell_json_payloads_ignore_prose_descriptions_and_commit_messages_but_reject_invocations`)
+  against the new fallback: if any of its payload shapes would newly
+  fire, STOP and report — do not change that test silently.
 - [ ] `rustfmt` parse-check the edited file (on a copy); full `guard::validator` module GREEN is established by CI (R6), including
   all pre-existing prose/pin tests.
 - [ ] Commit: `fix(guard): fall back to raw payload when JSON shell extraction is empty`
