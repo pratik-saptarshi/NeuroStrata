@@ -130,7 +130,7 @@ Files: `src/guard/validator.rs` (`extract_shell_commands`, tests mod).
 - [ ] Commit: `fix(guard): fall back to raw payload when JSON shell extraction is empty`
 
 TDD check script: `/tmp` script running
-`cargo test --lib guard::validator` and asserting the new test names
+`cargo test --bin neurostrata-mcp guard::validator` and asserting the new test names
 pass; RED state is the same script run before the implementation step
 (new tests fail).
 
