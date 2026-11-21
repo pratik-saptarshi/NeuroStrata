@@ -1736,10 +1736,13 @@ mod tests {
         );
     }
 
-    /// Fork #123 (defect B4): a quoted example shebang added mid-file in a
-    /// documentation patch is not the target's first added line; the old
-    /// patch extractor harvested a shebang from ANY added line, causing
-    /// false blocks.
+    /// Fork #123 (defect B4): a quoted example shebang in a documentation
+    /// patch yields no shebang via the documentation-target rule. The
+    /// `#!/usr/bin/env python3` line below IS the section's first added
+    /// line (the preceding line is a context line, which does not consume
+    /// the first-added slot), so the first-added-line rule alone would
+    /// harvest it; the no-shebang outcome here is delivered because the
+    /// target is docs.md, a documentation target.
     #[test]
     fn patch_mid_file_quoted_shebang_yields_no_shebang() {
         let patch =
@@ -1752,6 +1755,25 @@ mod tests {
         assert!(
             shebangs.is_empty(),
             "a mid-file quoted shebang must not be harvested: {shebangs:?}"
+        );
+    }
+
+    /// Fork #123 (defect B4): on a non-documentation target, only the
+    /// first added line of a patch section can contribute a shebang. A
+    /// shebang on the second added line must not be harvested; the old
+    /// patch extractor harvested a shebang from ANY added line.
+    #[test]
+    fn patch_second_added_line_shebang_yields_no_shebang() {
+        let patch =
+            "*** Update File: src/a.py\n@@ -1,1 +1,3 @@\n+print(1)\n+#!/usr/bin/env python3\n";
+        let (paths, shebangs) = GuardValidator::extract_file_mutation_targets_and_shebangs(patch);
+        assert!(
+            paths.contains(&"src/a.py".to_string()),
+            "patch target must still be harvested: {paths:?}"
+        );
+        assert!(
+            shebangs.is_empty(),
+            "a shebang on the second added line must not be harvested: {shebangs:?}"
         );
     }
 
