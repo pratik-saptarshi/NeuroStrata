@@ -131,6 +131,20 @@ below.
   mid-file B4 test's outcome is delivered by this rule rather than by
   position (its doc comment states this, commit `a2bc62af`). Also
   disclosed in the PR body.
+- **R9 (max_hops = minimum graph distance — Stage 6 Codex finding,
+  recorded 2026-11-20).** R4's depth semantics are amended for
+  polyhierarchies: `max_hops` bounds each node's **minimum graph
+  distance (hops) from a root**, computed by a bounded BFS over the
+  loaded concept graph following the same child relation and
+  allowed-set filtering `build_tree_node` uses (root distance = 0; a
+  node expands its children iff its minimum distance < `max_hops`).
+  Emission remains pre-order DFS first-visit and `limit` remains the
+  total emitted-node cap in pre-order — both unchanged. Rationale:
+  under DFS-depth capping, a concept first reached by a long DFS
+  path was emitted childless and its shorter path was skipped as
+  already visited, so descendants within `max_hops` of a root via
+  the short path silently disappeared (Codex P2 on PR #129:
+  root → a → x → y plus root → x, `max_hops=2` lost y).
 - **R6 (verification venue: CI).** Local builds of this tree are
   blocked: the tree pins `ort-sys 2.0.0-rc.15`, whose build script
   downloads ONNX Runtime 1.31.0 from `cdn.pyke.io`, which returns

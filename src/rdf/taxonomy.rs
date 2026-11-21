@@ -2054,6 +2054,48 @@ async fn execute_upsert_concept(
     }))
 }
 
+/// Minimum graph distance (hops) from any tree root to each reachable
+/// concept, computed by bounded BFS over the loaded concept graph
+/// following the same child relation (`narrower`) and allowed-set
+/// filtering `build_tree_node` uses. Roots are distance 0. Ruling R9:
+/// `max_hops` bounds this minimum distance, not the depth at which the
+/// pre-order DFS happens to first reach a node -- in a polyhierarchy a
+/// node first reached by a long DFS path may also be reachable by a
+/// shorter path, and its in-range descendants must not be suppressed
+/// by the longer first visit.
+fn min_root_distances(
+    root_slugs: &[String],
+    concepts: &BTreeMap<String, HydratedConcept>,
+    allowed_set: &BTreeSet<String>,
+) -> BTreeMap<String, usize> {
+    let mut distances: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for root in root_slugs {
+        if allowed_set.contains(root)
+            && concepts.contains_key(root)
+            && !distances.contains_key(root)
+        {
+            distances.insert(root.clone(), 0);
+            queue.push_back(root.clone());
+        }
+    }
+    while let Some(slug) = queue.pop_front() {
+        let distance = distances[&slug];
+        if let Some(c) = concepts.get(&slug) {
+            for child_slug in &c.narrower {
+                if allowed_set.contains(child_slug)
+                    && concepts.contains_key(child_slug)
+                    && !distances.contains_key(child_slug)
+                {
+                    distances.insert(child_slug.clone(), distance + 1);
+                    queue.push_back(child_slug.clone());
+                }
+            }
+        }
+    }
+    distances
+}
+
 fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
@@ -2062,6 +2104,7 @@ fn build_tree_node(
     depth: usize,
     max_hops: Option<usize>,
     budget: &mut usize,
+    min_distances: &BTreeMap<String, usize>,
 ) -> Option<TaxonomyTreeNode> {
     if *budget == 0 {
         return None;
@@ -2072,7 +2115,14 @@ fn build_tree_node(
     let c = concepts.get(slug)?;
     *budget -= 1;
     let mut children = Vec::new();
-    if max_hops.map_or(true, |h| depth < h) {
+    // R9: expansion is capped by the node's MINIMUM distance from a
+    // root, not by this visit's DFS depth. Emission order, the visited
+    // set and the `limit` budget remain pre-order DFS first-visit,
+    // unchanged. The DFS-depth fallback covers any node the BFS did
+    // not reach (not expected: BFS and DFS share roots, child relation
+    // and allowed-set filtering).
+    let min_distance = min_distances.get(slug).copied().unwrap_or(depth);
+    if max_hops.map_or(true, |h| min_distance < h) {
         for child_slug in &c.narrower {
             if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
                 if let Some(child_node) = build_tree_node(
@@ -2083,6 +2133,7 @@ fn build_tree_node(
                     depth + 1,
                     max_hops,
                     budget,
+                    min_distances,
                 ) {
                     children.push(child_node);
                 }
@@ -2167,6 +2218,8 @@ async fn execute_tree(
             .collect()
     };
 
+    let min_distances = min_root_distances(&root_slugs, &view.concepts, &allowed_slugs);
+
     let mut visited = BTreeSet::new();
     let mut roots = Vec::new();
     let mut budget = req.limit.unwrap_or(usize::MAX);
@@ -2179,6 +2232,7 @@ async fn execute_tree(
             0,
             req.max_hops,
             &mut budget,
+            &min_distances,
         ) {
             roots.push(node);
         }
@@ -5978,6 +6032,173 @@ mod tests {
         assert_eq!(
             roots[0]["children"][0]["children"][0]["slug"],
             "tree-grandchild"
+        );
+    }
+
+    // ── R9 (Codex P2, PR #129): max_hops bounds MINIMUM graph distance ──
+
+    /// Seeds the Codex polyhierarchy: poly-root -> poly-a -> poly-x ->
+    /// poly-y plus poly-root -> poly-x, modelled as broader edges
+    /// (x broader=[root, a], y broader=[x], a broader=[root]) exactly
+    /// as the chain seeder models parentage. Derived `narrower` is a
+    /// sorted set, so poly-root's children iterate [poly-a, poly-x]:
+    /// the DFS reaches poly-x via poly-a (depth 2) before the direct
+    /// root -> poly-x edge (depth 1).
+    async fn seed_polyhierarchy(store: &LadybugStore, embedder: &DummyEmbedder, ns: &str) {
+        for (slug, label, broader) in [
+            ("poly-root", "Poly Root", None),
+            ("poly-a", "Poly A", Some(vec!["poly-root"])),
+            ("poly-x", "Poly X", Some(vec!["poly-root", "poly-a"])),
+            ("poly-y", "Poly Y", Some(vec!["poly-x"])),
+        ] {
+            execute_taxonomy(
+                store,
+                embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(format!("Definition for {label}")),
+                    broader: broader.map(|bs| bs.iter().map(|b| b.to_string()).collect()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed polyhierarchy concept");
+        }
+    }
+
+    fn collect_tree_slugs(nodes: &[Value], out: &mut Vec<String>) {
+        for n in nodes {
+            out.push(n["slug"].as_str().expect("slug").to_string());
+            if let Some(children) = n["children"].as_array() {
+                collect_tree_slugs(children, out);
+            }
+        }
+    }
+
+    fn find_tree_node<'a>(nodes: &'a [Value], slug: &str) -> Option<&'a Value> {
+        for n in nodes {
+            if n["slug"].as_str() == Some(slug) {
+                return Some(n);
+            }
+            if let Some(children) = n["children"].as_array() {
+                if let Some(found) = find_tree_node(children, slug) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Codex P2 (thread PRRT_kwDOVS6VQM66PoLr): with DFS-depth capping,
+    /// poly-x is first visited at depth 2 (via poly-a), emitted
+    /// childless under max_hops=2, and the depth-1 path root -> poly-x
+    /// is skipped as already visited, so poly-y (2 hops via
+    /// root -> poly-x -> poly-y) disappears. RED basis on the
+    /// unmodified tree: build_tree_node expanded children iff
+    /// `depth < max_hops` with the DFS visit depth. Reproduced
+    /// standalone (/tmp/sim_taxonomy.rs, faithful port): CURRENT
+    /// emitted=[root, a, x], has_y=false; with BFS minimum distances
+    /// {root:0, a:1, x:1, y:2} the same DFS emits y.
+    #[tokio::test]
+    async fn tree_max_hops_polyhierarchy_keeps_in_range_descendant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-polyhierarchy-ns";
+        store.init(ns).await.expect("init");
+        seed_polyhierarchy(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        let mut slugs = Vec::new();
+        collect_tree_slugs(roots, &mut slugs);
+        assert!(
+            slugs.contains(&"poly-y".to_string()),
+            "poly-y is 2 hops from the root via root -> poly-x -> poly-y \
+             and must be present under max_hops=2: {slugs:?}"
+        );
+        assert_eq!(
+            count_tree_nodes(roots),
+            4,
+            "all four polyhierarchy concepts must be emitted: {slugs:?}"
+        );
+    }
+
+    /// R9 pin: a node whose MINIMUM distance equals max_hops still
+    /// emits, childless -- its children (minimum distance max_hops+1)
+    /// do not. In the polyhierarchy poly-y sits at minimum distance 2;
+    /// its child poly-z (minimum distance 3) must stay absent under
+    /// max_hops=2 while poly-y itself is present with no children.
+    #[tokio::test]
+    async fn tree_max_hops_node_at_min_distance_cap_emits_childless() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-polyhierarchy-cap-ns";
+        store.init(ns).await.expect("init");
+        seed_polyhierarchy(&store, &embedder, ns).await;
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("poly-z".to_string()),
+                pref_label: Some("Poly Z".to_string()),
+                definition: Some("Definition for Poly Z".to_string()),
+                broader: Some(vec!["poly-y".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("seed poly-z");
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        let mut slugs = Vec::new();
+        collect_tree_slugs(roots, &mut slugs);
+        assert!(
+            !slugs.contains(&"poly-z".to_string()),
+            "poly-z is 3 hops from the root and must be absent under max_hops=2: {slugs:?}"
+        );
+        let y_node = find_tree_node(roots, "poly-y").expect("poly-y must be present");
+        assert!(
+            y_node["children"]
+                .as_array()
+                .expect("y children array")
+                .is_empty(),
+            "poly-y sits at minimum distance == max_hops and must emit childless"
         );
     }
 }
