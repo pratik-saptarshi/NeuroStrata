@@ -323,8 +323,20 @@ impl GuardValidator {
         paths: &mut Vec<String>,
         shebangs: &mut Vec<String>,
     ) {
+        // Fork #123 (defect B4): a shebang is harvested only from the
+        // first added content line following a target header, per target
+        // section, and never for a documentation target -- harvesting
+        // from ANY added line false-blocks patches that merely quote a
+        // `#!` example line. A patch with no header at all therefore
+        // harvests no shebangs (a deliberate narrowing of the old
+        // behaviour). `@@` hunk lines do not consume the first-added-line
+        // slot; a new header re-arms it.
+        const DOC_EXTS: &[&str] = &[".md", ".markdown", ".rst", ".txt", ".adoc"];
+        let mut awaiting_first_added = false;
+        let mut current_is_doc = false;
         for line in patch_text.lines() {
             let trimmed = line.trim();
+            let mut header_target: Option<String> = None;
             for prefix in [
                 "*** Update File:",
                 "*** Add File:",
@@ -336,14 +348,30 @@ impl GuardValidator {
                     let candidate = rest.trim();
                     if !candidate.is_empty() && candidate != "/dev/null" {
                         paths.push(candidate.to_lowercase());
+                        if header_target.is_none() {
+                            header_target = Some(candidate.to_lowercase());
+                        }
                     }
                 }
             }
-            if let Some(added) = line.strip_prefix('+') {
-                if !line.starts_with("+++") {
-                    let added_trimmed = added.trim();
-                    if let Some(rest) = added_trimmed.strip_prefix("#!") {
-                        shebangs.push(rest.trim().to_lowercase());
+            if let Some(target) = header_target {
+                awaiting_first_added = true;
+                current_is_doc = DOC_EXTS.iter().any(|ext| target.ends_with(ext));
+                continue;
+            }
+            if trimmed.starts_with("@@") {
+                continue;
+            }
+            if awaiting_first_added {
+                if let Some(added) = line.strip_prefix('+') {
+                    if !line.starts_with("+++") {
+                        if !current_is_doc {
+                            let added_trimmed = added.trim();
+                            if let Some(rest) = added_trimmed.strip_prefix("#!") {
+                                shebangs.push(rest.trim().to_lowercase());
+                            }
+                        }
+                        awaiting_first_added = false;
                     }
                 }
             }
@@ -358,68 +386,128 @@ impl GuardValidator {
         }
     }
 
-    fn extract_file_mutation_targets_and_shebangs(payload: &str) -> (Vec<String>, Vec<String>) {
-        let mut paths = Vec::new();
-        let mut shebangs = Vec::new();
+    /// Bounded recursive walk over a decoded JSON value harvesting
+    /// file-mutation targets (fork #123, defect B1). Mirrors the bounds
+    /// of `collect_string_values`: recursion depth at most 3 below the
+    /// root and a shared budget of 512 visited nodes. At each object,
+    /// string values under the path keys become paths, string values
+    /// under the content keys (plus `new_source`, defect B3) contribute
+    /// their first-line shebang, and string values under the patch keys
+    /// go through patch extraction. Every other string value is scanned
+    /// for patch markers (ruling R3) -- scanning the decoded value is
+    /// what makes the exec-bridge shape work, since the patch's
+    /// newlines are `\n`-escaped in the raw JSON text. All object/array
+    /// values are recursed into regardless of key. Prose discipline is
+    /// preserved: arbitrary strings are never treated as paths, and
+    /// only content-key first lines become shebangs.
+    fn walk_file_mutation_value(
+        value: &serde_json::Value,
+        key_hint: Option<&str>,
+        depth: usize,
+        budget: &mut usize,
+        paths: &mut Vec<String>,
+        shebangs: &mut Vec<String>,
+    ) {
+        const PATH_KEYS: &[&str] = &[
+            "path",
+            "file_path",
+            "filePath",
+            "filepath",
+            "target_file",
+            "targetFile",
+            "filename",
+            "notebook_path",
+            "notebookPath",
+        ];
+        const CONTENT_KEYS: &[&str] = &[
+            "content",
+            "newString",
+            "new_string",
+            "new_str",
+            "replacement",
+            "insert_text",
+            "new_source",
+        ];
+        const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
 
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(payload)
-        {
-            const PATH_KEYS: &[&str] = &[
-                "path",
-                "file_path",
-                "filePath",
-                "filepath",
-                "target_file",
-                "targetFile",
-                "filename",
-                "notebook_path",
-                "notebookPath",
-            ];
-            const CONTENT_KEYS: &[&str] = &[
-                "content",
-                "newString",
-                "new_string",
-                "new_str",
-                "replacement",
-                "insert_text",
-            ];
-            const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
-
-            for key in PATH_KEYS {
-                if let Some( s) = map.get(*key).and_then(|v| v.as_str()) {
-                    paths.push(s.trim().to_lowercase());
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        match value {
+            serde_json::Value::String(s) => {
+                let is_patch_key = key_hint.is_some_and(|k| PATCH_KEYS.contains(&k));
+                match key_hint {
+                    Some(k) if PATH_KEYS.contains(&k) => {
+                        paths.push(s.trim().to_lowercase());
+                    }
+                    Some(k) if CONTENT_KEYS.contains(&k) => {
+                        Self::collect_shebang_from_content(s, shebangs);
+                    }
+                    Some(k) if PATCH_KEYS.contains(&k) => {
+                        Self::extract_patch_targets_and_shebangs(s, paths, shebangs);
+                    }
+                    _ => {}
+                }
+                if !is_patch_key
+                    && (s.contains("*** Update File:")
+                        || s.contains("*** Add File:")
+                        || s.contains("+++ "))
+                {
+                    Self::extract_patch_targets_and_shebangs(s, paths, shebangs);
                 }
             }
-            for key in CONTENT_KEYS {
-                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
-                    Self::collect_shebang_from_content(s, &mut shebangs);
-                }
-            }
-            for key in PATCH_KEYS {
-                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
-                    Self::extract_patch_targets_and_shebangs(s, &mut paths, &mut shebangs);
-                }
-            }
-            for array_key in ["edits", "files", "changes"] {
-                if let Some(serde_json::Value::Array(items)) = map.get(array_key) {
-                    for item in items {
-                        if let serde_json::Value::Object(sub) = item {
-                            for key in PATH_KEYS {
-                                if let Some(s) = sub.get(*key).and_then(|v| v.as_str()) {
-                                    paths.push(s.trim().to_lowercase());
-                                }
-                            }
-                            for key in CONTENT_KEYS {
-                                if let Some(s) = sub.get(*key).and_then(|v| v.as_str()) {
-                                    Self::collect_shebang_from_content(s, &mut shebangs);
-                                }
-                            }
+            serde_json::Value::Object(map) => {
+                if depth < 3 {
+                    for (k, v) in map {
+                        Self::walk_file_mutation_value(
+                            v,
+                            Some(k.as_str()),
+                            depth + 1,
+                            budget,
+                            paths,
+                            shebangs,
+                        );
+                        if *budget == 0 {
+                            return;
                         }
                     }
                 }
             }
-            return (paths, shebangs);
+            serde_json::Value::Array(items) => {
+                if depth < 3 {
+                    for v in items {
+                        Self::walk_file_mutation_value(v, None, depth + 1, budget, paths, shebangs);
+                        if *budget == 0 {
+                            return;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_file_mutation_targets_and_shebangs(payload: &str) -> (Vec<String>, Vec<String>) {
+        let mut paths = Vec::new();
+        let mut shebangs = Vec::new();
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            if matches!(
+                value,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            ) {
+                let mut budget = 512usize;
+                Self::walk_file_mutation_value(
+                    &value,
+                    None,
+                    0,
+                    &mut budget,
+                    &mut paths,
+                    &mut shebangs,
+                );
+                return (paths, shebangs);
+            }
         }
 
         if payload.contains("*** Update File:")
@@ -1569,6 +1657,154 @@ mod tests {
             !GuardValidator::matches_trigger("rm -rf", "bash", payload),
             "a string beyond depth 3 must not fire the rule"
         );
+    }
+
+    /// Fork #123 (defect B1): a wrapper object nests the modelled keys one
+    /// level below the root; the old extractor only read top-level keys
+    /// (plus one level under edits/files/changes), so this extracted
+    /// nothing.
+    #[test]
+    fn file_mutation_wrapper_object_yields_path_and_shebang() {
+        let payload = serde_json::json!({
+            "tool_input": {"path": "x.py", "content": "#!/usr/bin/env python3\nprint(1)\n"}
+        })
+        .to_string();
+        let (paths, shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            paths.contains(&"x.py".to_string()),
+            "wrapper-nested path must be harvested: {paths:?}"
+        );
+        assert!(
+            shebangs.contains(&"/usr/bin/env python3".to_string()),
+            "wrapper-nested content shebang must be harvested: {shebangs:?}"
+        );
+    }
+
+    /// Fork #123 (defect B1): targets under an array key the old extractor
+    /// did not list (it special-cased only edits/files/changes) were
+    /// missed entirely.
+    #[test]
+    fn file_mutation_unlisted_array_key_yields_path() {
+        let payload = serde_json::json!({"operations": [{"path": "y.py"}]}).to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            paths.contains(&"y.py".to_string()),
+            "path under an unlisted array key must be harvested: {paths:?}"
+        );
+    }
+
+    /// Fork #123 (defect B2, ruling R3): the exec-bridge shape carries the
+    /// patch text as a decoded string under `input`, a key in none of the
+    /// key sets; the old JSON early return suppressed the patch-marker
+    /// scan, so no target was extracted.
+    #[test]
+    fn file_mutation_exec_bridge_input_patch_markers_yield_path() {
+        let payload = serde_json::json!({
+            "tool": "apply_patch",
+            "input": "*** Update File: src/a.py\n@@\n+print(1)\n"
+        })
+        .to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            paths.contains(&"src/a.py".to_string()),
+            "patch markers in a decoded string value must yield the target: {paths:?}"
+        );
+    }
+
+    /// Fork #123 (defect B3): NotebookEdit carries its content under
+    /// `new_source`, which was missing from the content keys, so shebang
+    /// rules were blind on notebook edits.
+    #[test]
+    fn file_mutation_notebook_edit_new_source_yields_shebang() {
+        let payload = serde_json::json!({
+            "notebook_path": "n.ipynb",
+            "new_source": "#!/usr/bin/env python3\n..."
+        })
+        .to_string();
+        let (paths, shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            paths.contains(&"n.ipynb".to_string()),
+            "notebook path must be harvested: {paths:?}"
+        );
+        assert!(
+            shebangs.contains(&"/usr/bin/env python3".to_string()),
+            "new_source shebang must be harvested: {shebangs:?}"
+        );
+    }
+
+    /// Fork #123 (defect B4): a quoted example shebang added mid-file in a
+    /// documentation patch is not the target's first added line; the old
+    /// patch extractor harvested a shebang from ANY added line, causing
+    /// false blocks.
+    #[test]
+    fn patch_mid_file_quoted_shebang_yields_no_shebang() {
+        let patch =
+            "*** Update File: docs.md\n@@ -1,2 +1,3 @@\n context\n+#!/usr/bin/env python3\n+more\n";
+        let (paths, shebangs) = GuardValidator::extract_file_mutation_targets_and_shebangs(patch);
+        assert!(
+            paths.contains(&"docs.md".to_string()),
+            "patch target must still be harvested: {paths:?}"
+        );
+        assert!(
+            shebangs.is_empty(),
+            "a mid-file quoted shebang must not be harvested: {shebangs:?}"
+        );
+    }
+
+    /// Fork #123 (defect B4): the first added line of a script target IS
+    /// its shebang and must still be harvested.
+    #[test]
+    fn patch_first_added_line_shebang_is_harvested() {
+        let patch = "*** Add File: run.py\n+#!/usr/bin/env python3\n+print(1)\n";
+        let (_paths, shebangs) = GuardValidator::extract_file_mutation_targets_and_shebangs(patch);
+        assert!(
+            shebangs.contains(&"/usr/bin/env python3".to_string()),
+            "first-added-line shebang must be harvested: {shebangs:?}"
+        );
+    }
+
+    /// Fork #123 (defect B4): a documentation target never contributes a
+    /// shebang, even when its first added line is one (a quoted example).
+    #[test]
+    fn patch_docs_target_first_line_shebang_yields_no_shebang() {
+        let patch = "*** Add File: guide.md\n+#!/usr/bin/env python3\n";
+        let (paths, shebangs) = GuardValidator::extract_file_mutation_targets_and_shebangs(patch);
+        assert!(
+            paths.contains(&"guide.md".to_string()),
+            "patch target must still be harvested: {paths:?}"
+        );
+        assert!(
+            shebangs.is_empty(),
+            "a documentation target must not contribute a shebang: {shebangs:?}"
+        );
+    }
+
+    /// Regression pin: a top-level modelled payload extracts exactly as
+    /// before the recursive walk.
+    #[test]
+    fn file_mutation_top_level_modelled_payload_extracts_as_before() {
+        let payload = serde_json::json!({"path": "a.py", "content": "x = 1\n"}).to_string();
+        let (paths, shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert_eq!(paths, vec!["a.py".to_string()]);
+        assert!(
+            shebangs.is_empty(),
+            "plain content has no shebang: {shebangs:?}"
+        );
+
+        let payload = serde_json::json!({
+            "path": "a.py",
+            "content": "#!/usr/bin/env python3\nprint(1)\n"
+        })
+        .to_string();
+        let (paths, shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert_eq!(paths, vec!["a.py".to_string()]);
+        assert_eq!(shebangs, vec!["/usr/bin/env python3".to_string()]);
     }
 
     /// Fork #122 (ruling R7): the fallback walk is node-budget-bounded --
