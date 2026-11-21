@@ -1476,11 +1476,8 @@ mod tests {
     /// shell content rule could ever fire on it.
     #[test]
     fn shell_json_unlisted_key_matches_trigger_like_raw_string() {
-        let json_outcome = GuardValidator::matches_trigger(
-            "rm -rf",
-            "bash",
-            r#"{"input": "rm -rf /"}"#,
-        );
+        let json_outcome =
+            GuardValidator::matches_trigger("rm -rf", "bash", r#"{"input": "rm -rf /"}"#);
         let raw_outcome = GuardValidator::matches_trigger("rm -rf", "bash", "rm -rf /");
         assert!(raw_outcome, "the raw string itself fires the rule");
         assert_eq!(
@@ -1552,9 +1549,54 @@ mod tests {
             vec!["echo hi".to_string()]
         );
         assert!(!GuardValidator::matches_trigger(
-            "rm -rf",
-            "bash",
-            with_prose
+            "rm -rf", "bash", with_prose
         ));
+    }
+
+    /// Fork #122 (ruling R7): the fallback walk is depth-bounded -- a
+    /// string sitting 4 edges below the root (beyond depth 3) is not
+    /// collected as a command surface.
+    #[test]
+    fn shell_json_fallback_respects_depth_bound() {
+        let payload = r#"{"a":{"b":{"c":{"d":"rm -rf /"}}}}"#;
+        assert_eq!(
+            GuardValidator::extract_shell_commands(payload),
+            vec![payload.to_string()],
+            "a string beyond depth 3 must not be collected; \
+             with no collected surfaces the raw payload is the fallback"
+        );
+        assert!(
+            !GuardValidator::matches_trigger("rm -rf", "bash", payload),
+            "a string beyond depth 3 must not fire the rule"
+        );
+    }
+
+    /// Fork #122 (ruling R7): the fallback walk is node-budget-bounded --
+    /// with more than 512 nodes ahead of it in visit order, the banned
+    /// string under the last-sorted key is never reached.
+    #[test]
+    fn shell_json_fallback_respects_node_budget() {
+        let mut map = serde_json::Map::new();
+        for i in 0..599 {
+            map.insert(
+                format!("k{:03}", i),
+                serde_json::Value::String("echo benign".to_string()),
+            );
+        }
+        map.insert(
+            "zzz_last".to_string(),
+            serde_json::Value::String("rm -rf /".to_string()),
+        );
+        let payload = serde_json::Value::Object(map).to_string();
+        assert!(
+            !GuardValidator::extract_shell_commands(&payload)
+                .iter()
+                .any(|s| s == "rm -rf /"),
+            "a string beyond the 512-node budget must not be collected"
+        );
+        assert!(
+            !GuardValidator::matches_trigger("rm -rf", "bash", &payload),
+            "a string beyond the 512-node budget must not fire the rule"
+        );
     }
 }
