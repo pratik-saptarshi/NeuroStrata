@@ -2545,6 +2545,14 @@ fn transitive_ancestors_of(
     ancestors
 }
 
+/// C1 (fork #124): caps on caller-supplied `compare` collections. The
+/// per-slug ancestor walks, the O(n²) pair loop, and the
+/// O(|axes| × |slugs|) matrix are all sized by these two inputs, so
+/// over-cap requests are rejected rather than truncated. Thesis-derived
+/// and union-derived axes are store-bounded and are not capped.
+const MAX_COMPARE_SLUGS: usize = 64;
+const MAX_COMPARE_AXES: usize = 32;
+
 async fn execute_compare(
     store: &LadybugStore,
     namespace: &str,
@@ -2556,6 +2564,12 @@ async fn execute_compare(
         .as_ref()
         .ok_or_else(|| "slugs (array of >= 2 concept slugs) is required for compare".to_string())?;
     let slugs = validate_strict_slug_vec(raw_slugs, "slugs")?;
+    if slugs.len() > MAX_COMPARE_SLUGS {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_SLUGS} concept slugs (got {})",
+            slugs.len()
+        ));
+    }
     if slugs.len() < 2 {
         return Err("compare requires at least 2 distinct concept slugs".to_string());
     }
@@ -2640,7 +2654,14 @@ async fn execute_compare(
 
     // Determine evaluation axes
     let axes: Vec<String> = if let Some(req_axes) = &req.axes {
-        validate_strict_slug_vec(req_axes, "axes")?
+        let axes = validate_strict_slug_vec(req_axes, "axes")?;
+        if axes.len() > MAX_COMPARE_AXES {
+            return Err(format!(
+                "compare supports at most {MAX_COMPARE_AXES} evaluation axes (got {})",
+                axes.len()
+            ));
+        }
+        axes
     } else if let Some(ref t) = view.thesis {
         if !t.evaluation_axes.is_empty() {
             t.evaluation_axes.clone()
@@ -5533,5 +5554,170 @@ mod tests {
             snap.contains("DEPRECATED") || snap.contains("not_definition"),
             "snapshot taxonomy must expose the annotation: {snap}"
         );
+    }
+
+    // ── C1 (fork #124): execute_compare caps caller-supplied slugs/axes ──
+    #[tokio::test]
+    async fn compare_rejects_more_than_64_slugs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-slug-cap-ns";
+        store.init(ns).await.expect("init");
+
+        // The cap fires right after slug validation, before concept
+        // resolution, so an empty namespace suffices.
+        let slugs: Vec<String> = (0..65).map(|i| format!("concept-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("must reject more than 64 slugs");
+        assert!(err.contains("64"), "cap error must name the maximum: {err}");
+        assert!(
+            err.contains("compare supports at most 64 concept slugs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_rejects_more_than_32_axes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-axes-cap-ns";
+        store.init(ns).await.expect("init");
+
+        for (slug, label, def) in [
+            ("cap-alpha", "Cap Alpha", "first seeded concept"),
+            ("cap-beta", "Cap Beta", "second seeded concept"),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(def.to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..33).map(|i| format!("axis-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["cap-alpha".to_string(), "cap-beta".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("must reject more than 32 axes");
+        assert!(err.contains("32"), "cap error must name the maximum: {err}");
+        assert!(
+            err.contains("compare supports at most 32 evaluation axes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_at_64_slugs_proceeds_past_cap_to_concept_resolution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-slug-at-cap-ns";
+        store.init(ns).await.expect("init");
+
+        // Exactly at the cap on an empty namespace: the failure must be
+        // concept resolution, not the cap.
+        let slugs: Vec<String> = (0..64).map(|i| format!("concept-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("unknown concepts must fail resolution");
+        assert!(
+            err.contains("not found"),
+            "expected concept-not-found error, not the cap error: {err}"
+        );
+        assert!(
+            !err.contains("at most"),
+            "at-cap request must not hit the cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_at_32_axes_succeeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-axes-at-cap-ns";
+        store.init(ns).await.expect("init");
+
+        for (slug, label, def) in [
+            ("cap-alpha", "Cap Alpha", "first seeded concept"),
+            ("cap-beta", "Cap Beta", "second seeded concept"),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(def.to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..32).map(|i| format!("axis-{i}")).collect();
+        let cmp = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["cap-alpha".to_string(), "cap-beta".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("compare at exactly 32 axes must succeed");
+        assert_eq!(cmp["operation"], "compare");
+        assert_eq!(cmp["axis_matrix"].as_object().unwrap().len(), 32);
     }
 }
