@@ -34,6 +34,8 @@ export interface PluginConfig {
 }
 /** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
 export type ResolvedConfig = PluginConfig;
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)
@@ -70,7 +72,7 @@ export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
 export declare function buildHeaders(token: string | null): Record<string, string>;
 export interface JsonRpcRequest {
-    jsonrpc: "2.0";
+    jsonrpc: '2.0';
     id: number;
     method: string;
     params?: unknown;
@@ -116,7 +118,7 @@ export declare class NeuroStrataMCPClient {
     private post;
 }
 export interface GuardValidateResult {
-    verdict: "pass" | "reject";
+    verdict: 'pass' | 'reject';
     bucket: string;
     reasons: string[];
     constraints: string[];
@@ -124,7 +126,7 @@ export interface GuardValidateResult {
     rule_ids: string[];
 }
 export declare function parseGuardValidate(text: string): GuardValidateResult;
-export type AdapterState = "uninitialized" | "ready" | "degraded" | "unavailable";
+export type AdapterState = 'uninitialized' | 'ready' | 'degraded' | 'unavailable';
 export interface AdapterStatus {
     state: AdapterState;
     endpoint: string;
@@ -162,8 +164,8 @@ export interface Turn {
     parent_task_id?: string;
 }
 export interface TurnCandidate {
-    kind: "task_obligation" | "memory_candidate";
-    category?: "fact" | "decision" | "rule_candidate";
+    kind: 'task_obligation' | 'memory_candidate';
+    category?: 'fact' | 'decision' | 'rule_candidate';
     title: string;
     description?: string;
     confidence: number;
@@ -223,8 +225,15 @@ export declare const TOOL_CLASSIFICATION: {
 };
 export declare function isFileTouchTool(name: string): boolean;
 export declare function isMutatingTool(name: string): boolean;
+export declare function isReadOnlyInspectionTool(name: string): boolean;
 export declare function isSubagentTool(name: string): boolean;
 export declare function isCodeExecTool(name: string): boolean;
+/**
+ * True only for shell tools whose payload is provably read-only/verification.
+ * JSON payloads are unwrapped via `command`/`cmd`; substitutions, redirection
+ * and chains containing any mutating segment fail closed.
+ */
+export declare function isZeroActionExemptShellPayload(actionType: string, payloadOrCommand: string): boolean;
 export interface CodeModeInspection {
     id?: string;
     sessionId?: string;
@@ -276,8 +285,30 @@ export declare function confirmPrefetchDelivery(namespace: string, filePath: str
 export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
 export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
-export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string): string;
-export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string): boolean;
+export declare function isReadOnlySubagentAgent(agentId?: string | null): boolean;
+/** Resolve the subagent agent id from the fields harnesses use to name it. */
+export declare function resolveSubagentAgentId(target: Record<string, unknown>): string | undefined;
+/** Code-Mode harnesses (OpenCode V2) expose MCP via `execute` + tools.neurostrata.*. */
+export declare function detectCodeMode(ctx?: any, cfg?: PluginConfig): boolean;
+export interface SubagentHeaderOptions {
+    agentId?: string | null;
+    codeMode?: boolean;
+}
+/**
+ * Render a value inside a markdown backtick code span without allowing a
+ * breakout: backticks close the span and newlines end its line, so both are
+ * collapsed to single spaces. The namespace is not privileged input — it can
+ * arrive from a committed `.NeuroStrata/session_queries.json`, plugin config,
+ * or an environment variable — so every header interpolation goes through
+ * here (issue #316).
+ */
+export declare function markdownCodeSpanValue(value: unknown): string;
+/**
+ * Public header builder: sanitizes the two caller-supplied values before
+ * rendering (issue #316).
+ */
+export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): string;
+export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): boolean;
 export declare function extractRepoFilePaths(promptText: string): string[];
 export declare const cachedTaskInjection: Map<string, string | null>;
 export declare const cachedSubagentPromptByTask: Map<string, string | null>;
@@ -357,7 +388,7 @@ export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;
 export declare function onTurnEnd(turn: {
-    role: "user" | "assistant";
+    role: 'user' | 'assistant';
     content: string;
 }): Promise<void>;
 export declare function fetchContextPlan(opts: {
@@ -366,7 +397,7 @@ export declare function fetchContextPlan(opts: {
     file_path?: string;
     max_items?: number;
     max_bytes?: number;
-    format?: "json" | "text";
+    format?: 'json' | 'text';
 }): Promise<string>;
 export declare function createHarnessPlugin(pluginId?: string, harnessName?: string): {
     id: string;

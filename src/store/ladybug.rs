@@ -1612,7 +1612,62 @@ pub struct LadybugStore {
     /// file has.
     census_reads: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
+    form_scans: Arc<FormScanCounts>,
+    #[cfg(test)]
     test_cleanup_dir: Option<TestCleanupDir>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FormScanCounts {
+    exact: std::sync::atomic::AtomicUsize,
+    directory: std::sync::atomic::AtomicUsize,
+    metadata: std::sync::atomic::AtomicUsize,
+    exact_failures: std::sync::Mutex<HashSet<String>>,
+    fail_shared_metadata: std::sync::atomic::AtomicBool,
+    clock: std::sync::Mutex<Option<FormScanClock>>,
+}
+
+#[cfg(test)]
+struct FormScanClock {
+    now: i64,
+    advance_after_edges_for: &'static str,
+}
+
+#[cfg(test)]
+impl FormScanCounts {
+    fn check_exact<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let failures = self.exact_failures.lock().unwrap();
+        if let Some(path) = paths.into_iter().find(|path| failures.contains(*path)) {
+            anyhow::bail!("injected exact-file query failure for {path:?}");
+        }
+        Ok(())
+    }
+
+    fn finish_edges(&self, path: &str) {
+        if let Some(clock) = self.clock.lock().unwrap().as_mut() {
+            if path == clock.advance_after_edges_for {
+                clock.now += 1;
+            }
+        }
+    }
+
+    fn metadata_now(&self) -> i64 {
+        self.clock
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(|| chrono::Utc::now().timestamp(), |clock| clock.now)
+    }
+
+    fn take(&self) -> (usize, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.exact.swap(0, Relaxed),
+            self.directory.swap(0, Relaxed),
+            self.metadata.swap(0, Relaxed),
+        )
+    }
 }
 
 impl LadybugStore {
@@ -1622,6 +1677,7 @@ impl LadybugStore {
     /// this only moves for the hits no edge query reached (the metadata
     /// fallback), and the fallback reads them all in one query. A test that
     /// seeds a large hit set asserts it does not grow.
+    #[cfg(test)]
     pub fn census_reads(&self) -> u64 {
         self.census_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -2630,6 +2686,19 @@ fn unverified_replay_checksums_for(local_path: &std::path::Path) -> bool {
     }
 }
 
+/// Replay configuration for [`RecoveryArmId::ChecksumMismatchReplay`]: matches
+/// the WAL header's `enableChecksums` flag while keeping
+/// `throw_on_wal_replay_failure(true)` so any record-level corruption or
+/// semantic deserialization failure hidden behind the initial `checkWALHeader`
+/// mismatch still surfaces before a lenient retry can consume a frozen WAL.
+fn wal_header_checksums_config_for(local_path: &std::path::Path) -> SystemConfig {
+    with_buffer_pool(
+        SystemConfig::default()
+            .throw_on_wal_replay_failure(true)
+            .enable_checksums(unverified_replay_checksums_for(local_path)),
+    )
+}
+
 /// Lenient WAL replay configuration that matches the WAL header's
 /// `enableChecksums` flag (byte 16 of the header) while setting
 /// `throw_on_wal_replay_failure(false)` so `WALReplayer::dryReplay` replays
@@ -2686,6 +2755,25 @@ fn is_wal_integrity_failure(err: &str) -> bool {
     err.contains("Checksum verification failed")
         || err.contains("Corrupted wal file")
         || err.contains("invalid WAL record type")
+}
+
+/// The engine's *semantic* WAL-replay failure (`#228`).
+///
+/// The pinned engine throws a catalog error when a WAL record names a catalog
+/// entry the database does not have: `CatalogSet::validateExistNoLock` raises
+/// `"<name> does not exist in catalog."` (`catalog_set.cpp:362`), and
+/// `Catalog::getTableCatalogEntry` raises the same text
+/// (`catalog.cpp:149`). Such a replay is *semantic*: the bytes are intact and
+/// the engine refuses to apply them.
+///
+/// The shape is the pinned engine's own message, not a guess. The funnel uses
+/// it only to *name* the failure in the refusal: the accounting and the
+/// refusal do not depend on the label, so a semantic failure and any other
+/// unrecognized failure are treated the same way — accounted, restored,
+/// refused. A semantic failure never reaches the lenient replay: replaying
+/// the same bytes unverified would fail the same way.
+fn is_wal_semantic_failure(err: &str) -> bool {
+    err.contains("does not exist in catalog.")
 }
 
 fn sha256_regular_file(path: &std::path::Path) -> Option<[u8; 32]> {
@@ -3370,7 +3458,13 @@ fn open_after_quarantine(
         if !moved && attempt > 0 {
             break;
         }
-        match Database::new(local_path, verifying_config()) {
+        match run_recovery_arm(
+            RecoveryArmId::QuarantineReopen,
+            &ArmRequest {
+                local_path,
+                initial_config: None,
+            },
+        ) {
             Ok(db) => {
                 // Same rule as `preserve_wal_pair`: the artifacts this arm just
                 // wrote are the operator's only copy, so they are exempt.
@@ -3413,7 +3507,10 @@ fn open_after_quarantine(
 /// flag's result discarded (`#207` C5, second call site).
 /// The checkpoint outcome is also persisted to the store-state sidecar
 /// (`#212`), so a fresh process reports the last real checkpoint.
-fn run_recovery_checkpoint(local_path: &std::path::Path, unverified_db: Database) -> Result<Database> {
+fn run_recovery_checkpoint(
+    local_path: &std::path::Path,
+    unverified_db: Database,
+) -> Result<Database> {
     let ckpt_started = std::time::Instant::now();
     run_recovery_checkpoint_with(
         unverified_db,
@@ -3542,6 +3639,108 @@ fn strict_wal_refusal(
     }
 }
 
+/// The refusal headline for a verdict (`#228`).
+///
+/// The headline names the WAL and says *which* claim failed: a proven loss of
+/// committed records is not a replay that merely could not be verified, and
+/// the operator must be able to tell the two apart. The `#189` contract (the
+/// word `zero`) and the `#207` contract (the literal `WAL`) hold for every
+/// headline.
+fn refusal_headline(verdict: &crate::store::wal_accounting::WalAccounting) -> &'static str {
+    use crate::store::wal_accounting::WalAccounting;
+
+    match verdict {
+        WalAccounting::CommittedLost { .. } => {
+            "Refusing to open: the WAL held committed records that the replay did not apply, so the engine removed the WAL with zero committed records recovered"
+        }
+        WalAccounting::Unknown { .. } => {
+            "Refusing to open: the WAL's replay could not be verified, so it is unknown whether a committed record was applied; the accounting cannot prove the replay recovered zero committed records"
+        }
+        _ => "Unverified WAL replay recovered zero committed records where the write-ahead log accounting cannot prove the replay was empty",
+    }
+}
+
+/// Restores the sides that lost every byte from their preserved copies.
+///
+/// Returns what was restored and what could not be restored, so every refusal
+/// names the preserved bytes (`#207`).
+fn restore_lost_sides(
+    local_path: &std::path::Path,
+    restore: crate::store::wal_accounting::SideSet,
+    preserved: &PreservedPair,
+) -> (Vec<String>, Vec<String>) {
+    let mut restored = Vec::new();
+    let mut unrestored = Vec::new();
+    for side in [WalSide::Active, WalSide::Frozen] {
+        if !restore.contains(wal_side_set(side)) {
+            continue;
+        }
+        let label = wal_side_label(side);
+        match preserved.get(side) {
+            Some(copy) => {
+                let target = side.path(local_path);
+                match restore_regular_file_no_follow(copy, &target) {
+                    Ok(_) => restored.push(format!(
+                        "the {label} WAL was restored from {}",
+                        copy.display()
+                    )),
+                    Err(e) => unrestored.push(format!(
+                        "the {label} WAL could not be restored ({e}); its bytes are at {}",
+                        copy.display()
+                    )),
+                }
+            }
+            None => unrestored.push(format!("the {label} WAL has no preserved copy")),
+        }
+    }
+    (restored, unrestored)
+}
+
+/// The preservation tail every refusal carries: what was restored, where the
+/// preserved copies are, and where to read more (`#207`).
+fn preservation_tail(
+    restored: &[String],
+    unrestored: &[String],
+    preserved: &PreservedPair,
+    local_path: &std::path::Path,
+) -> String {
+    let preserved_display = preserved
+        .active
+        .as_ref()
+        .or(preserved.frozen.as_ref())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| format!("{}.wal.unclean.<none>", local_path.display()));
+    let preservation_note = format!(
+        "preserved copies: active {}, frozen {}",
+        preserved
+            .active
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        preserved
+            .frozen
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+
+    let mut tail = String::new();
+    if !restored.is_empty() {
+        tail.push(' ');
+        tail.push_str(&restored.join("; "));
+        tail.push('.');
+    }
+    if !unrestored.is_empty() {
+        tail.push(' ');
+        tail.push_str(&unrestored.join("; "));
+        tail.push('.');
+    }
+    tail.push_str(&format!(" {preservation_note}."));
+    tail.push_str(&format!(" Preserved WAL copy: {preserved_display}."));
+    tail.push_str(" See docs/runbooks/wal-recovery.md.");
+    tail
+}
+
 /// Refuses with the accounting verdict, restores the sides that lost every
 /// byte, and keeps the `#189` message contract (the word `zero`, the real
 /// preserved path).
@@ -3560,70 +3759,121 @@ fn wal_refusal(
     let pre_total = pre.0.pre.saturating_add(pre.1.pre);
     let scanned_total = pre.0.bytes_scanned.saturating_add(pre.1.bytes_scanned);
     let post_total = post.0.saturating_add(post.1);
-    let pair = Some(preserved);
 
-    let mut restored = Vec::new();
-    let mut unrestored = Vec::new();
-    for side in [WalSide::Active, WalSide::Frozen] {
-        if !restore.contains(wal_side_set(side)) {
-            continue;
-        }
-        let label = wal_side_label(side);
-        match pair.and_then(|p| p.get(side)) {
-            Some(copy) => {
-                let target = side.path(local_path);
-                match restore_regular_file_no_follow(copy, &target) {
-                    Ok(_) => restored.push(format!(
-                        "the {label} WAL was restored from {}",
-                        copy.display()
-                    )),
-                    Err(e) => unrestored.push(format!(
-                        "the {label} WAL could not be restored ({e}); its bytes are at {}",
-                        copy.display()
-                    )),
-                }
-            }
-            None => unrestored.push(format!("the {label} WAL has no preserved copy")),
-        }
-    }
-
-    let preserved_display = pair
-        .and_then(|p| p.active.as_ref().or(p.frozen.as_ref()))
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| format!("{}.wal.unclean.<none>", local_path.display()));
-    let preservation_note = format!(
-        "preserved copies: active {}, frozen {}",
-        preserved
-            .active
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string()),
-        preserved
-            .frozen
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string())
-    );
+    let (restored, unrestored) = restore_lost_sides(local_path, restore, preserved);
 
     let mut message = format!(
         "{headline}: verdict `{}` on {} ({pre_total} bytes before, {post_total} after the replay, {scanned_total} bytes scanned). Refusing to checkpoint over the WAL.",
         verdict.slug(),
         verdict.sides().label()
     );
-    if !restored.is_empty() {
-        message.push(' ');
-        message.push_str(&restored.join("; "));
-        message.push('.');
-    }
-    if !unrestored.is_empty() {
-        message.push(' ');
-        message.push_str(&unrestored.join("; "));
-        message.push('.');
-    }
-    message.push_str(&format!(" {preservation_note}."));
-    message.push_str(&format!(" Preserved WAL copy: {preserved_display}."));
-    message.push_str(" See docs/runbooks/wal-recovery.md.");
+    message.push_str(&preservation_tail(
+        &restored,
+        &unrestored,
+        preserved,
+        local_path,
+    ));
     eprintln!("ERROR: DATA LOSS. {message}");
+    anyhow::anyhow!(message)
+}
+
+/// Refuses a failed verified open whose failure the recovery funnel does not
+/// recognize (`#228`).
+///
+/// Fail-closed: the accounting runs on the pair as it stands after the failed
+/// open, the sides that lost every byte are restored from their preserved
+/// copies, and the refusal names the engine's own error. Nothing is replayed
+/// here — the lenient replay is only safe for the recognized failure classes
+/// (the checksum-config mismatch, a WAL integrity failure, a foreign WAL, a
+/// torn tail), and an unrecognized database error must never reach it.
+///
+/// The refusal never claims a replay: the accounting verdict and the engine's
+/// error are the whole story.
+fn refuse_unrecognized_wal_failure(
+    local_path: &std::path::Path,
+    err_msg: &str,
+    pre: &(
+        crate::store::wal_accounting::SideObservation,
+        crate::store::wal_accounting::SideObservation,
+    ),
+    preserved: &PreservedPair,
+) -> anyhow::Error {
+    use crate::store::wal_accounting::{
+        classify_pair_after_failed_open, AppliedRecords, SideSet, WalAccounting,
+    };
+
+    let post = wal_pair_sizes(local_path);
+    // A failed open reports no applied-record count, so the removed-WAL truth
+    // table sees `Unavailable`: absence of a signal is not evidence of a
+    // replay.
+    let verdict = classify_pair_after_failed_open(
+        pair_observation(pre, post, SideSet::EMPTY),
+        AppliedRecords::Unavailable,
+    );
+    let restore = sides_to_restore(pre, post);
+    let (restored, unrestored) = restore_lost_sides(local_path, restore, preserved);
+
+    let pre_total = pre.0.pre.saturating_add(pre.1.pre);
+    let scanned_total = pre.0.bytes_scanned.saturating_add(pre.1.bytes_scanned);
+    let post_total = post.0.saturating_add(post.1);
+    let kind = if is_wal_semantic_failure(err_msg) {
+        "a semantic catalog failure of the pinned engine"
+    } else {
+        "an error the write-ahead log recovery funnel does not recognize"
+    };
+    // The accounting, phrased so that it never claims a replay: the failed
+    // open replayed nothing, and the verdict says what the bytes prove. Only a
+    // loss verdict carries its slug; the no-loss case never names a replay.
+    let accounting = match verdict {
+        WalAccounting::CommittedLost { .. } => format!(
+            "The accounting proved a committed loss (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::Unknown { .. } => format!(
+            "The accounting cannot attribute the bytes (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::Deferred { .. } => format!(
+            "The write-ahead log is too large to classify (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::ForeignWal { .. } => format!(
+            "The write-ahead log was attributed to another database (verdict `{}`) on {}",
+            verdict.slug(),
+            verdict.sides().label()
+        ),
+        WalAccounting::Replayed { .. } => {
+            "The accounting found no committed loss: the write-ahead log's bytes survived the \
+             failed open, or the engine applied a completed checkpoint"
+                .to_string()
+        }
+        WalAccounting::NothingCommitted { .. } => {
+            "The accounting found no committed loss: the write-ahead log held no committed \
+             record"
+                .to_string()
+        }
+        WalAccounting::NoWal => {
+            "The accounting found no committed loss: there was no write-ahead log".to_string()
+        }
+    };
+
+    let mut message = format!(
+        "Refusing to open: the verified open failed with {kind} ({err_msg}), so the write-ahead log accounting cannot prove that zero committed records were recovered. {accounting} ({pre_total} bytes before the failed open, {post_total} bytes after it, {scanned_total} bytes scanned). Refusing to checkpoint over the WAL."
+    );
+    message.push_str(&preservation_tail(
+        &restored,
+        &unrestored,
+        preserved,
+        local_path,
+    ));
+    let prefix = match verdict {
+        WalAccounting::CommittedLost { .. } | WalAccounting::Unknown { .. } => "ERROR: DATA LOSS.",
+        _ => "ERROR: refusing to open.",
+    };
+    eprintln!("{prefix} {message}");
     anyhow::anyhow!(message)
 }
 
@@ -3687,6 +3937,173 @@ fn lenient_failure_action(verdict: crate::store::wal_accounting::WalAccounting) 
     }
 }
 
+/// The recovery arms of the WAL funnel (`#228` C2).
+///
+/// The arm list is a **dispatch table**, not documentation. The funnel opens
+/// through it and the census test walks it, so a comment can neither add an
+/// arm nor satisfy one: an arm exists only as a row of [`RECOVERY_ARMS`], and
+/// its opener is a real function that the census executes against a real
+/// database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryArmId {
+    /// The verified open that starts the funnel.
+    VerifiedOpen,
+    /// The replay of a WAL whose checksum flag disagrees with the database
+    /// configuration, under the WAL's own checksum setting.
+    ChecksumMismatchReplay,
+    /// The unverified replay of a WAL that failed verification.
+    LenientReplay,
+    /// The verified reopen after the recovery checkpoint.
+    VerifiedReopen,
+    /// The reopen after an unreadable WAL was renamed aside.
+    QuarantineReopen,
+}
+
+/// What an arm is asked to open.
+pub struct ArmRequest<'a> {
+    /// The database the arm opens.
+    pub local_path: &'a std::path::Path,
+    /// The configuration the caller asked for on the initial open. Only the
+    /// [`RecoveryArmId::VerifiedOpen`] arm reads it; the recovery arms open
+    /// with their own configuration.
+    pub initial_config: Option<SystemConfig>,
+}
+
+/// One recovery arm: its identity, its operator-facing name, and the opener
+/// the funnel dispatches to.
+pub struct RecoveryArm {
+    /// The arm's identity.
+    pub id: RecoveryArmId,
+    /// The arm's operator-facing name. The census pins the order.
+    pub name: &'static str,
+    /// The opener the funnel calls for this arm.
+    pub opener: fn(&ArmRequest) -> Result<Database>,
+}
+
+/// The recovery arms, in funnel order (`#228` C2).
+///
+/// This table is the *only* list of arms: the funnel dispatches through it
+/// and the census test asserts against it.
+pub const RECOVERY_ARMS: [RecoveryArm; 5] = [
+    RecoveryArm {
+        id: RecoveryArmId::VerifiedOpen,
+        name: "verified-open",
+        opener: open_verified,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::ChecksumMismatchReplay,
+        name: "checksum-mismatch-replay",
+        opener: open_with_wal_header_checksums,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::LenientReplay,
+        name: "lenient-replay",
+        opener: open_lenient_replay,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::VerifiedReopen,
+        name: "verified-reopen",
+        opener: open_verified_reopen,
+    },
+    RecoveryArm {
+        id: RecoveryArmId::QuarantineReopen,
+        name: "quarantine-reopen",
+        opener: open_quarantine_reopen,
+    },
+];
+
+thread_local! {
+    /// The arm whose opener ran last on this thread (`#228` C2).
+    ///
+    /// The census probe reads it to prove that every arm has its *own* opener:
+    /// two table rows sharing one function would report the first arm's id for
+    /// the second arm's probe, which no comment can fake.
+    static LAST_RECOVERY_ARM: std::cell::Cell<Option<RecoveryArmId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The arm with this identity.
+pub fn recovery_arm(id: RecoveryArmId) -> &'static RecoveryArm {
+    RECOVERY_ARMS
+        .iter()
+        .find(|arm| arm.id == id)
+        .expect("every recovery arm id has a row in RECOVERY_ARMS")
+}
+
+/// Opens through an arm of [`RECOVERY_ARMS`].
+///
+/// The funnel never calls `Database::new` itself: every production open goes
+/// through this dispatch, so the census can prove that each arm is reachable
+/// and that no arm opens the database behind the table's back.
+fn run_recovery_arm(id: RecoveryArmId, request: &ArmRequest) -> Result<Database> {
+    (recovery_arm(id).opener)(request)
+}
+
+/// The open modes the arms dispatch to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmMode {
+    /// The verified open under the caller's configuration.
+    Verified,
+    /// A replay under the WAL header's own checksum setting.
+    WalHeaderChecksums,
+    /// A replay under the WAL header's own checksum setting that tolerates a
+    /// corrupt tail.
+    LenientTail,
+    /// A verified reopen after the recovery checkpoint.
+    VerifiedReopen,
+    /// A verified reopen after a quarantine rename.
+    QuarantineReopen,
+}
+
+/// The single `Database::new` of the recovery funnel.
+///
+/// Every arm shares this one call, so the census can prove that no arm opens
+/// the database behind the dispatch table's back.
+fn open_in_mode(mode: ArmMode, request: &ArmRequest) -> Result<Database> {
+    let config = match mode {
+        ArmMode::Verified => request
+            .initial_config
+            .clone()
+            .unwrap_or_else(verifying_config),
+        ArmMode::WalHeaderChecksums => wal_header_checksums_config_for(request.local_path),
+        ArmMode::LenientTail => unverified_replay_config_for(request.local_path),
+        ArmMode::VerifiedReopen | ArmMode::QuarantineReopen => verifying_config(),
+    };
+    Ok(Database::new(request.local_path, config)?)
+}
+
+/// Arm 1 — the verified open that starts the funnel.
+fn open_verified(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::VerifiedOpen)));
+    open_in_mode(ArmMode::Verified, request)
+}
+
+/// Arm 2 — the checksum-config mismatch replay: the WAL is replayed under the
+/// WAL header's own checksum setting (`#207` BC-1).
+fn open_with_wal_header_checksums(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::ChecksumMismatchReplay)));
+    open_in_mode(ArmMode::WalHeaderChecksums, request)
+}
+
+/// Arm 3 — the unverified replay of a WAL that failed verification: the same
+/// framing as the WAL header, but the replay tolerates a corrupt tail.
+fn open_lenient_replay(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::LenientReplay)));
+    open_in_mode(ArmMode::LenientTail, request)
+}
+
+/// Arm 4 — the verified reopen after the recovery checkpoint.
+fn open_verified_reopen(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::VerifiedReopen)));
+    open_in_mode(ArmMode::VerifiedReopen, request)
+}
+
+/// Arm 5 — the reopen after an unreadable WAL was renamed aside.
+fn open_quarantine_reopen(request: &ArmRequest) -> Result<Database> {
+    LAST_RECOVERY_ARM.with(|slot| slot.set(Some(RecoveryArmId::QuarantineReopen)));
+    open_in_mode(ArmMode::QuarantineReopen, request)
+}
+
 /// The recovery funnel after the verified open failed (`#207`).
 fn recover_from_wal_failure(
     local_path: &std::path::Path,
@@ -3698,19 +4115,33 @@ fn recover_from_wal_failure(
     preserved: &PreservedPair,
 ) -> Result<(Database, OpenProvenance)> {
     use crate::store::wal_accounting::{
-        classify_pair, consumed_sides, disposition, Disposition, SideSet, WalAccounting,
-        WalPairBytes,
+        classify_pair, classify_pair_with_applied, consumed_sides, disposition,
+        emulated_applied_records, Disposition, SideSet, WalAccounting, WalPairBytes,
     };
 
     let err_msg = error.to_string();
     let checksum_mismatch = err_msg.contains("enableChecksums");
-    let integrity_failure = is_wal_integrity_failure(&err_msg);
+    let mut integrity_failure = is_wal_integrity_failure(&err_msg);
     let arm_a_foreign = foreign_side_from_error(&err_msg, local_path);
     let torn_tail = torn_tail_side(&err_msg, local_path, pre);
     let pre_total = pre.0.pre.saturating_add(pre.1.pre);
 
     if !checksum_mismatch && !integrity_failure && arm_a_foreign.is_none() && torn_tail.is_none() {
-        return Err(error);
+        // `#228`: fail closed. The lenient replay is only safe for the failure
+        // classes the funnel recognizes (the checksum-config mismatch, a WAL
+        // integrity failure, a foreign WAL, a torn tail). Any other failure
+        // with a WAL on disk still gets the accounting and the restoration,
+        // and refuses with the verdict — the engine's own error is embedded
+        // in the refusal so the operator still sees the cause.
+        //
+        // With no WAL on either side there is nothing to account for and
+        // nothing to preserve, so the engine's error is the whole truth.
+        if pre_total == 0 {
+            return Err(error);
+        }
+        return Err(refuse_unrecognized_wal_failure(
+            local_path, &err_msg, pre, preserved,
+        ));
     }
 
     let post = wal_pair_sizes(local_path);
@@ -3774,7 +4205,7 @@ fn recover_from_wal_failure(
         }
     }
 
-    let lenient_provenance = if checksum_mismatch {
+    let mut lenient_provenance = if checksum_mismatch {
         OpenProvenance::ChecksumConfigMismatch
     } else {
         OpenProvenance::UnverifiedWalReplay
@@ -3791,7 +4222,59 @@ fn recover_from_wal_failure(
         eprintln!("ERROR: retrying WITHOUT strict WAL verification to recover those writes. The records replayed this way are NOT fully authenticated -- if this database may have been tampered with, stop and inspect the preserved copy instead. Set NEUROSTRATA_STRICT_WAL=1 to refuse this fallback.");
     }
 
-    let lenient = Database::new(local_path, unverified_replay_config_for(local_path));
+    let lenient = if checksum_mismatch {
+        match run_recovery_arm(
+            RecoveryArmId::ChecksumMismatchReplay,
+            &ArmRequest {
+                local_path,
+                initial_config: None,
+            },
+        ) {
+            Ok(handle) => Ok(handle),
+            Err(mismatch_e) => {
+                let mismatch_msg = mismatch_e.to_string();
+                let post_mismatch = wal_pair_sizes(local_path);
+                let frozen_survived_mismatch = pre.1.pre == 0 || post_mismatch.1 > 0;
+                let mismatch_integrity = is_wal_integrity_failure(&mismatch_msg);
+                let mismatch_foreign = foreign_side_from_error(&mismatch_msg, local_path);
+                let mismatch_torn = torn_tail_side(&mismatch_msg, local_path, pre);
+                if let Some(side) = mismatch_foreign {
+                    foreign = foreign.union(wal_side_set(side));
+                }
+                if !mismatch_integrity && mismatch_foreign.is_none() && mismatch_torn.is_none() {
+                    return Err(refuse_unrecognized_wal_failure(
+                        local_path,
+                        &mismatch_msg,
+                        pre,
+                        preserved,
+                    ));
+                }
+                if frozen_survived_mismatch {
+                    integrity_failure |= mismatch_integrity;
+                }
+                if mismatch_integrity || mismatch_torn.is_some() {
+                    lenient_provenance = OpenProvenance::UnverifiedWalReplay;
+                    run_recovery_arm(
+                        RecoveryArmId::LenientReplay,
+                        &ArmRequest {
+                            local_path,
+                            initial_config: None,
+                        },
+                    )
+                } else {
+                    Err(mismatch_e)
+                }
+            }
+        }
+    } else {
+        run_recovery_arm(
+            RecoveryArmId::LenientReplay,
+            &ArmRequest {
+                local_path,
+                initial_config: None,
+            },
+        )
+    };
     // Captured immediately after the open and before any CHECKPOINT/reopen/rename.
     let post = wal_pair_sizes(local_path);
     if let Err(e) = &lenient {
@@ -3813,7 +4296,23 @@ fn recover_from_wal_failure(
         lenient.is_ok(),
     );
     let pair = pair_observation(pre, post, foreign).consumed(consumed);
-    let verdict = classify_pair(pair);
+    // The engine's replay result is not exposed by the binding
+    // (`neurostrata-5lam`), so the accounting emulates it from what the
+    // failed open proved about the WAL (`#228`):
+    //
+    // * a record-level failure means the lenient replay stops at the same
+    //   record and applies nothing, so the engine removes the frozen WAL
+    //   without applying a thing;
+    // * a header-level failure (the checksum-config mismatch) or a torn tail
+    //   leaves the records themselves intact, so the engine replays them
+    //   under the WAL header's own checksum setting and only then retires the
+    //   file.
+    //
+    // The emulation is built on **committed work**, never on "the WAL held
+    // some frames": a lone `BEGIN` frame commits nothing, so the engine
+    // applies nothing and retires the file (`#228`).
+    let applied = emulated_applied_records(integrity_failure, pre.1.scan);
+    let verdict = classify_pair_with_applied(pair, applied);
 
     let unverified_db = match lenient {
         Ok(handle) => handle,
@@ -3859,10 +4358,14 @@ fn recover_from_wal_failure(
 
     match disposition(verdict, pair) {
         Disposition::Proceed => {
-            eprintln!("Recovered by replaying the write-ahead log with lenient tail truncation.");
-            if let Some(note) = verdict.checkpoint_label() {
-                eprintln!("WAL accounting: {note}.");
-            }
+            let recovered_line = match verdict {
+                WalAccounting::Replayed { .. } => {
+                    "Recovered by replaying the write-ahead log with lenient tail truncation."
+                }
+                _ => {
+                    "Recovered from the write-ahead log with lenient tail truncation; it held no committed records."
+                }
+            };
             let unverified_db = run_recovery_checkpoint(local_path, unverified_db)?;
             drop(unverified_db);
             if pre_total > 0 {
@@ -3874,8 +4377,21 @@ fn recover_from_wal_failure(
                     "The pre-replay write-ahead log was {pre_total} bytes. The preserved copy is kept at {preserved_display} in case any tail records were truncated."
                 );
             }
-            let db = Database::new(local_path, verifying_config())
-                .map_err(|e| anyhow::anyhow!("Recovery reopen with verification failed: {e}"))?;
+            let db = run_recovery_arm(
+                RecoveryArmId::VerifiedReopen,
+                &ArmRequest {
+                    local_path,
+                    initial_config: None,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Recovery reopen with verification failed: {e}"))?;
+            // The recovery claim is printed only after the verified reopen
+            // succeeded: a failed reopen must never leave an operator with a
+            // "recovered" message for a database that did not open (`#228`).
+            eprintln!("{recovered_line}");
+            if let Some(note) = verdict.checkpoint_label() {
+                eprintln!("WAL accounting: {note}.");
+            }
             Ok((db, lenient_provenance))
         }
         Disposition::Refuse { restore } => {
@@ -3887,7 +4403,7 @@ fn recover_from_wal_failure(
                 post,
                 preserved,
                 restore,
-                "Unverified WAL replay recovered zero committed records where the write-ahead log accounting cannot prove the replay was empty",
+                refusal_headline(&verdict),
             ))
         }
         Disposition::Quarantine { sides } => {
@@ -4037,7 +4553,8 @@ impl FirstWriteFlip {
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
-                if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
+                if let Err(e) =
+                    crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
                 {
                     tracing::error!(
                         "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
@@ -4064,7 +4581,8 @@ impl FirstWriteFlip {
                 };
                 if let Some(descriptor) = descriptor {
                     let state = crate::model_choice::StoreState::new(true, descriptor);
-                    if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &state)
+                    if let Err(e) =
+                        crate::model_choice::write_store_state_identity(&self.local_path, &state)
                     {
                         tracing::error!(
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
@@ -4310,6 +4828,32 @@ impl LadybugStore {
         Self::with_system_config(local_path, dimensions, cfg)
     }
 
+    /// Test-only: replace a row's metadata exactly as given, bypassing the
+    /// write-path topology canonicalization. Reconstructs pre-#251 legacy
+    /// rows so revert comparisons can be exercised against raw state.
+    #[cfg(test)]
+    pub(crate) async fn overwrite_row_metadata_for_test(
+        &self,
+        namespace: &str,
+        id: &str,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let metadata = serde_json::to_string(&metadata)?;
+        self.write_with_deadline("test raw metadata overwrite", move |conn| {
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&id),
+                escape_ladybug_string(&metadata)
+            );
+            conn.query(&query)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         // Test harnesses opt into the bounded test configuration by env so the
         // same constructor path serves both production and test binaries.
@@ -4378,7 +4922,13 @@ impl LadybugStore {
         // Open with verification first. A successful verified open is a healthy
         // replay and is never classified (`#207` B6).
         let mut open_provenance = OpenProvenance::Verified;
-        let db = match Database::new(&local_path, initial_config) {
+        let db = match run_recovery_arm(
+            RecoveryArmId::VerifiedOpen,
+            &ArmRequest {
+                local_path: &local_path,
+                initial_config: Some(initial_config.clone()),
+            },
+        ) {
             Ok(db) => db,
             Err(e) => {
                 let (db, provenance) =
@@ -4426,6 +4976,8 @@ impl LadybugStore {
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            form_scans: Arc::default(),
             #[cfg(test)]
             test_cleanup_dir: None,
         })
@@ -4619,7 +5171,10 @@ impl LadybugStore {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
-                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+                        match crate::model_choice::write_store_state_identity(
+                            &self.local_path,
+                            &state,
+                        ) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -4634,7 +5189,10 @@ impl LadybugStore {
                 if let Some(serving) = self.serving_descriptor() {
                     if self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
-                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+                        match crate::model_choice::write_store_state_identity(
+                            &self.local_path,
+                            &state,
+                        ) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -5612,7 +6170,9 @@ fn plan_hygiene_row(
         let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let usable = crate::traits::has_source(&meta) && src != "N/A";
         if !usable {
-            let val = if !loc.is_empty() && loc != "N/A" {
+            // `source` is published to mesh peers and exported, so an
+            // absolute location (the author's machine) is not copied there.
+            let val = if !loc.is_empty() && loc != "N/A" && !crate::paths::is_absolute_any(loc) {
                 loc.clone()
             } else {
                 "legacy-rule".to_string()
@@ -6375,14 +6935,8 @@ pub(crate) fn row_source_key(metadata: &Value) -> Option<&str> {
 /// Normative memory types that the recall path reserves result slots for.
 /// Stated once here so the search ranker and the task gate can agree on the
 /// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
-const NORMATIVE_MEMORY_TYPES: [&str; 6] = [
-    "rule",
-    "fact",
-    "decision",
-    "procedure",
-    "thesis",
-    "concept",
-];
+const NORMATIVE_MEMORY_TYPES: [&str; 6] =
+    ["rule", "fact", "decision", "procedure", "thesis", "concept"];
 
 /// Relevance floor (similarity) below which a normative candidate is eligible
 /// for a reserved search slot. Scores are distances (lower = better, [0.0, 1.0]
@@ -7223,7 +7777,10 @@ impl LadybugStore {
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
-            if !matches!(mt, "code_ast" | "symbol" | "markdown" | "directory" | "file") {
+            if !matches!(
+                mt,
+                "code_ast" | "symbol" | "markdown" | "directory" | "file"
+            ) {
                 continue;
             }
             match crate::parser::ingest::split_scoped_id(&m.id) {
@@ -10312,7 +10869,7 @@ impl VectorStore for LadybugStore {
                         _ => (None, None),
                     };
                     let evidence_id = match (&file, &content_hash) {
-                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.len().min(12)]),
+                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.floor_char_boundary(12)]),
                         (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
                         _ => id.clone(),
                     };
@@ -12310,6 +12867,12 @@ fn is_active_id(id: &str, active_gens: &std::collections::HashSet<u64>) -> bool 
     }
 }
 
+#[derive(Default)]
+struct FileFormTargets {
+    files: Vec<String>,
+    matches: Vec<(String, GraphMatchKind)>,
+}
+
 /// Discovers the target nodes a query can match: the exact file node, the
 /// exact symbol nodes (when a symbol is named), and the ancestor directory
 /// nodes (when `include_ancestors`). The lookups are location-scoped Cypher
@@ -12318,34 +12881,60 @@ fn is_active_id(id: &str, active_gens: &std::collections::HashSet<u64>) -> bool 
 fn discover_candidates(
     conn: &Connection,
     safe_ns: &str,
-    path: &str,
+    paths: &[String],
     symbol: Option<&str>,
     include_ancestors: bool,
     active_gens: &std::collections::HashSet<u64>,
-) -> Result<(Vec<String>, Vec<(String, GraphMatchKind)>)> {
-    let mut file_ids: Vec<String> = Vec::new();
-    let mut candidates: Vec<(String, GraphMatchKind)> = Vec::new();
+    #[cfg(test)] scans: &FormScanCounts,
+) -> Result<Vec<FileFormTargets>> {
+    let mut targets: Vec<_> = paths.iter().map(|_| FileFormTargets::default()).collect();
 
     // The file node and its symbol nodes share `location = path`: the file's
     // logical path is the path itself, a symbol's is `path#kind:name@hash`.
-    let safe_path = escape_ladybug_string(path);
-    let query = format!(
-        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id",
-        safe_ns, safe_path
-    );
+    let path_indices: HashMap<_, _> = paths.iter().map(String::as_str).zip(0..).collect();
+    let query = if let [path] = paths {
+        let safe_path = escape_ladybug_string(path);
+        format!("MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location = '{safe_path}' RETURN m.id")
+    } else {
+        let locations = paths
+            .iter()
+            .map(|path| format!("'{}'", escape_ladybug_string(path)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location IN [{locations}] RETURN m.id, m.location")
+    };
+    #[cfg(test)]
+    scans.check_exact(paths.iter().map(String::as_str))?;
     let mut rows = conn.query(&query)?;
+    #[cfg(test)]
+    scans
+        .exact
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
         if !is_active_id(&id, active_gens) {
             continue;
         }
+        let index = if paths.len() == 1 {
+            0
+        } else {
+            let lbug::Value::String(location) = &row[1] else {
+                continue;
+            };
+            let Some(&index) = path_indices.get(location.as_str()) else {
+                continue;
+            };
+            index
+        };
+        let path = &paths[index];
+        let form = &mut targets[index];
         let logical = crate::parser::ingest::logical_path_of(&id);
         if logical == path {
-            file_ids.push(id.clone());
-            candidates.push((id.clone(), GraphMatchKind::ExactFile));
+            form.files.push(id.clone());
+            form.matches.push((id, GraphMatchKind::ExactFile));
         } else if let Some(sym) = symbol {
             if is_symbol_of(logical, path, sym) {
-                candidates.push((id.clone(), GraphMatchKind::ExactSymbol));
+                form.matches.push((id, GraphMatchKind::ExactSymbol));
             }
         }
     }
@@ -12356,19 +12945,26 @@ fn discover_candidates(
             safe_ns
         );
         let mut rows = conn.query(&dir_query)?;
+        #[cfg(test)]
+        scans
+            .directory
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while let Some(row) = rows.next() {
             let id = format!("{}", row[0]);
             if !is_active_id(&id, active_gens) {
                 continue;
             }
             let location = format!("{}", row[1]);
-            if is_ancestor_of(&location, path) {
-                candidates.push((id.clone(), GraphMatchKind::AncestorDirectory));
+            for (path, form) in paths.iter().zip(&mut targets) {
+                if is_ancestor_of(&location, path) {
+                    form.matches
+                        .push((id.clone(), GraphMatchKind::AncestorDirectory));
+                }
             }
         }
     }
 
-    Ok((file_ids, candidates))
+    Ok(targets)
 }
 
 /// The `memory_type IN [...]` condition of a type-scoped query, or `None`
@@ -12386,26 +12982,29 @@ fn memory_type_condition(memory_types: &[String]) -> Option<String> {
     Some(format!("m.memory_type IN [{}]", list))
 }
 
-/// The metadata fallback: a memory whose `metadata.governs` declares the path
-/// (or an ancestor) but whose edge never materialised -- e.g. the declaration
-/// predates the stub behaviour, or the target is outside the ingested tree.
+struct MetadataFallbackRow {
+    id: String,
+    content: String,
+    memory_type: String,
+    metadata: Value,
+    declared_paths: Vec<String>,
+    access_count: i64,
+}
+
+/// Read the metadata declarations once. Their retirement is evaluated in each
+/// form's fallback stage, after that form's edge reads.
 ///
 /// The query is scoped to the memory types asked for (rules/facts/procedures
 /// by default), so the ingested AST bulk -- file/symbol/directory rows, which
 /// never carry a `governs` declaration -- is never scanned.
-///
-/// The ids of the hits it found are collected in `fallback_ids`: they are the
-/// rows whose fan-out the census still has to read.
-fn add_metadata_fallback_conn(
+fn read_metadata_fallback_rows(
     conn: &Connection,
     safe_ns: &str,
-    hits: &mut Vec<MemoryHit>,
-    path: &str,
-    include_ancestors: bool,
     memory_types: &[String],
     active_gens: &std::collections::HashSet<u64>,
-    fallback_ids: &mut std::collections::HashSet<String>,
-) -> Result<()> {
+    #[cfg(test)] shared: bool,
+    #[cfg(test)] scans: &FormScanCounts,
+) -> Result<Vec<MetadataFallbackRow>> {
     // An empty `memory_types` means "no type filter" (the trait contract), so
     // the type condition is omitted entirely; a non-empty list is pushed into
     // the WHERE clause so only those rows are read.
@@ -12417,8 +13016,20 @@ fn add_metadata_fallback_conn(
         "MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.memory_type, m.metadata",
         where_clause
     );
-    let now = chrono::Utc::now().timestamp();
+    #[cfg(test)]
+    if shared
+        && scans
+            .fail_shared_metadata
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        anyhow::bail!("injected shared metadata query failure");
+    }
     let mut rows = conn.query(&query)?;
+    #[cfg(test)]
+    scans
+        .metadata
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut declarations = Vec::new();
     while let Some(row) = rows.next() {
         let id = format!("{}", row[0]);
         // A superseded tree declares nothing to the reader, the same way the
@@ -12426,8 +13037,6 @@ fn add_metadata_fallback_conn(
         if !is_active_id(&id, active_gens) {
             continue;
         }
-        let content = format!("{}", row[1]);
-        let memory_type = format!("{}", row[2]);
         let metadata_str = format!("{}", row[3]);
         let metadata: Value = match serde_json::from_str(&metadata_str) {
             Ok(v) => v,
@@ -12438,40 +13047,62 @@ fn add_metadata_fallback_conn(
                 Value::Null
             }
         };
-        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
-        {
+        if is_archived(&metadata) || is_mesh_conflicting(&metadata) {
             continue;
         }
-        let governs = match metadata.get("governs") {
-            Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
-            _ => continue,
+        let Some(Value::Array(governs)) = metadata.get("governs") else {
+            continue;
         };
-        for declared in governs {
-            let normalized = crate::parser::ingest::normalize_node_path(declared);
-            let matched =
-                normalized == path || (include_ancestors && is_ancestor_of(&normalized, path));
-            if matched {
-                let access_count = metadata
-                    .get("access_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                fallback_ids.insert(id.clone());
-                hits.push(MemoryHit {
-                    id,
-                    memory_type,
-                    content,
-                    match_kind: GraphMatchKind::MetadataFallback,
-                    access_count,
-                    explanation: format!("declares governs {}", normalized),
-                    metadata,
-                    conceptual_bridges: Vec::new(),
-                    linked_files: 0,
-                });
-                break;
-            }
-        }
+        let declared_paths = governs
+            .iter()
+            .filter_map(Value::as_str)
+            .map(crate::parser::ingest::normalize_node_path)
+            .collect();
+        let access_count = metadata
+            .get("access_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        declarations.push(MetadataFallbackRow {
+            id,
+            content: format!("{}", row[1]),
+            memory_type: format!("{}", row[2]),
+            metadata,
+            declared_paths,
+            access_count,
+        });
     }
-    Ok(())
+    Ok(declarations)
+}
+
+fn add_metadata_fallback_hits(
+    declarations: &[MetadataFallbackRow],
+    path: &str,
+    include_ancestors: bool,
+    now: i64,
+    form: &mut FileFormHits,
+) {
+    for row in declarations {
+        if is_retired_at(&row.metadata, now) {
+            continue;
+        }
+        let Some(declared) = row.declared_paths.iter().find(|declared| {
+            *declared == path || (include_ancestors && is_ancestor_of(declared, path))
+        }) else {
+            continue;
+        };
+        form.fallback_ids.insert(row.id.clone());
+        form.hits.push(MemoryHit {
+            id: row.id.clone(),
+            memory_type: row.memory_type.clone(),
+            content: row.content.clone(),
+            match_kind: GraphMatchKind::MetadataFallback,
+            access_count: row.access_count,
+            explanation: format!("declares governs {declared}"),
+            metadata: row.metadata.clone(),
+            conceptual_bridges: Vec::new(),
+            linked_files: 0,
+        });
+    }
 }
 
 /// The most memory ids one `linked_files` census query of the oracle carries.
@@ -12845,124 +13476,91 @@ impl OntologyStore for LadybugStore {
     }
 }
 
-#[async_trait::async_trait]
-impl GraphRead for LadybugStore {
-    async fn memories_for_file(
+/// The result of a per-logical-file, multi-form memory retrieval.
+///
+/// `candidate_truncated` reports that at least one spelling's raw candidate
+/// pool exceeded the per-form safety budget before the global merge, so the
+/// answer may not include every candidate the spelling matched.
+#[derive(Debug, Clone, Default)]
+pub struct MultiFormMemoryRetrieval {
+    pub hits: Vec<crate::graph_read::memories_for_file::MemoryHit>,
+    pub candidate_truncated: bool,
+}
+
+#[cfg(test)]
+static BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static BRIDGE_ENRICHMENT_TEST_ACTIVE: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
+
+#[cfg(test)]
+pub fn set_bridge_enrichment_test_active(active: bool) {
+    BRIDGE_ENRICHMENT_TEST_ACTIVE.with(|flag| flag.set(active));
+}
+
+#[cfg(test)]
+pub fn reset_bridge_enrichment_counter_for_tests() {
+    BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub fn bridge_enrichment_counter_for_tests() -> usize {
+    BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Safety budget on raw candidates collected from a single spelling before the
+/// global merge ranks and caps them. Prevents one high-fan-out spelling from
+/// monopolizing the candidate pool when many forms are queried.
+const MAX_RAW_CANDIDATES_PER_FORM: usize = 1024;
+
+#[derive(Default)]
+struct FileFormHits {
+    hits: Vec<MemoryHit>,
+    census: LinkedFilesCensus,
+    census_active: HashMap<String, ActiveGenerations>,
+    fallback_ids: HashSet<String>,
+}
+
+type RawFileFormHits = (Vec<MemoryHit>, bool);
+
+fn rank_and_cap_file_form(mut form: FileFormHits, exclude_ids: &[String]) -> RawFileFormHits {
+    // Drop exclusions before they can crowd out a live hit at either cap.
+    if !exclude_ids.is_empty() {
+        form.hits.retain(|hit| !exclude_ids.contains(&hit.id));
+    }
+    dedup_hits(&mut form.hits);
+    for hit in &mut form.hits {
+        hit.linked_files = form.census.count(&hit.id);
+    }
+    crate::graph_read::memories_for_file::rank_hits(&mut form.hits);
+    let truncated = form.hits.len() > MAX_RAW_CANDIDATES_PER_FORM;
+    form.hits.truncate(MAX_RAW_CANDIDATES_PER_FORM);
+    (form.hits, truncated)
+}
+
+impl LadybugStore {
+    /// Populate conceptual bridges on an already-ranked, capped hit set.
+    ///
+    /// Kept separate from candidate collection so a multi-form query enriches
+    /// the merged, per-logical-file result exactly once rather than once per
+    /// spelling.
+    async fn enrich_conceptual_bridges(
         &self,
         namespace: &str,
-        source: Option<&str>,
-        path: &str,
-        symbol: Option<&str>,
-        include_ancestors: bool,
-        memory_types: &[String],
-        exclude_ids: &[String],
-        limit: usize,
-    ) -> Result<Vec<MemoryHit>> {
-        let namespace = namespace.to_string();
-        let path = crate::parser::ingest::normalize_node_path(path);
-        let symbol = symbol.map(|s| s.to_string());
-        let memory_types = memory_types.to_vec();
-        let exclude_ids = exclude_ids.to_vec();
-        let limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
-        let source = source.map(|s| s.to_string());
-
-        let ns = namespace.clone();
-        let path_c = path.clone();
-        let sym_c = symbol.clone();
-        let types = memory_types.clone();
-        let census_reads = self.census_reads.clone();
-
-        let (mut hits, census) = self
-            .with_conn(move |conn| {
-                let safe_ns = escape_ladybug_string(&ns);
-
-                // A source key pins the query to that source's active
-                // generation; `None` keeps every published generation (the
-                // same set `list` reads).
-                let active_gens: std::collections::HashSet<u64> = match &source {
-                    Some(s) => {
-                        let g = active_generation_of_source(conn, &ns, s);
-                        if g > 0 {
-                            [g].into_iter().collect()
-                        } else {
-                            std::collections::HashSet::new()
-                        }
-                    }
-                    None => active_generations_of(conn, &ns),
-                };
-
-                let (file_ids, candidates) = discover_candidates(
-                    conn,
-                    &safe_ns,
-                    &path_c,
-                    sym_c.as_deref(),
-                    include_ancestors,
-                    &active_gens,
-                )?;
-
-                // The census is folded into the candidate queries: every hit
-                // comes back with its own fan-out, so the `linked_files` count
-                // costs no query of its own.
-                let mut census = LinkedFilesCensus::default();
-                let mut census_active: std::collections::HashMap<String, ActiveGenerations> =
-                    std::collections::HashMap::new();
-                // The rows the metadata fallback finds: their fan-out is read
-                // in one query after the scan.
-                let mut fallback_ids: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut hits = graph_hits_from_edges(
-                    conn,
-                    &ns,
-                    &candidates,
-                    &file_ids,
-                    &types,
-                    &mut census,
-                    &mut census_active,
-                )?;
-
-                add_metadata_fallback_conn(
-                    conn,
-                    &safe_ns,
-                    &mut hits,
-                    &path_c,
-                    include_ancestors,
-                    &types,
-                    &active_gens,
-                    &mut fallback_ids,
-                )?;
-
-                // The hits no edge query reached -- the metadata fallback --
-                // still need their fan-out read, and they read it all in one
-                // query: the total work does not grow with the number of
-                // fallback hits.
-                let reads = read_fallback_fan_out(
-                    conn,
-                    &safe_ns,
-                    &types,
-                    &fallback_ids,
-                    &mut census,
-                    &mut census_active,
-                )?;
-                census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
-
-                Ok((hits, census))
-            })
-            .await?;
-
-        // Exclusion happens before the limit is applied, so an excluded hit
-        // never crowds out a live one.
-        if !exclude_ids.is_empty() {
-            hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
+        hits: &mut [crate::graph_read::memories_for_file::MemoryHit],
+    ) {
+        #[cfg(test)]
+        if !hits.is_empty() {
+            if BRIDGE_ENRICHMENT_TEST_ACTIVE.with(|flag| flag.get()) {
+                BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            crate::server::context_plan_benchmark_instrumentation::record_bridge_enrichment_pass();
         }
-
-        dedup_hits(&mut hits);
-        // The census counts are exact and independent of the limit, so they
-        // are applied to the hits that survive the exclusion and the dedup.
-        for hit in hits.iter_mut() {
-            hit.linked_files = census.count(&hit.id);
-        }
-        crate::graph_read::memories_for_file::rank_hits(&mut hits);
-        hits.truncate(limit);
 
         // Populate conceptual_bridges: for each seed hit, find up to 2
         // 2-hop cross-domain bridges via 1-hop via nodes whose domain
@@ -12984,7 +13582,7 @@ impl GraphRead for LadybugStore {
             .collect();
             if let Ok(related) = self
                 .related(
-                    &namespace,
+                    namespace,
                     &hit.id,
                     &relations_vec,
                     crate::graph_read::related::Direction::Both,
@@ -13018,7 +13616,7 @@ impl GraphRead for LadybugStore {
                     .collect();
                     if let Ok(related2) = self
                         .related(
-                            &namespace,
+                            namespace,
                             via_id,
                             &relations_vec,
                             crate::graph_read::related::Direction::Both,
@@ -13041,7 +13639,7 @@ impl GraphRead for LadybugStore {
                                 continue;
                             }
                             if let Ok(Some((_, target_payload))) =
-                                self.get(&namespace, &target_node.id).await
+                                self.get(namespace, &target_node.id).await
                             {
                                 let is_normative = matches!(
                                     target_payload.memory_type.as_str(),
@@ -13106,8 +13704,302 @@ impl GraphRead for LadybugStore {
             }
             hit.conceptual_bridges = bridges;
         }
+    }
 
-        Ok(hits)
+    /// Collect raw candidate hits for one normalized spelling, without applying
+    /// the caller's `limit` and without conceptual-bridge enrichment. Both are
+    /// deferred to the global merge in `memories_for_file_forms`.
+    #[allow(clippy::too_many_arguments)]
+    async fn raw_memories_for_single_form(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        normalized_path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+    ) -> Result<RawFileFormHits> {
+        self.raw_memories_for_forms(
+            namespace,
+            source,
+            vec![normalized_path.to_string()],
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+        )
+        .await?
+        .pop()
+        .expect("one result for the single form")
+    }
+
+    /// Share discovery and metadata scans, retaining one edge/census result
+    /// and candidate budget per form. An outer error means the shared work
+    /// failed and individual queries can be retried on fresh connections.
+    #[allow(clippy::too_many_arguments)]
+    async fn raw_memories_for_forms(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        paths: Vec<String>,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+    ) -> Result<Vec<Result<RawFileFormHits>>> {
+        let ns = namespace.to_string();
+        let sym_c = symbol.map(|s| s.to_string());
+        let types = memory_types.to_vec();
+        let source = source.map(|s| s.to_string());
+        let census_reads = self.census_reads.clone();
+        let checkpoints = self.checkpoints.clone();
+        #[cfg(test)]
+        let scans = self.form_scans.clone();
+
+        let form_hits = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns);
+                let explain_form_error = |error| {
+                    stop_checkpoints_after_pool_failure(conn, &checkpoints, &error, false);
+                    explain_engine_error(error)
+                };
+
+                // A source key pins the query to that source's active
+                // generation; `None` keeps every published generation (the
+                // same set `list` reads).
+                let active_gens: std::collections::HashSet<u64> = match &source {
+                    Some(s) => {
+                        let g = active_generation_of_source(conn, &ns, s);
+                        if g > 0 {
+                            [g].into_iter().collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        }
+                    }
+                    None => active_generations_of(conn, &ns),
+                };
+
+                let targets = discover_candidates(
+                    conn,
+                    &safe_ns,
+                    &paths,
+                    sym_c.as_deref(),
+                    include_ancestors,
+                    &active_gens,
+                    #[cfg(test)]
+                    &scans,
+                )?;
+
+                // Complete each form's time-sensitive reads in their original
+                // order. Cache the declarations at the first fallback stage.
+                #[cfg(test)]
+                let shared = paths.len() > 1;
+                let mut declarations = None;
+                let mut form_hits = Vec::with_capacity(paths.len());
+                for (path, targets) in paths.iter().zip(targets) {
+                    let mut form = FileFormHits::default();
+                    form.hits = match graph_hits_from_edges(
+                        conn,
+                        &ns,
+                        &targets.matches,
+                        &targets.files,
+                        &types,
+                        &mut form.census,
+                        &mut form.census_active,
+                    ) {
+                        Ok(hits) => hits,
+                        Err(error) => {
+                            form_hits.push(Err(explain_form_error(error)));
+                            continue;
+                        }
+                    };
+                    #[cfg(not(test))]
+                    let now = chrono::Utc::now().timestamp();
+                    #[cfg(test)]
+                    let now = {
+                        scans.finish_edges(path);
+                        scans.metadata_now()
+                    };
+                    let rows = match &mut declarations {
+                        Some(rows) => rows,
+                        slot @ None => slot.insert(read_metadata_fallback_rows(
+                            conn,
+                            &safe_ns,
+                            &types,
+                            &active_gens,
+                            #[cfg(test)]
+                            shared,
+                            #[cfg(test)]
+                            &scans,
+                        )?),
+                    };
+                    add_metadata_fallback_hits(rows, path, include_ancestors, now, &mut form);
+
+                    // Edge hits carry their own fan-out. Read the metadata
+                    // hits' fan-out before starting the next form's edges.
+                    let result = read_fallback_fan_out(
+                        conn,
+                        &safe_ns,
+                        &types,
+                        &form.fallback_ids,
+                        &mut form.census,
+                        &mut form.census_active,
+                    )
+                    .map(|reads| {
+                        census_reads.fetch_add(reads as u64, std::sync::atomic::Ordering::Relaxed);
+                        form
+                    })
+                    .map_err(explain_form_error);
+                    form_hits.push(result);
+                }
+                Ok(form_hits)
+            })
+            .await?;
+
+        Ok(form_hits
+            .into_iter()
+            .map(|result| result.map(|form| rank_and_cap_file_form(form, exclude_ids)))
+            .collect())
+    }
+
+    /// Retrieve memories for every distinct logical form of one file as a
+    /// single logical query: collect raw candidates per form, merge/rank/dedup
+    /// globally, cap to the caller's limit, then enrich bridges exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn memories_for_file_forms(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        forms: &[String],
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<MultiFormMemoryRetrieval> {
+        let mut hits: Vec<crate::graph_read::memories_for_file::MemoryHit> = Vec::new();
+        let mut candidate_truncated = false;
+        let mut any_success = false;
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut seen_paths = HashSet::new();
+        let (originals, paths): (Vec<_>, Vec<_>) = forms
+            .iter()
+            .filter_map(|form| {
+                let path = crate::parser::ingest::normalize_node_path(form);
+                if !seen_paths.insert(path.clone()) {
+                    return None;
+                }
+                // The context-plan benchmark counts distinct logical forms.
+                // Physical scans and retries are counted at their query sites.
+                #[cfg(test)]
+                crate::server::context_plan_benchmark_instrumentation::record_store_memory_multiform_op(
+                );
+                Some((form, path))
+            })
+            .unzip();
+
+        let mut batched = if paths.len() > 1 {
+            match self
+                .raw_memories_for_forms(
+                    namespace,
+                    source,
+                    paths.clone(),
+                    symbol,
+                    include_ancestors,
+                    memory_types,
+                    exclude_ids,
+                )
+                .await
+            {
+                Ok(results) => Some(results.into_iter()),
+                Err(error) => {
+                    tracing::warn!("shared memories_for_file query failed, retrying forms individually: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        for (form, path) in originals.into_iter().zip(paths) {
+            let result = match &mut batched {
+                Some(results) => results.next().expect("one result per form"),
+                None => {
+                    self.raw_memories_for_single_form(
+                        namespace,
+                        source,
+                        &path,
+                        symbol,
+                        include_ancestors,
+                        memory_types,
+                        exclude_ids,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok((batch, truncated)) => {
+                    any_success = true;
+                    candidate_truncated |= truncated;
+                    hits.extend(batch);
+                }
+                Err(e) => {
+                    tracing::warn!("memories_for_file lookup of {form:?} failed: {e}");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+
+        if !any_success {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+
+        // Global merge: rank the whole candidate pool, dedup by id keeping the
+        // best-ranked occurrence, then cap to the caller's limit.
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|h| seen.insert(h.id.clone()));
+        let effective_limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+        hits.truncate(effective_limit);
+
+        // One enrichment pass over the final per-logical-file hit set.
+        self.enrich_conceptual_bridges(namespace, &mut hits).await;
+
+        Ok(MultiFormMemoryRetrieval {
+            hits,
+            candidate_truncated,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl GraphRead for LadybugStore {
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        self.memories_for_file_forms(
+            namespace,
+            source,
+            &[path.to_string()],
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+            limit,
+        )
+        .await
+        .map(|r| r.hits)
     }
 
     async fn related(
@@ -13158,14 +14050,14 @@ impl GraphRead for LadybugStore {
         let seed_c = seed.clone();
         let rels = relations.clone();
 
-        let (nodes, edges, generation) = self
+        let (nodes, edges, generation, resolved_seed_id) = self
             .with_conn(move |conn| {
                 fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops, &policy, &expanded_set)
             })
             .await?;
 
         Ok(crate::graph_read::related::graph_read_related(
-            &seed,
+            &resolved_seed_id,
             &nodes,
             &edges,
             &relations,
@@ -13176,6 +14068,151 @@ impl GraphRead for LadybugStore {
             generation,
             cursor,
         ))
+    }
+}
+
+impl LadybugStore {
+    /// Resolve a caller-supplied file-path seed (expanded into every spelling
+    /// it may be stored under) to exactly one active node id in `namespace`.
+    /// Deterministic: form order first, then priority rank, then id lexical.
+    pub async fn resolve_canonical_file_seed_id(
+        &self,
+        namespace: &str,
+        forms: &[String],
+    ) -> Result<Option<String>> {
+        let namespace = namespace.to_string();
+        let forms = forms.to_vec();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let active_gens = active_generations_of(conn, &namespace);
+            let now = chrono::Utc::now().timestamp();
+
+            let parse_meta = |raw: &str| -> Value {
+                match serde_json::from_str(raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !raw.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                }
+            };
+
+            let visible = |id: &str, metadata: &Value| -> bool {
+                is_active_id(id, &active_gens)
+                    && !is_archived(metadata)
+                    && !is_retired_at(metadata, now)
+                    && !is_mesh_conflicting(metadata)
+                    && !crate::registry::is_registry_row(metadata)
+            };
+
+            let location_matches = |metadata: &Value, norm: &str| -> bool {
+                if norm.is_empty() {
+                    return false;
+                }
+                let matches_path = |p: &str| {
+                    crate::parser::ingest::normalize_node_path(p) == norm
+                };
+                metadata
+                    .get("relative_path")
+                    .and_then(|v| v.as_str())
+                    .map(matches_path)
+                    .unwrap_or(false)
+                    || metadata
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(matches_path)
+                        .unwrap_or(false)
+                    || metadata
+                        .get("locations")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter().any(|loc| {
+                                loc.get("path")
+                                    .and_then(|v| v.as_str())
+                                    .map(matches_path)
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+            };
+
+            for form in &forms {
+                let norm = crate::parser::ingest::normalize_node_path(form);
+                let mut rows: Vec<(String, String, Value)> = Vec::new();
+
+                // (a) exact id / file:-prefixed id / location matches.
+                let direct_q = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{ns}' AND (m.id = '{form}' OR m.id = '{norm}' OR m.id = 'file:{form}' OR m.id = 'file:{norm}' OR m.location = '{form}' OR m.location = '{norm}') RETURN m.id, m.memory_type, m.location, m.metadata",
+                    ns = safe_ns,
+                    form = escape_ladybug_string(form),
+                    norm = escape_ladybug_string(&norm),
+                );
+                let result = conn.query(&direct_q)?;
+                for row in result {
+                    let id = format!("{}", row[0]);
+                    let memory_type = format!("{}", row[1]);
+                    let metadata = parse_meta(&format!("{}", row[3]));
+                    rows.push((id, memory_type, metadata));
+                }
+
+                // (b) memories storing the path only in metadata (empty
+                // `location` column): narrow the CONTAINS prefilter to rows
+                // whose parsed metadata actually carries the normalized path.
+                if !norm.is_empty() {
+                    let meta_q = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{ns}' AND m.metadata CONTAINS '{norm}' RETURN m.id, m.memory_type, m.location, m.metadata",
+                        ns = safe_ns,
+                        norm = escape_ladybug_string(&norm),
+                    );
+                    let result = conn.query(&meta_q)?;
+                    for row in result {
+                        let id = format!("{}", row[0]);
+                        let memory_type = format!("{}", row[1]);
+                        let metadata = parse_meta(&format!("{}", row[3]));
+                        if location_matches(&metadata, &norm) {
+                            rows.push((id, memory_type, metadata));
+                        }
+                    }
+                }
+
+                let mut seen = std::collections::HashSet::new();
+                let candidates: Vec<(String, u8)> = rows
+                    .into_iter()
+                    .filter(|(id, _, metadata)| visible(id, metadata))
+                    .filter_map(|(id, memory_type, _)| {
+                        if !seen.insert(id.clone()) {
+                            return None;
+                        }
+                        let rank = if id.as_str() == form.as_str() || id.as_str() == norm.as_str() {
+                            0
+                        } else if memory_type == "file" {
+                            1
+                        } else if memory_type == "structural"
+                            || id.as_str() == format!("file:{}", form).as_str()
+                            || id.as_str() == format!("file:{}", norm).as_str()
+                        {
+                            2
+                        } else if memory_type == "code_ast" || memory_type == "symbol" {
+                            3
+                        } else {
+                            4
+                        };
+                        Some((id, rank))
+                    })
+                    .collect();
+
+                if let Some((best, _)) = candidates
+                    .into_iter()
+                    .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+                {
+                    return Ok(Some(best));
+                }
+            }
+            Ok(None)
+        })
+        .await
     }
 }
 
@@ -13200,6 +14237,7 @@ fn fetch_related_subgraph(
     Vec<crate::graph_read::related::NodeSpec>,
     Vec<crate::graph_read::related::EdgeSpec>,
     u64,
+    String,
 )> {
     use crate::graph_read::related::{EdgeSpec, NodeSpec};
 
@@ -13331,8 +14369,11 @@ fn fetch_related_subgraph(
     }
 
     let Some(seed_id) = seed_id else {
-        return Ok((Vec::new(), Vec::new(), generation));
+        return Ok((Vec::new(), Vec::new(), generation, seed.to_string()));
     };
+    // The seed may have matched by `location`; pass the resolved node id on so
+    // the pure traversal's `node_map.get(seed)` still finds its own root node.
+    let resolved_seed_id = seed_id.clone();
 
     // BFS out to `max_hops`, fetching both orientations (the pure traversal
     // reapplies the direction allowlist). Only same-namespace neighbours are
@@ -13480,7 +14521,7 @@ fn fetch_related_subgraph(
     }
 
     let nodes: Vec<NodeSpec> = nodes.into_values().collect();
-    Ok((nodes, edges, generation))
+    Ok((nodes, edges, generation, resolved_seed_id))
 }
 
 impl LadybugStore {
@@ -13523,6 +14564,11 @@ impl LadybugStore {
                 "symbol_name",
                 "ast_kind",
                 "eligibility",
+                // Capability C: these drive the deterministic deprecation
+                // banner and negative boundary on recall surfaces. Dropping
+                // them on truncation would silently lose that presentation.
+                "deprecation",
+                "not_definition",
             ] {
                 if let Some(val) = obj.get(key) {
                     compact.insert(key.to_string(), val.clone());
@@ -15317,11 +16363,704 @@ eurostrata\src\daemon.rs",
     async fn retired_test_store() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-retired-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp test dir");
-        let mut store =
-            LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        let mut store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
         store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
         store
+    }
+
+    const SCAN_FORM_A: &str = "src/l'ib.rs";
+    const SCAN_FORM_B: &str = "/tmp/ns-scan/src/l'ib.rs";
+
+    fn create_form_scan_row(
+        conn: &Connection,
+        id: &str,
+        kind: &str,
+        location: &str,
+        metadata: Value,
+    ) -> Result<()> {
+        conn.query(&format!(
+            "CREATE (:Memory {{id: '{}', namespace: 'probe', content: '{}', memory_type: '{kind}', location: '{}', metadata: '{}'}})",
+            escape_ladybug_string(id), escape_ladybug_string(id),
+            escape_ladybug_string(location), escape_ladybug_string(&metadata.to_string()),
+        ))?;
+        Ok(())
+    }
+
+    fn create_form_scan_edge(conn: &Connection, from: &str, to: &str, edge: &str) -> Result<()> {
+        conn.query(&format!(
+            "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:{edge}]->(b)",
+            escape_ladybug_string(from),
+            escape_ladybug_string(to),
+        ))?;
+        Ok(())
+    }
+
+    async fn seed_form_scan_fixture(store: &LadybugStore) {
+        store
+            .with_conn(|conn| {
+                for (id, kind, location, metadata) in [
+                    ("probe::src/l'ib.rs", "file", SCAN_FORM_A, json!({})),
+                    (
+                        "probe::/tmp/ns-scan/src/l'ib.rs",
+                        "file",
+                        SCAN_FORM_B,
+                        json!({}),
+                    ),
+                    ("probe::src", "directory", "src", json!({})),
+                    (
+                        "probe::/tmp/ns-scan/src",
+                        "directory",
+                        "/tmp/ns-scan/src",
+                        json!({}),
+                    ),
+                    ("exact-a", "rule", "", json!({})),
+                    ("exact-b", "rule", "", json!({})),
+                    ("directory-a", "rule", "", json!({})),
+                    ("directory-b", "rule", "", json!({})),
+                    ("fallback-a", "fact", "", json!({"governs": [SCAN_FORM_A]})),
+                    ("fallback-b", "fact", "", json!({"governs": [SCAN_FORM_B]})),
+                ] {
+                    create_form_scan_row(conn, id, kind, location, metadata)?;
+                }
+                for (from, to) in [
+                    ("exact-a", "probe::src/l'ib.rs"),
+                    ("exact-b", "probe::/tmp/ns-scan/src/l'ib.rs"),
+                    ("directory-a", "probe::src"),
+                    ("directory-b", "probe::/tmp/ns-scan/src"),
+                ] {
+                    create_form_scan_edge(conn, from, to, "GOVERNS")?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_runs_one_physical_scan_set() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let types = ["rule".to_string(), "fact".to_string()];
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let duplicates = [SCAN_FORM_A.to_string(), "./src\\l'ib.rs/".to_string()];
+        for (forms, ancestors, expected_ids, baseline_counts, batched_counts) in [
+            (
+                forms.as_slice(),
+                true,
+                &[
+                    "exact-a",
+                    "exact-b",
+                    "directory-a",
+                    "directory-b",
+                    "fallback-a",
+                    "fallback-b",
+                ][..],
+                (2, 2, 2),
+                (1, 1, 1),
+            ),
+            (
+                forms.as_slice(),
+                false,
+                &["exact-a", "exact-b", "fallback-a", "fallback-b"][..],
+                (2, 0, 2),
+                (1, 0, 1),
+            ),
+            (&[][..], true, &[][..], (0, 0, 0), (0, 0, 0)),
+            (
+                duplicates.as_slice(),
+                true,
+                &["exact-a", "directory-a", "fallback-a"][..],
+                (1, 1, 1),
+                (1, 1, 1),
+            ),
+        ] {
+            per_form_retrieval_baseline(&store, None, forms, None, ancestors, &types, &[], 20)
+                .await
+                .unwrap();
+            assert_eq!(store.form_scans.take(), baseline_counts);
+            let result = store
+                .memories_for_file_forms("probe", None, forms, None, ancestors, &types, &[], 20)
+                .await
+                .unwrap();
+            let ids: Vec<_> = result.hits.iter().map(|hit| hit.id.as_str()).collect();
+            assert_eq!(ids, expected_ids);
+            assert_eq!(store.form_scans.take(), batched_counts);
+        }
+    }
+
+    // Keep the baseline's per-form reads and ordered merge as an oracle for
+    // the batched public entry point.
+    #[allow(clippy::too_many_arguments)]
+    async fn per_form_retrieval_baseline(
+        store: &LadybugStore,
+        source: Option<&str>,
+        forms: &[String],
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        types: &[String],
+        exclude: &[String],
+        limit: usize,
+    ) -> Result<MultiFormMemoryRetrieval> {
+        let mut normalized_forms = HashSet::new();
+        let mut out = MultiFormMemoryRetrieval::default();
+        let mut first_error = None;
+        let mut any_success = false;
+        for form in forms {
+            let path = crate::parser::ingest::normalize_node_path(form);
+            if !normalized_forms.insert(path.clone()) {
+                continue;
+            }
+            match store
+                .raw_memories_for_single_form(
+                    "probe",
+                    source,
+                    &path,
+                    symbol,
+                    include_ancestors,
+                    types,
+                    exclude,
+                )
+                .await
+            {
+                Ok((hits, truncated)) => {
+                    any_success = true;
+                    out.hits.extend(hits);
+                    out.candidate_truncated |= truncated;
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let (false, Some(error)) = (any_success, first_error) {
+            return Err(error);
+        }
+        crate::graph_read::memories_for_file::rank_hits(&mut out.hits);
+        let mut seen = HashSet::new();
+        out.hits.retain(|hit| seen.insert(hit.id.clone()));
+        out.hits
+            .truncate(limit.min(crate::graph_read::memories_for_file::MAX_LIMIT));
+        store
+            .enrich_conceptual_bridges("probe", &mut out.hits)
+            .await;
+        Ok(out)
+    }
+
+    // The serialized hits contain every field except the ranking-only census.
+    fn observable_form_retrieval(
+        result: Result<MultiFormMemoryRetrieval>,
+    ) -> Result<String, String> {
+        let result = result.map_err(|error| format!("{error:#}"))?;
+        let census: Vec<_> = result.hits.iter().map(|hit| hit.linked_files).collect();
+        Ok(serde_json::to_string(&(result.hits, census, result.candidate_truncated)).unwrap())
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_hits_and_filters() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        store
+            .with_conn(|conn| {
+                for (id, kind, location, metadata) in [
+                    (
+                        "probe::src/l'ib.rs#function:entry@1",
+                        "symbol",
+                        SCAN_FORM_A,
+                        json!({}),
+                    ),
+                    (
+                        "probe::2::/tmp/ns-scan/src/l'ib.rs",
+                        "file",
+                        SCAN_FORM_B,
+                        json!({}),
+                    ),
+                    (
+                        "probe::2::fallback-scoped",
+                        "fact",
+                        "",
+                        json!({"governs": [SCAN_FORM_B]}),
+                    ),
+                    ("exact-scoped", "rule", "", json!({})),
+                    ("symbol-rule", "rule", "", json!({})),
+                    ("bridge-via", "file", "aux.rs", json!({})),
+                    (
+                        "bridge-target",
+                        "procedure",
+                        "",
+                        json!({"domain": ["runtime"]}),
+                    ),
+                    (
+                        "fallback-either",
+                        "fact",
+                        "",
+                        json!({"governs": ["./src", SCAN_FORM_A, SCAN_FORM_B]}),
+                    ),
+                ] {
+                    create_form_scan_row(conn, id, kind, location, metadata)?;
+                }
+                for (from, to, edge) in [
+                    (
+                        "exact-scoped",
+                        "probe::2::/tmp/ns-scan/src/l'ib.rs",
+                        "GOVERNS",
+                    ),
+                    ("exact-b", "probe::2::/tmp/ns-scan/src/l'ib.rs", "GOVERNS"),
+                    (
+                        "symbol-rule",
+                        "probe::src/l'ib.rs#function:entry@1",
+                        "GOVERNS",
+                    ),
+                    (
+                        "probe::src/l'ib.rs",
+                        "probe::src/l'ib.rs#function:entry@1",
+                        "CONTAINS",
+                    ),
+                    ("exact-a", "bridge-via", "RELATES_TO"),
+                    ("fallback-a", "bridge-via", "RELATES_TO"),
+                    ("bridge-via", "bridge-target", "RELATES_TO"),
+                ] {
+                    create_form_scan_edge(conn, from, to, edge)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-b", 2)
+            .await
+            .unwrap();
+
+        let forward = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let reverse = [SCAN_FORM_B.to_string(), SCAN_FORM_A.to_string()];
+        let rules = ["rule".to_string()];
+        let facts = ["fact".to_string()];
+        let excluded = ["exact-a".to_string()];
+        for (forms, source, types, exclude, explanation) in [
+            (
+                &forward,
+                None,
+                &[][..],
+                &[][..],
+                Some("declares governs src".to_string()),
+            ),
+            (
+                &reverse,
+                None,
+                &[][..],
+                &[][..],
+                Some(format!("declares governs {SCAN_FORM_B}")),
+            ),
+            (&forward, Some("source-a"), &rules[..], &excluded[..], None),
+            (
+                &forward,
+                Some("source-a"),
+                &facts[..],
+                &[][..],
+                Some("declares governs src".to_string()),
+            ),
+        ] {
+            let baseline = per_form_retrieval_baseline(
+                &store,
+                source,
+                forms,
+                Some("entry"),
+                true,
+                types,
+                exclude,
+                20,
+            )
+            .await
+            .unwrap();
+            let find_hit = |id: &str| baseline.hits.iter().find(|hit| hit.id == id);
+            assert_eq!(
+                find_hit("fallback-either").map(|hit| &hit.explanation),
+                explanation.as_ref()
+            );
+            if source.is_none() {
+                assert_eq!(
+                    find_hit("symbol-rule").unwrap().match_kind,
+                    GraphMatchKind::ExactSymbol
+                );
+                assert_eq!(find_hit("exact-a").unwrap().linked_files, 2);
+                assert_eq!(find_hit("fallback-a").unwrap().linked_files, 1);
+                assert!(find_hit("exact-a")
+                    .unwrap()
+                    .conceptual_bridges
+                    .iter()
+                    .any(|bridge| {
+                        bridge.via_id == "bridge-via" && bridge.target_id == "bridge-target"
+                    }));
+                assert!(find_hit("exact-scoped").is_some());
+                assert!(find_hit("probe::2::fallback-scoped").is_some());
+            } else {
+                assert!(baseline.hits.iter().all(|hit| hit.memory_type == types[0]));
+                assert!(find_hit("exact-a").is_none());
+                assert!(find_hit("exact-scoped").is_none());
+                assert!(find_hit("probe::2::fallback-scoped").is_none());
+            }
+            let actual = store
+                .memories_for_file_forms(
+                    "probe",
+                    source,
+                    forms,
+                    Some("entry"),
+                    true,
+                    types,
+                    exclude,
+                    20,
+                )
+                .await;
+            assert_eq!(
+                observable_form_retrieval(actual),
+                observable_form_retrieval(Ok(baseline))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_retirement_boundary() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let start = 1_800_000_000;
+        let valid_to = start + 1;
+        store
+            .with_conn(move |conn| {
+                for (id, path) in [
+                    ("retiring-first", SCAN_FORM_A),
+                    ("retiring-second", SCAN_FORM_B),
+                ] {
+                    create_form_scan_row(
+                        conn,
+                        id,
+                        "fact",
+                        "",
+                        json!({"governs": [path], "valid_to": valid_to}),
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Both reads start at the same second. The second form's edge stage
+        // ends at the retirement boundary, before its metadata evaluation.
+        let reset_clock = || {
+            *store.form_scans.clock.lock().unwrap() = Some(FormScanClock {
+                now: start,
+                advance_after_edges_for: SCAN_FORM_B,
+            });
+        };
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        let types = ["fact".to_string()];
+        reset_clock();
+        let baseline =
+            per_form_retrieval_baseline(&store, None, &forms, None, false, &types, &[], 20)
+                .await
+                .unwrap();
+        assert!(baseline.hits.iter().any(|hit| hit.id == "retiring-first"));
+        assert!(!baseline.hits.iter().any(|hit| hit.id == "retiring-second"));
+        assert_eq!(store.form_scans.take(), (2, 0, 2));
+
+        reset_clock();
+        let actual = store
+            .memories_for_file_forms("probe", None, &forms, None, false, &types, &[], 20)
+            .await;
+        assert_eq!(store.form_scans.take(), (1, 0, 1));
+        assert_eq!(
+            observable_form_retrieval(actual),
+            observable_form_retrieval(Ok(baseline))
+        );
+    }
+
+    async fn seed_form_cap_rows(
+        store: &LadybugStore,
+        path: &'static str,
+        prefix: &'static str,
+        count: usize,
+    ) {
+        store.with_conn(move |conn| {
+            let metadata = escape_ladybug_string(&json!({"governs": [path]}).to_string());
+            conn.query(&format!(
+                "UNWIND range(1, {count}) AS n CREATE (:Memory {{id: '{prefix}' + string(n), namespace: 'probe', content: 'cap fixture', memory_type: 'fact', location: '', metadata: '{metadata}'}})"
+            ))?;
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_candidate_caps() {
+        let store = retired_test_store().await;
+        let types = ["fact".to_string()];
+        let forms = [SCAN_FORM_A.to_string(), SCAN_FORM_B.to_string()];
+        seed_form_cap_rows(&store, SCAN_FORM_A, "cap-a-", 520).await;
+        seed_form_cap_rows(&store, SCAN_FORM_B, "cap-b-", 520).await;
+
+        for exceeds_per_form_cap in [false, true] {
+            if exceeds_per_form_cap {
+                seed_form_cap_rows(&store, SCAN_FORM_B, "cap-extra-", 505).await;
+            }
+            let a = store
+                .raw_memories_for_single_form("probe", None, SCAN_FORM_A, None, false, &types, &[])
+                .await
+                .unwrap();
+            let b = store
+                .raw_memories_for_single_form("probe", None, SCAN_FORM_B, None, false, &types, &[])
+                .await
+                .unwrap();
+            assert_eq!((a.0.len(), a.1), (520, false));
+            assert_eq!(
+                (b.0.len(), b.1),
+                if exceeds_per_form_cap {
+                    (1_024, true)
+                } else {
+                    (520, false)
+                }
+            );
+            assert!(a.0.iter().all(|hit| hit.id.starts_with("cap-a-")));
+            assert!(b
+                .0
+                .iter()
+                .all(|hit| hit.id.starts_with("cap-b-") || hit.id.starts_with("cap-extra-")));
+
+            let baseline =
+                per_form_retrieval_baseline(&store, None, &forms, None, false, &types, &[], 20)
+                    .await
+                    .unwrap();
+            assert_eq!(baseline.candidate_truncated, exceeds_per_form_cap);
+            assert_eq!(baseline.hits.len(), 20);
+            let actual = store
+                .memories_for_file_forms("probe", None, &forms, None, false, &types, &[], 20)
+                .await;
+            assert_eq!(
+                observable_form_retrieval(actual),
+                observable_form_retrieval(Ok(baseline))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_forms_matches_per_form_failures_and_empty_input() {
+        let store = retired_test_store().await;
+        seed_form_scan_fixture(&store).await;
+        let forms = [SCAN_FORM_B.to_string(), SCAN_FORM_A.to_string()];
+        for (
+            forms,
+            failed,
+            first_error,
+            fail_metadata,
+            baseline_counts,
+            batched_counts,
+            expected_ids,
+        ) in [
+            (
+                forms.as_slice(),
+                &[SCAN_FORM_B][..],
+                None,
+                false,
+                (1, 1, 1),
+                (1, 1, 1),
+                &["exact-a", "directory-a", "fallback-a"][..],
+            ),
+            (
+                forms.as_slice(),
+                &[SCAN_FORM_A, SCAN_FORM_B][..],
+                Some(SCAN_FORM_B),
+                false,
+                (0, 0, 0),
+                (0, 0, 0),
+                &[][..],
+            ),
+            (
+                &[][..],
+                &[SCAN_FORM_A, SCAN_FORM_B][..],
+                None,
+                false,
+                (0, 0, 0),
+                (0, 0, 0),
+                &[][..],
+            ),
+            // Discovery succeeded once as a batch before the shared metadata
+            // failure. Both forms must replay individually after that error.
+            (
+                forms.as_slice(),
+                &[][..],
+                None,
+                true,
+                (2, 2, 2),
+                (3, 3, 2),
+                &[
+                    "exact-a",
+                    "exact-b",
+                    "directory-a",
+                    "directory-b",
+                    "fallback-a",
+                    "fallback-b",
+                ][..],
+            ),
+        ] {
+            *store.form_scans.exact_failures.lock().unwrap() =
+                failed.iter().map(|path| path.to_string()).collect();
+            store
+                .form_scans
+                .fail_shared_metadata
+                .store(fail_metadata, std::sync::atomic::Ordering::Relaxed);
+            let baseline =
+                per_form_retrieval_baseline(&store, None, forms, None, true, &[], &[], 20).await;
+            match first_error {
+                Some(path) => assert_eq!(
+                    baseline.as_ref().unwrap_err().to_string(),
+                    format!("injected exact-file query failure for {path:?}")
+                ),
+                None => {
+                    let out = baseline.as_ref().unwrap();
+                    let ids: Vec<_> = out.hits.iter().map(|hit| hit.id.as_str()).collect();
+                    assert_eq!(ids, expected_ids);
+                    assert!(!out.candidate_truncated);
+                }
+            }
+            assert_eq!(store.form_scans.take(), baseline_counts);
+            let actual = store
+                .memories_for_file_forms("probe", None, forms, None, true, &[], &[], 20)
+                .await;
+            assert_eq!(
+                observable_form_retrieval(actual),
+                observable_form_retrieval(baseline)
+            );
+            assert_eq!(store.form_scans.take(), batched_counts);
+        }
+    }
+
+    /// Per-logical-file retrieval must rank the GLOBAL candidate pool, not each
+    /// spelling in isolation: a high-value hit from a later form outranks the
+    /// low-value hits an earlier form would have used to fill a per-form limit.
+    #[tokio::test]
+    async fn memories_for_file_forms_preserves_global_best_hit_across_form_cutoff_boundary() {
+        let form_a = "src/lib.rs";
+        let form_b = "/tmp/ns-v1190-project/src/lib.rs";
+        let dir = std::env::temp_dir().join(format!("ns-v1190-forms-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.init("ns").await.expect("init namespace");
+
+        for id in ["hit-a1", "hit-a2", "hit-a3"] {
+            let mtype = if id == "hit-a3" {
+                "structural"
+            } else {
+                "symbol"
+            };
+            store
+                .upsert(
+                    "ns",
+                    id,
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        mtype,
+                        "agent",
+                        json!({"governs": [form_a], "locations": [{"path": form_a}]}),
+                    ),
+                )
+                .await
+                .expect("seed form_a hit");
+        }
+        store
+            .upsert(
+                "ns",
+                "best-rule-b1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"governs": [form_b], "locations": [{"path": form_b}]}),
+                ),
+            )
+            .await
+            .expect("seed form_b rule");
+
+        let out = store
+            .memories_for_file_forms(
+                "ns",
+                None,
+                &[form_a.to_string(), form_b.to_string()],
+                None,
+                false,
+                &[],
+                &[],
+                2,
+            )
+            .await
+            .expect("multi-form retrieval");
+
+        assert!(
+            out.hits.iter().any(|h| h.id == "best-rule-b1"),
+            "global best rule must survive the per-form cutoff: {:?}",
+            out.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>()
+        );
+        assert!(out.hits.len() <= 2, "global limit is 2");
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            out.hits.iter().all(|h| seen.insert(h.id.clone())),
+            "hits are globally deduped"
+        );
+    }
+
+    /// Bridge enrichment runs once on the merged per-logical-file hit set, not
+    /// once per spelling -- the counter must read exactly 1 for two forms.
+    #[tokio::test]
+    async fn memories_for_file_forms_enriches_bridges_once_per_logical_file() {
+        crate::store::ladybug::set_bridge_enrichment_test_active(true);
+        reset_bridge_enrichment_counter_for_tests();
+        let form_a = "src/lib.rs";
+        let form_b = "/tmp/ns-v1190-project/src/lib.rs";
+        let forms = vec![form_a.to_string(), form_b.to_string()];
+        let dir = std::env::temp_dir().join(format!("ns-v1190-bridges-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        let store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        store.init("ns").await.expect("init namespace");
+
+        store
+            .upsert(
+                "ns",
+                "seed-1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({"governs": [form_a], "locations": [{"path": form_a}]}),
+                ),
+            )
+            .await
+            .expect("seed seed-1");
+        store
+            .upsert(
+                "ns",
+                "seed-2",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"governs": [form_b], "locations": [{"path": form_b}]}),
+                ),
+            )
+            .await
+            .expect("seed seed-2");
+
+        let out = store
+            .memories_for_file_forms("ns", None, &forms, None, false, &[], &[], 10)
+            .await
+            .expect("ok");
+
+        assert!(!out.hits.is_empty(), "at least one seed hit is returned");
+        assert_eq!(
+            bridge_enrichment_counter_for_tests(),
+            1,
+            "bridge enrichment runs once per logical file, not once per form"
+        );
+        crate::store::ladybug::set_bridge_enrichment_test_active(false);
     }
 
     /// Composite Recommendation #11: the first embedding descriptor recorded
@@ -15420,11 +17159,8 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        let lesson_payload = retired_test_payload(
-            "fact",
-            "agent",
-            json!({ "extracted_from": ["task-1"] }),
-        );
+        let lesson_payload =
+            retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] }));
         store
             .upsert("probe", "lesson-1", vec![0.0; 4], lesson_payload)
             .await
@@ -18212,8 +19948,7 @@ eurostrata\src\daemon.rs",
     async fn store_with_two_declarations() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp test dir");
-        let mut store =
-            LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        let mut store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
         store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
 
@@ -20627,7 +22362,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let _zero = vec![0.0f32; 4];
+        let _zero = [0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Primary: a fact that matches the query
@@ -20903,7 +22638,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let _zero = vec![0.0f32; 4];
+        let _zero = [0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Two primaries that both connect to the same expansion candidate
@@ -21311,7 +23046,7 @@ eurostrata\src\daemon.rs",
     async fn family_independence_one_hop_does_not_crowd_out_siblings() {
         let store = episode_sibling_test_store().await;
         // Add many one-hop neighbors
-        let _zero = vec![0.0f32; 4];
+        let _zero = [0.0f32; 4];
         for i in 0..5 {
             store
                 .upsert(
@@ -22836,6 +24571,75 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    async fn assert_f6_evidence_id_hash(hash_field: &str, hash: &str, expected: &str) {
+        let store = retired_test_store().await;
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        store
+            .upsert(
+                "probe",
+                "target-node",
+                v.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let mut metadata = json!({
+            "governs": ["target-node"],
+            "absolute_path": "src/a.rs",
+            "source": "src/a.rs"
+        });
+        metadata[hash_field] = json!(hash);
+        let mut declarer = retired_test_payload("rule", "agent", metadata);
+        declarer.location = "src/a.rs".to_string();
+        declarer.location_lines = "3-4".to_string();
+        store
+            .upsert("probe", "declaring-rule", v, declarer)
+            .await
+            .expect("persist declaration and its resolved edge");
+
+        let evidence_ids = store
+            .with_conn(|conn| {
+                let rows = conn.query(
+                    "MATCH (a:Memory {id: 'declaring-rule'})-[r:GOVERNS]->(b:Memory {id: 'target-node'}) RETURN r.evidence_id",
+                )?;
+                Ok(rows.map(|row| format!("{}", row[0])).collect::<Vec<_>>())
+            })
+            .await
+            .unwrap();
+        assert_eq!(evidence_ids, vec![expected.to_string()]);
+
+        let (_, payload) = store
+            .get("probe", "declaring-rule")
+            .await
+            .unwrap()
+            .expect("persisted declaration");
+        let sources = payload.metadata["edge_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["evidence_id"], expected);
+        assert_eq!(sources[0]["content_hash"], hash);
+        assert_eq!(sources[0]["file"], "src/a.rs");
+        assert_eq!(sources[0]["line_start"], 3);
+        assert_eq!(sources[0]["line_end"], 4);
+    }
+
+    #[tokio::test]
+    async fn test_f6_evidence_id_hash_multibyte_byte_cap() {
+        let hash = "abcdefghijkérest";
+        assert!(!hash.is_char_boundary(12));
+        assert_f6_evidence_id_hash("file_sha256", hash, "src/a.rs:3-4:abcdefghijk").await;
+    }
+
+    #[tokio::test]
+    async fn test_f6_evidence_id_hash_long_ascii_unchanged() {
+        assert_f6_evidence_id_hash(
+            "span_sha256",
+            "0123456789abcdef0123456789abcdef",
+            "src/a.rs:3-4:0123456789ab",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn test_f13_dangling_edges_and_f18_shape_warnings() {
         let dir = std::env::temp_dir().join(format!("ns-f13-f18-{}", uuid::Uuid::new_v4()));
@@ -22940,6 +24744,52 @@ eurostrata\src\daemon.rs",
             Some(&json!({ "kind": "release-run", "ref": "v1.16.0" })),
             "the repair must not overwrite an object source with a string"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `source` is published to mesh peers, so the repair fills a missing one
+    /// from the row's location only when that location is relative. An
+    /// absolute one names the author's machine (Windows or POSIX).
+    #[tokio::test]
+    async fn repair_hygiene_never_copies_an_absolute_location_into_source() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-abs-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        for (id, location) in [
+            (
+                "rule-windows",
+                r"C:\Users\src-leak-sentinel\proj\src\lib.rs",
+            ),
+            ("rule-posix", "/home/src-leak-sentinel/proj/src/lib.rs"),
+            ("rule-relative", "src/lib.rs"),
+        ] {
+            let rule = MemoryPayload {
+                location: location.to_string(),
+                ..retired_test_payload("rule", "agent", json!({}))
+            };
+            store.upsert("probe", id, v.clone(), rule).await.unwrap();
+        }
+
+        store.repair_namespace_hygiene("probe").await.unwrap();
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let source = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.payload.metadata.get("source").cloned())
+        };
+        assert_eq!(source("rule-windows"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-posix"), Some(json!("legacy-rule")));
+        assert_eq!(source("rule-relative"), Some(json!("src/lib.rs")));
+        // Neither absolute location (Windows nor POSIX) may leak a host path.
+        for id in ["rule-windows", "rule-posix", "rule-relative"] {
+            let s = source(id)
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap();
+            assert!(!s.contains("src-leak-sentinel"), "{id} leaked a host path");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23416,6 +25266,50 @@ eurostrata\src\daemon.rs",
             Some("https://neurostrata.io/concepts/authentication")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bound_neighbor_metadata_preserves_capc_fields_and_bounds_bulky_metadata() {
+        let meta = serde_json::json!({
+            "deprecation": {
+                "status": "deprecated",
+                "superseded_by": "mem-77",
+                "reason": "replaced by the new neighbor",
+                "effective_at": 1700000000
+            },
+            "not_definition": "not for rootless sockets",
+            "governs": ["NeuroStrata::src/lib.rs"],
+            "bulky_payload": "x".repeat(LadybugStore::MAX_NEIGHBOR_METADATA_BYTES * 4),
+        });
+        let (bounded, truncated) = LadybugStore::bound_neighbor_metadata(meta);
+        assert!(truncated, "oversized metadata must be flagged truncated");
+        assert_eq!(
+            bounded["deprecation"]["superseded_by"],
+            serde_json::json!("mem-77"),
+            "deprecation must survive truncation: {bounded}"
+        );
+        assert_eq!(
+            bounded["deprecation"]["reason"],
+            serde_json::json!("replaced by the new neighbor"),
+            "deprecation reason must survive truncation: {bounded}"
+        );
+        assert_eq!(
+            bounded["not_definition"],
+            serde_json::json!("not for rootless sockets"),
+            "not_definition must survive truncation: {bounded}"
+        );
+        assert!(
+            bounded.get("bulky_payload").is_none(),
+            "unrelated bulky metadata must be dropped: {bounded}"
+        );
+        assert_eq!(bounded["truncated"], serde_json::json!(true));
+        let byte_len = serde_json::to_string(&bounded)
+            .expect("serialize bounded")
+            .len();
+        assert!(
+            byte_len <= LadybugStore::MAX_NEIGHBOR_METADATA_BYTES,
+            "bounded metadata must stay within budget: {byte_len}"
+        );
     }
 
     /// `ast_neighborhood_for_file` bundles 1-hop `DEPENDS_ON`/`RELATES_TO`
@@ -27269,7 +29163,9 @@ eurostrata\src\daemon.rs",
     fn release_handle_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-release-leak-{}-{}",
@@ -27307,7 +29203,9 @@ eurostrata\src\daemon.rs",
     fn release_handle_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-release-ok-{}-{}",
@@ -27347,7 +29245,9 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-leak-{}-{}",
@@ -27395,7 +29295,9 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_failure_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-drop-{}-{}",
@@ -27436,7 +29338,9 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_success_returns_the_handle() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-ok-{}-{}",
@@ -27691,6 +29595,114 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Strips Rust comments from source, keeping string literals intact.
+    ///
+    /// The census reads the result, so a comment can never satisfy one of its
+    /// assertions (`#228` C2). Raw strings, byte strings and char literals
+    /// are carried over verbatim; a lifetime (`'a`) is not a char literal and
+    /// survives untouched.
+    fn strip_rust_comments(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            // A raw string: `r"..."` or `r#"..."#`.
+            if b == b'r' && i + 1 < bytes.len() {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' {
+                    let mut k = j + 1;
+                    while k < bytes.len() {
+                        if bytes[k] == b'"' {
+                            let mut seen = 0usize;
+                            while seen < hashes
+                                && k + 1 + seen < bytes.len()
+                                && bytes[k + 1 + seen] == b'#'
+                            {
+                                seen += 1;
+                            }
+                            if seen == hashes {
+                                let end = k + 1 + hashes;
+                                out.extend_from_slice(&bytes[i..end]);
+                                i = end;
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        if bytes[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if b == b'"' {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                let end = i.min(bytes.len());
+                out.extend_from_slice(&bytes[start..end]);
+                continue;
+            }
+            if b == b'\'' {
+                if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                    let end = (i + 4).min(bytes.len());
+                    out.extend_from_slice(&bytes[i..end]);
+                    i = end;
+                    continue;
+                }
+                if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                    out.extend_from_slice(&bytes[i..i + 3]);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// #209: a no-open export of a crashed checkpoint copies the frozen WAL
     /// under the role it holds, plus the shadow the engine needs to replay
     /// that checkpoint, and records that it was taken uncoordinated.
@@ -27821,6 +29833,7 @@ eurostrata\src\daemon.rs",
     /// copied -- following the link to whatever it pointed at -- and a broken
     /// link used to read as "no WAL at all", so the manifest claimed a role
     /// the store did not have. Both are refused now.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_wal_side_is_refused_rather_than_copied() {
         let root = std::env::temp_dir().join(format!(
@@ -27859,6 +29872,7 @@ eurostrata\src\daemon.rs",
     /// #241: a broken symlink is still a symlink. Reading it as "there is no
     /// WAL here" would write a manifest claiming a role the store does not
     /// have, so it is refused instead.
+    #[cfg(unix)]
     #[test]
     fn a_broken_symlinked_wal_side_is_refused() {
         let root = std::env::temp_dir().join(format!(
@@ -28026,139 +30040,146 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// #86: census guard — every production `Database::new` call site
-    /// funnels through `with_system_config` (the single recovery funnel),
-    /// and the funnel carries all three recovery arms: the strict-gated
-    /// `enableChecksums` reopen, the unverified-WAL replay with its
-    /// verified reopen, and the unreadable-WAL `.corrupted.<ts>` rename.
+    /// #86/#207/#228 C2 — the recovery-arm census.
+    ///
+    /// The census must not be satisfiable by a comment. The old one scanned
+    /// the funnel's *text* for substrings, so a comment that merely
+    /// mentioned an arm was enough — the `.corrupted.` arm, for one, was
+    /// "found" in a doc comment while the rename itself lives in another
+    /// function. This census reads the **comment-stripped** production code
+    /// and the dispatch table itself:
+    ///
+    /// * every production `Database::new` lives in the one shared opener, so
+    ///   no arm opens the database behind the table's back;
+    /// * every arm of the table is dispatched in the funnel;
+    /// * the table is the only arm list, its names and order are pinned, and
+    ///   each arm has its own opener;
+    /// * every opener really opens a database (the runtime probe).
     #[test]
     fn wal_recovery_arms_census_and_corrupted_rename() {
         let src = include_str!("ladybug.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        // The recovery block starts at the `#207` preservation/accounting
-        // helpers and runs through the funnel itself; every `Database::new` in
-        // it belongs to one arm.
-        let fn_start = lines
-            .iter()
-            .position(|l| l.contains("fn preserve_wal_side("))
-            .expect("the WAL preservation helper is defined");
-        let fn_end = lines
-            .iter()
-            .position(|l| l.contains("pub fn with_embed_config_dir"))
-            .expect("with_embed_config_dir follows with_system_config");
-        let tests_start = lines
-            .iter()
-            .position(|l| l.trim_start().starts_with("mod tests {"))
+        let code = strip_rust_comments(src);
+        let tests_start = code
+            .find("mod tests {")
             .expect("the unit test module is in this file");
+        let production = &code[..tests_start];
 
-        let mut production_sites = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains("Database::new") {
-                continue;
-            }
-            let within_funnel = i >= fn_start && i < fn_end;
-            let within_tests = i >= tests_start;
+        // 1. Every production open goes through the table's shared opener.
+        let opener_at = production
+            .find("fn open_in_mode(")
+            .expect("the shared opener is defined");
+        let open_sites: Vec<usize> = production
+            .match_indices("Database::new")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            open_sites.len(),
+            1,
+            "every production open must go through the arm table's shared opener, found {open_sites:?}"
+        );
+        assert!(
+            open_sites[0] > opener_at,
+            "the only production Database::new must live in the shared opener"
+        );
+
+        // 2. Every arm is dispatched in the funnel, not merely listed.
+        for arm in RECOVERY_ARMS.iter() {
+            let path = format!("RecoveryArmId::{:?}", arm.id);
             assert!(
-                within_funnel || within_tests,
-                "Database::new at line {} is outside the with_system_config recovery funnel and outside the tests module",
-                i + 1
+                production.matches(path.as_str()).count() >= 2,
+                "the arm {} must be dispatched in the funnel, not only listed in the table",
+                arm.name
             );
-            if within_funnel {
-                production_sites.push(i + 1);
-            }
         }
-        // The initial open plus the recovery arms (checksum-mismatch reopen,
-        // unverified WAL replay, verified reopen, quarantine reopen) all live in
-        // the one funnel.
-        assert!(
-            production_sites.len() >= 4,
-            "expected the initial open and the recovery arms in one funnel, found {production_sites:?}"
-        );
 
-        let funnel = lines[fn_start..fn_end].join("\n");
-        // Arm 1 — enableChecksums mismatch, gated by strict WAL verification
-        // when a non-empty WAL is present.
-        assert!(
-            funnel.contains("enableChecksums"),
-            "the enableChecksums arm is in the funnel"
+        // 3. The table is the arm list: pinned names, in order, one row per id.
+        let names: Vec<&str> = RECOVERY_ARMS.iter().map(|arm| arm.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "verified-open",
+                "checksum-mismatch-replay",
+                "lenient-replay",
+                "verified-reopen",
+                "quarantine-reopen",
+            ],
+            "the recovery arms changed; the census pins the list"
         );
+        for (index, arm) in RECOVERY_ARMS.iter().enumerate() {
+            assert_eq!(
+                arm.id,
+                recovery_arm(arm.id).id,
+                "every arm id resolves to its own row"
+            );
+            assert!(
+                RECOVERY_ARMS[..index]
+                    .iter()
+                    .all(|other| other.id != arm.id),
+                "an arm id must appear exactly once in the table"
+            );
+        }
+
+        // 4. The runtime probe: every opener really opens a database, and each
+        //    arm has its own opener — two rows sharing one function would
+        //    report the first arm's id for the second arm's probe.
+        for arm in RECOVERY_ARMS.iter() {
+            let root = std::env::temp_dir().join(format!(
+                "lbug-arm-probe-{}-{}",
+                arm.name,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create the probe directory");
+            let db_path = root.join("probe.lbug");
+            let request = ArmRequest {
+                local_path: &db_path,
+                initial_config: None,
+            };
+            let db = (arm.opener)(&request)
+                .unwrap_or_else(|e| panic!("the arm {} must open a database: {e}", arm.name));
+            assert!(
+                db_path.exists(),
+                "the arm {} must really create the database",
+                arm.name
+            );
+            assert_eq!(
+                LAST_RECOVERY_ARM.with(|slot| slot.get()),
+                Some(arm.id),
+                "the arm {} must have its own opener",
+                arm.name
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // 5. The funnel's behaviour, read from code and not from a comment.
+        for needle in [
+            "enableChecksums",
+            "strict_wal_verification",
+            "unverified_replay_config_for",
+            "classify_pair",
+            "disposition",
+            "verifying_config()",
+            "CHECKPOINT;",
+            "preserve_wal_pair",
+            "preserve_wal_side",
+            "force_checkpoint_on_close=false",
+            "consumed_sides(",
+            ".consumed(",
+            "lenient_failure_action(",
+            "clean_foreign_action(",
+            "release_handle(",
+            "allocate_wal_artifact_path(&target, \"corrupted\")",
+            "std::fs::rename",
+        ] {
+            assert!(
+                production.contains(needle),
+                "the funnel must contain {needle} in code, not in a comment"
+            );
+        }
         assert!(
-            funnel.contains("strict_wal_verification"),
-            "the mismatch arm gates on strict WAL verification"
-        );
-        // Arm 2 — WAL integrity failure: lenient replay under the WAL's own
-        // checksum flag, classification, CHECKPOINT, then a verified reopen.
-        assert!(
-            funnel.contains("unverified_replay_config_for"),
-            "the unverified replay arm is in the funnel"
-        );
-        assert!(
-            funnel.contains("classify_pair"),
-            "every successful lenient open is classified (#207)"
-        );
-        assert!(
-            funnel.contains("disposition"),
-            "the classification drives the arm's disposition (#207)"
-        );
-        assert!(
-            funnel.contains("verifying_config()"),
-            "the funnel reopens under verifying_config()"
-        );
-        assert!(
-            funnel.contains("CHECKPOINT;"),
-            "the funnel checkpoints the replayed WAL"
-        );
-        // Arm 3 — unreadable WAL: renamed aside to .corrupted.<ts>.
-        assert!(
-            funnel.contains(".corrupted."),
-            "the unreadable-WAL rename arm is in the funnel"
-        );
-        assert!(
-            funnel.contains("rename"),
-            "the unreadable WAL is moved aside"
-        );
-        // The WAL pair is preserved before the unverified replay, and a
-        // refusal can restore either side.
-        assert!(
-            funnel.contains("preserve_wal_pair"),
-            "the pre-replay preservation is in the funnel"
-        );
-        assert!(
-            funnel.contains("preserve_wal_side"),
-            "one hardened copy primitive serves both sides"
-        );
-        assert!(
-            funnel.contains("force_checkpoint_on_close=false"),
-            "a refusing arm never lets ~Database() checkpoint over the WAL"
-        );
-        assert!(
-            funnel.contains("consumed_sides("),
-            "the consumed-side decision is the pure `consumed_sides`, not an inline set (#207)"
-        );
-        assert!(
-            funnel.contains(".consumed("),
-            "the sealed consumption is attached to the pair observation (#207)"
-        );
-        assert!(
-            funnel.contains("let initial_foreign = quarantine_is_foreign(&foreign);"),
-            "arm D's wording branch comes from the attribution seam at the call site, \
-             not a literal (#207)"
-        );
-        assert!(
-            funnel.contains("lenient_failure_action("),
-            "a failed lenient open acts on its verdict instead of always quarantining (#207 C3)"
-        );
-        assert!(
-            funnel.contains("clean_foreign_action("),
-            "the clean-foreign arm acts on its pair snapshot instead of always quarantining (#207 C4)"
-        );
-        assert!(
-            funnel.contains("release_handle("),
-            "the drop flag is applied through `release_handle`, which leaks on failure (#207 C5)"
-        );
-        assert!(
-            !funnel.contains("SideSet::BOTH"),
-            "no arm may mark both sides consumed: the active side is never a \"consumed checkpoint\" (#207)"
+            !production.contains("SideSet::BOTH"),
+            "no arm may mark both sides consumed (#207)"
         );
     }
 
@@ -31892,6 +33913,385 @@ mod wal_zero_record {
     }
 }
 
+/// `#228` C1: the frozen-WAL semantic early failure must be *detected*.
+///
+/// A frozen WAL whose first record cannot be deserialized is deleted by the
+/// engine even though the open succeeds (`wal_replayer.cpp:674-679`: "Nothing
+/// was committed, so the frozen WAL holds nothing to keep"). The committed
+/// records are gone and nothing was applied, so the verdict must be
+/// `CommittedLost` — never `Replayed` — and the open must refuse with the
+/// bytes preserved. Sibling of `mod tests` for the same eval-filter reason
+/// as `wal_zero_record`.
+#[cfg(test)]
+mod wal_semantic_loss {
+    use super::tests::{
+        allow_unverified_wal_recovery, restore_model_env, restore_wal_env, without_model_env,
+        WAL_ENV_LOCK,
+    };
+    use super::*;
+    use crate::store::wal_accounting::{scan_wal, CommitEvidence};
+
+    fn wal_of(db: &std::path::Path) -> std::path::PathBuf {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(".wal");
+        std::path::PathBuf::from(os)
+    }
+
+    fn ckpt_of(db: &std::path::Path) -> std::path::PathBuf {
+        let mut os = db.to_path_buf().into_os_string();
+        os.push(".wal.checkpoint");
+        std::path::PathBuf::from(os)
+    }
+
+    /// One `serializeWithLength` frame with a real checksum trailer.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = (payload.len() as u64).to_ne_bytes().to_vec();
+        out.extend_from_slice(payload);
+        let crc = crate::store::wal_accounting::wal_checksum(&out);
+        out.extend_from_slice(&crc.to_ne_bytes());
+        out
+    }
+
+    /// A frozen WAL the *scanner* reads as committed and the *engine* cannot
+    /// read past its first record.
+    ///
+    /// The first frame is a `COPY_TABLE_RECORD` (type 13) whose owner-name
+    /// length overflows the record boundary: the engine throws "Corrupted
+    /// wal file. Owner catalog name length overflows the record boundary."
+    /// (`wal_record.cpp:123`). The second frame is a `COMMIT_RECORD`, so the
+    /// scanner proves a committed record while the engine's `dryReplay`
+    /// stops at offset 0 and the frozen WAL is deleted.
+    fn semantic_loss_wal(header: &[u8]) -> Vec<u8> {
+        let mut out = header.to_vec();
+        let mut payload = vec![13u8];
+        payload.extend_from_slice(&0u64.to_ne_bytes());
+        payload.extend_from_slice(&u64::MAX.to_ne_bytes());
+        out.extend_from_slice(&frame(&payload));
+        let mut payload = vec![2u8];
+        payload.extend_from_slice(&0u64.to_ne_bytes());
+        out.extend_from_slice(&frame(&payload));
+        out
+    }
+
+    #[tokio::test]
+    async fn a_semantic_early_failure_is_a_committed_loss_and_never_a_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-semantic-loss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("semantic-loss.lbug");
+        let previous_model = without_model_env();
+
+        // A store with a checkpointed schema, so the recovery open's
+        // `has_memory_table` is true for reasons unrelated to the WAL.
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+
+        // A real, checksummed WAL header written by the pinned engine.
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query("CREATE (m:Memory {id: 'semantic-0', namespace: 'probe', content: 'row', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]})")
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let seeded = std::fs::read(wal_of(&db)).expect("read the seeded WAL");
+        let header = &seeded[..crate::store::wal_header::WAL_HEADER_CHECKSUMMED_BYTES as usize];
+        let crafted = semantic_loss_wal(header);
+
+        // The scanner's contract on the crafted bytes: a *proven* commit.
+        let scan = scan_wal(&crafted);
+        assert_eq!(scan.commit_evidence(), CommitEvidence::Some);
+        assert!(
+            scan.proved_commit(),
+            "the crafted WAL must prove a committed record"
+        );
+        assert!(
+            !scan.ended_in_checkpoint(),
+            "the crafted WAL must not end in a CHECKPOINT record: that would be \
+             positive evidence of a replay"
+        );
+
+        // The frozen side only: the active WAL is gone.
+        std::fs::remove_file(wal_of(&db)).expect("remove the active WAL");
+        std::fs::write(ckpt_of(&db), &crafted).expect("write the crafted frozen WAL");
+
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::for_testing(&db, 8);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "a semantic early failure must refuse, not open as {:?} (#228)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("committed_lost"),
+            "the verdict must be a committed loss: {err}"
+        );
+        assert!(err.contains("WAL"), "the refusal must name the WAL: {err}");
+        assert!(
+            !err.contains("successful replay"),
+            "the refusal must never claim a replay: {err}"
+        );
+        assert!(
+            !err.contains("Recovered by replaying"),
+            "the refusal must never claim a recovery: {err}"
+        );
+
+        // The frozen WAL survives, byte for byte.
+        assert_eq!(
+            std::fs::read(ckpt_of(&db)).expect("read the frozen WAL"),
+            crafted,
+            "the frozen WAL must be restored with every pre-replay byte (#228)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    #[tokio::test]
+    async fn a_checksum_mismatch_does_not_mask_a_semantic_early_failure_on_frozen_wal() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-checksum-mismatch-semantic-loss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("checksum-semantic-loss.lbug");
+        let previous_model = without_model_env();
+
+        let embed = root.join("embed");
+        std::fs::create_dir_all(&embed).expect("create the embed config dir");
+        std::fs::write(
+            embed.join("embedders.json"),
+            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+        )
+        .expect("write the fixture embedders.json");
+        let creator = LadybugStore::for_testing(&db, 8)
+            .expect("open temp database")
+            .with_embed_config_dir(&embed);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let raw = Database::new(&db, cfg).expect("raw open to seed the WAL");
+        let conn = Connection::new(&raw).expect("raw connection");
+        conn.query("CREATE (m:Memory {id: 'semantic-mismatch-0', namespace: 'probe', content: 'row', user_id: '', memory_type: 'fact', agent_name: '', location: '', location_lines: '', metadata: '{}', embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]})")
+            .expect("seed a committed WAL-only row");
+        conn.query("CALL force_checkpoint_on_close=false")
+            .expect("turn off checkpoint on close");
+        drop(conn);
+        drop(raw);
+
+        let seeded = std::fs::read(wal_of(&db)).expect("read the seeded WAL");
+        let header = &seeded[..crate::store::wal_header::WAL_HEADER_CHECKSUMMED_BYTES as usize];
+        let crafted = semantic_loss_wal(header);
+        std::fs::remove_file(wal_of(&db)).expect("remove the active WAL");
+        std::fs::write(ckpt_of(&db), &crafted).expect("write the crafted frozen WAL");
+
+        // Open with enable_checksums(false) against a checksummed frozen WAL so
+        // the verified open fails in checkWALHeader with an enableChecksums
+        // mismatch before reading the corrupt COPY_TABLE_RECORD.
+        let mismatch_cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true)
+            .enable_checksums(false);
+        let _wal_env_serial = WAL_ENV_LOCK.lock().await;
+        let previous_wal = allow_unverified_wal_recovery();
+        let result = LadybugStore::with_system_config(&db, 8, mismatch_cfg);
+        restore_wal_env(previous_wal);
+        drop(_wal_env_serial);
+
+        let err = match result {
+            Ok(store) => panic!(
+                "an enableChecksums mismatch must not mask a bad frozen record and open as {:?} (#228)",
+                store.open_provenance()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("committed_lost"),
+            "the verdict must be a committed loss even after an enableChecksums mismatch: {err}"
+        );
+        assert_eq!(
+            std::fs::read(ckpt_of(&db)).expect("read the frozen WAL"),
+            crafted,
+            "the frozen WAL must be restored with every pre-replay byte (#228)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        restore_model_env(previous_model);
+    }
+
+    /// A checksummed WAL header, as the pinned engine writes it: a 16-byte
+    /// database id, the `enableChecksums` flag, and the header's own checksum
+    /// (`storage/wal/wal.cpp:394-402`).
+    fn checksummed_header() -> Vec<u8> {
+        let mut header = vec![0u8; 16];
+        header.push(1u8); // `enableChecksums` = true
+        let crc = crate::store::wal_accounting::wal_checksum(&header);
+        header.extend_from_slice(&crc.to_ne_bytes());
+        header
+    }
+
+    /// A frozen WAL whose walk **proves** a committed record: a `BEGIN` frame
+    /// and a `COMMIT` frame, both with a real checksum trailer.
+    fn committed_wal() -> Vec<u8> {
+        let mut out = checksummed_header();
+        let mut begin = vec![crate::store::wal_accounting::BEGIN_TRANSACTION_RECORD_TYPE];
+        begin.extend_from_slice(&0u64.to_ne_bytes());
+        out.extend_from_slice(&frame(&begin));
+        let mut commit = vec![crate::store::wal_accounting::COMMIT_RECORD_TYPE];
+        commit.extend_from_slice(&0u64.to_ne_bytes());
+        out.extend_from_slice(&frame(&commit));
+        out
+    }
+
+    /// `#228` IMPORTANT 1: an unrecognized engine failure is accounted for,
+    /// the side that lost every byte is restored, and the refusal never claims
+    /// a replay.
+    ///
+    /// The pinned engine's *semantic* replay failure — a WAL record naming a
+    /// catalog entry the database does not have — is not a WAL integrity
+    /// failure, so the lenient replay must not run: replaying the same bytes
+    /// unverified fails the same way. The funnel therefore accounts for the
+    /// pair, restores the frozen WAL from its preserved copy, and refuses with
+    /// the verdict and the engine's own error.
+    #[test]
+    fn an_unrecognized_engine_failure_is_accounted_restored_and_never_replayed() {
+        let root = std::env::temp_dir().join(format!(
+            "lbug-wal-unrecognized-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("unrecognized-failure.lbug");
+
+        let crafted = committed_wal();
+
+        // The scanner's contract on the crafted bytes: a *proven* commit.
+        let scan = scan_wal(&crafted);
+        assert_eq!(scan.commit_evidence(), CommitEvidence::Some);
+        assert!(
+            scan.proved_commit(),
+            "the crafted WAL must prove a committed record"
+        );
+        assert!(
+            !scan.ended_in_checkpoint(),
+            "the crafted WAL must not end in a CHECKPOINT record: that would be \
+             positive evidence of a replay"
+        );
+
+        // The frozen side only: the active WAL is gone.
+        std::fs::write(ckpt_of(&db), &crafted).expect("write the crafted frozen WAL");
+
+        // What the funnel observed before the failed open.
+        let pre = (
+            observe_wal_side(&db, WalSide::Active),
+            observe_wal_side(&db, WalSide::Frozen),
+        );
+        assert!(pre.0.pre == 0, "the active side is empty");
+        assert!(pre.1.pre > 0, "the frozen side holds the crafted WAL");
+
+        // The mandatory pair preservation the refusing arm takes.
+        let preserved = preserve_wal_pair(&db).expect("preserve the WAL pair");
+        assert!(
+            preserved.frozen.is_some(),
+            "the frozen WAL must have a preserved copy"
+        );
+
+        // The failed open removed the frozen WAL: the engine retires it when
+        // it cannot apply the records.
+        std::fs::remove_file(ckpt_of(&db)).expect("remove the frozen WAL");
+
+        let err = match recover_from_wal_failure(
+            &db,
+            anyhow::anyhow!("Ghost does not exist in catalog."),
+            &pre,
+            &preserved,
+        ) {
+            Ok((_db, provenance)) => panic!(
+                "an unrecognized failure must refuse, not open as {:?} (#228)",
+                provenance
+            ),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            err.contains("committed_lost"),
+            "the verdict must be a committed loss: {err}"
+        );
+        assert!(
+            err.contains("does not exist in catalog."),
+            "the refusal must name the engine's own error: {err}"
+        );
+        assert!(
+            err.contains("zero"),
+            "the refusal must keep the #189 message contract: {err}"
+        );
+        assert!(
+            !err.contains("successful replay"),
+            "the refusal must never claim a replay: {err}"
+        );
+        assert!(
+            !err.contains("Recovered by replaying"),
+            "the refusal must never claim a recovery: {err}"
+        );
+        assert!(
+            !err.contains("replayed"),
+            "the refusal must never name a replay: {err}"
+        );
+
+        // The frozen WAL survives, byte for byte.
+        assert_eq!(
+            std::fs::read(ckpt_of(&db)).expect("read the frozen WAL"),
+            crafted,
+            "the frozen WAL must be restored with every pre-replay byte (#228)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 /// `#207` B8/P4: mandatory pair preservation for a refusing arm. Sibling of
 /// `mod tests` for the same eval-filter reason as `wal_zero_record`.
 #[cfg(test)]
@@ -32373,6 +34773,29 @@ mod wal_preservation {
 }
 
 impl LadybugStore {
+    /// Returns the ontobug catalog registered for this store's database.
+    ///
+    /// Acquires `write_lock` while initializing the schema tables (`SchemaEntry`, `OntologyClass`,
+    /// `OntologyProperty`, `ShaclShape`, `ShaclProperty`, `Namespace`, `RdfNode`, `Statement`),
+    /// and returns `ontobug::Catalog::from_database(self.db.clone(), &self.local_path)`.
+    pub async fn ontobug_catalog(&self) -> anyhow::Result<ontobug::Catalog> {
+        let _guard = self.write_lock.lock().await;
+        ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Executes `f` against an `ontobug::Catalog` while holding `self.write_lock`
+    /// across both schema initialization and the caller's catalog operation.
+    pub async fn with_ontobug_catalog<F, R>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut ontobug::Catalog) -> ontobug::Result<R>,
+    {
+        let _guard = self.write_lock.lock().await;
+        let mut catalog = ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        f(&mut catalog).map_err(|e| anyhow::anyhow!(e))
+    }
+
     pub async fn list_edges(
         &self,
         namespace: &str,

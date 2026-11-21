@@ -1511,9 +1511,7 @@ mod tests {
             "BGESmallENV15Q shows its measured overlap"
         );
         assert!(
-            bge.contains(
-                "Measured: top-5 overlap with the FP32 default was 0.667."
-            ),
+            bge.contains("Measured: top-5 overlap with the FP32 default was 0.667."),
             "BGESmallENV15Q shows its measured quality line verbatim"
         );
         let nomic = render_offer(&top3[0..1]);
@@ -2054,6 +2052,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_broken_symlinked_sidecar_reads_as_unparseable_not_absent() {
         // #241: a dangling symlink is a sidecar that is present and cannot

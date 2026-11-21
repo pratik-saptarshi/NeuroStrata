@@ -6,8 +6,8 @@ mod bench;
 mod buffer;
 mod community;
 mod compression;
-mod connectors;
 mod config;
+mod connectors;
 mod context;
 mod crash;
 mod daemon;
@@ -19,7 +19,6 @@ mod domain;
 mod embed;
 mod events;
 mod formal_kernel;
-mod kernel;
 mod fts;
 mod gliner;
 mod graph_read;
@@ -28,6 +27,7 @@ mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+mod kernel;
 mod kge;
 mod learning;
 mod lexical;
@@ -37,6 +37,7 @@ mod model_downloader;
 mod multimodal;
 mod ontology_grounding;
 mod parser;
+mod paths;
 mod procmem;
 mod rag_chat;
 mod rdf;
@@ -47,6 +48,7 @@ mod registry;
 mod retention;
 mod search;
 mod secrets;
+mod semantic_eval;
 mod server;
 mod setup;
 mod source_context;
@@ -59,6 +61,7 @@ mod telemetry;
 mod time_series;
 mod tools;
 mod traits;
+mod vault_ld;
 mod workflow;
 
 use crate::traits::SearchResult;
@@ -210,6 +213,26 @@ enum Commands {
         /// Optional namespace to record latency samples into TimeSeriesStore
         #[arg(long)]
         record_metrics: Option<String>,
+    },
+
+    /// Run offline semantic competency and four-arm retrieval evaluation gate
+    #[command(name = "semantic-eval")]
+    SemanticEval {
+        /// Strict competency fixture path
+        #[arg(long)]
+        competency: std::path::PathBuf,
+        /// Strict retrieval fixture path
+        #[arg(long)]
+        retrieval: std::path::PathBuf,
+        /// Number of measured iterations (warmup excluded); must be >= 3
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Optional path for the strict JSON evidence receipt
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Exit nonzero on any validation, execution, or gate failure
+        #[arg(long)]
+        check: bool,
     },
 
     /// Report what the thalamic bus has done since the daemon started
@@ -604,6 +627,21 @@ enum Commands {
     DataConnector {
         #[command(subcommand)]
         action: DataConnectorCommands,
+    },
+
+    /// Vault-LD sync: export/import vault notes + Canvas topology
+    #[command(name = "vault-sync")]
+    VaultSync {
+        /// Sync direction: export (memories -> vault) or import (vault -> memories)
+        action: String,
+        /// The exact project name
+        namespace: String,
+        /// Directory of the Markdown vault
+        vault_path: String,
+        /// Directory for generated artifacts (export only)
+        output_dir: String,
+        /// Optional ReBAC principal
+        principal: Option<String>,
     },
 }
 
@@ -1212,6 +1250,26 @@ enum ScenarioCommands {
         /// Scenario ID
         scenario_id: String,
     },
+    /// Zero-mutation ontology blast-radius & semantic closure diff (dry run)
+    PlanOntologyDiff {
+        /// Target namespace
+        namespace: String,
+        /// Optional overlay scenario ID (defaults to active namespace)
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Turtle/N-Quads additions staged in the ephemeral sandbox
+        #[arg(long)]
+        add_turtle: Option<String>,
+        /// Canonical N-Triple/N-Quad patterns retracted in the sandbox
+        #[arg(long)]
+        retract_triples: Vec<String>,
+        /// Replacement SHACL shapes Turtle validated against the post-image
+        #[arg(long)]
+        candidate_shacl_turtle: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
     /// List active scenario overlays in a namespace
     List {
         /// Target namespace
@@ -1377,6 +1435,33 @@ fn scenario_command_to_json(scenario: &ScenarioCommands) -> anyhow::Result<serde
             "action": "drop",
             "scenario_id": scenario_id,
         })),
+        ScenarioCommands::PlanOntologyDiff {
+            namespace,
+            scenario_id,
+            add_turtle,
+            retract_triples,
+            candidate_shacl_turtle,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "plan_ontology_diff",
+                "retract_triples": retract_triples,
+            });
+            if let Some(id) = scenario_id {
+                body["scenario_id"] = serde_json::json!(id);
+            }
+            if let Some(t) = add_turtle {
+                body["add_turtle"] = serde_json::json!(t);
+            }
+            if let Some(sh) = candidate_shacl_turtle {
+                body["candidate_shacl_turtle"] = serde_json::json!(sh);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
         ScenarioCommands::List { namespace } => Ok(serde_json::json!({
             "namespace": namespace,
             "action": "list",
@@ -3573,14 +3658,14 @@ mod tests {
         // A PATH with git but no neurostrata-mcp anywhere on it.
         let out = t4_push(&root, "/usr/bin:/bin", None);
         assert!(
-            out.status.success(),
-            "a missing gate binary must not block the push: {}",
+            !out.status.success(),
+            "a missing gate binary must block the push: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
             String::from_utf8_lossy(&out.stderr)
-                .contains("warning: neurostrata-mcp not found — gate NOT run for this push"),
-            "the skip-by-absence is announced, never silent: {}",
+                .contains("error: neurostrata-mcp not found — gate NOT run for this push"),
+            "the missing binary is announced, never silent: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3594,21 +3679,22 @@ mod tests {
     /// pass left in the hook's own paths.
     #[cfg(unix)]
     #[test]
-    fn gate_exit_two_is_announced_and_passes() {
+    fn gate_exit_two_is_announced_and_blocks() {
         let root = t4_repo_with_remote("exittwo");
         install_pre_push_hook(&root, false).expect("install succeeds");
         let (stub_bin, marker) = t4_stub_bin(&root);
         let path = format!("{}:/usr/bin:/bin", stub_bin.display());
         let out = t4_push(&root, &path, Some("2"));
         assert!(
-            out.status.success(),
-            "an exit 2 never blocks the push: {}",
+            !out.status.success(),
+            "an exit 2 now blocks the push: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(marker.exists(), "the gate was invoked");
         assert!(
-            String::from_utf8_lossy(&out.stderr)
-                .contains("warning: neurostrata-mcp task gate exited 2"),
+            String::from_utf8_lossy(&out.stderr).contains(
+                "error: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push"
+            ),
             "the could-not-run is announced, never silent: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -3638,8 +3724,11 @@ mod tests {
             "neurostrata-mcp task gate \"$NAMESPACE\" --strict",
             "code=$?",
             "if [ $code -eq 1 ]; then",
-            "echo \"Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push\" >&2",
-            "exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking",
+            "echo \"Push blocked: resolve the tasks above\" >&2",
+            "exit 1",
+            "if [ $code -ne 0 ]; then",
+            "echo \"error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push\" >&2",
+            "exit 1",
         ] {
             assert!(
                 hook.contains(behavior),
@@ -3647,25 +3736,23 @@ mod tests {
                 behavior
             );
         }
-        // Fix round (F5): an exit 2 is announced, never silent — and
-        // still never blocks. (Under --strict the gate CLI itself exits
-        // only 0 or 1, so a 2 is never a verdict: a stale, foreign, or
-        // dying binary.) The announcement branch must say so and must
-        // not exit 1.
+        // Fail-closed: any gate exit other than 0 blocks the push, including
+        // a 2 from a stale, foreign, or dying binary. The announcement
+        // branch must say so and must exit 1.
         let two_branch = hook
-            .split("if [ $code -eq 2 ]; then")
+            .split("if [ $code -ne 0 ]; then")
             .nth(1)
-            .expect("the exit-2 announcement branch exists")
+            .expect("the gate-failure announcement branch exists")
             .split("fi")
             .next()
             .unwrap();
         assert!(
             two_branch.contains("gate could NOT run for this push"),
-            "an exit 2 is announced as a could-not-run, never silent"
+            "a non-zero gate exit is announced as a could-not-run, never silent"
         );
         assert!(
-            !two_branch.contains("exit 1"),
-            "2 never blocks in the hook itself"
+            two_branch.contains("exit 1"),
+            "a non-zero gate exit blocks the push"
         );
     }
 
@@ -4976,7 +5063,10 @@ mod tests {
             members.iter().any(|m| m == "ladybug.store.shadow"),
             "the checkpoint shadow was copied: {members:?}"
         );
-        assert!(out.join("ladybug.store").exists(), "the snapshot carries the store");
+        assert!(
+            out.join("ladybug.store").exists(),
+            "the snapshot carries the store"
+        );
         assert!(
             out.join("ladybug.store.wal").exists(),
             "the snapshot carries the WAL"
@@ -6476,6 +6566,28 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            Commands::SemanticEval {
+                competency,
+                retrieval,
+                iterations,
+                output,
+                check,
+            } => {
+                let outcome =
+                    crate::semantic_eval::run_semantic_eval(&competency, &retrieval, iterations)
+                        .await;
+                let json = serde_json::to_string_pretty(&outcome.receipt)?;
+                if let Some(path) = &output {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, &json)?;
+                }
+                println!("{json}");
+                if check && !outcome.passed {
+                    std::process::exit(1);
+                }
+            }
             Commands::BusMetrics => {
                 // Answered from the daemon, never from a bus built here: the
                 // pulses are emitted by the daemon that owns the store, so a
@@ -6895,9 +7007,9 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!(
                                 "[neurostrata:gate] {}",
                                 if strict {
-                                    "--strict: an unavailable database blocks the push. Skip explicitly with NEUROSTRATA_SKIP_GATE=1 git push."
+                                    "--strict: an unavailable database blocks the push."
                                 } else {
-                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Set NEUROSTRATA_SKIP_GATE=1 to silence this, or pass --strict to block."
+                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Pass --strict to block."
                                 }
                             );
                             std::process::exit(gate_exit_code(None, strict));
@@ -7131,8 +7243,7 @@ async fn run() -> anyhow::Result<()> {
                             .or_else(git_toplevel)
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let connector =
-                            crate::workflow::resolve_workflow_connector(&target_root);
+                        let connector = crate::workflow::resolve_workflow_connector(&target_root);
                         let scope = connector.capture_scope(&target_root);
                         let (revision_id, dirty_state_hash) =
                             connector.capture_state_digest(&target_root);
@@ -7171,8 +7282,7 @@ async fn run() -> anyhow::Result<()> {
                             .or_else(git_toplevel)
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let connector =
-                            crate::workflow::resolve_workflow_connector(&target_root);
+                        let connector = crate::workflow::resolve_workflow_connector(&target_root);
                         match connector.install_triggers(&target_root) {
                             Ok(report) => {
                                 println!(
@@ -7842,7 +7952,11 @@ async fn run() -> anyhow::Result<()> {
                             serde_json::json!({ "operation": "list_connectors" }),
                             None,
                         ),
-                        DataConnectorCommands::Describe { connector_id, pool_id, principal } => (
+                        DataConnectorCommands::Describe {
+                            connector_id,
+                            pool_id,
+                            principal,
+                        } => (
                             "NeuroStrata".to_string(),
                             serde_json::json!({
                                 "operation": "describe_pool",
@@ -7851,12 +7965,28 @@ async fn run() -> anyhow::Result<()> {
                             }),
                             principal.clone(),
                         ),
-                        DataConnectorCommands::RegisterPointer { namespace, payload, connector_id, pointer_id, pool_id, pointer_uri, entity_type, captured_at_secs, max_staleness_secs, principal } => {
+                        DataConnectorCommands::RegisterPointer {
+                            namespace,
+                            payload,
+                            connector_id,
+                            pointer_id,
+                            pool_id,
+                            pointer_uri,
+                            entity_type,
+                            captured_at_secs,
+                            max_staleness_secs,
+                            principal,
+                        } => {
                             let payload_value: serde_json::Value = match payload {
                                 Some(raw) => {
                                     let text = if let Some(file_path) = raw.strip_prefix('@') {
-                                        std::fs::read_to_string(file_path)
-                                            .map_err(|e| anyhow::anyhow!("read payload file {}: {}", file_path, e))?
+                                        std::fs::read_to_string(file_path).map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "read payload file {}: {}",
+                                                file_path,
+                                                e
+                                            )
+                                        })?
                                     } else {
                                         raw.clone()
                                     };
@@ -7865,7 +7995,9 @@ async fn run() -> anyhow::Result<()> {
                                 }
                                 None => serde_json::json!({}),
                             };
-                            let pointer_id_value = pointer_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let pointer_id_value = pointer_id
+                                .clone()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                             let record = serde_json::json!({
                                 "pointer_id": pointer_id_value,
                                 "connector_id": connector_id.clone().unwrap_or_else(|| "memory_pool".to_string()),
@@ -7876,9 +8008,21 @@ async fn run() -> anyhow::Result<()> {
                                 "captured_at_secs": captured_at_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
                                 "max_staleness_secs": max_staleness_secs.unwrap_or(0),
                             });
-                            (namespace.clone(), serde_json::json!({ "operation": "register_pointer", "record": record }), principal.clone())
+                            (
+                                namespace.clone(),
+                                serde_json::json!({ "operation": "register_pointer", "record": record }),
+                                principal.clone(),
+                            )
                         }
-                        DataConnectorCommands::Resolve { namespace, pointer_id, offset, limit, max_bytes, now_secs, principal } => (
+                        DataConnectorCommands::Resolve {
+                            namespace,
+                            pointer_id,
+                            offset,
+                            limit,
+                            max_bytes,
+                            now_secs,
+                            principal,
+                        } => (
                             namespace.clone(),
                             serde_json::json!({
                                 "operation": "resolve_pointer",
@@ -7892,17 +8036,33 @@ async fn run() -> anyhow::Result<()> {
                             }),
                             principal.clone(),
                         ),
-                        DataConnectorCommands::ApplyEffect { namespace, pointer_id, operation, payload, action_receipt_id, idempotency_key, expected_source_sha256, now_secs, principal } => {
+                        DataConnectorCommands::ApplyEffect {
+                            namespace,
+                            pointer_id,
+                            operation,
+                            payload,
+                            action_receipt_id,
+                            idempotency_key,
+                            expected_source_sha256,
+                            now_secs,
+                            principal,
+                        } => {
                             let payload_value: serde_json::Value = match payload {
                                 Some(raw) => {
                                     let text = if let Some(file_path) = raw.strip_prefix('@') {
-                                        std::fs::read_to_string(file_path)
-                                            .map_err(|e| anyhow::anyhow!("read payload file {}: {}", file_path, e))?
+                                        std::fs::read_to_string(file_path).map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "read payload file {}: {}",
+                                                file_path,
+                                                e
+                                            )
+                                        })?
                                     } else {
                                         raw.clone()
                                     };
-                                    serde_json::from_str(&text)
-                                        .context("data-connector apply-effect payload must be valid JSON")?
+                                    serde_json::from_str(&text).context(
+                                        "data-connector apply-effect payload must be valid JSON",
+                                    )?
                                 }
                                 None => serde_json::json!({}),
                             };
@@ -7923,7 +8083,18 @@ async fn run() -> anyhow::Result<()> {
                                 principal.clone(),
                             )
                         }
-                        DataConnectorCommands::Mediate { namespace, from_stage, to_stage, gate_passed, pointer_id, offset, limit, max_bytes, now_secs, principal } => (
+                        DataConnectorCommands::Mediate {
+                            namespace,
+                            from_stage,
+                            to_stage,
+                            gate_passed,
+                            pointer_id,
+                            offset,
+                            limit,
+                            max_bytes,
+                            now_secs,
+                            principal,
+                        } => (
                             namespace.clone(),
                             serde_json::json!({
                                 "operation": "mediate",
@@ -7942,13 +8113,20 @@ async fn run() -> anyhow::Result<()> {
                         ),
                     };
                     let bus = Arc::new(crate::events::ThalamicBus::new(daemon::BUS_CAPACITY));
-                    let kernel = crate::kernel::AgentKernel::new(concrete_store.clone(), bus, workspace_root);
+                    let kernel = crate::kernel::AgentKernel::new(
+                        concrete_store.clone(),
+                        bus,
+                        workspace_root,
+                    );
                     match kernel
                         .execute_connector_command(&namespace, &args_json, principal.as_deref())
                         .await
                     {
                         Ok(value) => {
-                            println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&value).unwrap_or_default()
+                            );
                         }
                         Err(e) => {
                             eprintln!("data-connector error: {}", e);
@@ -8396,6 +8574,32 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Warning: failed to clear export freshness: {e}");
                         }
                     }
+                    Commands::VaultSync {
+                        action,
+                        namespace,
+                        vault_path,
+                        output_dir,
+                        principal,
+                    } => {
+                        use crate::vault_ld::vault_sync::handle_vault_sync;
+                        let args = serde_json::json!({
+                            "action": action,
+                            "namespace": namespace,
+                            "vault_path": vault_path,
+                            "output_dir": output_dir,
+                            "principal": principal,
+                        });
+                        let embedder = build_embedder()?;
+                        let response = handle_vault_sync(
+                            &args,
+                            vector_store.clone(),
+                            embedder,
+                            None,
+                            None,
+                        )
+                        .await;
+                        println!("{}", response);
+                    }
                     Commands::NormalizeMetadata { namespace } => {
                         let embedder = build_embedder()?;
                         prepare_fallback_write_store(&vector_store, &embedder, &namespace)
@@ -8677,6 +8881,7 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::DataConnector { .. }
                     | Commands::Hooks { .. }
                     | Commands::Bench { .. }
+                    | Commands::SemanticEval { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),
