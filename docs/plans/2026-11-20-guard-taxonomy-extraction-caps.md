@@ -27,8 +27,8 @@ request fields (C).
 **Tech Stack:** Rust (cargo test, sequential, `CARGO_BUILD_JOBS=1`),
 TypeScript plugin core (tsc + bundle-adapter, `node --test`).
 
-**Spec:** Panel verdict `~/workspace/pr120-ghas-panel/verdict.md` (§3–§4,
-§7 remediation sketches) and the filed issue bodies (fork #122/#123/#124;
+**Spec:** The GHAS verification panel's verdict (§3–§4, §7 remediation
+sketches; report linked in the PR body) and the filed issue bodies (fork #122/#123/#124;
 upstream #332/#333/#334). This plan argues from the verdict; where this
 plan narrows the verdict's sketch, the narrowing is recorded as a ruling
 below.
