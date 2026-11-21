@@ -20,6 +20,30 @@ pub struct GuardValidator {
 const EXTRACTION_MAX_DEPTH: usize = 3;
 const EXTRACTION_MAX_NODES: usize = 512;
 
+// Modelled file-mutation keys, shared by the recursive walk and the
+// root pre-pass in `extract_file_mutation_targets_and_shebangs`.
+const PATH_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "filePath",
+    "filepath",
+    "target_file",
+    "targetFile",
+    "filename",
+    "notebook_path",
+    "notebookPath",
+];
+const CONTENT_KEYS: &[&str] = &[
+    "content",
+    "newString",
+    "new_string",
+    "new_str",
+    "replacement",
+    "insert_text",
+    "new_source",
+];
+const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
+
 impl GuardValidator {
     pub async fn new(
         store: Arc<dyn VectorStore>,
@@ -412,28 +436,6 @@ impl GuardValidator {
         paths: &mut Vec<String>,
         shebangs: &mut Vec<String>,
     ) {
-        const PATH_KEYS: &[&str] = &[
-            "path",
-            "file_path",
-            "filePath",
-            "filepath",
-            "target_file",
-            "targetFile",
-            "filename",
-            "notebook_path",
-            "notebookPath",
-        ];
-        const CONTENT_KEYS: &[&str] = &[
-            "content",
-            "newString",
-            "new_string",
-            "new_str",
-            "replacement",
-            "insert_text",
-            "new_source",
-        ];
-        const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
-
         if *budget == 0 {
             return;
         }
@@ -501,6 +503,33 @@ impl GuardValidator {
                 value,
                 serde_json::Value::Object(_) | serde_json::Value::Array(_)
             ) {
+                // Root pre-pass: harvest the ROOT object's modelled
+                // fields directly, before the bounded walk. The walk's
+                // 512-node budget is spent in visit order, so a large
+                // sibling value ordered before the root's own fields
+                // (e.g. a multiedit payload's 171-entry `edits` array
+                // ahead of `file_path`) exhausts the budget inside the
+                // sibling and the authoritative root targets are never
+                // reached. Root fields are the payload's own statement
+                // of what it mutates; they must not depend on walk
+                // budget or key order.
+                if let serde_json::Value::Object(map) = &value {
+                    for (k, v) in map {
+                        if let serde_json::Value::String(s) = v {
+                            if PATH_KEYS.contains(&k.as_str()) {
+                                paths.push(s.trim().to_lowercase());
+                            } else if CONTENT_KEYS.contains(&k.as_str()) {
+                                Self::collect_shebang_from_content(s, &mut shebangs);
+                            } else if PATCH_KEYS.contains(&k.as_str()) {
+                                Self::extract_patch_targets_and_shebangs(
+                                    s,
+                                    &mut paths,
+                                    &mut shebangs,
+                                );
+                            }
+                        }
+                    }
+                }
                 let mut budget = EXTRACTION_MAX_NODES;
                 Self::walk_file_mutation_value(
                     &value,
@@ -510,6 +539,17 @@ impl GuardValidator {
                     &mut paths,
                     &mut shebangs,
                 );
+                // The walk re-harvests whatever root fields it reaches,
+                // so the pre-pass can duplicate entries. The only
+                // consumer, `file_mutation_matches_branch`, matches
+                // with `any()` over both vectors and is therefore
+                // duplicate-insensitive; dedupe anyway (first
+                // occurrence wins) so the extractor's output stays
+                // canonical for exact-equality callers and tests.
+                let mut seen_paths = std::collections::BTreeSet::new();
+                paths.retain(|p| seen_paths.insert(p.clone()));
+                let mut seen_shebangs = std::collections::BTreeSet::new();
+                shebangs.retain(|s| seen_shebangs.insert(s.clone()));
                 return (paths, shebangs);
             }
         }
@@ -1960,6 +2000,60 @@ mod tests {
         assert!(
             !paths.contains(&"target.py".to_string()),
             "a path beyond the 512-node budget must not be harvested: {paths:?}"
+        );
+    }
+
+    /// Codex P2 (PR #129): budget starvation of authoritative root
+    /// fields. A multiedit payload whose `edits` array (171 entries,
+    /// ordered before `file_path`) exhausts the walk's 512-node budget
+    /// inside `edits` -- each edit object costs 3 nodes, so the budget
+    /// reaches 0 before the walk visits `file_path`, and the old
+    /// extractor returned no path for the file actually being edited.
+    /// RED basis on the unmodified tree: the walk in
+    /// `extract_file_mutation_targets_and_shebangs` is the only
+    /// harvest, and it returns early once `budget == 0`; the root
+    /// pre-pass added with this test is what reaches `file_path`.
+    /// Reproduced standalone (/tmp/sim2_resolved.rs, faithful port of
+    /// the unmodified walk): paths=[], budget_left=0.
+    #[test]
+    fn file_mutation_root_file_path_survives_edits_budget_starvation() {
+        let edits: Vec<serde_json::Value> = (0..171)
+            .map(|_| serde_json::json!({"old_string": "...", "new_string": "..."}))
+            .collect();
+        let payload = serde_json::json!({
+            "edits": edits,
+            "file_path": "script.py"
+        })
+        .to_string();
+        let (paths, _shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            paths.contains(&"script.py".to_string()),
+            "the root file_path must survive edits budget starvation: {paths:?}"
+        );
+    }
+
+    /// Codex P2 (PR #129): the same starvation shape applied to a root
+    /// content field. `new_source` is a content key ordered after
+    /// `edits` in visit order, so the unmodified walk exhausted its
+    /// budget inside `edits` and never harvested the shebang.
+    /// Reproduced standalone (/tmp/sim2_resolved.rs): shebangs=[],
+    /// budget_left=0.
+    #[test]
+    fn file_mutation_root_content_shebang_survives_edits_budget_starvation() {
+        let edits: Vec<serde_json::Value> = (0..171)
+            .map(|_| serde_json::json!({"old_string": "...", "new_string": "..."}))
+            .collect();
+        let payload = serde_json::json!({
+            "edits": edits,
+            "new_source": "#!/usr/bin/env python3\nprint(1)\n"
+        })
+        .to_string();
+        let (_paths, shebangs) =
+            GuardValidator::extract_file_mutation_targets_and_shebangs(&payload);
+        assert!(
+            shebangs.contains(&"/usr/bin/env python3".to_string()),
+            "the root content shebang must survive edits budget starvation: {shebangs:?}"
         );
     }
 }
