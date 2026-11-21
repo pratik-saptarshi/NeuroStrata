@@ -12,7 +12,7 @@
   "keywords": ["neurostrata", "plugin", "core", "task-tracking", "guard"],
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^26.6.6",
     "typescript": "^5.0.0",
     "vitest": "^5.1.0"
   },
