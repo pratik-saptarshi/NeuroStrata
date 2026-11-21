@@ -115,6 +115,22 @@ below.
   The fork-A filing's "same verdict as the raw string" regression
   requirement is met by this shape and could not be met by the
   one-line shape.
+- **R8 (documentation-extension shebang suppression — Stage 3 finding
+  F1, recorded 2026-11-20).** Task 2's patch extractor never harvests
+  a shebang for a patch target whose path ends in a documentation
+  extension (`.md`, `.markdown`, `.rst`, `.txt`, `.adoc`), even when
+  the shebang-shaped line is the first added line of its section. The
+  plan text did not specify this (the verdict §7 sketch (iii)
+  contemplated script-like-path gating, which the plan did not adopt);
+  the implementation (commit `5e4c71f6`, disclosed in its body; pinned
+  by `patch_docs_target_first_line_shebang_yields_no_shebang`) is
+  ACCEPTED as implemented and recorded here: documentation files are
+  never executed, so a shebang-shaped first line in a documentation
+  patch is prose, and harvesting it would false-block documentation
+  edits that quote shell snippets. Consequence for the record: the
+  mid-file B4 test's outcome is delivered by this rule rather than by
+  position (its doc comment states this, commit `a2bc62af`). Also
+  disclosed in the PR body.
 - **R6 (verification venue: CI).** Local builds of this tree are
   blocked: the tree pins `ort-sys 2.0.0-rc.15`, whose build script
   downloads ONNX Runtime 1.31.0 from `cdn.pyke.io`, which returns
