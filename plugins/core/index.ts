@@ -70,6 +70,22 @@ function firstRecord(...candidates: unknown[]): Record<string, unknown> {
   return {};
 }
 
+/**
+ * Payload for neurostrata_guard_validate. Some harnesses (Codex apply_patch)
+ * deliver the tool input as a raw string, which firstRecord discards — the
+ * guard would receive "{}" and no file-mutation rule could fire (fork #123).
+ * Forward the first non-empty raw string candidate verbatim; otherwise keep
+ * the JSON form of the extracted record.
+ */
+function guardPayloadFor(record: Record<string, unknown>, ...rawCandidates: unknown[]): string {
+  for (const candidate of rawCandidates) {
+    if (typeof candidate === "string" && candidate.length > 0) {
+      return candidate;
+    }
+  }
+  return JSON.stringify(record);
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 }
@@ -2546,7 +2562,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
         args: firstRecord(input?.input, input?.args, input),
         session_id: asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined,
       };
-      const payload = JSON.stringify(call.args);
+      const payload = guardPayloadFor(call.args, input?.input, input);
       const cwd = process.cwd();
       const session_id = call.session_id;
       const active_task_id = asString(args.active_task_id) ?? activeTaskId;
@@ -2828,7 +2844,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
       }
       if (config.strictMode) {
         const callArgs = firstRecord(toolInput);
-        const payload = JSON.stringify(callArgs);
+        const payload = guardPayloadFor(callArgs, toolInputRaw);
         const cwd = process.cwd();
         const session_id = asString(callArgs.session_id) ?? asString(event.session_id) ?? activeSessionId ?? undefined;
         const active_task_id = asString(callArgs.active_task_id) ?? activeTaskId;
