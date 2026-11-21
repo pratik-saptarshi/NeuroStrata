@@ -2054,21 +2054,89 @@ async fn execute_upsert_concept(
     }))
 }
 
+/// Minimum graph distance (hops) from any tree root to each reachable
+/// concept, computed by bounded BFS over the loaded concept graph
+/// following the same child relation (`narrower`) and allowed-set
+/// filtering `build_tree_node` uses. Roots are distance 0. Ruling R9:
+/// `max_hops` bounds this minimum distance, not the depth at which the
+/// pre-order DFS happens to first reach a node -- in a polyhierarchy a
+/// node first reached by a long DFS path may also be reachable by a
+/// shorter path, and its in-range descendants must not be suppressed
+/// by the longer first visit.
+fn min_root_distances(
+    root_slugs: &[String],
+    concepts: &BTreeMap<String, HydratedConcept>,
+    allowed_set: &BTreeSet<String>,
+) -> BTreeMap<String, usize> {
+    let mut distances: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for root in root_slugs {
+        if allowed_set.contains(root)
+            && concepts.contains_key(root)
+            && !distances.contains_key(root)
+        {
+            distances.insert(root.clone(), 0);
+            queue.push_back(root.clone());
+        }
+    }
+    while let Some(slug) = queue.pop_front() {
+        let distance = distances[&slug];
+        if let Some(c) = concepts.get(&slug) {
+            for child_slug in &c.narrower {
+                if allowed_set.contains(child_slug)
+                    && concepts.contains_key(child_slug)
+                    && !distances.contains_key(child_slug)
+                {
+                    distances.insert(child_slug.clone(), distance + 1);
+                    queue.push_back(child_slug.clone());
+                }
+            }
+        }
+    }
+    distances
+}
+
 fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
     visited: &mut BTreeSet<String>,
+    depth: usize,
+    max_hops: Option<usize>,
+    budget: &mut usize,
+    min_distances: &BTreeMap<String, usize>,
 ) -> Option<TaxonomyTreeNode> {
+    if *budget == 0 {
+        return None;
+    }
     if !visited.insert(slug.to_string()) {
         return None;
     }
     let c = concepts.get(slug)?;
+    *budget -= 1;
     let mut children = Vec::new();
-    for child_slug in &c.narrower {
-        if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
-            if let Some(child_node) = build_tree_node(child_slug, concepts, allowed_set, visited) {
-                children.push(child_node);
+    // R9: expansion is capped by the node's MINIMUM distance from a
+    // root, not by this visit's DFS depth. Emission order, the visited
+    // set and the `limit` budget remain pre-order DFS first-visit,
+    // unchanged. The DFS-depth fallback covers any node the BFS did
+    // not reach (not expected: BFS and DFS share roots, child relation
+    // and allowed-set filtering).
+    let min_distance = min_distances.get(slug).copied().unwrap_or(depth);
+    if max_hops.map_or(true, |h| min_distance < h) {
+        for child_slug in &c.narrower {
+            if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
+                if let Some(child_node) = build_tree_node(
+                    child_slug,
+                    concepts,
+                    allowed_set,
+                    visited,
+                    depth + 1,
+                    max_hops,
+                    budget,
+                    min_distances,
+                ) {
+                    children.push(child_node);
+                }
             }
         }
     }
@@ -2150,10 +2218,22 @@ async fn execute_tree(
             .collect()
     };
 
+    let min_distances = min_root_distances(&root_slugs, &view.concepts, &allowed_slugs);
+
     let mut visited = BTreeSet::new();
     let mut roots = Vec::new();
+    let mut budget = req.limit.unwrap_or(usize::MAX);
     for r_slug in root_slugs {
-        if let Some(node) = build_tree_node(&r_slug, &view.concepts, &allowed_slugs, &mut visited) {
+        if let Some(node) = build_tree_node(
+            &r_slug,
+            &view.concepts,
+            &allowed_slugs,
+            &mut visited,
+            0,
+            req.max_hops,
+            &mut budget,
+            &min_distances,
+        ) {
             roots.push(node);
         }
     }
@@ -2538,6 +2618,14 @@ fn transitive_ancestors_of(
     ancestors
 }
 
+/// C1 (fork #124): caps on caller-supplied `compare` collections. The
+/// per-slug ancestor walks, the O(n²) pair loop, and the
+/// O(|axes| × |slugs|) matrix are all sized by these two inputs, so
+/// over-cap requests are rejected rather than truncated. Thesis-derived
+/// and union-derived axes are store-bounded and are not capped.
+const MAX_COMPARE_SLUGS: usize = 64;
+const MAX_COMPARE_AXES: usize = 32;
+
 async fn execute_compare(
     store: &LadybugStore,
     namespace: &str,
@@ -2549,6 +2637,12 @@ async fn execute_compare(
         .as_ref()
         .ok_or_else(|| "slugs (array of >= 2 concept slugs) is required for compare".to_string())?;
     let slugs = validate_strict_slug_vec(raw_slugs, "slugs")?;
+    if slugs.len() > MAX_COMPARE_SLUGS {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_SLUGS} concept slugs (got {})",
+            slugs.len()
+        ));
+    }
     if slugs.len() < 2 {
         return Err("compare requires at least 2 distinct concept slugs".to_string());
     }
@@ -2633,7 +2727,14 @@ async fn execute_compare(
 
     // Determine evaluation axes
     let axes: Vec<String> = if let Some(req_axes) = &req.axes {
-        validate_strict_slug_vec(req_axes, "axes")?
+        let axes = validate_strict_slug_vec(req_axes, "axes")?;
+        if axes.len() > MAX_COMPARE_AXES {
+            return Err(format!(
+                "compare supports at most {MAX_COMPARE_AXES} evaluation axes (got {})",
+                axes.len()
+            ));
+        }
+        axes
     } else if let Some(ref t) = view.thesis {
         if !t.evaluation_axes.is_empty() {
             t.evaluation_axes.clone()
@@ -5590,6 +5691,514 @@ mod tests {
         assert!(
             snap.contains("DEPRECATED") || snap.contains("not_definition"),
             "snapshot taxonomy must expose the annotation: {snap}"
+        );
+    }
+
+    // ── C1 (fork #124): execute_compare caps caller-supplied slugs/axes ──
+    #[tokio::test]
+    async fn compare_rejects_more_than_64_slugs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-slug-cap-ns";
+        store.init(ns).await.expect("init");
+
+        // The cap fires right after slug validation, before concept
+        // resolution, so an empty namespace suffices.
+        let slugs: Vec<String> = (0..65).map(|i| format!("concept-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("must reject more than 64 slugs");
+        assert!(err.contains("64"), "cap error must name the maximum: {err}");
+        assert!(
+            err.contains("compare supports at most 64 concept slugs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_rejects_more_than_32_axes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-axes-cap-ns";
+        store.init(ns).await.expect("init");
+
+        for (slug, label, def) in [
+            ("cap-alpha", "Cap Alpha", "first seeded concept"),
+            ("cap-beta", "Cap Beta", "second seeded concept"),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(def.to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..33).map(|i| format!("axis-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["cap-alpha".to_string(), "cap-beta".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("must reject more than 32 axes");
+        assert!(err.contains("32"), "cap error must name the maximum: {err}");
+        assert!(
+            err.contains("compare supports at most 32 evaluation axes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_at_64_slugs_proceeds_past_cap_to_concept_resolution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-slug-at-cap-ns";
+        store.init(ns).await.expect("init");
+
+        // Exactly at the cap on an empty namespace: the failure must be
+        // concept resolution, not the cap.
+        let slugs: Vec<String> = (0..64).map(|i| format!("concept-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("unknown concepts must fail resolution");
+        assert!(
+            err.contains("not found"),
+            "expected concept-not-found error, not the cap error: {err}"
+        );
+        assert!(
+            !err.contains("at most"),
+            "at-cap request must not hit the cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_at_32_axes_succeeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-compare-axes-at-cap-ns";
+        store.init(ns).await.expect("init");
+
+        for (slug, label, def) in [
+            ("cap-alpha", "Cap Alpha", "first seeded concept"),
+            ("cap-beta", "Cap Beta", "second seeded concept"),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(def.to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..32).map(|i| format!("axis-{i}")).collect();
+        let cmp = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["cap-alpha".to_string(), "cap-beta".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("compare at exactly 32 axes must succeed");
+        assert_eq!(cmp["operation"], "compare");
+        assert_eq!(cmp["axis_matrix"].as_object().unwrap().len(), 32);
+    }
+
+    // ── C2 (fork #124): execute_tree honours limit / max_hops ──
+
+    /// Seeds a 3-level chain: tree-root -> tree-child -> tree-grandchild.
+    async fn seed_three_level_chain(store: &LadybugStore, embedder: &DummyEmbedder, ns: &str) {
+        for (slug, label, broader) in [
+            ("tree-root", "Tree Root", None),
+            ("tree-child", "Tree Child", Some("tree-root")),
+            ("tree-grandchild", "Tree Grandchild", Some("tree-child")),
+        ] {
+            execute_taxonomy(
+                store,
+                embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(format!("Definition for {label}")),
+                    broader: broader.map(|b| vec![b.to_string()]),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed chain concept");
+        }
+    }
+
+    fn count_tree_nodes(nodes: &[Value]) -> usize {
+        nodes
+            .iter()
+            .map(|n| 1 + n["children"].as_array().map_or(0, |c| count_tree_nodes(c)))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn tree_max_hops_one_truncates_grandchildren() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-max-hops-one-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=1");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["slug"], "tree-child");
+        assert!(
+            children[0]["children"]
+                .as_array()
+                .expect("child children array")
+                .is_empty(),
+            "max_hops=1 must emit depth-1 nodes with no children (grandchild absent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_max_hops_zero_returns_roots_without_children() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-max-hops-zero-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(0),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=0");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        assert!(
+            roots[0]["children"]
+                .as_array()
+                .expect("root children array")
+                .is_empty(),
+            "max_hops=0 must emit roots with empty children"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_limit_two_caps_total_nodes_across_forest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-limit-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                limit: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with limit=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(
+            count_tree_nodes(roots),
+            2,
+            "limit=2 must cap the total emitted nodes across the forest at 2"
+        );
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["slug"], "tree-child");
+    }
+
+    #[tokio::test]
+    async fn tree_without_caps_returns_all_three_levels() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-uncapped-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("uncapped tree");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(count_tree_nodes(roots), 3);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        assert_eq!(roots[0]["children"][0]["slug"], "tree-child");
+        assert_eq!(
+            roots[0]["children"][0]["children"][0]["slug"],
+            "tree-grandchild"
+        );
+    }
+
+    // ── R9 (Codex P2, PR #129): max_hops bounds MINIMUM graph distance ──
+
+    /// Seeds the Codex polyhierarchy: poly-root -> poly-a -> poly-x ->
+    /// poly-y plus poly-root -> poly-x, modelled as broader edges
+    /// (x broader=[root, a], y broader=[x], a broader=[root]) exactly
+    /// as the chain seeder models parentage. Derived `narrower` is a
+    /// sorted set, so poly-root's children iterate [poly-a, poly-x]:
+    /// the DFS reaches poly-x via poly-a (depth 2) before the direct
+    /// root -> poly-x edge (depth 1).
+    async fn seed_polyhierarchy(store: &LadybugStore, embedder: &DummyEmbedder, ns: &str) {
+        for (slug, label, broader) in [
+            ("poly-root", "Poly Root", None),
+            ("poly-a", "Poly A", Some(vec!["poly-root"])),
+            ("poly-x", "Poly X", Some(vec!["poly-root", "poly-a"])),
+            ("poly-y", "Poly Y", Some(vec!["poly-x"])),
+        ] {
+            execute_taxonomy(
+                store,
+                embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(format!("Definition for {label}")),
+                    broader: broader.map(|bs| bs.iter().map(|b| b.to_string()).collect()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed polyhierarchy concept");
+        }
+    }
+
+    fn collect_tree_slugs(nodes: &[Value], out: &mut Vec<String>) {
+        for n in nodes {
+            out.push(n["slug"].as_str().expect("slug").to_string());
+            if let Some(children) = n["children"].as_array() {
+                collect_tree_slugs(children, out);
+            }
+        }
+    }
+
+    fn find_tree_node<'a>(nodes: &'a [Value], slug: &str) -> Option<&'a Value> {
+        for n in nodes {
+            if n["slug"].as_str() == Some(slug) {
+                return Some(n);
+            }
+            if let Some(children) = n["children"].as_array() {
+                if let Some(found) = find_tree_node(children, slug) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Codex P2 (thread PRRT_kwDOVS6VQM66PoLr): with DFS-depth capping,
+    /// poly-x is first visited at depth 2 (via poly-a), emitted
+    /// childless under max_hops=2, and the depth-1 path root -> poly-x
+    /// is skipped as already visited, so poly-y (2 hops via
+    /// root -> poly-x -> poly-y) disappears. RED basis on the
+    /// unmodified tree: build_tree_node expanded children iff
+    /// `depth < max_hops` with the DFS visit depth. Reproduced
+    /// standalone (/tmp/sim_taxonomy.rs, faithful port): CURRENT
+    /// emitted=[root, a, x], has_y=false; with BFS minimum distances
+    /// {root:0, a:1, x:1, y:2} the same DFS emits y.
+    #[tokio::test]
+    async fn tree_max_hops_polyhierarchy_keeps_in_range_descendant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-polyhierarchy-ns";
+        store.init(ns).await.expect("init");
+        seed_polyhierarchy(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        let mut slugs = Vec::new();
+        collect_tree_slugs(roots, &mut slugs);
+        assert!(
+            slugs.contains(&"poly-y".to_string()),
+            "poly-y is 2 hops from the root via root -> poly-x -> poly-y \
+             and must be present under max_hops=2: {slugs:?}"
+        );
+        assert_eq!(
+            count_tree_nodes(roots),
+            4,
+            "all four polyhierarchy concepts must be emitted: {slugs:?}"
+        );
+    }
+
+    /// R9 pin: a node whose MINIMUM distance equals max_hops still
+    /// emits, childless -- its children (minimum distance max_hops+1)
+    /// do not. In the polyhierarchy poly-y sits at minimum distance 2;
+    /// its child poly-z (minimum distance 3) must stay absent under
+    /// max_hops=2 while poly-y itself is present with no children.
+    #[tokio::test]
+    async fn tree_max_hops_node_at_min_distance_cap_emits_childless() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-polyhierarchy-cap-ns";
+        store.init(ns).await.expect("init");
+        seed_polyhierarchy(&store, &embedder, ns).await;
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("poly-z".to_string()),
+                pref_label: Some("Poly Z".to_string()),
+                definition: Some("Definition for Poly Z".to_string()),
+                broader: Some(vec!["poly-y".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("seed poly-z");
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        let mut slugs = Vec::new();
+        collect_tree_slugs(roots, &mut slugs);
+        assert!(
+            !slugs.contains(&"poly-z".to_string()),
+            "poly-z is 3 hops from the root and must be absent under max_hops=2: {slugs:?}"
+        );
+        let y_node = find_tree_node(roots, "poly-y").expect("poly-y must be present");
+        assert!(
+            y_node["children"]
+                .as_array()
+                .expect("y children array")
+                .is_empty(),
+            "poly-y sits at minimum distance == max_hops and must emit childless"
         );
     }
 }

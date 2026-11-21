@@ -148,7 +148,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], guardMutations: [] };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [], guardMutations: [], guardPayloads: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -227,6 +227,7 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
             counters.guardValidate++;
             const guardArgs = params.arguments ?? {};
             counters.guardMutations.push(guardArgs.mutations_since_note);
+            counters.guardPayloads.push(guardArgs.payload);
             // `guardReject` may be a boolean or a getter, so a test can flip the
             // verdict between two calls against the same mock daemon.
             const reject = typeof guardReject === "function" ? guardReject() : guardReject;
@@ -2348,6 +2349,69 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       assert.equal(queries.filter((q) => q === "src/café.rs" || q === "src/quote\"file.rs").length, 2, "existing decoded paths must not be duplicated");
     } finally {
       rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// B2 (fork #123): Codex delivers apply_patch input as a raw patch string.
+// firstRecord(...) discards a string input and yields {}, so in strict mode
+// both guard_validate call sites must forward the raw string itself as the
+// payload — otherwise the guard receives "{}" and no file-mutation rule
+// can fire on the patch body.
+// ──────────────────────────────────────────────────────────────────────
+
+describe("B2: raw apply_patch string forwarded to guard_validate (fork #123)", () => {
+  const patch = "*** Begin Patch\n*** Update File: src/a.py\n@@\n-old\n+new\n*** End Patch";
+
+  it("handleHookEvent (strict) sends the raw patch text as guard payload, not {}", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      await initialize({
+        config: { namespace: "b2-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      const result = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "apply_patch",
+        tool_input: patch,
+      });
+      assert.equal(result.hookSpecificOutput.permissionDecision, "allow");
+      assert.equal(counters.guardValidate, 1, "guard_validate must run exactly once");
+      assert.deepEqual(
+        counters.guardPayloads,
+        [patch],
+        `guard payload must be the raw patch text, got ${JSON.stringify(counters.guardPayloads)}`,
+      );
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("executeBeforeHandler (strict) sends the raw patch text as guard payload, not {}", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      let beforeExecFn = null;
+      await initialize({
+        config: { namespace: "b2-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+        hooks: {
+          beforeToolExec: async (fn) => {
+            beforeExecFn = fn;
+          },
+        },
+      });
+      await beforeExecFn({ tool: "apply_patch", input: patch });
+      assert.equal(counters.guardValidate, 1, "guard_validate must run exactly once");
+      assert.deepEqual(
+        counters.guardPayloads,
+        [patch],
+        `guard payload must be the raw patch text, got ${JSON.stringify(counters.guardPayloads)}`,
+      );
+    } finally {
+      server.close();
+      resetModuleState();
     }
   });
 });
