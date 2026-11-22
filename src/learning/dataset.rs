@@ -6,7 +6,6 @@
 
 use crate::learning::labels::{derive_labels, LabelRule, LabelTier};
 use crate::learning::observation::{DecisionObservation, LearningOutcome, LearningOutcomeKind};
-use crate::learning::split::DatasetSplits;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

@@ -12,21 +12,6 @@ pub mod split;
 pub mod status;
 pub mod trainer;
 
-pub use blob_store::BlobStore;
-pub use calibration::TemperatureFitter;
-pub use dataset::{build_dedup_dataset, DatasetBuildReport, DatasetManifest, DistancePolicy};
-pub use evaluator::{EvaluationReport as EvaluatorReport, SuiteReport};
-pub use labels::{derive_labels, DerivedLabel, LabelRule, LabelTier};
-pub use model_bundle::ModelBundle;
-pub use observation::{
-    CandidateSource, DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind,
-    ObservedCandidate, PayloadHash,
-};
-pub use recorder::LearningRecorder;
-pub use runtime::{LearningRuntimeManager, ModelVersion, RuntimeState};
-pub use split::{split_observations, DatasetSplits, Split};
-pub use trainer::{EvaluationReport, TrainingJobState};
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;

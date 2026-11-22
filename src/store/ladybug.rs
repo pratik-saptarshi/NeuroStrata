@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
 
-use crate::domain::domain_key;
 use crate::traits::{
     is_internal_ingest_stage_namespace, is_reserved_ingest_destination, DomainMatchMode,
     DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload, RelocateOutcome,

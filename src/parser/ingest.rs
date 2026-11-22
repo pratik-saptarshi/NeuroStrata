@@ -1,9 +1,6 @@
 use crate::parser::get_language;
 use crate::parser::schema::ParserSchema;
-use crate::traits::{
-    is_reserved_ingest_destination, Embedder, MemoryPayload, VectorStore,
-    INTERNAL_INGEST_STAGE_PREFIX,
-};
+use crate::traits::{is_reserved_ingest_destination, Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1669,6 +1666,8 @@ pub async fn ingest_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::traits::INTERNAL_INGEST_STAGE_PREFIX;
 
     fn map_from(json: &str) -> HashMap<String, String> {
         build_ext_map(&ParserSchema::load(json).expect("schema parses"))

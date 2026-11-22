@@ -1,5 +1,4 @@
 use crate::judgment::policy::DedupDecision;
-use crate::traits::MemoryPayload;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

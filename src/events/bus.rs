@@ -1594,7 +1594,8 @@ mod tests {
 
     // ---- Task 12: durable outbox for audit & mesh events ----
 
-    use crate::events::{EventClass, EventOutbox, GuardEventLog};
+    use crate::events::outbox::{EventClass, EventOutbox};
+    use crate::events::GuardEventLog;
     use crate::store::LadybugStore;
     use std::collections::HashSet;
     use std::path::PathBuf;

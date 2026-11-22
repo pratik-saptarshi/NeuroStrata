@@ -2,7 +2,6 @@
 
 pub mod store;
 
-pub use store::{Receipt, ReceiptStore};
 // Durable, event-keyed receipts for recall/procedure/tool-invocation
 // outcomes. A receipt is the retention record `retention::gate` verifies
 // against: keyed by `(session_id, task_id, event_id)` so a replayed event
