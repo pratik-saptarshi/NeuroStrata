@@ -339,6 +339,13 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Accepted exceptions, matching the local pre-PR gate's standing
+          # calibration: RUSTSEC-2026-0194/-0195 (quick-xml 0.37.5) cannot be
+          # fixed yet — the ox stack caps quick-xml at ^0.37 (oxrdfxml 0.2.5
+          # and sparesults 0.3.5, their newest releases, require ^0.37;
+          # probe 2026-11-20). Lift condition: remove both ignores once an
+          # ox-stack release lets quick-xml reach >= 0.41.0.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
   deny:
     name: deny (report-only)
