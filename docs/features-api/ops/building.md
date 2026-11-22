@@ -1,0 +1,328 @@
+# Building neurostrata-mcp
+
+cargo builds this, but not on its own: `lbug` (LadybugDB) compiles a C++ graph
+engine from vendored source, so a build also needs CMake and a C++20 toolchain.
+Both surface minutes in, as errors naming neither cargo nor NeuroStrata.
+
+That is what the scripts in `scripts/` are for. They locate the toolchain, check
+the versions this build is sensitive to, and hand off to cargo. They install
+nothing.
+
+| Route | Command |
+| --- | --- |
+| Linux / macOS | `scripts/build.sh` |
+| Windows | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1` |
+| Container, no host toolchain | see [Dockerfile.build](../../../Dockerfile.build) |
+
+`--check` / `-CheckOnly` reports the resolved toolchain and builds nothing.
+Output lands in `target/release/` (`.exe` on Windows).
+
+## Fast linking on Linux
+
+`.cargo/config.toml` sets `rustflags = ["-C", "link-arg=-fuse-ld=lld"]` for the
+`x86_64-unknown-linux-gnu` target, so Linux dev/test links use lld instead of
+the system default linker. This is a rustflags-only setting: the repo installs
+no linker — the host still needs `ld.lld` available for the flag to take
+effect. The setting is scoped to that single target, so Windows and macOS
+builds are unaffected; remove or override the file if the environment's lld
+is unavailable.
+
+---
+
+## What a build needs
+
+**CMake 3.15 or newer**, the highest `cmake_minimum_required` in the vendored
+tree. CMake 4 works: the one sub-3.5 declaration is in a re2 branch guarded by
+`BUILD_SHARED_LIBS`, which is off here, so it is never evaluated. Built against
+4.3.1 with MSVC and 4.4.0 with Clang, both with no policy override.
+
+**A C++20 standard library with `<format>`.** `common/assert.h` includes it.
+This is a toolset-version floor rather than a language-level one — the compilers
+below all accept `-std=c++20`:
+
+| | works | fails |
+| --- | --- | --- |
+| GCC | 13+ | 12 — `fatal error: format: No such file or directory` |
+| MSVC | 14.40+ | 14.37 — `C1001` internal compiler error ~848 files in |
+| Clang | Apple clang on macOS 15, arm64 and x64 | — |
+
+`build.sh` compiles a probe instead of parsing `--version`, since the gap is in
+the standard library rather than the compiler. The MSVC failure is a front-end
+ICE in `PackExpander.cpp`, so a lower optimisation level does not avoid it.
+
+**A generator.** Make or Ninja on Linux and macOS; on Windows, Ninja
+specifically — see the quirks below.
+
+**perl and pkg-config, on Linux only.** `openssl` is vendored there and its
+`Configure` is perl. `Cargo.toml` gates the dependency out on Windows and Apple
+targets, which have a system TLS stack.
+
+Rust itself is often installed but off `PATH`, so both scripts check
+`CARGO_HOME` and `~/.cargo/bin` before reporting cargo missing.
+`NEUROSTRATA_CMAKE` and `NEUROSTRATA_NINJA` replace discovery for a tool and are
+authoritative: an unusable one is an error rather than a fallback.
+
+---
+
+## Toolchain versions
+
+Tested here:
+
+| Component | Good | Bad |
+| --- | --- | --- |
+| Rust | 1.98.0 | — |
+| CMake | 3.28.3, 3.31.12, 4.3.1, 4.4.0 | — |
+| GCC | 13.3, 14 | 12.4 |
+| MSVC | 14.44.35207, 14.51.36231 | 14.37 |
+| Ninja | 1.11.1, 1.13.2 | — |
+| Clang | Apple clang, macOS 15 arm64 and x64 | — |
+
+The Good column is what CI builds on every push and pull request, across four
+runners. The Bad column comes from local machines — CI has never been handed a
+GCC 12 or an MSVC 14.37 to fail on.
+
+The container route needs none of this on the host: `Dockerfile.build` pins
+Debian trixie (GCC 14, CMake 3.31) and proves `<format>` at image build time. If
+a container build dies with `unexpected EOF`, that is usually the VM running out
+of memory; the file's header covers that and the named-volume setup.
+
+---
+
+## CI
+
+| Workflow | Trigger | Publishes |
+| --- | --- | --- |
+| `ci.yml` | push, PR | nothing — a `--release --locked` build on linux, windows, and macOS arm64, plus a version assertion (there is no macOS x64 runner: `ort` rc.13, pinned by `fastembed >= 5`, ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`) |
+| `nightly.yml` | cron, dispatch | linux + windows amd64 → the `nightly` tag, prerelease |
+| `release.yml` | `v*` tags | all four targets → that tag (linux amd64 + linux arm64, darwin arm64, windows amd64) |
+
+Both publishing workflows attach `SHA256SUMS`, and they target separate tags;
+the nightly archives also carry `nightly` in their filenames.
+
+Cross-compilation is impractical for releases — vendored OpenSSL, `cxx-build`,
+and ONNX via `fastembed` — so each target builds on its own native runner.
+
+Timings on GitHub-hosted runners, every run cold — nothing is cached between
+them: macOS arm64 ~20 min, linux ~18-24 min, windows ~61 min.
+The four run concurrently, so a full CI cycle is bounded by Windows.
+
+---
+
+## Building the desktop app
+
+`scripts/build.ps1` builds `neurostrata-mcp`, the daemon and CLI. The visualizer
+in `src-tauri/` is a separate build, and it has one trap.
+
+```
+cd web-ui && npm run build          # the frontend, into web-ui/dist
+cd ..
+cargo build --release --features custom-protocol --manifest-path src-tauri/Cargo.toml
+```
+
+**`--features custom-protocol` is not optional.** The tauri crate's build script
+sets `dev = !custom_protocol`, so a plain `cargo build` produces a DEV build: the
+webview loads `tauri.conf.json`'s `devUrl`, `http://localhost:5173`, instead of
+the bundled `web-ui/dist`. The window then shows whatever happens to be serving
+that port on the machine — a frontend dev server, another project, or nothing.
+
+It fails silently. The app launches, the window opens, and only the contents are
+wrong, so it looks like a data or daemon problem rather than a build one.
+
+`cargo tauri build` passes the feature itself and also runs the frontend build,
+so it is the safer command where the tauri CLI is installed. Everything above is
+for the case where it is not.
+
+To confirm a build is right, check the frontend is actually inside the binary:
+
+```
+grep -c index- src-tauri/target/release/neurostrata.exe    # 0 = dev build
+```
+
+---
+
+## Installing it
+
+`cargo build` leaves the binary in `target/release/`. To put it on `PATH`, where
+an MCP client will find it:
+
+```
+cargo install --path . --force --locked
+```
+
+**All three flags matter.**
+
+`--locked` is the important one. Without it `cargo install` ignores `Cargo.lock`
+and re-resolves dependencies, which picks up whatever newer `lbug` has been
+published -- installing a release newer than the 0.22.3 the lockfile pins. That
+silently swaps the storage engine underneath an existing database. The pin is
+deliberate: WAL behaviour is governed by `strict_wal_verification()` in
+`src/store/ladybug.rs`, which refuses an unauthenticated WAL by default
+(`NEUROSTRATA_STRICT_WAL=1`) and only falls back to the unverified recovery
+open (`unverified_config()`) when the operator explicitly opts out, and the
+engine version that behaviour was measured against is the one in the lockfile.
+
+`--force` is needed because the binary already exists after the first install;
+without it cargo stops with "binary `neurostrata-mcp.exe` already exists".
+
+Installing also needs the C++ toolchain on `PATH`, exactly as a build does. A
+bare `cargo install` outside a Developer Command Prompt fails inside the `lbug`
+build script with:
+
+```
+CMake Error: CMake was unable to find a build program corresponding to "Ninja".
+CMAKE_MAKE_PROGRAM is not set.
+```
+
+On Windows, run it from a Developer PowerShell, or import the environment the
+way `scripts/build.ps1` does before calling cargo.
+
+**Stop the daemon first.** The running daemon *is* the binary being replaced, so
+the install fails with `Access is denied. (os error 5)` while it is up -- and
+that error arrives after a successful compile, which makes it look like a build
+failure rather than a lock. `neurostrata-mcp shutdown` stops it and checkpoints;
+never kill it -- writes that only reached the WAL are discarded if the process
+dies before a checkpoint. Any stdio proxy started by an MCP client
+holds the installed binary too, and has to stop for the same reason.
+
+### Choosing the embedding model at setup
+
+On a fresh install, while the store is still empty, the first interactive
+command offers a one-time choice of embedding model. Daemon and serving
+processes never prompt: when the built-in default configuration is first
+materialized they only record that a choice is pending, and the next
+interactive command surfaces it. The offer presents the top three candidates
+in the table below. Keeping the built-in default, `NomicEmbedTextV15`, is one
+of the outcomes: explicitly declining the offer — or never being asked —
+leaves the default in place, and a declined install is not asked again. (An
+answer that is neither a pick nor a decline leaves the choice pending for the
+next interactive command.)
+
+The pick is recorded in `embedders.json` in the configuration directory, as
+the first entry, followed by the built-in default entry. The choice is
+one-way once data exists. The offer renders this warning verbatim:
+
+> This choice is permanent for this database: the store refuses any other model once data exists. Changing later requires a new database.
+
+| Model | Dimensions | Context limit | ONNX file size |
+| :--- | ---: | ---: | ---: |
+| `NomicEmbedTextV15Q` | 768 | 8,192 tokens | 137,296,292 bytes (130.9 MiB) |
+| `BGESmallENV15Q` | 384 | 512 tokens | 66,465,124 bytes (63.4 MiB) |
+| `SnowflakeArcticEmbedMQ` | 768 | 512 tokens | 110,084,023 bytes (105.0 MiB) |
+| `BGESmallENV15` | 384 | 512 tokens | 133,093,490 bytes (126.9 MiB) |
+| `BGEBaseENV15Q` | 768 | 512 tokens | 217,824,172 bytes (207.7 MiB) |
+
+`NomicEmbedTextV15Q` is the standard default's model, int8-quantized, with
+dimensions and context unchanged; `BGESmallENV15Q` is the smallest download.
+For every 512-token candidate the offer also renders this warning verbatim:
+
+> This model's context is 512 tokens. About 6% of the items in a measured reference store exceed that and would be embedded truncated — silently, and permanently for those items.
+
+The precise figure behind that "about 6%" is 6.08% (18 of 296) of the
+reference store's memories exceeding 512 tokens.
+
+#### Measured example figures
+
+Measured on a 7.9 GiB CPU-only VM against a ~1,400-memory store, 2026-11, on a development build; your figures will differ. These are example figures
+from one machine, not a ranking of the candidates.
+
+- **Resident memory:** after a batch, `NomicEmbedTextV15Q` ran at 330/332 MiB
+  against the FP32 default's 947/938 MiB — a measured saving of 606 MiB (the
+  smaller of two paired deltas, 617 MiB and 606 MiB).
+- **Embedding drift (60 texts):** FP32-to-quantized mean cosine
+  0.948 for `NomicEmbedTextV15Q`; top-5 overlap against FP32 was 0.873 for
+  `NomicEmbedTextV15Q` and 0.667 for `BGESmallENV15Q`.
+- **Recall (30 blind-judged queries):** FP32 22/30,
+  `NomicEmbedTextV15Q` 23/30. The one-query difference sits well inside the
+  ±0.214 noise band, so it is not evidence that either model recalls better.
+- **Not measured:** `SnowflakeArcticEmbedMQ` — resident memory and recall
+  were not measured. `BGESmallENV15Q` — resident memory was not measured.
+  `BGESmallENV15` and `BGEBaseENV15Q` — neither resident memory nor quality
+  was measured.
+
+#### How the configured model is resolved
+
+Resolution is unchanged by the setup choice; it is stated here because it is
+what makes the choice durable. Each process resolves its model in this order:
+
+1. `NEUROSTRATA_MODEL`, when it names an entry in the acceptable-embedder
+   list (case-insensitively). A value that names no acceptable entry is
+   ignored and resolution falls through — it is not an error.
+2. The first entry of `embedders.json` — the user-edited file, in which a
+   setup pick is written first.
+3. The built-in default (`NomicEmbedTextV15`) — used when the file is absent
+   or an empty list, and as the in-memory fallback when the file cannot be
+   parsed.
+
+#### Idle unload (develop branch only)
+
+`NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS` is a capability of the develop
+branch; it is not a feature of this build, and setting it here has no effect.
+On the develop branch it unloads the embedder session after that many seconds
+idle; the session is dropped and reloaded on the next embedding access rather
+than by a timer while the daemon sits idle. Unset or `0` means off. To use it
+there, the variable must be set in the environment of the path that starts
+the daemon — setting it in a client shell afterwards changes nothing — and a
+running daemon's setting can be checked by inspecting the daemon process's
+environment (on Linux, its `/proc/<pid>/environ`). Honestly: measured in
+2026-11 on a development build, in the same measurement series as the figures
+above, it released no resident memory while idle — drops of 0 MiB and −1 MiB
+across two idle windows — and resident memory grew across reload cycles
+(921 MiB loaded, 1,637 MiB after the first reload, 2,263 MiB after the
+second).
+
+#### If `embedders.json` is corrupted
+
+If `embedders.json` is corrupted or otherwise unparseable, the loader falls
+back to the built-in default in memory without overwriting the file. If that
+default's identity differs from the model the store recorded, a store with
+recorded data then refuses to open under the different model identity. The
+store itself is undamaged. To recover: restore `embedders.json` with the store's recorded model as the first entry (an entry carrying `model_name` and
+`dimensions`, plus its `model_sha256` pin if the entry was setup-written),
+then start again. Backups and restores preserve the store's recorded model
+identity, so a restored store opens under the same model it was backed up
+with.
+
+---
+
+## Windows quirks
+
+None of this affects a Linux or macOS build.
+
+**Nothing is on `PATH`.** Visual Studio keeps `cl.exe`, CMake and Ninja inside
+its own tree, so none of them resolve on an ordinary shell even with the full
+C++ workload installed — a Developer Command Prompt is a different environment.
+`build.ps1` imports what `vcvars64.bat` produces rather than assembling `PATH`
+itself, since `cl.exe` also needs `INCLUDE`, `LIB` and `LIBPATH`.
+
+**CMake comes from Visual Studio.** VS 2026 bundles 4.3.1, and `vcvars64.bat`
+puts it on `PATH`, so that is normally the one used — it builds this fine. For
+a VS install without the CMake component, `build.ps1` also looks in
+`%USERPROFILE%\.local\tools\`, where an extracted zip needs no admin rights and
+no `PATH` change. `NEUROSTRATA_CMAKE` overrides both.
+
+**Ninja is required rather than optional**, because the `cmake` crate selects
+that generator here. Without it, configuration fails with `CMake was unable to
+find a build program corresponding to "Ninja"`. Visual Studio bundles one.
+
+**A debug build does not link.** `cargo build` without `--release` compiles the
+vendored C++ with full debug info, and the resulting static `lbug.lib` passes the
+4 GiB ceiling for a COFF image:
+
+```
+lbug.lib : fatal error LNK1248: image size (1000AA2B0) exceeds maximum allowable size (FFFFFFFF)
+```
+
+Release is unaffected — the same tree links to a 44.5 MB binary — so both scripts
+and all three workflows build release on Windows.
+
+**`-VcToolsVersion 14.44`** picks a specific toolset when several are installed.
+
+**`C1056: cannot update the time date stamp field`** on a single `.obj` is a
+file lock, characteristic of real-time antivirus rather than a toolchain
+problem. Ninja resumes on a re-run.
+
+## Runtime memory knobs
+
+- `NEUROSTRATA_EMBED_ARENA`: ONNX Runtime's CPU memory arena is disabled by default (`0` / unset) so transient embedding bursts release memory back to the OS instead of ratcheting up the resident set; set `NEUROSTRATA_EMBED_ARENA=1` (or `true`/`yes`/`on`) to opt back into the arena allocator (`neurostrata-igg4`).
+- `NEUROSTRATA_BUFFER_POOL_MB`: Caps the LadybugDB buffer pool in MiB (default `384`); set a positive integer to size the pool explicitly or `0` to use the engine's uncapped default. Any other value below the 128 MiB floor is raised to that floor, and an unparseable value is ignored in favour of the configured `storage_hygiene.buffer_pool_mb` value (`384` by default), which is then treated exactly like a directly set value (`0` stays uncapped, a value below the floor is raised to it) (`neurostrata-igg4`).
+- `NEUROSTRATA_PROFILE`, `NEUROSTRATA_RSS_LOG_MB` (default `50`, `0` disables per-call rows), and `NEUROSTRATA_RSS_SAMPLE_SECS` (default `600`, `0` disables periodic sampling) for opt-in `memory-growth.log` profiling (`neurostrata-igg4`).
