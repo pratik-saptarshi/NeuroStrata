@@ -26,13 +26,8 @@ pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v1"
 fn archived_flag(metadata: &serde_json::Value) -> i64 {
     match metadata.get("archived") {
         Some(v) if v.as_bool() == Some(true) => 1,
-        Some(v) => {
-            if v.as_i64().map(|n| n != 0).unwrap_or(false) {
-                1
-            } else {
-                0
-            }
-        }
+        Some(v) if v.as_i64().map(|n| n != 0).unwrap_or(false) => 1,
+        Some(_) => 0,
         None => 0,
     }
 }

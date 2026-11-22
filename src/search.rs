@@ -107,10 +107,8 @@ pub fn passes_filters(
     }
     if memory_type == "fact" {
         if let Some(shape) = &filters.fact_shape {
-            if !shape.is_empty() && shape != "any" {
-                if !fact_shape_matches(metadata, shape) {
-                    return false;
-                }
+            if !shape.is_empty() && shape != "any" && !fact_shape_matches(metadata, shape) {
+                return false;
             }
         }
     }

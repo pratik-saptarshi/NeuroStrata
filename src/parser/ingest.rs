@@ -630,19 +630,17 @@ fn run_producer(
 
         // Incremental skip: if this file's hash matches the previous active
         // generation, carry it forward instead of re-parsing/re-embedding.
-        if is_file {
-            if !force_reparse {
-                if let Some(prev_hash) = prev_file_map.get(&node_path) {
-                    if prev_hash == file_sha256.as_deref().unwrap_or("") {
-                        if let Some(obs) = &observer {
-                            obs.file_skipped(&path_str, "unchanged");
-                        }
-                        // Record the current hash so unchanged rows can be carried.
-                        if let Some(h) = file_sha256.as_deref() {
-                            current_hashes.insert(node_path.clone(), h.to_string());
-                        }
-                        continue;
+        if is_file && !force_reparse {
+            if let Some(prev_hash) = prev_file_map.get(&node_path) {
+                if prev_hash == file_sha256.as_deref().unwrap_or("") {
+                    if let Some(obs) = &observer {
+                        obs.file_skipped(&path_str, "unchanged");
                     }
+                    // Record the current hash so unchanged rows can be carried.
+                    if let Some(h) = file_sha256.as_deref() {
+                        current_hashes.insert(node_path.clone(), h.to_string());
+                    }
+                    continue;
                 }
             }
         }
@@ -4063,7 +4061,7 @@ pub async fn dry_run_directory(
                                 let mut cursor = tree_sitter::QueryCursor::new();
                                 let mut iter =
                                     cursor.matches(&q, tree.root_node(), content.as_bytes());
-                                while let Some(_) = iter.next() {
+                                while iter.next().is_some() {
                                     symbols += 1;
                                 }
                             }

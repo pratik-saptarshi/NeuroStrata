@@ -3162,28 +3162,25 @@ async fn handle_add_memory(
     // SHACL warnings on directory ingest and direct tool writes. If the
     // caller omitted source (or left it blank), backfill from the location
     // argument when it is usable, otherwise fall back to "agent".
-    if memory_type == "rule" {
-        if metadata
+    if memory_type == "rule"
+        && metadata
             .as_object()
             .map_or(true, |o| match o.get("source") {
                 None => true,
                 Some(Value::String(s)) => s.trim().is_empty(),
                 Some(_) => false,
             })
-        {
-            let resolved_source = if !location.is_empty() && location != "N/A" {
-                Some(location.clone())
-            } else {
-                None
-            };
-            if let Some(o) = metadata.as_object_mut() {
-                o.insert(
-                    "source".to_string(),
-                    serde_json::Value::String(
-                        resolved_source.unwrap_or_else(|| "agent".to_string()),
-                    ),
-                );
-            }
+    {
+        let resolved_source = if !location.is_empty() && location != "N/A" {
+            Some(location.clone())
+        } else {
+            None
+        };
+        if let Some(o) = metadata.as_object_mut() {
+            o.insert(
+                "source".to_string(),
+                serde_json::Value::String(resolved_source.unwrap_or_else(|| "agent".to_string())),
+            );
         }
     }
 

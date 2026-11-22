@@ -3001,10 +3001,7 @@ impl LadybugStore {
                     eprintln!(
                         "WARN: DB checksum config mismatch; reopening with checksums disabled."
                     );
-                    match Database::new(&local_path, unverified_config(limits)) {
-                        Ok(db) => db,
-                        Err(e2) => return Err(e2.into()),
-                    }
+                    Database::new(&local_path, unverified_config(limits))?
                 } else if !is_wal_integrity_failure(&err_msg) {
                     return Err(e.into());
                 } else {

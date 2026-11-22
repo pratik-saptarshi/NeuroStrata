@@ -530,10 +530,8 @@ fn test_f17_canonical_entity_slug() {
 /// Compute epistemic facets from a memory's metadata (F16).
 pub fn compute_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
-    if memory_type == "rule" {
-        if metadata.get("enforcement").is_some() {
-            out.push("enforced-rule".to_string());
-        }
+    if memory_type == "rule" && metadata.get("enforcement").is_some() {
+        out.push("enforced-rule".to_string());
     }
     if memory_type == "fact" {
         if let Some(attempt) = metadata.get("attempt") {
@@ -561,25 +559,23 @@ pub fn compute_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<St
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
+        && !out.contains(&"enforced-rule".to_string())
     {
-        if !out.contains(&"enforced-rule".to_string()) {
-            out.push("enforced-rule".to_string());
-        }
+        out.push("enforced-rule".to_string());
     }
-    if metadata.get("attempt_status").and_then(|v| v.as_str()) == Some("failed") {
-        if !out.contains(&"failed-attempt".to_string()) {
-            out.push("failed-attempt".to_string());
-        }
+    if metadata.get("attempt_status").and_then(|v| v.as_str()) == Some("failed")
+        && !out.contains(&"failed-attempt".to_string())
+    {
+        out.push("failed-attempt".to_string());
     }
     if metadata
         .get("decision_type")
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
+        && !out.contains(&"architecture-decision".to_string())
     {
-        if !out.contains(&"architecture-decision".to_string()) {
-            out.push("architecture-decision".to_string());
-        }
+        out.push("architecture-decision".to_string());
     }
     out
 }
@@ -595,16 +591,15 @@ pub struct InferredFacetEntry {
 /// Computes ONLY the rule/fact inferred facets (without copying metadata.facets).
 pub fn inferred_only_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
-    if memory_type == "rule" {
-        if metadata.get("enforcement").is_some()
+    if memory_type == "rule"
+        && (metadata.get("enforcement").is_some()
             || metadata
                 .get("rule_kind")
                 .and_then(|v| v.as_str())
                 .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        {
-            out.push("enforced-rule".to_string());
-        }
+                .unwrap_or(false))
+    {
+        out.push("enforced-rule".to_string());
     }
     if memory_type == "fact" {
         if let Some(attempt) = metadata.get("attempt") {

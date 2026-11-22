@@ -852,9 +852,7 @@ fn validate_parsed_record(
     // beside, not instead of, the served-namespace parity check below: a
     // peer's namespace must be a legal name before it matters whether this
     // node serves it.
-    if let Err(e) = crate::domain::validate_namespace(&record.namespace) {
-        return Err(e);
-    }
+    crate::domain::validate_namespace(&record.namespace)?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
@@ -2488,32 +2486,32 @@ async fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)
         if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-                    if path.to_string_lossy().ends_with(".bundle.zst") {
-                        // Local-only (git-ignored or untracked) bundles
-                        // never replay; tracked bundles are the transport.
-                        let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
-                        if !tracked_bundles.contains(rel) {
+                if path.extension().and_then(|e| e.to_str()) == Some("zst")
+                    && path.to_string_lossy().ends_with(".bundle.zst")
+                {
+                    // Local-only (git-ignored or untracked) bundles
+                    // never replay; tracked bundles are the transport.
+                    let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
+                    if !tracked_bundles.contains(rel) {
+                        tracing::debug!(
+                            "mesh bundle {} is local-only (not tracked) — skipped",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    match read_compressed_bundle(&path) {
+                        Ok(records) => {
                             tracing::debug!(
-                                "mesh bundle {} is local-only (not tracked) — skipped",
-                                path.display()
+                                "mesh bundle {} decoded: {} record(s)",
+                                path.display(),
+                                records.len()
                             );
-                            continue;
+                            for record in records {
+                                bundled_records.push((path.clone(), record));
+                            }
                         }
-                        match read_compressed_bundle(&path) {
-                            Ok(records) => {
-                                tracing::debug!(
-                                    "mesh bundle {} decoded: {} record(s)",
-                                    path.display(),
-                                    records.len()
-                                );
-                                for record in records {
-                                    bundled_records.push((path.clone(), record));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
-                            }
+                        Err(e) => {
+                            tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
                         }
                     }
                 }

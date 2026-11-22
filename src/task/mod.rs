@@ -3068,12 +3068,10 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
         if pc_content.contains("NeuroStrata pre-commit hook")
             && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK
+            && std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
+            && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
         {
-            if std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
-                && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
-            {
-                set_executable(&pre_commit_target);
-            }
+            set_executable(&pre_commit_target);
         }
     }
     let repo_scripts_hooks = root.join("scripts/hooks");
