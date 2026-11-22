@@ -3366,7 +3366,8 @@ impl LadybugStore {
             })?,
             Err(_) => {
                 eprintln!(
-                    "DIAGNOSTIC: publication exceeded its {}s deadline; waiting for its transaction to commit or roll back before reporting an outcome -- engine: {}",
+                    "DIAGNOSTIC: {} exceeded its {}s deadline; waiting for its transaction to commit or roll back before reporting an outcome -- engine: {}",
+                    what,
                     deadline.as_secs(),
                     engine_stats()
                 );
