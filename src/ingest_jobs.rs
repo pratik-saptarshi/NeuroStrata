@@ -269,7 +269,7 @@ impl IngestJobs {
         // Poison disposition (this fn returns bool, so the error cannot
         // propagate): a suspect registry cannot confirm idle, so the
         // answer is false, with the failure logged.
-        let receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
+        let _receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
             Ok(jobs) => jobs.values().cloned().collect(),
             Err(e) => {
                 tracing::error!(error = %e, "ingest jobs lock poisoned; cannot confirm idle");

@@ -1026,11 +1026,6 @@ async fn search_inner(
             //
             // ORDER BY dist ASC, id ASC gives deterministic tie-breaking so the
             // same query returns the same rows across runs.
-            let structural_types = STRUCTURAL_MEMORY_TYPES
-                .iter()
-                .map(|t| format!("'{}'", t))
-                .collect::<Vec<_>>()
-                .join(", ");
 
             // Build the row-class filter for the base query.
             // We exclude tasks, archived, and mesh-conflicting rows HERE so they
@@ -1114,8 +1109,6 @@ async fn search_inner(
                 let n = access_count.max(0) as f32;
                 let gain = 0.05 * (1.0 + n).ln();
                 let source_gain = if crate::traits::has_source(&metadata_val) { SOURCE_RANK_GAIN } else { 0.0 };
-                let capped_gain = (gain + source_gain).min(0.5 * distance);
-                let boosted_distance = distance - capped_gain;
                 let feedback_gain = metadata_val
                     .get("feedback_score")
                     .and_then(|v| v.as_f64())
@@ -6030,8 +6023,6 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
-        // Parse shape warnings from the ORIGINAL payload before the write.
-        let shape_warnings = write_shape_warnings(&payload);
         let pk_ready = self.pk_ready();
         // AC3: canonicalize resolvable targets at write time via KnownIds::resolve.
         // Fetch known symbol ids for this namespace and rewrite unqualified edge
@@ -8404,7 +8395,6 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[6]);
                 let metadata_str: String = format!("{}", row[7]);
 
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
                 let metadata_val: Value = match serde_json::from_str(&metadata_str) {
                     Ok(v) => v,
                     Err(e) => {
@@ -8452,7 +8442,7 @@ impl VectorStore for LadybugStore {
             // With the pk column present the row is addressed by its
             // derived pk (bound, B1); legacy mode keeps the (namespace,
             // id) property match.
-            let mut result = if pk_ready {
+            let _result = if pk_ready {
                 let mut stmt = conn.prepare(
                     "MATCH (m:Memory {pk: $pk}) RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
                 )?;
@@ -8494,7 +8484,6 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[6]);
                 let metadata_str: String = format!("{}", row[7]);
 
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
                 let metadata_val: Value = match serde_json::from_str(&metadata_str) {
                     Ok(v) => v,
                     Err(e) => {
@@ -9014,7 +9003,6 @@ fn edge_hits_from_rows(
         let id = format!("{}", row[1]);
         let content = format!("{}", row[2]);
         let memory_type = format!("{}", row[3]);
-        let metadata: Value = serde_json::from_str(&format!("{}", row[4])).unwrap_or(Value::Null);
         let metadata_str = format!("{}", row[4]);
         let metadata: Value = match serde_json::from_str(&metadata_str) {
             Ok(v) => v,
@@ -9254,7 +9242,6 @@ fn add_metadata_fallback_conn(
         let id = format!("{}", row[0]);
         let content = format!("{}", row[1]);
         let memory_type = format!("{}", row[2]);
-        let metadata: Value = serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
         let metadata_str = format!("{}", row[3]);
         let metadata: Value = match serde_json::from_str(&metadata_str) {
             Ok(v) => v,
@@ -9556,7 +9543,6 @@ fn fetch_related_subgraph(
         let id = format!("{}", row[0]);
         let memory_type = format!("{}", row[1]);
         let content = format!("{}", row[2]);
-        let metadata: Value = serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
         let metadata_str = format!("{}", row[3]);
         let metadata: Value = match serde_json::from_str(&metadata_str) {
             Ok(v) => v,
@@ -9588,8 +9574,6 @@ fn fetch_related_subgraph(
             let id = format!("{}", row[0]);
             let memory_type = format!("{}", row[1]);
             let content = format!("{}", row[2]);
-            let metadata: Value =
-                serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
             let metadata_str = format!("{}", row[3]);
             let metadata: Value = match serde_json::from_str(&metadata_str) {
                 Ok(v) => v,
@@ -9660,10 +9644,6 @@ fn fetch_related_subgraph(
                 let frontier_id = format!("{}", row[0]);
                 let relation = format!("{}", row[1]);
                 let neighbor_id = format!("{}", row[2]);
-                let neighbor_type = format!("{}", row[3]);
-                let neighbor_content = format!("{}", row[4]);
-                let neighbor_meta: Value =
-                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
                 if !allowed.contains(relation.as_str()) {
                     continue;
                 }
@@ -9726,10 +9706,6 @@ fn fetch_related_subgraph(
                 let frontier_id = format!("{}", row[0]);
                 let relation = format!("{}", row[1]);
                 let neighbor_id = format!("{}", row[2]);
-                let neighbor_type = format!("{}", row[3]);
-                let neighbor_content = format!("{}", row[4]);
-                let neighbor_meta: Value =
-                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
                 if !allowed.contains(relation.as_str()) {
                     continue;
                 }
@@ -10529,7 +10505,6 @@ impl crate::traits::IntakeStore for LadybugStore {
         };
 
         // Serialize detected intents for storage
-        let intents_json = serde_json::to_string(&detected_intents).unwrap_or_default();
         let intents_json = match serde_json::to_string(&detected_intents) {
             Ok(s) => s,
             Err(e) => {
@@ -10732,12 +10707,6 @@ impl crate::traits::IntakeStore for LadybugStore {
                 .and_then(|row| format!("{}", row[0]).parse().ok())
                 .unwrap_or(0);
 
-            // Get paginated results
-            let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at ORDER BY c.created_at DESC LIMIT {} OFFSET {}",
-                where_clause, limit, offset
-            );
-            let mut results: Vec<crate::task::intake::IntakeCandidate> = Vec::new();
             if limit == 0 {
                 return Ok(crate::task::intake::IntakeListResponse {
                     namespace: namespace.clone(),

@@ -5237,8 +5237,6 @@ async fn run() -> anyhow::Result<()> {
                     if daemon_holds_lock(&db_path) {
                         saw_lock = true;
                     } else if saw_lock {
-                        let report =
-                            std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
                         let report = match std::fs::read_to_string(daemon_lock_path(&db_path)) {
                             Ok(report) => report,
                             Err(e) => {
@@ -5801,7 +5799,7 @@ async fn run() -> anyhow::Result<()> {
             }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
-                    let root = git_toplevel()
+                    let _root = git_toplevel()
                         .or_else(|| std::env::current_dir().ok())
                         .unwrap();
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
@@ -5841,7 +5839,7 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 HooksCommands::InstallPreCommit => {
-                    let root = git_toplevel()
+                    let _root = git_toplevel()
                         .or_else(|| std::env::current_dir().ok())
                         .unwrap();
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
@@ -5958,7 +5956,6 @@ async fn run() -> anyhow::Result<()> {
                             .expect("export graph target resolved before daemon dispatch");
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
                         // AW-A2: `--source-id <id>` on the CLI scopes the
                         // export just like the env var it falls back to.
                         let source_id = cli_source_id
@@ -6384,7 +6381,6 @@ async fn run() -> anyhow::Result<()> {
                         // the search and snapshot read surfaces use.
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
                         // AW-A2: `--source-id <id>` on the CLI scopes the
                         // export just like the env var it falls back to.
                         let source_id = cli_source_id
