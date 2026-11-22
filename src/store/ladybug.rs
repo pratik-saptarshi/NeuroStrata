@@ -431,7 +431,7 @@ fn has_ingest_stage_lease(db_path: &Path, aliases: &[PathBuf], namespace: &str) 
 }
 
 fn read_stage_provenance(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut rows = match conn
+    let rows = match conn
         .query("MATCH (s:IngestStage) RETURN s.namespace, s.generation ORDER BY s.namespace")
     {
         Ok(rows) => rows,
@@ -441,7 +441,7 @@ fn read_stage_provenance(conn: &Connection) -> Result<Vec<(String, String)>> {
         Err(error) => return Err(error.into()),
     };
     let mut stages = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         let namespace = format!("{}", row[0]);
         let generation = format!("{}", row[1]);
         let valid = namespace
@@ -475,13 +475,13 @@ fn read_hidden_stage_namespaces(
             continue;
         }
         let safe = escape_ladybug_string(&namespace);
-        let mut rows = conn.query(&format!(
+        let rows = conn.query(&format!(
             "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.user_id",
             safe
         ))?;
         let mut found = false;
         let mut owned = true;
-        while let Some(row) = rows.next() {
+        for row in rows {
             found = true;
             let id = format!("{}", row[0]);
             let user_id = format!("{}", row[1]);
@@ -553,12 +553,12 @@ fn migrate_legacy_stages_at_snapshot_cut(
         conn.query("BEGIN TRANSACTION")?;
         let result = (|| -> Result<bool> {
             let safe = escape_ladybug_string(&namespace);
-            let mut rows = conn.query(&format!(
+            let rows = conn.query(&format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.user_id",
                 safe
             ))?;
             let mut found = false;
-            while let Some(row) = rows.next() {
+            for row in rows {
                 found = true;
                 let id = format!("{}", row[0]);
                 let user_id = format!("{}", row[1]);
@@ -2055,13 +2055,13 @@ fn parse_width_marker(path: &Path, bytes: &[u8]) -> Result<EmbeddingMarker> {
 
 fn persisted_embedding_width(db: &Database) -> Result<Option<usize>> {
     let conn = Connection::new(db)?;
-    let mut rows = match conn.query("CALL table_info('Memory') RETURN *") {
+    let rows = match conn.query("CALL table_info('Memory') RETURN *") {
         Ok(rows) => rows,
         Err(error) if error.to_string().contains("does not exist in catalog") => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let mut has_properties = false;
-    while let Some(row) = rows.next() {
+    for row in rows {
         has_properties = true;
         if format!("{}", row[1]) != "embedding" {
             continue;
@@ -2657,12 +2657,12 @@ impl LadybugStore {
                     conn.query("BEGIN TRANSACTION")?;
                     let result = (|| -> Result<bool> {
                         let safe = escape_ladybug_string(&namespace);
-                        let mut rows = conn.query(&format!(
+                        let rows = conn.query(&format!(
                             "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.user_id",
                             safe
                         ))?;
                         let mut found = false;
-                        while let Some(row) = rows.next() {
+                        for row in rows {
                             found = true;
                             let id = format!("{}", row[0]);
                             let user_id = format!("{}", row[1]);
@@ -4572,10 +4572,10 @@ impl LadybugStore {
                 "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.metadata",
                 escape_ladybug_string(&namespace)
             );
-            let mut res = conn.query(&query)?;
+            let res = conn.query(&query)?;
             let mut rows: Vec<(String, String)> = Vec::new();
             let now = chrono::Utc::now().timestamp();
-            while let Some(row) = res.next() {
+            for row in res {
                 let id = if let lbug::Value::String(s) = &row[0] {
                     s.clone()
                 } else {
@@ -4718,10 +4718,10 @@ impl LadybugStore {
         self.write_with_deadline("repairing namespace hygiene", move |conn| {
             let safe = crate::store::ladybug::escape_ladybug_string(&namespace);
             let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata", safe);
-            let mut res = conn.query(&query)?;
+            let res = conn.query(&query)?;
             let mut known_ids = std::collections::HashSet::new();
             let mut rows = Vec::new();
-            while let Some(row) = res.next() {
+            for row in res {
                 let id = format!("{}", row[0]);
                 let mtype = format!("{}", row[1]);
                 let loc = format!("{}", row[2]);
@@ -5805,7 +5805,7 @@ impl VectorStore for LadybugStore {
             if let Ok(mut rows) = conn.query(
                 "MATCH (m:Memory) WHERE m.namespace IS NULL RETURN m.id, m.metadata",
             ) {
-                while let Some(row) = rows.next() {
+                for row in rows.by_ref() {
                     orphans.push((format!("{}", row[0]), format!("{}", row[1])));
                 }
             }
@@ -5874,7 +5874,7 @@ impl VectorStore for LadybugStore {
                     if let Ok(mut rows) = conn.query(
                         "MATCH (m:Memory) WHERE m.namespace IS NOT NULL RETURN m.id, m.namespace, m.pk",
                     ) {
-                        while let Some(row) = rows.next() {
+                        for row in rows.by_ref() {
                             let row_id = format!("{}", row[0]);
                             let row_ns = format!("{}", row[1]);
                             let row_pk = format!("{}", row[2]);
@@ -8052,7 +8052,7 @@ impl VectorStore for LadybugStore {
                         safe_stage_namespace
                     ))?;
                     let mut page = Vec::with_capacity(128);
-                    while let Some(row) = staged.next() {
+                    for row in staged.by_ref() {
                         page.push((format!("{}", row[0]), format!("{}", row[1])));
                     }
                     drop(staged);
@@ -8125,13 +8125,13 @@ impl VectorStore for LadybugStore {
 
                 // Re-read declarations inside the transaction so the new nodes
                 // and the rules that point at them become visible together.
-                let mut memories = conn.query(&format!(
+                let memories = conn.query(&format!(
                     "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.user_id, m.metadata",
                     safe_namespace
                 ))?;
                 let mut edge_rows = Vec::new();
                 let mut known_ids = Vec::new();
-                while let Some(row) = memories.next() {
+                for row in memories {
                     let id = format!("{}", row[0]);
                     let user_id = format!("{}", row[1]);
                     let metadata_text = format!("{}", row[2]);
@@ -8344,9 +8344,9 @@ impl VectorStore for LadybugStore {
                 "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' RETURN m.id",
                 escape_ladybug_string(&prefix)
             );
-            let mut rows = conn.query(&query)?;
+            let rows = conn.query(&query)?;
             let mut ids = Vec::new();
-            while let Some(row) = rows.next() {
+            for row in rows {
                 ids.push(format!("{}", row[0]));
             }
             Ok(ids)
@@ -8548,10 +8548,10 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let hidden_stages = read_hidden_stage_namespaces(conn, &db_path, &path_aliases)?;
             let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
-            let mut result = conn.query(query)?;
+            let result = conn.query(query)?;
 
             let mut namespaces = Vec::new();
-            while let Some(row) = result.next() {
+            for row in result {
                 if let lbug::Value::String(ns) = row[0].clone() {
                     if !hidden_stages.contains(&ns) {
                         namespaces.push(ns);
@@ -8591,9 +8591,9 @@ impl VectorStore for LadybugStore {
             let mut exported_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let active_gens = all_active_generations(conn);
             let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
-            let mut result_nodes = conn.query(query_nodes)?;
+            let result_nodes = conn.query(query_nodes)?;
 
-            while let Some(row) = result_nodes.next() {
+            for row in result_nodes {
                 let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
                 if hidden_stage_namespaces.contains(&namespace) {
@@ -8698,8 +8698,8 @@ impl VectorStore for LadybugStore {
 
             // RELATES_TO
             let query_relates = "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id;";
-            let mut res_relates = conn.query(query_relates)?;
-            while let Some(row) = res_relates.next() {
+            let res_relates = conn.query(query_relates)?;
+            for row in res_relates {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
@@ -8717,8 +8717,8 @@ impl VectorStore for LadybugStore {
 
             // CONTAINS
             let query_contains = "MATCH (a:Memory)-[r:CONTAINS]->(b:Memory) RETURN a.id, b.id;";
-            let mut res_contains = conn.query(query_contains)?;
-            while let Some(row) = res_contains.next() {
+            let res_contains = conn.query(query_contains)?;
+            for row in res_contains {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
@@ -8736,8 +8736,8 @@ impl VectorStore for LadybugStore {
 
             // GOVERNS
             let query_governs = "MATCH (a:Memory)-[r:GOVERNS]->(b:Memory) RETURN a.id, b.id;";
-            let mut res_governs = conn.query(query_governs)?;
-            while let Some(row) = res_governs.next() {
+            let res_governs = conn.query(query_governs)?;
+            for row in res_governs {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
@@ -8949,9 +8949,9 @@ fn retire_replaced_stubs(
         "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.agent_name = 'neurostrata-stub' RETURN m.id",
         escape_ladybug_string(namespace)
     );
-    let mut rows = conn.query(&query)?;
+    let rows = conn.query(&query)?;
     let mut stubs = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         let id = format!("{}", row[0]);
         let path = crate::parser::ingest::logical_path_of(&id);
         if active_paths.contains(path) {
@@ -9007,9 +9007,9 @@ fn edge_hits_from_rows(
     edge_name: &str,
 ) -> Result<Vec<MemoryHit>> {
     let now = chrono::Utc::now().timestamp();
-    let mut rows = conn.query(query)?;
+    let rows = conn.query(query)?;
     let mut hits = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         let target_id = format!("{}", row[0]);
         let id = format!("{}", row[1]);
         let content = format!("{}", row[2]);
@@ -9174,8 +9174,8 @@ fn discover_candidates(
         "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id",
         safe_ns, safe_path
     );
-    let mut rows = conn.query(&query)?;
-    while let Some(row) = rows.next() {
+    let rows = conn.query(&query)?;
+    for row in rows {
         let id = format!("{}", row[0]);
         if !is_active_id(&id, active_gens) {
             continue;
@@ -9196,8 +9196,8 @@ fn discover_candidates(
             "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type = 'directory' RETURN m.id, m.location",
             safe_ns
         );
-        let mut rows = conn.query(&dir_query)?;
-        while let Some(row) = rows.next() {
+        let rows = conn.query(&dir_query)?;
+        for row in rows {
             let id = format!("{}", row[0]);
             if !is_active_id(&id, active_gens) {
                 continue;
@@ -9249,8 +9249,8 @@ fn add_metadata_fallback_conn(
         where_clause
     );
     let now = chrono::Utc::now().timestamp();
-    let mut rows = conn.query(&query)?;
-    while let Some(row) = rows.next() {
+    let rows = conn.query(&query)?;
+    for row in rows {
         let id = format!("{}", row[0]);
         let content = format!("{}", row[1]);
         let memory_type = format!("{}", row[2]);
@@ -9581,10 +9581,10 @@ fn fetch_related_subgraph(
             safe_ns,
             escape_ladybug_string(&normalized)
         );
-        let mut rows = conn.query(&loc_q)?;
+        let rows = conn.query(&loc_q)?;
         // Prefer the file node over a symbol over any other row.
         let mut candidate: Option<(String, String, String, Value)> = None;
-        while let Some(row) = rows.next() {
+        for row in rows {
             let id = format!("{}", row[0]);
             let memory_type = format!("{}", row[1]);
             let content = format!("{}", row[2]);
@@ -9655,8 +9655,8 @@ fn fetch_related_subgraph(
             id_list, ns_filter, RELATED_FETCH_LIMIT
         );
         {
-            let mut rows = conn.query(&out_q)?;
-            while let Some(row) = rows.next() {
+            let rows = conn.query(&out_q)?;
+            for row in rows {
                 let frontier_id = format!("{}", row[0]);
                 let relation = format!("{}", row[1]);
                 let neighbor_id = format!("{}", row[2]);
@@ -9721,8 +9721,8 @@ fn fetch_related_subgraph(
             id_list, ns_filter, RELATED_FETCH_LIMIT
         );
         {
-            let mut rows = conn.query(&in_q)?;
-            while let Some(row) = rows.next() {
+            let rows = conn.query(&in_q)?;
+            for row in rows {
                 let frontier_id = format!("{}", row[0]);
                 let relation = format!("{}", row[1]);
                 let neighbor_id = format!("{}", row[2]);
@@ -9911,9 +9911,9 @@ impl LadybugStore {
                             ),
                             _ => unreachable!(),
                         };
-                        let mut res = conn.query(&query)?;
+                        let res = conn.query(&query)?;
                         let mut rows_seen = 0usize;
-                        while let Some(row) = res.next() {
+                        for row in res {
                             rows_seen += 1;
                             let id = Self::cell_string(&row[0]);
                             let metadata = Self::cell_metadata(&row[3]);
@@ -9965,8 +9965,8 @@ impl LadybugStore {
                     let query = format!(
                         "MATCH (m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.metadata LIMIT {row_limit}"
                     );
-                    let mut res = conn.query(&query)?;
-                    while let Some(row) = res.next() {
+                    let res = conn.query(&query)?;
+                    for row in res {
                         let id = Self::cell_string(&row[0]);
                         let metadata = Self::cell_metadata(&row[1]);
                         if let Some(by) = metadata
@@ -10111,9 +10111,9 @@ impl LadybugStore {
             let symbol_query = format!(
                 "MATCH (s:Memory) WHERE s.namespace = '{safe_ns}' AND (s.location = '{safe_path}' OR s.location STARTS WITH '{safe_path}#') RETURN s.id, s.content, s.memory_type, s.location, s.metadata LIMIT {row_limit}"
             );
-            let mut res = conn.query(&symbol_query)?;
+            let res = conn.query(&symbol_query)?;
             let mut rows_seen = 0usize;
-            while let Some(row) = res.next() {
+            for row in res {
                 rows_seen += 1;
                 let id = Self::cell_string(&row[0]);
                 let raw_content = Self::cell_string(&row[1]);
@@ -10180,8 +10180,8 @@ impl LadybugStore {
             let file_query = format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location = '{safe_path}' RETURN m.id, m.metadata LIMIT {row_limit}"
             );
-            let mut res = conn.query(&file_query)?;
-            while let Some(row) = res.next() {
+            let res = conn.query(&file_query)?;
+            for row in res {
                 let id = Self::cell_string(&row[0]);
                 let meta = Self::cell_metadata(&row[1]);
                 if !is_visible(&id, &meta) || symbol_ids.contains(&id) {
@@ -10237,9 +10237,9 @@ impl LadybugStore {
                 let callee_query = format!(
                     "MATCH (s:Memory)-[:DEPENDS_ON]->(t:Memory) WHERE s.id IN [{sym_list}] AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata LIMIT {row_limit}"
                 );
-                let mut res = conn.query(&callee_query)?;
+                let res = conn.query(&callee_query)?;
                 let mut rows_seen = 0usize;
-                while let Some(row) = res.next() {
+                for row in res {
                     rows_seen += 1;
                     let id = Self::cell_string(&row[0]);
                     let meta = Self::cell_metadata(&row[3]);
@@ -10290,9 +10290,9 @@ impl LadybugStore {
                 let caller_query = format!(
                     "MATCH (c:Memory)-[:DEPENDS_ON]->(s:Memory) WHERE s.id IN [{sym_list}] AND c.namespace = '{safe_ns}' RETURN c.id, c.content, c.memory_type, c.metadata LIMIT {row_limit}"
                 );
-                let mut res = conn.query(&caller_query)?;
+                let res = conn.query(&caller_query)?;
                 let mut rows_seen = 0usize;
-                while let Some(row) = res.next() {
+                for row in res {
                     rows_seen += 1;
                     let id = Self::cell_string(&row[0]);
                     let meta = Self::cell_metadata(&row[3]);
@@ -10352,9 +10352,9 @@ impl LadybugStore {
             let edge_importer_query = format!(
                 "MATCH (m:Memory)-[:DEPENDS_ON]->(f:Memory) WHERE f.id IN [{file_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.location, m.memory_type, m.metadata LIMIT {row_limit}"
             );
-            let mut res = conn.query(&edge_importer_query)?;
+            let res = conn.query(&edge_importer_query)?;
             let mut rows_seen = 0usize;
-            while let Some(row) = res.next() {
+            for row in res {
                 rows_seen += 1;
                 let id = Self::cell_string(&row[0]);
                 let meta = Self::cell_metadata(&row[3]);
@@ -10409,9 +10409,9 @@ impl LadybugStore {
             let fallback_importer_query = format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.metadata CONTAINS '{safe_path}' RETURN m.id, m.location, m.memory_type, m.metadata LIMIT {row_limit}"
             );
-            let mut res = conn.query(&fallback_importer_query)?;
+            let res = conn.query(&fallback_importer_query)?;
             let mut rows_seen = 0usize;
-            while let Some(row) = res.next() {
+            for row in res {
                 rows_seen += 1;
                 let id = Self::cell_string(&row[0]);
                 let meta = Self::cell_metadata(&row[3]);
@@ -11338,8 +11338,8 @@ fn bind_row_namespace(conn: &Connection, id: &str, preferred: &str) -> RowBind {
     );
     let mut namespaces = Vec::new();
     match conn.query(&query) {
-        Ok(mut rows) => {
-            while let Some(row) = rows.next() {
+        Ok(rows) => {
+            for row in rows {
                 namespaces.push(format!("{}", row[0]));
             }
         }
@@ -11376,12 +11376,12 @@ fn resolve_target_on_write(
         escape_ladybug_string(namespace),
         candidates
     );
-    let mut rows = match conn.query(&query) {
+    let rows = match conn.query(&query) {
         Ok(rows) => rows,
         Err(e) => return crate::traits::TargetResolution::Failed(e.to_string()),
     };
     let mut found = Vec::new();
-    while let Some(row) = rows.next() {
+    for row in rows {
         found.push(format!("{}", row[0]));
     }
     pick_declared_target(namespace, active_gen, declared, &found)
@@ -23839,7 +23839,7 @@ impl LadybugStore {
                         table, safe_ns, safe_ns
                     );
                     if let Ok(mut rows) = conn.query(&query) {
-                        while let Some(row) = rows.next() {
+                        for row in rows.by_ref() {
                             let from = format!("{}", row[0]);
                             let to = format!("{}", row[1]);
                             let source = match format!("{}", row[2]).as_str() {
