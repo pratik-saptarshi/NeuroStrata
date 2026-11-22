@@ -1413,7 +1413,7 @@ impl RemoteEmbedder {
         }
         let response = self
             .client
-            .post(&format!("{}/embeddings", self.base_url))
+            .post(format!("{}/embeddings", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({
                 "input": text,

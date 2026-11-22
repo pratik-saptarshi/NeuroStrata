@@ -703,7 +703,7 @@ pub fn execute_on_records(
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && payload.memory_type != "" {
                                     root_result = build_memory_node(
-                                        &id_str,
+                                        id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,

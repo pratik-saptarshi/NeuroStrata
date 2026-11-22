@@ -1215,7 +1215,7 @@ async fn search_inner(
             // would break the one-hop path the parent spec §4.2.3 depends on.
             if !primary_ids.is_empty() {
                 let id_list = primary_ids.iter()
-                    .map(|id| format!("'{}'", escape_ladybug_string(&id)))
+                    .map(|id| format!("'{}'", escape_ladybug_string(id)))
                     .collect::<Vec<_>>()
                     .join(", ");
 
@@ -6635,7 +6635,7 @@ impl VectorStore for LadybugStore {
                         }
                     }
                 };
-                if !crate::rdf::shacl::endpoint_role_allowed(&edge.rel_type, &payload.memory_type, &target_type) {
+                if !crate::rdf::shacl::endpoint_role_allowed(edge.rel_type, &payload.memory_type, &target_type) {
                     emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                         field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                         why: format!("endpoint role mismatch: {} (source={} target={})", edge.rel_type, payload.memory_type, target_type),
@@ -9428,7 +9428,7 @@ impl GraphRead for LadybugStore {
                     let adapter = crate::rdf::reasoning::ReasoningAdapter::new();
                     let mut expanded: Vec<String> = Vec::new();
                     for rel in relations {
-                        for r in adapter.expand_relations_for_search(&index, &rel) {
+                        for r in adapter.expand_relations_for_search(&index, rel) {
                             expanded_set.insert(r.clone());
                             expanded.push(r);
                         }
@@ -9872,7 +9872,7 @@ impl LadybugStore {
                 let now = chrono::Utc::now().timestamp();
                 let active_gens: std::collections::HashSet<u64> = match &source_str {
                     Some(s) => {
-                        let g = active_generation_of_source(conn, &ns, &s);
+                        let g = active_generation_of_source(conn, &ns, s);
                         if g > 0 {
                             [g].into_iter().collect()
                         } else {
@@ -9975,7 +9975,7 @@ impl LadybugStore {
                         {
                             if !by.is_empty()
                                 && !crate::registry::is_registry_row(&metadata)
-                                && is_active_id(&by, &active_gens)
+                                && is_active_id(by, &active_gens)
                                 && !seen.contains(by)
                             {
                                 let safe_by = escape_ladybug_string(by);

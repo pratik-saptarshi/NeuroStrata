@@ -356,11 +356,11 @@ impl TantivyLexicalIndex {
             .get("symbol")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        doc.add_text(self.symbol_f, &tokenize_code_for_tantivy(symbol_raw));
+        doc.add_text(self.symbol_f, tokenize_code_for_tantivy(symbol_raw));
         // Location: pre-tokenized.
         doc.add_text(
             self.location_f,
-            &tokenize_code_for_tantivy(&payload.location),
+            tokenize_code_for_tantivy(&payload.location),
         );
         doc.add_text(self.memory_type_f, &payload.memory_type);
         let valid_from: i64 = payload
@@ -461,10 +461,10 @@ impl TantivyLexicalIndex {
                     .get("symbol")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                doc.add_text(self.symbol_f, &tokenize_code_for_tantivy(symbol_raw));
+                doc.add_text(self.symbol_f, tokenize_code_for_tantivy(symbol_raw));
                 doc.add_text(
                     self.location_f,
-                    &tokenize_code_for_tantivy(&payload.location),
+                    tokenize_code_for_tantivy(&payload.location),
                 );
                 doc.add_text(self.memory_type_f, &payload.memory_type);
                 let valid_from: i64 = payload
