@@ -170,7 +170,14 @@ jobs:
       # is verified before it runs.
       #   leanprover/elan v4.2.4 = commit 227caca133724d5516bee25c2aeb3e609478f2d8
       #   elan-init.sh sha256 = a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+      # Upstream's Lean parity tests (tests/lean_parity_test.rs) hard-require
+      # `lake` on PATH: find_lake() panics when it is absent. Upstream's
+      # ci.yml installs the toolchain here; this mirrors that step. The
+      # hashFiles guard keeps the step inert on trees that predate the
+      # proofs/lean-toolchain pin (this branch's tree has no pin yet); on
+      # trees carrying the pin the step runs in full.
       - name: Install Lean 4 toolchain (elan)
+        if: hashFiles('proofs/lean-toolchain') != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -454,3 +461,52 @@ jobs:
       - name: Validate release-narrative references
         shell: bash
         run: bash scripts/check-release-references.sh
+
+  # Task 15a's scripted assertion for the release governance (J17),
+  # grep-level by design: release.yml must not grant contents: write at
+  # the top level (only its release job may), and every action in every
+  # workflow must be pinned to a full commit SHA. It is its own job -- a
+  # HARD gate, no continue-on-error -- because a governance regression
+  # must fail the run; riding in a report-only job (it originally sat in
+  # `fmt`) buries the signal inside a job that is expected to be red.
+  # Checkout and a shell are all it needs; no toolchain.
+  release-governance:
+    name: release governance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Release governance assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          top="$(awk '/^permissions:/{f=1} /^jobs:/{f=0} f' .github/workflows/release.yml)"
+          if printf '%s\n' "$top" | grep -q 'contents: *write'; then
+            echo "::error::release.yml grants contents: write at the top level; only the release job may."
+            exit 1
+          fi
+          if ! printf '%s\n' "$top" | grep -q 'contents: *read'; then
+            echo "::error::release.yml top-level permissions must default to contents: read."
+            exit 1
+          fi
+          # These two assertions pin the PR #24 P2 fix: release.yml is
+          # tag-push only because the build-provenance attestation derives
+          # from the workflow run's ref, so a dispatched run would sign
+          # provenance naming the dispatch ref rather than the built tag.
+          # A future sync that reintroduces a dispatch trigger or dispatch
+          # inputs must fail this gate loudly.
+          trig="$(awk '/^on:/{f=1} /^permissions:/{f=0} f' .github/workflows/release.yml | grep -v '^[[:space:]]*#')"
+          if printf '%s\n' "$trig" | grep -q 'workflow_dispatch'; then
+            echo "::error::release.yml must not declare a workflow_dispatch trigger; releases are tag-push only (attested provenance derives from the run ref, not the checkout)."
+            exit 1
+          fi
+          if grep -v '^[[:space:]]*#' .github/workflows/release.yml | grep -q 'inputs\.'; then
+            echo "::error::release.yml must not reference the inputs context; there are no dispatch inputs — the published tag is github.ref_name."
+            exit 1
+          fi
+          if grep -hE '^[[:space:]]*uses:' .github/workflows/*.yml | grep -vE '^[[:space:]]*uses:[[:space:]]*[^[:space:]@]+@[0-9a-f]{40}([[:space:]]|$)'; then
+            echo "::error::Every action in every workflow must be pinned to a full commit SHA (tag in a trailing comment)."
+            exit 1
+          fi
+          echo "release governance assertions passed"
