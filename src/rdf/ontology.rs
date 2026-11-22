@@ -1066,7 +1066,7 @@ impl OntologyIndex {
 
         for shape in &self.shacl_shapes {
             // Match shape to memory_type via targetClass (ns:Rule, ns:Procedure, ns:Task, etc.)
-            let shape_match = shape.target_class.as_deref().map_or(false, |tc| {
+            let shape_match = shape.target_class.as_deref().is_some_and(|tc| {
                 memory_type == tc.split('/').last().unwrap_or(&tc)
                     || memory_type.to_lowercase()
                         == tc.split('/').last().unwrap_or(&tc).to_lowercase()
@@ -1080,7 +1080,7 @@ impl OntologyIndex {
             if shape
                 .target_class
                 .as_deref()
-                .map_or(false, |tc| tc.ends_with("Memory"))
+                .is_some_and(|tc| tc.ends_with("Memory"))
                 || shape_match
             {
                 for (path, _) in &shape.property_constraints {

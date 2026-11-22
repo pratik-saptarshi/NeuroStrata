@@ -432,7 +432,7 @@ fn meets_high_entropy(token: &str) -> bool {
     if !(has_digit && has_letter) {
         return false;
     }
-    shannon_entropy_bits_per_char(token).map_or(false, |h| h >= 4.2)
+    shannon_entropy_bits_per_char(token).is_some_and(|h| h >= 4.2)
 }
 
 /// Shannon entropy of `s` in bits per character.

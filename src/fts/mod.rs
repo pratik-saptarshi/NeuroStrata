@@ -656,9 +656,9 @@ pub(crate) fn doc_visible(doc: &LexicalDoc, opts: &SearchOptions) -> bool {
 
 fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
     match as_of {
-        None => doc.valid_to.map_or(true, |v| v > 0 && v > now),
+        None => doc.valid_to.is_none_or(|v| v > 0 && v > now),
         Some(ts) => {
-            doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.map_or(true, |v| v > 0 && ts < v)
+            doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.is_none_or(|v| v > 0 && ts < v)
         }
     }
 }

@@ -607,7 +607,7 @@ pub fn cli_train(
                 if all {
                     collected.insert(id_str.clone());
                 } else {
-                    let in_scope = ns_val.map_or(true, |ns| ns == scope || ns.is_empty())
+                    let in_scope = ns_val.is_none_or(|ns| ns == scope || ns.is_empty())
                         || id_str.starts_with(&format!("{}::", scope));
                     if in_scope {
                         collected.insert(id_str.clone());

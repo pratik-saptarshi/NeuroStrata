@@ -187,7 +187,7 @@ pub fn validate_node_provenance(target: &str, prov: &NodeProvenance) -> Vec<Prov
             message: "valid_to < valid_from".to_string(),
         });
     }
-    if prov.source.as_ref().map_or(false, |s| s.trim().is_empty()) {
+    if prov.source.as_ref().is_some_and(|s| s.trim().is_empty()) {
         warnings.push(ProvenanceWarning {
             target: target.to_string(),
             field: "source".to_string(),

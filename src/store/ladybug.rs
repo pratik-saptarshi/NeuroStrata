@@ -1711,8 +1711,8 @@ async fn search_inner(
             // then expansions (OneHop/Governs2hop, EXPANSION_BASE_SCORE).
             // Within expansions, the admission order (co-occurrence DESC, family order) is preserved.
             results.sort_by(|a, b| {
-                let a_is_primary = a.evidence.as_ref().map_or(false, |evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
-                let b_is_primary = b.evidence.as_ref().map_or(false, |evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
+                let a_is_primary = a.evidence.as_ref().is_some_and(|evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
+                let b_is_primary = b.evidence.as_ref().is_some_and(|evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
                 match (a_is_primary, b_is_primary) {
                     (true, false) => std::cmp::Ordering::Less,
                     (false, true) => std::cmp::Ordering::Greater,
@@ -4783,11 +4783,11 @@ impl LadybugStore {
                     let task_meta = meta.get("task").cloned();
                     let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
                     let mut task_changed = false;
-                    if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
+                    if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).is_none_or(|s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
                         task_obj.insert("status".to_string(), serde_json::Value::String("open".to_string()));
                         task_changed = true;
                     }
-                    if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
+                    if task_obj.get("priority").is_none() || !task_obj.get("priority").is_some_and(|v| v.as_u64().is_some_and(|_| true)) {
                         task_obj.insert("priority".to_string(), serde_json::Value::Number(serde_json::Number::from(2)));
                         task_changed = true;
                     }
@@ -4795,7 +4795,7 @@ impl LadybugStore {
                         task_obj.insert("task_type".to_string(), serde_json::Value::String("task".to_string()));
                         task_changed = true;
                     }
-                    if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
+                    if task_changed || meta.get("task").is_none() || !meta.get("task").is_some_and(|v| v.is_object()) {
                         if let Some(obj) = meta.as_object_mut() {
                             obj.insert("task".to_string(), serde_json::Value::Object(task_obj));
                             shape_changed = true;

@@ -3163,14 +3163,11 @@ async fn handle_add_memory(
     // caller omitted source (or left it blank), backfill from the location
     // argument when it is usable, otherwise fall back to "agent".
     if memory_type == "rule" {
-        if metadata
-            .as_object()
-            .map_or(true, |o| match o.get("source") {
-                None => true,
-                Some(Value::String(s)) => s.trim().is_empty(),
-                Some(_) => false,
-            })
-        {
+        if metadata.as_object().is_none_or(|o| match o.get("source") {
+            None => true,
+            Some(Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        }) {
             let resolved_source = if !location.is_empty() && location != "N/A" {
                 Some(location.clone())
             } else {
@@ -7748,7 +7745,7 @@ async fn handle_search_memory(
                 let blended = 0.7 + 0.3 * lex.score;
                 let mut lex = lex;
                 lex.score = blended;
-                if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
+                if lex.evidence.as_ref().is_none_or(|e| e.is_empty()) {
                     lex.evidence = Some(vec![crate::traits::SearchEvidence {
                         kind: crate::traits::EvidenceKind::DirectMatch,
                         path: Vec::new(),

@@ -1793,9 +1793,7 @@ pub async fn handle_task_complete(
             if !meta
                 .get("extracted_from")
                 .and_then(|v| v.as_array())
-                .map_or(false, |arr| {
-                    arr.iter().any(|t| t.as_str() == Some(id.as_str()))
-                })
+                .is_some_and(|arr| arr.iter().any(|t| t.as_str() == Some(id.as_str())))
             {
                 match meta.get_mut("extracted_from") {
                     None => meta["extracted_from"] = json!([id.as_str()]),

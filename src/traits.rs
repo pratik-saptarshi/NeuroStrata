@@ -141,9 +141,9 @@ pub struct SearchEvidence {
 /// handler's access-count bump (server.rs). One definition, two callers,
 /// so they cannot drift.
 pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
-    evidence.as_ref().map_or(false, |evs| {
-        evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch)
-    })
+    evidence
+        .as_ref()
+        .is_some_and(|evs| evs.iter().any(|e| e.kind == EvidenceKind::DirectMatch))
 }
 
 /// How the domain filter affected the search results.
