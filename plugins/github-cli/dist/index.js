@@ -687,7 +687,9 @@ export const MUTATING_FILE_TOOLS = new Set([
     'patch_file',
     'apply_patch',
     'replace_string_in_file',
-    'insert_edit_into_file'
+    'insert_edit_into_file',
+    // Claude Code edits notebook cells with NotebookEdit (#333/B3).
+    'NotebookEdit'
 ]);
 export const SHELL_TOOLS = new Set([
     'bash',
@@ -2112,12 +2114,16 @@ function extractFilePath(args, altArgs, rawPatch) {
     return (asString(args.file_path) ??
         asString(args.filePath) ??
         asString(args.path) ??
+        asString(args.notebook_path) ??
         extractPatchPath(args.patchText ?? args.patch ?? args.diff ?? args.input) ??
         extractPatchPath(rawPatch) ??
+        // Codex CLI's PreToolUse hook sends apply_patch as {"command": "<patch>"}.
+        extractPatchPath(args.command) ??
         (altArgs
             ? (asString(altArgs.file_path) ??
                 asString(altArgs.filePath) ??
                 asString(altArgs.path) ??
+                asString(altArgs.notebook_path) ??
                 extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input))
             : undefined));
 }
@@ -2450,6 +2456,12 @@ const executeBeforeHandler = async (input) => {
     // demanding an active task for `git push` would be an unbreakable Catch-22).
     if (isMutatingTool(toolName)) {
         const payload = JSON.stringify(args);
+        // Same forwarding rule as the hook path: a raw patch string under
+        // `input` is the analysable surface (#333/B2 exec bridge).
+        const rawStringInput = typeof input?.input === 'string' && input.input.trim() !== ''
+            ? input.input
+            : null;
+        const guardPayload = rawStringInput ?? payload;
         const shellExempt = isZeroActionExemptShellPayload(toolName, payload);
         if (config.strictMode) {
             const call = {
@@ -2475,7 +2487,7 @@ const executeBeforeHandler = async (input) => {
                     active_task_id,
                     worktree,
                     action_type: toolName,
-                    payload,
+                    payload: guardPayload,
                     cwd,
                     is_mutating: !shellExempt,
                     use_sandbox: false,
@@ -2731,6 +2743,12 @@ export async function handleHookEvent(event) {
             }
             const callArgs = firstRecord(toolInput);
             const payload = JSON.stringify(callArgs);
+            // A raw-string tool input (Codex apply_patch) is discarded by
+            // firstRecord; forward the text itself so the daemon can scan the
+            // patch body instead of receiving "{}" (#333/B2).
+            const guardPayload = typeof toolInputRaw === 'string' && toolInputRaw.trim() !== ''
+                ? toolInputRaw
+                : payload;
             const shellExempt = isZeroActionExemptShellPayload(toolNameRaw, payload);
             if (config.strictMode) {
                 const projectRoot = effectiveProjectRoot(config);
@@ -2750,7 +2768,7 @@ export async function handleHookEvent(event) {
                         active_task_id,
                         worktree,
                         action_type: toolNameRaw,
-                        payload,
+                        payload: guardPayload,
                         cwd,
                         is_mutating: !shellExempt,
                         use_sandbox: false,
@@ -2796,9 +2814,10 @@ export async function handleHookEvent(event) {
         if (hookEventName === 'Stop' && transcript) {
             await onTurnEnd({ role: 'assistant', content: transcript });
         }
-        return {
-            hookSpecificOutput: { hookEventName, permissionDecision: 'allow' }
-        };
+        // Stop takes no permission decision. Codex CLI rejects a Stop reply that
+        // carries one and reports the hook as failed; `continue: true` is valid
+        // for both Claude Code and Codex (and matches the hermes/openclaw shims).
+        return { continue: true };
     }
     return { hookSpecificOutput: { hookEventName, permissionDecision: 'allow' } };
 }

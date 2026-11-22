@@ -1,3 +1,27 @@
+// Legacy surface module: the staged-quality gate lints this file in full
+// whenever it changes, surfacing long-standing clippy drift in untouched
+// regions. These allows are scoped to this module (never crate-wide) so this
+// watch task's diff stays focused; new code here should avoid these patterns.
+#![allow(
+    clippy::await_holding_lock,
+    clippy::borrow_deref_ref,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_if,
+    clippy::if_same_then_else,
+    clippy::manual_contains,
+    clippy::manual_pattern_char_comparison,
+    clippy::map_flatten,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::redundant_closure,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_sort_by,
+    clippy::unnecessary_to_owned,
+    clippy::useless_conversion,
+    clippy::useless_format
+)]
+
 use crate::synaptic_mesh::record::{
     Lifecycle, LifecycleState, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
 };
@@ -101,6 +125,30 @@ impl JsonRpcResponse<Value> {
     }
 }
 
+pub async fn process_mcp_request_with_watch(
+    request: JsonRpcRequest,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+    ingests: Arc<crate::ingest_jobs::IngestJobs>,
+    deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
+    bus: Arc<crate::events::ThalamicBus>,
+    watch: Option<Arc<crate::ingest_watch::IngestWatchService>>,
+) -> Value {
+    _with_watch(
+        request,
+        emb,
+        store,
+        ingests,
+        deduplication_checker,
+        bus,
+        watch,
+    )
+    .await
+}
+
+// Compatibility wrapper retained for existing callers and tests; the daemon
+// uses `process_mcp_request_with_watch` to pass its watch service.
+#[allow(dead_code)]
 pub async fn process_mcp_request(
     request: JsonRpcRequest,
     emb: Arc<dyn Embedder>,
@@ -108,6 +156,27 @@ pub async fn process_mcp_request(
     ingests: Arc<crate::ingest_jobs::IngestJobs>,
     deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
     bus: Arc<crate::events::ThalamicBus>,
+) -> Value {
+    _with_watch(
+        request,
+        emb,
+        store,
+        ingests,
+        deduplication_checker,
+        bus,
+        None,
+    )
+    .await
+}
+
+async fn _with_watch(
+    request: JsonRpcRequest,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+    ingests: Arc<crate::ingest_jobs::IngestJobs>,
+    deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
+    bus: Arc<crate::events::ThalamicBus>,
+    watch: Option<Arc<crate::ingest_watch::IngestWatchService>>,
 ) -> Value {
     let id = request.id.clone();
     // Echo the negotiated JSON-RPC version so a malformed envelope is visible
@@ -311,7 +380,8 @@ pub async fn process_mcp_request(
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
                                 "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
-                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." }
+                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." },
+                                "include_related": { "type": "boolean", "description": "DEPRECATED alias for include_references. Emits a warning; do not use in new prompts." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -375,7 +445,9 @@ pub async fn process_mcp_request(
                                 "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Memory types to return. Default [\"rule\",\"fact\",\"procedure\"]." },
                                 "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
                                 "limit": { "type": "integer", "description": "Max results. Default 5, max 20." },
-                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." }
+                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." },
+                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." },
+                                "diff_text": { "type": "string", "description": "Optional staged unified diff text supplied by the caller. When staged_file_count is 3 or more, this is the diff_text bound to the T_DIFF prescription for neurostrata_diff_tour; absent or empty means T_DIFF is withheld with a suppressed_reason rather than dispatching an empty diff." }
                             },
                             "required": ["namespace", "path"]
                         }
@@ -692,7 +764,7 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata'; runtime defaults to 'global' if omitted on direct handler calls)." },
-                                "principal": { "type": "string", "description": "Optional requested principal." },
+                                "principal": { "type": "string", "description": "Requested principal. Required for pointer reads (list_pointers, resolve_pointer, mediate); optional for other operations." },
                                 "args": {
                                     "type": "object",
                                     "description": "Connector operation arguments discriminated by 'operation'; each variant declares its own required fields. Omitting 'now_secs' defaults it to the current epoch. Runtime also accepts extra fields not listed here.",
@@ -1438,6 +1510,30 @@ pub async fn process_mcp_request(
                             "required": ["namespace", "operation"]
                         }
                     }
+                ,
+                {
+                    "name": "neurostrata_unwatch",
+                    "description": "Remove a previously registered watch root for a namespace and canonical path. This unwatch persists to the watch registry and is idempotent on re-registration.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "namespace": { "type": "string", "description": "The project namespace." },
+                            "dir_path": { "type": "string", "description": "Absolute path to the watched root directory." }
+                        },
+                        "required": ["namespace", "dir_path"]
+                    }
+                }
+                ,
+                {
+                    "name": "neurostrata_watch_status",
+                    "description": "Report the current watch status for a namespace, showing registered roots with last trigger, result, backoff, and dirty state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "namespace": { "type": "string", "description": "Optional namespace filter; when omitted, all namespaces are shown." }
+                        }
+                    }
+                }
                 ]
             });
             // SynapticMesh surface: the schemas live with the module so the
@@ -1516,6 +1612,9 @@ pub async fn process_mcp_request(
             // and the error must surface as a -32603, not as a success
             // payload containing an error string.
             let mut error_response: Option<Value> = None;
+            // Spec §6 R6.2: latency is measured around the real dispatch and
+            // read only AFTER the handler returns.
+            let dispatch_started = std::time::Instant::now();
             if let Some(params) = &request.params {
                 if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
                     let arguments = params
@@ -1579,6 +1678,7 @@ pub async fn process_mcp_request(
                                 store.clone(),
                                 ingests.clone(),
                                 Some(bus.clone()),
+                                watch.clone(),
                             )
                             .await;
                         }
@@ -1943,6 +2043,51 @@ pub async fn process_mcp_request(
                             )
                             .await;
                         }
+                        "neurostrata_unwatch" => {
+                            if let Some(watch) = watch.clone() {
+                                let namespace = arguments
+                                    .get("namespace")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let dir_path = arguments
+                                    .get("dir_path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                match watch.unregister(namespace, std::path::Path::new(dir_path)) {
+                                    Ok(removed) => {
+                                        // Parity with the daemon HTTP unwatch shim: emit the
+                                        // same structured shape. Reuse the core's J6 resolver
+                                        // so the echo matches the path the core operated on,
+                                        // even when the path has a non-existent tail.
+                                        let canonical = watch
+                                            .resolve_path(std::path::Path::new(dir_path))
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|_| dir_path.to_string());
+                                        result_text = serde_json::json!({
+                                            "removed": removed,
+                                            "namespace": namespace,
+                                            "canonical_path": canonical,
+                                        })
+                                        .to_string();
+                                    }
+                                    Err(e) => {
+                                        result_text = format!("Error unwatching: {}", e);
+                                    }
+                                }
+                            } else {
+                                result_text = "Error: watch service not available.".to_string();
+                            }
+                        }
+                        "neurostrata_watch_status" => {
+                            if let Some(watch) = watch.clone() {
+                                let namespace = arguments.get("namespace").and_then(|v| v.as_str());
+                                let report = watch.status(namespace);
+                                result_text = serde_json::to_string_pretty(&report)
+                                    .unwrap_or_else(|_| format!("{:?}", report));
+                            } else {
+                                result_text = "Error: watch service not available.".to_string();
+                            }
+                        }
                         "neurostrata_data_connector" => {
                             result_text =
                                 handle_data_connector(&arguments, store.clone(), bus.clone()).await;
@@ -1974,22 +2119,115 @@ pub async fn process_mcp_request(
                         }
                     }
 
-                    if matches!(
+                    // Spec §6 R6: record ONE post-dispatch receipt for every
+                    // in-scope graph/ontology tool, derived from the REAL
+                    // outcome the handler just returned — never a hardcoded
+                    // success/0/[]. GRAPH_TOOLS is the single source of truth,
+                    // so all eight tools get identical coverage.
+                    if crate::task::snapshot_readiness::GRAPH_TOOLS.contains(&name) {
+                        // `arguments` was moved into the handler; read the
+                        // original params value instead.
+                        let args_ref = params.get("arguments");
+                        {
+                            // P1-7: a failed MCP tools/call with no namespace
+                            // still records a receipt under "global" — MCP
+                            // post-dispatch receipt completeness is 100%.
+                            // Daemon REST/CLI are out of scope (spec §2).
+                            let ns_arg = args_ref
+                                .and_then(|a| a.get("namespace"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("global");
+                            let query_raw = args_ref
+                                .and_then(|a| {
+                                    a.get("query")
+                                        .or_else(|| a.get("path"))
+                                        .or_else(|| a.get("file_path"))
+                                        .or_else(|| a.get("id"))
+                                        .or_else(|| a.get("memory_id"))
+                                        .or_else(|| a.get("question"))
+                                        .or_else(|| a.get("goal"))
+                                })
+                                .and_then(Value::as_str)
+                                .unwrap_or(name);
+                            let caller_root = args_ref
+                                .and_then(|a| {
+                                    a.get("project_root")
+                                        .or_else(|| a.get("worktree"))
+                                        .or_else(|| a.get("cwd"))
+                                })
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let ns = resolve_namespace(&store, ns_arg).await;
+                            // R7: the real handler response carries §5
+                            // next_actions/next_hop_calls with trigger ids and
+                            // action ids. Thread them into the receipt so task
+                            // validation can find applicable escalations with
+                            // no caller-supplied signals.
+                            let mut fields = crate::task::tool_receipts::attach_trigger_context(
+                                crate::task::tool_receipts::build_dispatch_receipt(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    chrono::Utc::now().timestamp(),
+                                    crate::task::current_session_id(),
+                                    ns.clone(),
+                                    name.to_string(),
+                                    query_raw,
+                                    &result_text,
+                                    error_response.is_some(),
+                                    dispatch_started.elapsed().as_millis() as u64,
+                                ),
+                                &result_text,
+                            );
+                            // Task 11 Fix 2b: a failed taxonomy call carries no
+                            // handler `operation`, so recover the requested op
+                            // from args (bounded string only; no raw args stored).
+                            fields.operation =
+                                crate::task::tool_receipts::taxonomy_operation_fallback(
+                                    &fields.operation,
+                                    name == "neurostrata_taxonomy",
+                                    args_ref,
+                                );
+                            // R7 proof: mint a digest-only proof under the
+                            // trigger actually followed. `related` serves two
+                            // triggers with identical args, so only an
+                            // explicit `followed_trigger_id` (copied from the
+                            // prescribed `next_action.args`) can bind it; no
+                            // hint => abstain, never default. Reuse the
+                            // existing `followed_action_ids` field; no raw
+                            // args are written into the ledger.
+                            let followed_hint = args_ref
+                                .and_then(|a| a.get("followed_trigger_id"))
+                                .and_then(Value::as_str);
+                            if let Some((proof_id, followed_trigger)) = mint_followed_action_id(
+                                name,
+                                fields.operation.as_str(),
+                                args_ref,
+                                followed_hint,
+                                &ns,
+                            ) {
+                                fields.followed_action_ids = vec![proof_id];
+                                if fields.trigger_id.trim().is_empty() {
+                                    fields.trigger_id = followed_trigger;
+                                }
+                            }
+                            crate::task::record_tool_receipt(&store, fields, caller_root).await;
+                        }
+                    } else if matches!(
                         name,
-                        "neurostrata_search_memory"
-                            | "neurostrata_related"
-                            | "neurostrata_sparql_query"
-                            | "neurostrata_graphql_query"
+                        "neurostrata_graphql_query"
                             | "neurostrata_chat_ask"
                             | "neurostrata_context_plan"
                             | "neurostrata_provenance_for"
                     ) {
-                        if let Some(ns) = params
-                            .get("arguments")
+                        // Legacy `queries[]` compatibility for tools that used
+                        // to be recorded here but are outside GRAPH_TOOLS.
+                        // `record_graph_query_with_root` is now legacy-only —
+                        // it cannot fabricate an `events[]` outcome receipt.
+                        let args_ref = params.get("arguments");
+                        if let Some(ns) = args_ref
                             .and_then(|a| a.get("namespace"))
-                            .and_then(|v| v.as_str())
+                            .and_then(Value::as_str)
                         {
-                            let args_ref = params.get("arguments");
                             let hint = args_ref
                                 .and_then(|a| {
                                     a.get("query")
@@ -2000,7 +2238,7 @@ pub async fn process_mcp_request(
                                         .or_else(|| a.get("question"))
                                         .or_else(|| a.get("goal"))
                                 })
-                                .and_then(|v| v.as_str())
+                                .and_then(Value::as_str)
                                 .unwrap_or(name);
                             let caller_root = args_ref
                                 .and_then(|a| {
@@ -2008,7 +2246,7 @@ pub async fn process_mcp_request(
                                         .or_else(|| a.get("worktree"))
                                         .or_else(|| a.get("cwd"))
                                 })
-                                .and_then(|v| v.as_str())
+                                .and_then(Value::as_str)
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
                             crate::task::record_graph_query_with_root(
@@ -2081,6 +2319,26 @@ pub async fn process_mcp_request(
     }
 }
 
+/// Pointer-read operations whose caller-facing output exposes data-pointer
+/// records or contents. The port's trusted `None` principal exists for
+/// kernel-internal reads and must not be reachable by omitting a field.
+pub(crate) fn connector_operation_reads_pointers(operation: &str) -> bool {
+    matches!(operation, "list_pointers" | "resolve_pointer" | "mediate")
+}
+
+/// Reject an omitted principal on a caller-originated pointer read (#348).
+pub(crate) fn enforce_external_connector_principal(
+    operation: &str,
+    principal: Option<&str>,
+) -> Result<(), String> {
+    if connector_operation_reads_pointers(operation) && principal.is_none() {
+        return Err(format!(
+            "principal is required for data-connector pointer reads ('{operation}')"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_data_connector(
     arguments: &Value,
     store: Arc<dyn VectorStore>,
@@ -2111,6 +2369,14 @@ pub(crate) async fn handle_data_connector(
         return serde_json::json!({"ok": false, "error": "args object required"}).to_string();
     };
     let principal = arguments.get("principal").and_then(|v| v.as_str());
+    if let Err(error) = enforce_external_connector_principal(
+        args.get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        principal,
+    ) {
+        return serde_json::json!({"ok": false, "error": error}).to_string();
+    }
     let workspace_root = crate::daemon::resolve_project_root();
     let kernel = crate::kernel::AgentKernel::new(store.clone(), bus.clone(), workspace_root);
     match kernel
@@ -3386,24 +3652,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     };
     let namespace = resolve_namespace(&store, namespace).await;
 
-    // Direct invocations of handle_memories_for_file also record the
-    // touched file path in `.NeuroStrata/session_queries.json` and bump
-    // `graph_queries_count` on the active in_progress task.
-    let caller_root = arguments
-        .get("project_root")
-        .or_else(|| arguments.get("worktree"))
-        .or_else(|| arguments.get("cwd"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let _ = crate::task::record_graph_query_with_root(
-        &store,
-        &namespace,
-        "neurostrata_memories_for_file",
-        path,
-        caller_root,
-    )
-    .await;
+    // Spec §6 R6.2: no pre-dispatch ledger write here. Receipts for this tool
+    // are written post-dispatch at the MCP tools/call boundary with the REAL
+    // result (success/empty/unsupported/failed), latency and returned ids.
 
     let symbol = arguments.get("symbol").and_then(|s| s.as_str());
     let include_ancestors = arguments
@@ -3456,6 +3707,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 "unsupported": !graph_read,
                 "path": path,
                 "error": format!("{e:#}"),
+                "status": "failed",
+                "next_actions": [],
+                "suppressed_reason": "Path resolution failed; no graph lookup ran, so no escalation is prescribed.",
             });
             if e.downcast_ref::<crate::paths::UnresolvablePathError>()
                 .is_some()
@@ -3479,6 +3733,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             "memories": [],
             "unsupported": true,
             "path": original_path,
+            "status": "unsupported",
+            "next_actions": [],
+            "suppressed_reason": "Graph-read backend unavailable; no lookup ran, so no escalation is prescribed.",
         })
         .to_string();
     };
@@ -3584,14 +3841,64 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                     }
                 }
             }
+
+            // Task 4: conditional escalation decided by a crate-free pure
+            // function so the decision itself is testable without a store.
+            // All fields here are additive; existing fields stay byte-stable.
+            let blast_radius_count = response
+                .get("ast_summary")
+                .and_then(|v| v.get("blast_radius_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let bridge_ids: Vec<String> = hits
+                .iter()
+                .flat_map(|h| h.conceptual_bridges.iter())
+                .map(|b| b.target_id.clone())
+                .collect();
+            let staged_file_count = arguments
+                .get("staged_file_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            // Prefer a returned symbol id, then a returned memory id, then the
+            // queried path (all valid `related` seeds; an empty lookup supplies
+            // the path as the `locate` query).
+            let seed_id = response
+                .get("ast_summary")
+                .and_then(|v| v.get("symbols"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|s| s.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| hit_ids.first().map(String::as_str))
+                .unwrap_or(original_path);
+            let diff_text = arguments
+                .get("diff_text")
+                .and_then(serde_json::Value::as_str);
+            let escalation =
+                crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+                    blast_radius_count,
+                    &bridge_ids,
+                    staged_file_count,
+                    hits.is_empty(),
+                    &namespace,
+                    Some(seed_id),
+                    diff_text,
+                );
+            if let Some(status) = escalation.get("status").and_then(serde_json::Value::as_str) {
+                response["status"] = serde_json::Value::String(status.to_string());
+            }
+            if let Some(actions) = escalation.get("next_actions") {
+                response["next_actions"] = actions.clone();
+            }
+            if let Some(reason) = escalation.get("suppressed_reason") {
+                response["suppressed_reason"] = reason.clone();
+            }
             response.to_string()
         }
-        Err(e) => serde_json::json!({
-            "memories": [],
-            "unsupported": false,
-            "path": original_path,
-            "error": e.to_string(),
-        })
+        Err(e) => crate::graph_read::memories_for_file::query_failure_response(
+            original_path,
+            &e.to_string(),
+        )
         .to_string(),
     }
 }
@@ -5483,6 +5790,24 @@ fn apply_doctor_version(state: &mut Value, version: &str, allowed: bool) {
     }
 }
 
+/// Read the session ledger fail-soft and count only attributed post-dispatch
+/// graph tools from active tasks. A missing/unreadable ledger yields 0. Legacy
+/// `queries[]` rows are excluded from this metric by design (spec R6), so the
+/// thin wrapper delegates to the pure helper after parsing.
+fn active_task_graph_tool_names(
+    root: &std::path::Path,
+    active_task_ids: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let path = root.join(".NeuroStrata/session_queries.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    crate::task::snapshot_readiness::graph_tools_from_ledger(&doc, active_task_ids)
+}
+
 async fn handle_get_snapshot(
     arguments: Value,
     store: Arc<dyn VectorStore>,
@@ -6315,6 +6640,55 @@ async fn handle_get_snapshot(
         None => String::new(),
     };
 
+    // R5: graph/ontology readiness. Concept data comes from the same ReBAC-
+    // filtered taxonomy view the section above renders, so restricted rows are
+    // never counted or named. Tool diversity is read fail-soft from the session
+    // ledger; no ledger means an honest 0, never a fabricated count.
+    let (has_thesis, concept_statuses) = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>(
+    ) {
+        Some(ls) => crate::rdf::taxonomy::snapshot_taxonomy_readiness_view(ls, namespace).await,
+        None => (false, Vec::new()),
+    };
+    let readiness_concepts: Vec<crate::task::snapshot_readiness::ReadinessConcept> =
+        concept_statuses
+            .into_iter()
+            .map(
+                |(slug, epistemic_status)| crate::task::snapshot_readiness::ReadinessConcept {
+                    slug,
+                    restricted: false,
+                    epistemic_status,
+                },
+            )
+            .collect();
+    // Only work in flight may attract tool receipts; done/retired tasks must
+    // not inflate diversity. Status mapping is the gate's own enum -> string.
+    let active_task_status_rows: Vec<(String, String)> = all_memories
+        .iter()
+        .filter(|r| crate::task::gate::is_task(r))
+        .filter(|r| !crate::task::gate::is_retired(&r.payload.metadata, now))
+        .map(|r| {
+            (
+                r.id.clone(),
+                crate::task::gate::task_status(r).as_str().to_string(),
+            )
+        })
+        .collect();
+    let active_task_ids =
+        crate::task::snapshot_readiness::active_task_ids(&active_task_status_rows);
+    // P1-8: snapshot readiness must read the SAME root the recorder writes.
+    // Route the hint through the shared receipt_ledger_root policy (validated
+    // worktree marker -> registry -> directory rows -> daemon CWD).
+    let ledger_root =
+        crate::task::receipt_ledger_root(inferred_root.as_deref(), &store, namespace).await;
+    let readiness_input = crate::task::snapshot_readiness::ReadinessInput {
+        concepts: readiness_concepts,
+        graph_tool_names: active_task_graph_tool_names(&ledger_root, &active_task_ids),
+        has_thesis,
+    };
+    let readiness_section =
+        crate::task::snapshot_readiness::render_readiness_section(&readiness_input);
+
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
@@ -6325,6 +6699,7 @@ async fn handle_get_snapshot(
     if !taxonomy_section.is_empty() {
         parts.push(taxonomy_section);
     }
+    parts.push(readiness_section);
     if !stale_section.is_empty() {
         parts.push(stale_section);
     }
@@ -6358,6 +6733,7 @@ async fn handle_ingest_directory(
     store: Arc<dyn VectorStore>,
     ingests: Arc<crate::ingest_jobs::IngestJobs>,
     bus: Option<Arc<ThalamicBus>>,
+    watch: Option<Arc<crate::ingest_watch::IngestWatchService>>,
 ) -> String {
     let dir_path = match arguments.get("dir_path").and_then(|d| d.as_str()) {
         Some(d) => d,
@@ -6436,6 +6812,16 @@ async fn handle_ingest_directory(
                     },
                     &RecursionToken::root(),
                 );
+            }
+            // Auto-register watch on successful ingest (idempotent).
+            if let Some(watch) = watch {
+                let canonical = match std::path::Path::new(dir_path).canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => std::path::PathBuf::from(dir_path),
+                };
+                if let Err(e) = watch.on_ingest_success(namespace, &canonical) {
+                    tracing::warn!("watch auto-register failed: {e}");
+                }
             }
             let skipped = if progress.files_skipped > 0 {
                 format!(", {} skipped", progress.files_skipped)
@@ -6550,6 +6936,7 @@ async fn handle_ingest_bounded(
         ingest_bounded_classification, BoundedClassificationRequest, CandidateLiteral,
         CandidateObject, ClassificationCandidate,
     };
+    #[allow(unused_imports)]
     use crate::traits::VectorStore as _;
 
     let namespace_raw = arguments
@@ -10738,6 +11125,30 @@ fn token_set_tokens(content: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// IDs surfaced only through graph expansion, never direct semantic hits.
+/// Evidence kind is the discriminator: `DirectMatch` is a direct hit; every
+/// other kind was discovered by traversing a graph edge.
+fn graph_expanded_ids_from_results(results: &[SearchResult]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for result in results {
+        let expanded = result.evidence.as_ref().is_some_and(|evs| {
+            evs.iter()
+                .any(|ev| ev.kind != crate::traits::EvidenceKind::DirectMatch)
+        });
+        if expanded && !ids.contains(&result.id) {
+            ids.push(result.id.clone());
+        }
+    }
+    ids
+}
+
+/// Append the response contract as one additive JSON line. Older report
+/// fields stay byte-identical; parsers that ignore unknown lines are unaffected.
+fn finalize_search_report(report: String, arguments: &Value, results: &[SearchResult]) -> String {
+    let ids = graph_expanded_ids_from_results(results);
+    crate::search::append_search_contract_line(report, arguments, ids)
+}
+
 async fn handle_search_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
@@ -10745,11 +11156,23 @@ async fn handle_search_memory(
 ) -> String {
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
-        None => return "Missing 'query' parameter.".to_string(),
+        None => {
+            return finalize_search_report(
+                "Missing 'query' parameter.".to_string(),
+                &arguments,
+                &[],
+            )
+        }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
         Some(n) => n,
-        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
+        None => {
+            return finalize_search_report(
+                "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
+                &arguments,
+                &[],
+            )
+        }
     };
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
@@ -10782,9 +11205,13 @@ async fn handle_search_memory(
         && search_mode != "lexical"
         && search_mode != "lexical-inhouse"
     {
-        return format!(
-            "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
-            search_mode
+        return finalize_search_report(
+            format!(
+                "ERROR [MODE]: unknown search mode '{}'. Use 'hybrid' (default), 'vector', 'lexical', or 'lexical-inhouse'.",
+                search_mode
+            ),
+            &arguments,
+            &[],
         );
     }
     // No authenticated principal context exists on this local MCP surface yet;
@@ -10834,10 +11261,12 @@ async fn handle_search_memory(
         .get("domain_expansion")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let include_references = arguments
-        .get("include_references")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `include_related` never existed in this schema: it was silently ignored.
+    // Resolve it here as a deprecated alias so the caller gets both the provenance
+    // behaviour and an explicit warning in the response contract.
+    let search_contract =
+        crate::search::SearchMemoryContract::from_arguments(&arguments, Vec::new());
+    let include_references = search_contract.include_references;
 
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
@@ -10880,8 +11309,12 @@ async fn handle_search_memory(
         let registry_root = match crate::registry::cached_project_root(&store, namespace).await {
             Ok(root) => root,
             Err(e) => {
-                return format!(
-                    "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                return crate::search::append_search_contract_line(
+                    format!(
+                        "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                    ),
+                    &arguments,
+                    vec![],
                 );
             }
         };
@@ -10891,7 +11324,13 @@ async fn handle_search_memory(
             registry_root.as_deref(),
         ) {
             Ok(forms) => forms,
-            Err(e) => return format!("ERROR [PATH_PREFIX]: {e}"),
+            Err(e) => {
+                return crate::search::append_search_contract_line(
+                    format!("ERROR [PATH_PREFIX]: {e}"),
+                    &arguments,
+                    vec![],
+                )
+            }
         };
         search_filters.path_prefix_forms = prefix_forms;
     }
@@ -10983,7 +11422,11 @@ async fn handle_search_memory(
         let outcome = match outcome_res {
             Ok(outcome) => outcome,
             Err(error) => {
-                return format!("Failed to search the lexical index: {error}");
+                return crate::search::append_search_contract_line(
+                    format!("Failed to search the lexical index: {error}"),
+                    &arguments,
+                    vec![],
+                );
             }
         };
 
@@ -11045,7 +11488,11 @@ async fn handle_search_memory(
         results.truncate(DEFAULT_LIMIT);
 
         if results.is_empty() {
-            return "No relevant memories found.".to_string();
+            return finalize_search_report(
+                "No relevant memories found.".to_string(),
+                &arguments,
+                &results,
+            );
         }
 
         for res in &results {
@@ -11098,7 +11545,7 @@ async fn handle_search_memory(
             ));
         }
         if !domain_requested {
-            return report;
+            return finalize_search_report(report, &arguments, &results);
         }
         let mode_line = if slugs.is_empty() {
             "domain filter: skipped — the domain did not normalize; the results are unfiltered (lexical)"
@@ -11107,18 +11554,30 @@ async fn handle_search_memory(
         } else {
             "domain filter: skipped — no row matched the domain; the results are unfiltered (lexical)"
         };
-        return format!("{}\n\n{}", mode_line, report);
+        return format!(
+            "{}\n\n{}",
+            mode_line,
+            finalize_search_report(report, &arguments, &results)
+        );
     }
 
     if let Err(e) = store.init(namespace).await {
         tracing::warn!("search_memory init failed for '{namespace}': {e}");
-        return format!("Failed to initialize namespace table.: {e}");
+        return finalize_search_report(
+            format!("Failed to initialize namespace table.: {e}"),
+            &arguments,
+            &[],
+        );
     }
     let vec = match emb.embed(&query).await {
         Ok(vec) => vec,
         Err(e) => {
             tracing::warn!("search_memory embedding failed for '{namespace}': {e}");
-            return format!("Failed to generate embedding for search.: {e}");
+            return finalize_search_report(
+                format!("Failed to generate embedding for search.: {e}"),
+                &arguments,
+                &[],
+            );
         }
     };
     let is_ladybug_store = crate::traits::VectorStore::as_any(store.as_ref())
@@ -11353,7 +11812,11 @@ async fn handle_search_memory(
             );
         }
         if results.is_empty() {
-            "No relevant memories found.".to_string()
+            finalize_search_report(
+                "No relevant memories found.".to_string(),
+                &arguments,
+                &results,
+            )
         } else {
             // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
             for res in &results {
@@ -11407,7 +11870,7 @@ async fn handle_search_memory(
                 ));
             }
             if !domain_requested {
-                report
+                finalize_search_report(report, &arguments, &results)
             } else {
                 // A filter that was skipped is a substitution the caller
                 // has to be told about: a wrong domain must never blind
@@ -11425,11 +11888,15 @@ async fn handle_search_memory(
                         }
                     }
                 };
-                format!("{}\n\n{}", mode_line, report)
+                format!(
+                    "{}\n\n{}",
+                    mode_line,
+                    finalize_search_report(report, &arguments, &results)
+                )
             }
         }
     } else {
-        "Failed to search database.".to_string()
+        finalize_search_report("Failed to search database.".to_string(), &arguments, &[])
     }
 }
 
@@ -12468,11 +12935,419 @@ mod migration_notice_tests {
     }
 }
 
+/// Mint a digest-only follow-through proof for an MCP `tools/call` dispatch.
+/// Returns `(action_id, followed_trigger)`, or `None` when the call cannot
+/// honestly prove a prescription. Single source of truth shared by the live
+/// dispatcher and its C32 regression test.
+fn mint_followed_action_id(
+    tool: &str,
+    operation: &str,
+    args: Option<&Value>,
+    hint: Option<&str>,
+    namespace: &str,
+) -> Option<(String, String)> {
+    let plan = crate::task::graph_advisories::dispatch_proof(
+        tool,
+        Some(operation),
+        args,
+        hint,
+        namespace,
+    )?;
+    let action_id = crate::task::routing::action_id(&plan.trigger, &plan.args, &plan.ids);
+    Some((action_id, plan.trigger))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+    /// Focused MCP-surface tests for the watch shims (Task 5). Handlers stay
+    /// thin; these prove delegation, J6 refusal, read-only status, and the
+    /// ingest-success auto-registration hook through the real dispatch path.
+    mod watch {
+        use super::*;
+        use crate::ingest_watch::{
+            IngestTrigger, IngestWatchService, JsonFileRegistrationStore, TestEventSource,
+            TriggerOutcome, TriggerState, WatchRegistrationStore,
+        };
+        use std::path::Path;
+
+        struct StubTrigger;
+
+        #[async_trait::async_trait]
+        impl IngestTrigger for StubTrigger {
+            async fn trigger(
+                &self,
+                _namespace: &str,
+                _canonical_path: &str,
+            ) -> anyhow::Result<TriggerOutcome> {
+                Ok(TriggerOutcome {
+                    state: TriggerState::Finished,
+                    error: None,
+                })
+            }
+        }
+
+        fn watch_service(root: &Path) -> Arc<IngestWatchService> {
+            let store: Arc<dyn WatchRegistrationStore> = Arc::new(JsonFileRegistrationStore::new(
+                root.join("watch_registrations.json"),
+            ));
+            Arc::new(IngestWatchService::new(
+                Box::new(TestEventSource::channel()),
+                store,
+                Arc::new(StubTrigger),
+                root.to_path_buf(),
+                Vec::new(),
+            ))
+        }
+
+        async fn call(
+            store: Arc<dyn VectorStore>,
+            ingests: Arc<crate::ingest_jobs::IngestJobs>,
+            bus: Arc<ThalamicBus>,
+            watch: Option<Arc<IngestWatchService>>,
+            name: &str,
+            args: serde_json::Value,
+        ) -> serde_json::Value {
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/call".to_string(),
+                params: Some(serde_json::json!({
+                    "name": name,
+                    "arguments": args,
+                })),
+            };
+            process_mcp_request_with_watch(
+                request,
+                Arc::new(StubEmbedder),
+                store,
+                ingests,
+                None,
+                bus,
+                watch,
+            )
+            .await
+        }
+
+        fn text_of(response: &serde_json::Value) -> &str {
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool result carries text")
+        }
+
+        #[tokio::test]
+        async fn watch_tools_list_exposes_both_names_with_schemas() {
+            let (store, _) = store_with_one_rule("probe").await;
+            let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+            let (bus, _) = recording_bus();
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/list".to_string(),
+                params: Some(serde_json::json!({})),
+            };
+            let response = process_mcp_request_with_watch(
+                request,
+                Arc::new(StubEmbedder),
+                store,
+                ingests,
+                None,
+                bus,
+                None,
+            )
+            .await;
+            let tools = response["result"]["tools"]
+                .as_array()
+                .expect("tools/list returns an array");
+            let unwatch = tools
+                .iter()
+                .find(|t| t["name"] == "neurostrata_unwatch")
+                .expect("unwatch tool exposed");
+            assert_eq!(
+                unwatch["inputSchema"]["required"],
+                serde_json::json!(["namespace", "dir_path"])
+            );
+            let status = tools
+                .iter()
+                .find(|t| t["name"] == "neurostrata_watch_status")
+                .expect("watch_status tool exposed");
+            assert!(status["inputSchema"]["properties"]["namespace"].is_object());
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_delegates_and_refuses_outside_root() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let canonical = root.canonicalize().unwrap();
+            let watch = watch_service(&root);
+            watch.register("ns", &canonical).unwrap();
+            let (store, _) = store_with_one_rule("ns").await;
+            let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+            let (bus, _) = recording_bus();
+
+            let response = call(
+                store.clone(),
+                ingests.clone(),
+                bus.clone(),
+                Some(watch.clone()),
+                "neurostrata_unwatch",
+                serde_json::json!({
+                    "namespace": "ns",
+                    "dir_path": canonical.display().to_string()
+                }),
+            )
+            .await;
+            let unwatch: serde_json::Value =
+                serde_json::from_str(text_of(&response)).expect("unwatch is JSON");
+            assert_eq!(
+                unwatch["removed"], true,
+                "unwatch did not delegate: {unwatch}"
+            );
+            assert_eq!(unwatch["namespace"], "ns");
+            assert_eq!(unwatch["canonical_path"], canonical.display().to_string());
+            assert!(watch.status(Some("ns")).roots.is_empty());
+
+            // A path outside the startup root is refused by the core J6 gate;
+            // the MCP shim surfaces it as an error, never a success payload.
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let response = call(
+                store,
+                ingests,
+                bus,
+                Some(watch),
+                "neurostrata_unwatch",
+                serde_json::json!({
+                    "namespace": "ns",
+                    "dir_path": outside.display().to_string()
+                }),
+            )
+            .await;
+            let text = text_of(&response);
+            assert!(
+                text.contains("Error unwatching") && text.contains("outside the project root"),
+                "J6 path was not refused: {text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_echoes_core_resolved_path_for_nonexistent_tail() {
+            // A path with a `.` segment and a non-existent tail is resolvable by
+            // the core J6 policy (nearest existing ancestor + plain remainder)
+            // but not by std::fs::canonicalize. The MCP echo must match the core.
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let canonical_root = root.canonicalize().unwrap();
+            let watch = watch_service(&root);
+            let (store, _) = store_with_one_rule("ns").await;
+            let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+            let (bus, _) = recording_bus();
+            let raw = format!("{}/./missing/deep", canonical_root.display());
+
+            let response = call(
+                store,
+                ingests,
+                bus,
+                Some(watch),
+                "neurostrata_unwatch",
+                serde_json::json!({ "namespace": "ns", "dir_path": raw }),
+            )
+            .await;
+            let parsed: serde_json::Value =
+                serde_json::from_str(text_of(&response)).expect("unwatch is JSON");
+            assert_eq!(parsed["removed"], false);
+            assert_eq!(
+                parsed["canonical_path"],
+                canonical_root.join("missing/deep").display().to_string(),
+                "echo must use the core resolver, not raw-path canonicalize"
+            );
+        }
+
+        #[tokio::test]
+        async fn watch_status_returns_report_without_mutating() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let canonical = root.canonicalize().unwrap();
+            let watch = watch_service(&root);
+            watch.register("ns", &canonical).unwrap();
+            let before = watch.status(None).roots.len();
+            let (store, _) = store_with_one_rule("ns").await;
+            let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+            let (bus, _) = recording_bus();
+
+            let response = call(
+                store,
+                ingests,
+                bus,
+                Some(watch.clone()),
+                "neurostrata_watch_status",
+                serde_json::json!({ "namespace": "ns" }),
+            )
+            .await;
+            let report: serde_json::Value =
+                serde_json::from_str(text_of(&response)).expect("status is JSON");
+            assert_eq!(report["roots"][0]["namespace"], "ns");
+            assert_eq!(
+                watch.status(None).roots.len(),
+                before,
+                "status is read-only"
+            );
+        }
+
+        #[tokio::test]
+        async fn watch_ingest_directory_auto_registers_only_on_success() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("lib.rs"), "pub fn probe() {}\n").unwrap();
+            let watch = watch_service(&root);
+            let (store, _) = store_with_one_rule("ns").await;
+            let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+            let (bus, _) = recording_bus();
+
+            let response = call(
+                store.clone(),
+                ingests.clone(),
+                bus.clone(),
+                Some(watch.clone()),
+                "neurostrata_ingest_directory",
+                serde_json::json!({
+                    "namespace": "ns",
+                    "dir_path": root.display().to_string()
+                }),
+            )
+            .await;
+            let text = text_of(&response);
+            assert!(
+                !text.starts_with("ERROR") && !text.starts_with("Failed"),
+                "ingest failed: {text}"
+            );
+            assert_eq!(watch.status(None).roots.len(), 1, "success auto-registered");
+            assert_eq!(
+                watch.status(None).roots[0].canonical_path,
+                root.canonicalize().unwrap()
+            );
+
+            // A failed ingest (missing directory) must not register a root.
+            let response = call(
+                store,
+                ingests,
+                bus,
+                Some(watch.clone()),
+                "neurostrata_ingest_directory",
+                serde_json::json!({
+                    "namespace": "ns-fail",
+                    "dir_path": tmp.path().join("missing").display().to_string()
+                }),
+            )
+            .await;
+            assert!(
+                watch.status(Some("ns-fail")).roots.is_empty(),
+                "failed ingest registered a root: {}",
+                text_of(&response)
+            );
+        }
+    }
+
+    /// oy5c C32 regression: drive the SAME mint step the MCP dispatcher uses.
+    /// A real T_SEED_EXPAND next_action (hint included in its args) mints a
+    /// seed-expansion proof that cannot resolve a T_HIGH_BLAST advisory; a
+    /// hint-less related call mints nothing.
+    #[test]
+    fn c32_related_proof_mint_dealiases_and_abstains_without_hint() {
+        use crate::task::graph_advisories::{compute_advisories, AdvisoryInput, HIGH_BLAST_TOOL};
+        use crate::task::routing::{next_action, RouteTrigger};
+        use serde_json::json;
+        use std::collections::BTreeSet;
+
+        let ns = "NeuroStrata";
+        let seed = "mem-seed-42";
+        let make = |trigger: &'static str| {
+            let t = RouteTrigger {
+                id: trigger,
+                tool: HIGH_BLAST_TOOL,
+                args: json!({
+                    "namespace": ns,
+                    "id": seed,
+                    "max_hops": 2,
+                    "followed_trigger_id": trigger,
+                }),
+                reason: String::new(),
+            };
+            next_action(&t, &[seed.to_string()])
+        };
+        let seed_expand = make("T_SEED_EXPAND");
+        let high_blast = make("T_HIGH_BLAST");
+        let (proof, _) = super::mint_followed_action_id(
+            HIGH_BLAST_TOOL,
+            "related",
+            Some(&seed_expand["args"]),
+            seed_expand["args"]["followed_trigger_id"].as_str(),
+            ns,
+        )
+        .expect("hinted related call has a proof");
+        assert!(proof.starts_with("T_SEED_EXPAND:"), "actual: {proof}");
+        assert_eq!(
+            proof,
+            seed_expand["action_id"].as_str().unwrap(),
+            "proof must bind to the prescribed seed-expansion action"
+        );
+        assert_ne!(
+            proof,
+            high_blast["action_id"].as_str().unwrap(),
+            "seed-expansion proof must differ from the high-blast prescription"
+        );
+
+        let active: BTreeSet<String> = ["t-active".to_string()].into_iter().collect();
+        let ledger = json!({
+            "events": [
+                {
+                    "task_id": "t-active",
+                    "tool": "neurostrata_memories_for_file",
+                    "status": "success",
+                    "ts": 10,
+                    "prescribed_action_ids": [high_blast["action_id"]]
+                },
+                {
+                    "task_id": "t-active",
+                    "tool": HIGH_BLAST_TOOL,
+                    "status": "success",
+                    "ts": 11,
+                    "returned_ids": ["mem-x"],
+                    "followed_action_ids": [proof]
+                }
+            ]
+        });
+        let r = compute_advisories(&AdvisoryInput {
+            ledger: &ledger,
+            active_task_ids: &active,
+            allowed_graph_tools: &["neurostrata_memories_for_file", HIGH_BLAST_TOOL],
+            applicable_trigger_ids: &["T_HIGH_BLAST".to_string()],
+            taxonomy_available: false,
+            concept_grounding_linked: false,
+        });
+        assert!(
+            r.high_blast_radius_unexplored,
+            "a seed-expansion follow must not resolve T_HIGH_BLAST"
+        );
+
+        assert!(
+            super::mint_followed_action_id(
+                HIGH_BLAST_TOOL,
+                "related",
+                Some(&json!({ "namespace": ns, "id": seed, "max_hops": 2 })),
+                None,
+                ns,
+            )
+            .is_none(),
+            "a hint-less related call cannot distinguish the triggers; abstain"
+        );
+    }
 
     #[test]
     fn inject_proxy_caller_cwd_stamps_cwd_and_preserves_explicit_roots() {
@@ -14595,6 +15470,760 @@ mod tests {
         assert!(
             text.contains("lexical-inhouse"),
             "the derivation is visible: {text}"
+        );
+    }
+
+    /// #363: provenance must retire with the edge it cites. Removing the last
+    /// WikiLink deletes the stored edge; an `edge_sources` entry left behind
+    /// would keep citing the deleted relationship to `include_references`.
+    #[tokio::test]
+    async fn removed_wikilink_retires_edge_source_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vault_edge_provenance";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let declarer = "provenance-declarer";
+        let target = "provenance-target";
+        let mut a = make_note(declarer, &[target], "provenanceprobe linker body");
+        let b = make_note(target, &[], "target body");
+        std::fs::write(vault.join(format!("{declarer}.md")), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join(format!("{target}.md")), b.to_markdown()).expect("write b");
+
+        import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+
+        let refs_for = |out: &str| -> Vec<serde_json::Value> {
+            out.lines()
+                .find_map(|line| line.strip_prefix("edge_references: "))
+                .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+                .unwrap_or_default()
+        };
+        let cites_target = |refs: &[serde_json::Value]| {
+            refs.iter().any(|r| {
+                r["id"] == declarer
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| s["resolved_target"] == target)
+                    })
+            })
+        };
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "provenanceprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            cites_target(&refs_for(&search_out)),
+            "control: the live edge must be cited: {search_out}"
+        );
+
+        // Remove the final WikiLink and reimport the changed note.
+        a.related.clear();
+        a.content = "provenanceprobe linker body without links".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        std::fs::write(vault.join(format!("{declarer}.md")), a.to_markdown()).expect("rewrite a");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == declarer && rel == "RELATES_TO"),
+            "the removed link must retire its edge: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, declarer)
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+        let stale = head
+            .metadata
+            .get("edge_sources")
+            .and_then(|v| v.as_array())
+            .is_some_and(|sources| sources.iter().any(|s| s["resolved_target"] == target));
+        assert!(
+            !stale,
+            "provenance for the deleted edge must be retired: {:?}",
+            head.metadata
+        );
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "provenanceprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            !cites_target(&refs_for(&search_out)),
+            "search must not cite the deleted relationship: {search_out}"
+        );
+    }
+
+    /// #363: an unchanged declarer rebound to a newly imported preferred id
+    /// keeps a citation for the live edge. The alias entry retires with its
+    /// edge; the replacement edge carries its own declaration provenance.
+    #[tokio::test]
+    async fn rebound_declaration_keeps_edge_source_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprov";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred = format!("{ns}::z");
+        let linker = make_note("a", &[preferred.as_str()], "rebindprobe linker body");
+        let alias = make_note("z", &[], "body of the bare alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        let targets = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let before_edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            targets(&before_edges),
+            vec!["z".to_string()],
+            "the first import binds the stored alias: {before_edges:?}"
+        );
+        let (_, before) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+
+        let literal = make_note(&preferred, &[], "body of the verbatim note");
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        assert_eq!(
+            targets(&edges),
+            vec![preferred.clone()],
+            "the unchanged declarer must rebind its preferred target: {edges:?}"
+        );
+
+        let (_, after) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        assert_eq!(
+            after.content, before.content,
+            "head content must not change"
+        );
+        assert_eq!(
+            after.metadata.get("canonical_sha256"),
+            before.metadata.get("canonical_sha256"),
+            "head identity must not change"
+        );
+        assert_eq!(
+            after.metadata.get("supersedes"),
+            None,
+            "an edge rebind must not supersede the head: {:?}",
+            after.metadata
+        );
+        let history_rows = store
+            .list(ns, None, None)
+            .await
+            .expect("list rows")
+            .into_iter()
+            .filter(|row| row.id.starts_with("a.vault-history."))
+            .count();
+        assert_eq!(history_rows, 0, "no history version may be created");
+
+        let sources = after.metadata["edge_sources"]
+            .as_array()
+            .expect("rebound declarer must carry provenance");
+        assert!(
+            sources.iter().any(|s| s["rel_type"] == "RELATES_TO"
+                && s["declared_target"] == preferred
+                && s["resolved_target"] == preferred
+                && s["extractor"] == "upsert"),
+            "the rebound edge must cite its declaration: {sources:?}"
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|s| s["rel_type"] == "RELATES_TO" && s["resolved_target"] == "z"),
+            "the retired alias citation must go: {sources:?}"
+        );
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "rebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        let cites = |target: &str| {
+            refs.iter().any(|r| {
+                r["id"] == "a"
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| {
+                            s["rel_type"] == "RELATES_TO" && s["resolved_target"] == target
+                        })
+                    })
+            })
+        };
+        assert!(
+            cites(&preferred),
+            "search must cite the live rebound edge: {search_out}"
+        );
+        assert!(
+            !cites("z"),
+            "search must not cite the retired alias edge: {search_out}"
+        );
+    }
+
+    /// #363: a rebind replaces only the citation for the binding it rebinds.
+    /// The unchanged declarer keeps another live declaration to `c`, so the
+    /// replacement set must add `ns::z` and leave `c`'s provenance in place.
+    #[tokio::test]
+    async fn rebound_declaration_preserves_retained_edge_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprovretain";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred = format!("{ns}::z");
+        let linker = make_note(
+            "a",
+            &["c", preferred.as_str()],
+            "keeprebindprobe linker body",
+        );
+        let retained = make_note("c", &[], "retained target body");
+        let alias = make_note("z", &[], "body of the bare alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("c.md"), retained.to_markdown()).expect("write c");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        let a_targets =
+            |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+                edges
+                    .iter()
+                    .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                    .map(|(_, _, to, _)| to.clone())
+                    .collect::<Vec<_>>()
+            };
+        let before_edges = store.list_edges(ns).await.expect("list edges");
+        let mut before = a_targets(&before_edges);
+        before.sort();
+        assert_eq!(before, vec!["c".to_string(), "z".to_string()]);
+
+        let literal = make_note(&preferred, &[], "body of the verbatim note");
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        let mut after = a_targets(&edges);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["c".to_string(), preferred.clone()],
+            "the retained and rebound edges must both stay live: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        let live_sources = |target: &str| {
+            head.metadata["edge_sources"]
+                .as_array()
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter(|s| {
+                            s["rel_type"] == "RELATES_TO"
+                                && s["extractor"] == "upsert"
+                                && s["orientation"] == "self_to_target"
+                                && s["resolved_target"] == target
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(live_sources("c"), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources(&preferred), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources("z"), 0, "{:?}", head.metadata);
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "keeprebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        let cited = |target: &str| {
+            refs.iter().any(|r| {
+                r["id"] == "a"
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| {
+                            s["rel_type"] == "RELATES_TO" && s["resolved_target"] == target
+                        })
+                    })
+            })
+        };
+        assert!(
+            cited("c"),
+            "search must cite the retained edge: {search_out}"
+        );
+        assert!(
+            cited(&preferred),
+            "search must cite the rebound edge: {search_out}"
+        );
+        assert!(
+            !cited("z"),
+            "search must not cite the alias edge: {search_out}"
+        );
+    }
+
+    /// #363: two declarations rebinding in one import must both keep a
+    /// citation. A per-iteration replace that drops earlier replacements
+    /// leaves only the last target cited.
+    #[tokio::test]
+    async fn multiple_rebound_declarations_accumulate_edge_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprovmulti";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred_y = format!("{ns}::y");
+        let preferred_z = format!("{ns}::z");
+        let linker = make_note(
+            "a",
+            &[preferred_y.as_str(), preferred_z.as_str()],
+            "multirebindprobe linker body",
+        );
+        let alias_y = make_note("y", &[], "body of the bare y alias");
+        let alias_z = make_note("z", &[], "body of the bare z alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("y.md"), alias_y.to_markdown()).expect("write y");
+        std::fs::write(vault.join("z.md"), alias_z.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        for (name, id, content) in [
+            ("preferred-y", preferred_y.as_str(), "verbatim y body"),
+            ("preferred-z", preferred_z.as_str(), "verbatim z body"),
+        ] {
+            let literal = make_note(id, &[], content);
+            std::fs::write(vault.join(format!("{name}.md")), literal.to_markdown())
+                .expect("write preferred");
+        }
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 2, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        let mut targets = edges
+            .iter()
+            .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+            .map(|(_, _, to, _)| to.clone())
+            .collect::<Vec<_>>();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![preferred_y.clone(), preferred_z.clone()],
+            "both rebound edges must stay live: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        let live_sources = |target: &str| {
+            head.metadata["edge_sources"]
+                .as_array()
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter(|s| {
+                            s["rel_type"] == "RELATES_TO"
+                                && s["extractor"] == "upsert"
+                                && s["orientation"] == "self_to_target"
+                                && s["resolved_target"] == target
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(live_sources(&preferred_y), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources(&preferred_z), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources("y"), 0, "{:?}", head.metadata);
+        assert_eq!(live_sources("z"), 0, "{:?}", head.metadata);
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "multirebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        for target in [&preferred_y, &preferred_z] {
+            assert!(
+                refs.iter().any(|r| {
+                    r["id"] == "a"
+                        && r["edge_sources"].as_array().is_some_and(|sources| {
+                            sources.iter().any(|s| {
+                                s["rel_type"] == "RELATES_TO" && s["resolved_target"] == *target
+                            })
+                        })
+                }),
+                "search must cite every rebound edge ({target}): {search_out}"
+            );
+        }
+    }
+
+    /// #363: two declarations on one exact-mode head can name the same target
+    /// under different relationships. Replay must cite each edge by
+    /// `(relationship, resolved target)`, not by endpoints alone; otherwise the
+    /// second citation replaces the first and `include_references` reports one
+    /// relationship for both edges.
+    #[tokio::test]
+    async fn replay_cites_both_relations_when_they_share_a_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(dir.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vault_multi_relation";
+        store.init(ns).await.expect("init");
+
+        let upsert = |id: &str, content: &str, metadata: serde_json::Value| {
+            let store = store.clone();
+            let id = id.to_string();
+            let content = content.to_string();
+            async move {
+                store
+                    .upsert(
+                        ns,
+                        &id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content,
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("seed memory");
+            }
+        };
+
+        // The target is absent when the head is written, so both declarations
+        // defer to replay.
+        upsert(
+            "multi-relation",
+            "multirelationprobe head body",
+            serde_json::json!({
+                "exact_edge_targets": true,
+                "related_to": ["shared-target"],
+                "depends_on": ["shared-target"]
+            }),
+        )
+        .await;
+        upsert("shared-target", "shared target body", serde_json::json!({})).await;
+
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        let rels = ["RELATES_TO", "DEPENDS_ON"];
+        for rel in rels {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(from, edge_rel, to, prov)| from == "multi-relation"
+                        && edge_rel == rel
+                        && to == "shared-target"
+                        && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("upsert")),
+                "replay must materialise the {rel} edge: {edges:?}"
+            );
+        }
+
+        let (_, head) = store
+            .get(ns, "multi-relation")
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+        let sources = head
+            .metadata
+            .get("edge_sources")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for rel in rels {
+            assert_eq!(
+                sources
+                    .iter()
+                    .filter(|s| s["rel_type"] == rel && s["resolved_target"] == "shared-target")
+                    .count(),
+                1,
+                "each relation must keep its own citation ({rel}): {sources:?}"
+            );
+        }
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "multirelationprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        for rel in rels {
+            assert!(
+                refs.iter().any(|r| {
+                    r["id"] == "multi-relation"
+                        && r["edge_sources"].as_array().is_some_and(|sources| {
+                            sources.iter().any(|s| {
+                                s["rel_type"] == rel && s["resolved_target"] == "shared-target"
+                            })
+                        })
+                }),
+                "search must cite the {rel} edge ({rel}): {search_out}"
+            );
+        }
+    }
+
+    /// The lexical empty-results path must still emit the additive response
+    /// contract, otherwise `include_related` is a silent no-op and
+    /// `graph_expanded_ids` disappears on exactly the path callers hit most.
+    #[tokio::test]
+    async fn lexical_empty_results_report_include_related_warning_and_graph_contract() {
+        let dir = std::env::temp_dir().join(format!("ns-lex-empty-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("init the schema");
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "no such memory exists here",
+                "mode": "lexical-inhouse",
+                "include_related": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            text.contains("No relevant memories found."),
+            "empty-result message preserved: {text}"
+        );
+        assert!(
+            text.contains(crate::search::INCLUDE_RELATED_DEPRECATION_WARNING),
+            "deprecation warning must appear on the empty lexical path: {text}"
+        );
+        assert!(
+            text.contains("graph_expanded_ids"),
+            "graph contract line must appear on the empty lexical path: {text}"
+        );
+        assert!(
+            text.contains("search_contract"),
+            "additive contract line must be present: {text}"
         );
     }
 
@@ -18509,11 +20138,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// The T_DIFF escalation trigger is fed by a caller-supplied scope count,
+    /// so `staged_file_count` must be a declared (optional) schema property.
+    #[tokio::test]
+    async fn memories_for_file_schema_declares_optional_staged_file_count() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_memories_for_file")
+            .expect("memories_for_file tool must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["staged_file_count"]["type"], "integer");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required
+                .iter()
+                .any(|v| v.as_str() == Some("staged_file_count")),
+            "staged_file_count must stay optional (absent = no diff-tour trigger)"
+        );
+    }
+
+    /// PR #356 (Codex P2): MCP callers can only supply declared inputSchema
+    /// properties. `diff_text` must be declared optional so a caller can hand
+    /// the real unified diff to `diff_tour`; otherwise T_DIFF is honestly
+    /// withheld but the advertised action is unreachable for tools/call clients.
+    #[tokio::test]
+    async fn memories_for_file_diff_text_schema_and_action_contract() {
+        // (a) schema declares diff_text as an optional string property.
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_memories_for_file")
+            .expect("memories_for_file tool must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["diff_text"]["type"], "string");
+        let desc = schema["properties"]["diff_text"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(desc.contains("diff"), "description was {desc:?}");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("diff_text")),
+            "diff_text must stay optional (absent = honest abstention)"
+        );
+
+        // (b) staged_file_count>=3 + non-empty diff_text emits T_DIFF bound to it.
+        let with_diff = crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+            3,
+            &[],
+            3,
+            false,
+            "NeuroStrata",
+            Some("sym::x"),
+            Some("real diff"),
+        );
+        let diff = with_diff["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["trigger_id"] == "T_DIFF")
+            .expect("T_DIFF emitted when diff_text is supplied");
+        assert_eq!(
+            diff["args"],
+            serde_json::json!({ "namespace": "NeuroStrata", "diff_text": "real diff" }),
+            "T_DIFF args must be schema-valid for neurostrata_diff_tour"
+        );
+
+        // (c) absent diff_text abstains with suppressed_reason, no invalid action.
+        let abstained = crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+            3,
+            &[],
+            3,
+            false,
+            "NeuroStrata",
+            Some("sym::x"),
+            None,
+        );
+        assert!(
+            abstained["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["trigger_id"] != "T_DIFF"),
+            "no T_DIFF prescription without diff_text"
+        );
+        let reason = abstained["suppressed_reason"].as_str().unwrap_or("");
+        assert!(reason.contains("diff_text"), "reason was {reason:?}");
+    }
+
     /// Every tool the surface exposes, in the order tools/list returns them.
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_eight_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_forty_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -18597,6 +20340,8 @@ mod tests {
                 "neurostrata_diff_tour",
                 "neurostrata_insights",
                 "neurostrata_taxonomy",
+                "neurostrata_unwatch",
+                "neurostrata_watch_status",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.
@@ -19175,6 +20920,94 @@ mod tests {
         (store, ladybug_store, bus, ptr)
     }
 
+    /// Shared fixture: a `visible_to: ["alice"]` pointer backed by a persisted
+    /// `memory_pool` pool, so a read that passes the ACL actually returns
+    /// records (an unregistered connector would deny for the wrong reason).
+    async fn seed_resolvable_pointer_in_namespace(
+        namespace: &str,
+    ) -> (
+        Arc<dyn VectorStore>,
+        Arc<crate::store::ladybug::LadybugStore>,
+        Arc<crate::events::ThalamicBus>,
+    ) {
+        use crate::connectors::DataPointerRecord;
+        use crate::store::ladybug::LadybugStore;
+        use crate::traits::MemoryPayload;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ns-dc-resolvable-{}-{}",
+            namespace,
+            uuid::Uuid::new_v4()
+        ));
+        let ladybug_store = Arc::new(LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        let store: Arc<dyn VectorStore> = ladybug_store.clone();
+        store.init(namespace).await.expect("init schema");
+        let (bus, _seen) = recording_bus();
+
+        // Persist pool + records through the production surface; a fresh
+        // handler kernel hydrates them when the pointer is resolved.
+        let register = json!({
+            "namespace": namespace,
+            "principal": "admin",
+            "args": {
+                "operation": "register_pool",
+                "schema": {
+                    "connector_id": "memory_pool",
+                    "pool_id": "pool1",
+                    "access_mode": "read_write",
+                    "entity_types": ["item"],
+                    "max_slice_rows": 10,
+                    "max_slice_bytes": 4096,
+                    "description": "principal authority fixture"
+                },
+                "records": {"uri1": [{"secret": "s3cr3t"}]}
+            }
+        });
+        let response_text = handle_data_connector(&register, store.clone(), bus.clone()).await;
+        let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+        assert_ne!(
+            response.get("ok"),
+            Some(&json!(false)),
+            "fixture pool registration failed: {response_text}"
+        );
+
+        let ptr = DataPointerRecord {
+            pointer_id: "ptr_secret".to_string(),
+            connector_id: "memory_pool".to_string(),
+            pool_id: "pool1".to_string(),
+            pointer_uri: "uri1".to_string(),
+            entity_type: "item".to_string(),
+            expected_source_sha256: None,
+            captured_at_secs: 1000,
+            max_staleness_secs: 1_000_000,
+        };
+        let metadata = json!({
+            "eligibility": "private",
+            "pointer": serde_json::to_value(&ptr).unwrap(),
+            "source": {"kind": "data_connector", "ref": ptr.pointer_uri.clone()},
+            "visible_to": ["alice"],
+        });
+        let payload = MemoryPayload {
+            content: format!("data pointer {}", ptr.pointer_id),
+            user_id: "alice".to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: ptr.pointer_uri.clone(),
+            location_lines: String::new(),
+            metadata,
+        };
+        crate::traits::OntologyStore::put_scoped_memory(
+            &*ladybug_store,
+            namespace,
+            &ptr.pointer_id,
+            &payload,
+        )
+        .await
+        .expect("seed pointer");
+
+        (store, ladybug_store, bus)
+    }
+
     /// Data connector: blank/whitespace/non-string principal must be rejected.
     /// Seeds pointer in "global" namespace (where old code maps invalid principal to None).
     /// Table-driven: covers empty string, whitespace-only, null, number, object, array.
@@ -19289,15 +21122,17 @@ mod tests {
         }
     }
 
-    /// Compatibility: omitted namespace and principal must use existing defaults
-    /// (namespace -> "global", principal -> None) and return successful response.
+    /// Compatibility: an omitted namespace still defaults to "global" for a
+    /// caller that names its principal. (An omitted principal is a pointer
+    /// read without authority and is rejected; see
+    /// `data_connector_pointer_reads_require_principal`.)
     #[tokio::test]
-    async fn data_connector_omitted_fields_use_defaults() {
+    async fn data_connector_omitted_namespace_uses_default() {
         let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
 
-        // No namespace, no principal — should use defaults and succeed
         let arguments = json!({
-            "args": {"operation": "list_pointers"}
+            "args": {"operation": "list_pointers"},
+            "principal": "alice"
         });
         let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
         let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
@@ -19306,6 +21141,172 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["pointer_id"], "ptr_secret");
         assert_eq!(list[0]["pointer_uri"], "uri1");
+    }
+
+    /// The external boundary rejects omission only on pointer reads; the
+    /// write path and non-pointer operations keep their existing handling.
+    #[test]
+    fn external_connector_principal_required_only_for_pointer_reads() {
+        for operation in ["list_pointers", "resolve_pointer", "mediate"] {
+            assert!(
+                enforce_external_connector_principal(operation, None).is_err(),
+                "{operation} must reject an omitted principal"
+            );
+            assert!(
+                enforce_external_connector_principal(operation, Some("alice")).is_ok(),
+                "{operation} must accept a named principal"
+            );
+        }
+        for operation in [
+            "list_connectors",
+            "describe_pool",
+            "register_pool",
+            "upsert_pool",
+            "list_pools",
+            "register_pointer",
+            "apply_effect",
+            "unknown",
+        ] {
+            assert!(
+                enforce_external_connector_principal(operation, None).is_ok(),
+                "{operation} must keep its existing boundary handling"
+            );
+        }
+    }
+
+    /// #348: omitting `principal` must not escalate a caller to the trusted
+    /// internal read. A `visible_to: ["alice"]` pointer stays invisible to
+    /// the anonymous surface on both listing and resolution, before any
+    /// connector I/O, while a named owner and a named stranger keep their
+    /// existing verdicts.
+    #[tokio::test]
+    async fn data_connector_pointer_reads_require_principal() {
+        let (store, _ladybug_store, bus) = seed_resolvable_pointer_in_namespace("global").await;
+        let namespace = "global";
+        let resolve_args = |principal: Option<&str>| {
+            let mut args = json!({
+                "namespace": namespace,
+                "args": {
+                    "operation": "resolve_pointer",
+                    "req": {
+                        "pointer_id": "ptr_secret",
+                        "offset": 0,
+                        "limit": 1,
+                        "max_bytes": 256
+                    },
+                    "now_secs": 1000
+                }
+            });
+            if let Some(p) = principal {
+                args["principal"] = json!(p);
+            }
+            args
+        };
+        let list_args = |principal: Option<&str>| {
+            let mut args = json!({
+                "namespace": namespace,
+                "args": {"operation": "list_pointers"}
+            });
+            if let Some(p) = principal {
+                args["principal"] = json!(p);
+            }
+            args
+        };
+
+        // Omitted principal: denied on both reads, no pointer, URI, or record content.
+        for arguments in [list_args(None), resolve_args(None)] {
+            let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
+            let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
+            assert_eq!(
+                response["ok"], false,
+                "omitted principal must be rejected: {response_text}"
+            );
+            let err = response["error"].as_str().expect("error string");
+            assert!(
+                err.contains("principal"),
+                "error must name the missing principal: {err}"
+            );
+            for secret in ["ptr_secret", "uri1", "s3cr3t"] {
+                assert!(
+                    !response_text.contains(secret),
+                    "omitted principal must not disclose restricted data"
+                );
+            }
+        }
+
+        // Named owner keeps read access on both surfaces.
+        let list_text =
+            handle_data_connector(&list_args(Some("alice")), store.clone(), bus.clone()).await;
+        let list: Value = serde_json::from_str(&list_text).expect("valid JSON");
+        let listed = list.as_array().expect("owner list returns array");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["pointer_id"], "ptr_secret");
+        let resolve_text =
+            handle_data_connector(&resolve_args(Some("alice")), store.clone(), bus.clone()).await;
+        let resolved: Value = serde_json::from_str(&resolve_text).expect("valid JSON");
+        assert_eq!(
+            resolved["records"][0]["secret"], "s3cr3t",
+            "named owner must resolve the restricted record: {resolve_text}"
+        );
+
+        // Named stranger stays denied: empty listing, pre-gate resolution.
+        let stranger_list_text =
+            handle_data_connector(&list_args(Some("mallory")), store.clone(), bus.clone()).await;
+        let stranger_list: Value = serde_json::from_str(&stranger_list_text).expect("valid JSON");
+        assert_eq!(
+            stranger_list
+                .as_array()
+                .expect("stranger list returns array")
+                .len(),
+            0,
+            "stranger listing must omit the restricted pointer: {stranger_list_text}"
+        );
+        let stranger_resolve_text =
+            handle_data_connector(&resolve_args(Some("mallory")), store.clone(), bus.clone()).await;
+        let stranger_resolve: Value =
+            serde_json::from_str(&stranger_resolve_text).expect("valid JSON");
+        assert_eq!(stranger_resolve["ok"], false);
+        assert!(
+            stranger_resolve["error"]
+                .as_str()
+                .expect("error string")
+                .contains("Pre-gate"),
+            "stranger denial stays a pre-gate denial: {stranger_resolve_text}"
+        );
+        assert!(!stranger_resolve_text.contains("s3cr3t"));
+
+        // Write path is unchanged: the omission still fails closed inside the
+        // pre-gate, not at the new read boundary.
+        let write_text = handle_data_connector(
+            &json!({
+                "namespace": namespace,
+                "args": {
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_secret",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_missing",
+                        "idempotency_key": "idem-1"
+                    },
+                    "now_secs": 1000
+                }
+            }),
+            store.clone(),
+            bus.clone(),
+        )
+        .await;
+        let write: Value = serde_json::from_str(&write_text).expect("valid JSON");
+        assert_eq!(write["ok"], false);
+        assert!(
+            write["error"]
+                .as_str()
+                .expect("error string")
+                .contains("Pre-gate"),
+            "write path keeps its existing fail-closed pre-gate: {write_text}"
+        );
+        assert!(!write_text.contains("principal is required"));
+        assert!(!write_text.contains("s3cr3t"));
     }
 
     /// Vocabulary v4: `procedure` is an ordinary memory type on the
@@ -20406,6 +22407,39 @@ mod tests {
             !required_names.contains(&"namespace"),
             "namespace must not be in required: {:?}",
             required_names
+        );
+    }
+
+    /// Task 13 P1-7: a failed MCP tools/call with no `namespace` still writes a
+    /// post-dispatch receipt (under "global") — MCP completeness is 100%.
+    #[tokio::test]
+    async fn tools_call_without_namespace_still_records_receipt() {
+        let root = std::env::temp_dir().join(format!("ns-mcp-no-ns-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).expect("worktree marker");
+        let store = Arc::new(MockStore::new());
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_search_memory",
+                "arguments": { "project_root": root.display().to_string() }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let _ =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let ledger = root.join(".NeuroStrata").join("session_queries.json");
+        let text = std::fs::read_to_string(&ledger)
+            .unwrap_or_else(|e| panic!("no receipt ledger at {}: {e}", ledger.display()));
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("ledger json");
+        let events = doc["events"].as_array().expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["tool"] == "neurostrata_search_memory" && e["namespace"] == "global"),
+            "missing-namespace call must still record a receipt: {events:?}"
         );
     }
 

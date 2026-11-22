@@ -22,6 +22,10 @@ pub const CANVAS_SCHEMA: &str = "https://jsoncanvas.org";
 /// block. Only lines after this marker are stripped on re-import.
 pub const STRUCTURAL_EDGE_MARKER: &str = "<!-- vault-ld:structural-edges -->";
 
+/// Identity schema stamped on every imported head. v2 adds `rdf_type` to the
+/// fingerprint inputs; v1 heads are still comparable via `fingerprint_legacy`.
+pub const FINGERPRINT_VERSION: u64 = 2;
+
 /// Represents a single vault note with YAML-LD 1.0 frontmatter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultNote {
@@ -47,23 +51,43 @@ pub struct VaultNote {
 
 impl VaultNote {
     /// Identity of a note for bitemporal change detection. Content alone is
-    /// insufficient: an edge-only edit is a new version too.
+    /// insufficient: an edge-only edit is a new version too, and so is a
+    /// type-only edit because `@type` drives `memory_type`.
     pub fn fingerprint(&self) -> String {
-        let mut related = self.related.clone();
-        related.sort();
-        related.dedup();
         let canonical = format!(
-            "{}\u{1f}{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
             self.content.trim(),
             self.epistemic_tier,
-            related.join("\u{1e}")
+            self.rdf_type,
+            Self::canonical_related(&self.related)
         );
         hex::encode(Sha256::digest(canonical.as_bytes()))
     }
 
-    /// Create a VaultNote from a SearchResult (ladybug payload)
-    pub fn from_search_result(result: &SearchResult) -> Result<Self, String> {
-        let payload = &result.payload;
+    /// v1 identity (content, tier, related). Comparison only: an existing head
+    /// is matched on this so the v1 -> v2 upgrade does not re-version it.
+    pub fn fingerprint_legacy(&self) -> String {
+        let canonical = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            self.content.trim(),
+            self.epistemic_tier,
+            Self::canonical_related(&self.related)
+        );
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    }
+
+    fn canonical_related(related: &[String]) -> String {
+        let mut sorted = related.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        sorted.join("\u{1e}")
+    }
+
+    /// Create a VaultNote from a stored payload. Used by export and by the
+    /// import unchanged-round-trip check for rows that carry no
+    /// `canonical_sha256` in metadata (task rows are written as `{task: …}`
+    /// without it, so a hash-only comparison can never match them).
+    pub fn from_payload(id: &str, payload: &crate::traits::MemoryPayload) -> Self {
         let memory_type = payload.memory_type.clone();
 
         let epistemic_tier = match memory_type.as_str() {
@@ -92,7 +116,7 @@ impl VaultNote {
         related.dedup();
 
         let mut note = VaultNote {
-            id: result.id.clone(),
+            id: id.to_string(),
             rdf_type: format!("yaml:{memory_type}"),
             context: YAML_LD_CONTEXT.to_string(),
             epistemic_tier,
@@ -103,7 +127,12 @@ impl VaultNote {
             content: payload.content.trim().to_string(),
         };
         note.canonical_sha256 = note.fingerprint();
-        Ok(note)
+        note
+    }
+
+    /// Create a VaultNote from a SearchResult (ladybug payload)
+    pub fn from_search_result(result: &SearchResult) -> Result<Self, String> {
+        Ok(Self::from_payload(&result.id, &result.payload))
     }
 
     /// Render to YAML-LD 1.0 Markdown with frontmatter
