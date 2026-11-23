@@ -443,7 +443,7 @@ impl TimeSeriesStore {
             let key = (namespace.to_string(), metric, st.to_string());
             if let Some(series) = guard.get(&key) {
                 for s in series.samples.iter() {
-                    if from.map_or(true, |f| s.ts >= f) && to.map_or(true, |t| s.ts <= t) {
+                    if from.is_none_or(|f| s.ts >= f) && to.is_none_or(|t| s.ts <= t) {
                         all_samples.push(s.clone());
                     }
                 }
@@ -452,7 +452,7 @@ impl TimeSeriesStore {
             for (key, series) in guard.iter() {
                 if key.0 == namespace && key.1 == metric {
                     for s in series.samples.iter() {
-                        if from.map_or(true, |f| s.ts >= f) && to.map_or(true, |t| s.ts <= t) {
+                        if from.is_none_or(|f| s.ts >= f) && to.is_none_or(|t| s.ts <= t) {
                             let samp = s.clone();
                             // Ensure stage field reflects stage from series key
                             // (already embedded via id, but keep as-is)
@@ -489,7 +489,7 @@ impl TimeSeriesStore {
                 }
             }
             // Include DB sample if it matches range
-            if from.map_or(true, |f| samp.ts >= f) && to.map_or(true, |t| samp.ts <= t) {
+            if from.is_none_or(|f| samp.ts >= f) && to.is_none_or(|t| samp.ts <= t) {
                 seen.insert(samp.id.clone(), samp.clone());
             }
         }

@@ -456,7 +456,7 @@ pub fn set_state(
         .metadata
         .as_object_mut()
         .ok_or_else(|| TwinError::InvalidPayload("metadata is not an object".to_string()))?;
-    if !meta.contains_key("twin") || meta.get("twin").map_or(true, |v| !v.is_object()) {
+    if !meta.contains_key("twin") || meta.get("twin").is_none_or(|v| !v.is_object()) {
         meta.insert("twin".to_string(), serde_json::json!({}));
     }
     let twin = meta
@@ -465,8 +465,7 @@ pub fn set_state(
         .ok_or_else(|| TwinError::InvalidPayload("twin is not an object".to_string()))?;
 
     if merge {
-        if !twin.contains_key("variables") || twin.get("variables").map_or(true, |v| !v.is_object())
-        {
+        if !twin.contains_key("variables") || twin.get("variables").is_none_or(|v| !v.is_object()) {
             twin.insert("variables".to_string(), serde_json::json!({}));
         }
         let vars_obj = twin
@@ -726,7 +725,7 @@ pub fn list_twins_from_rows(rows: &[(String, crate::traits::MemoryPayload)]) -> 
         let not_retired = match valid_to {
             None => true,
             Some(v) if v.is_null() => true,
-            Some(v) => v.as_i64().map_or(false, |ts| ts == 0 || ts > now),
+            Some(v) => v.as_i64().is_some_and(|ts| ts == 0 || ts > now),
         };
         if !not_retired {
             continue;
@@ -828,7 +827,7 @@ pub fn get_twin_state_from_rows(
             .and_then(|t| t.get("version"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        if best_version.map_or(true, |bv| version >= bv) {
+        if best_version.is_none_or(|bv| version >= bv) {
             best_version = Some(version);
             best_payload = Some(payload);
         }

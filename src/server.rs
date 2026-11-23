@@ -4783,14 +4783,11 @@ async fn handle_add_memory(
     // project-relative spelling when a project root actually places it; raw
     // local paths must not reach mesh peers, otherwise fall back to "agent".
     if memory_type == "rule" {
-        if metadata
-            .as_object()
-            .map_or(true, |o| match o.get("source") {
-                None => true,
-                Some(Value::String(s)) => s.trim().is_empty(),
-                Some(_) => false,
-            })
-        {
+        if metadata.as_object().is_none_or(|o| match o.get("source") {
+            None => true,
+            Some(Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        }) {
             let project_root = arguments.get("project_root").and_then(|r| r.as_str());
             let resolved_source =
                 implicit_source_from_location(&store, namespace, &location, project_root).await;
@@ -11337,7 +11334,7 @@ async fn handle_search_memory(
                     let blended = 0.7 + 0.3 * lex.score;
                     let mut lex = lex;
                     lex.score = blended;
-                    if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
+                    if lex.evidence.as_ref().is_none_or(|e| e.is_empty()) {
                         lex.evidence = Some(vec![crate::traits::SearchEvidence {
                             kind: crate::traits::EvidenceKind::DirectMatch,
                             path: Vec::new(),

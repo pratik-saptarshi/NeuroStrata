@@ -807,7 +807,7 @@ fn process_walked_entry(
                         let capture_name = query.capture_names()[capture.index as usize];
                         if capture_name == "name" {
                             name = capture.node.utf8_text(content.as_bytes()).ok();
-                        } else if definition.map_or(true, |d: tree_sitter::Node| {
+                        } else if definition.is_none_or(|d: tree_sitter::Node| {
                             capture.node.byte_range().len() > d.byte_range().len()
                         }) {
                             definition = Some(capture.node);
@@ -1364,8 +1364,8 @@ fn run_producer(
             contained_by.push(generation_scoped_id(&namespace, generation, &pid));
         }
 
-        let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-        let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
 
         let mem_type = if is_dir {
             "directory"
@@ -6614,7 +6614,7 @@ pub async fn dry_run_directory(
         if should_skip {
             continue;
         }
-        let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
         if !is_file {
             continue;
         }
@@ -6725,7 +6725,7 @@ pub async fn dry_run_directory(
         // `.bak`/`.old` suffixes strip off in file_stem() and would never match (AH-17).
         if p.file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |name| v_pattern.is_match(name))
+            .is_some_and(|name| v_pattern.is_match(name))
             && !version_candidates.contains(path_str)
         {
             version_candidates.push(path_str.clone());
