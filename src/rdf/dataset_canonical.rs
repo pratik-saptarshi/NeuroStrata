@@ -694,13 +694,33 @@ mod tests {
         let tags = vec!["t1".to_string(), "t2".to_string()];
         let uuid_str = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
         let update_id_val = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a14";
-        let (nquads, digest) = build_mesh_canonical_nquads(
-            MeshCanonicalRecord { id: uuid_str, namespace: "test.ns", memory_type: "memory", lifecycle_state: "active", created_at: "2026-10-30T12:00:00+00:00", created_by: "author-1", superseded_by: Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"), archived_at: Some("2026-10-30T13:00:00+00:00"), tombstoned_at: None, content: "test content body", eligibility: Some("shareable"), source: Some("owner"), tags: &tags, concept_iri: Some("https://example.com/concept/test"), relationships: &[(
+        let (nquads, digest) = build_mesh_canonical_nquads(MeshCanonicalRecord {
+            id: uuid_str,
+            namespace: "test.ns",
+            memory_type: "memory",
+            lifecycle_state: "active",
+            created_at: "2026-10-30T12:00:00+00:00",
+            created_by: "author-1",
+            superseded_by: Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"),
+            archived_at: Some("2026-10-30T13:00:00+00:00"),
+            tombstoned_at: None,
+            content: "test content body",
+            eligibility: Some("shareable"),
+            source: Some("owner"),
+            tags: &tags,
+            concept_iri: Some("https://example.com/concept/test"),
+            relationships: &[(
                 "supersedes".to_string(),
                 "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13".to_string(),
-            )], update_id: &update_id_val, origin_mesh_epoch: 3, trust: "trusted", trigger: // origin_mesh_epoch=3 matches MeshRecord
-            None, initial_fires: None, valid_to: None, rehearsal_script: None },
-        );
+            )],
+            update_id: &update_id_val,
+            origin_mesh_epoch: 3, // origin_mesh_epoch=3 matches MeshRecord
+            trust: "trusted",
+            trigger: None,
+            initial_fires: None,
+            valid_to: None,
+            rehearsal_script: None,
+        });
         use crate::synaptic_mesh::record::{LifecycleState, MeshRecord, RdfBlock};
         use chrono::{DateTime, Utc};
         use uuid::Uuid;

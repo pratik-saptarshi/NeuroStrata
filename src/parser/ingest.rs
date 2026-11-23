@@ -435,11 +435,7 @@ fn scan_for_ingest(text: &str) -> Option<String> {
     crate::secrets::scan_entry_point(text, &serde_json::json!({}), "ingest").map(|r| r.to_string())
 }
 
-/// Blocking producer: walks the directory tree, reads files, parses ASTs,
-/// and streams owned results through `tx`. Runs on the blocking thread pool
-/// so filesystem I/O never stalls the async runtime.
-/// Parameters for `run_producer`, in the function's original
-/// parameter order.
+/// Parameters for run_producer.
 struct RunProducerParams {
     pub dir_path: std::path::PathBuf,
     pub ext_to_lang: HashMap<String, String>,
@@ -452,6 +448,9 @@ struct RunProducerParams {
     pub observer: Option<std::sync::Arc<dyn IngestObserver>>,
 }
 
+/// Blocking producer: walks the directory tree, reads files, parses ASTs,
+/// and streams owned results through `tx`. Runs on the blocking thread pool
+/// so filesystem I/O never stalls the async runtime.
 fn run_producer(
     params: RunProducerParams,
 ) -> anyhow::Result<(
@@ -823,10 +822,7 @@ fn with_relative_path(
     si
 }
 
-/// Async consumer: receives owned items from the producer, embeds symbols,
-/// and upserts everything to the vector store.
-/// Parameters for `run_consumer`, in the function's original
-/// parameter order.
+/// Parameters for run_consumer.
 struct RunConsumerParams<'a> {
     pub rx: mpsc::Receiver<IngestItem>,
     pub embedder: Arc<dyn Embedder>,
@@ -840,6 +836,8 @@ struct RunConsumerParams<'a> {
     pub node_set: &'a [String],
 }
 
+/// Async consumer: receives owned items from the producer, embeds symbols,
+/// and upserts everything to the vector store.
 async fn run_consumer(params: RunConsumerParams<'_>) -> anyhow::Result<()> {
     let RunConsumerParams {
         mut rx,
