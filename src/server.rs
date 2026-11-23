@@ -1596,19 +1596,19 @@ async fn handle_context_plan(
         if let Some(ls) = ladybug {
             for fp in &requested_files {
                 match ls
-                    .memories_for_file(
-                        effective_ns,
-                        None,
-                        fp,
-                        None,
-                        true,
-                        &crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+                    .memories_for_file(crate::traits::MemoriesForFileParams {
+                        namespace: effective_ns,
+                        source: None,
+                        path: fp,
+                        symbol: None,
+                        include_ancestors: true,
+                        memory_types: &crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
                             .iter()
                             .map(|s| s.to_string())
                             .collect::<Vec<String>>(),
-                        &[],
-                        max_items.max(1),
-                    )
+                        exclude_ids: &[],
+                        limit: max_items.max(1),
+                    })
                     .await
                 {
                     Ok(hits) => {
@@ -2075,16 +2075,16 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     };
 
     match store
-        .memories_for_file(
-            &namespace,
-            source.as_deref(),
+        .memories_for_file(crate::traits::MemoriesForFileParams {
+            namespace: &namespace,
+            source: source.as_deref(),
             path,
             symbol,
             include_ancestors,
-            &memory_types,
-            &exclude_ids,
+            memory_types: &memory_types,
+            exclude_ids: &exclude_ids,
             limit,
-        )
+        })
         .await
     {
         Ok(hits) => {
@@ -2241,17 +2241,17 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     };
 
     match store
-        .related(
-            &namespace,
+        .related(crate::traits::RelatedParams {
+            namespace: &namespace,
             seed,
-            &relations,
+            relations: &relations,
             direction,
             max_hops,
-            &memory_types,
+            memory_types: &memory_types,
             limit,
-            cursor.as_ref(),
-            &cross_namespace,
-        )
+            cursor: cursor.as_ref(),
+            cross_namespace: &cross_namespace,
+        })
         .await
     {
         Ok(mut result) => {
@@ -4523,28 +4523,30 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
                 let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                    id_str,
-                    namespace_str,
-                    memory_type,
-                    lifecycle_state,
-                    &created_at,
-                    created_by,
-                    superseded_by,
-                    archived_at.as_deref(),
-                    tombstoned_at,
-                    &content_str,
-                    eligibility,
-                    source,
-                    &tags,
-                    concept_iri,
-                    &rels,
-                    &update_id,
-                    origin_mesh_epoch,
-                    trust,
-                    trigger,
-                    initial_fires,
-                    valid_to,
-                    rehearsal_script,
+                    crate::rdf::dataset_canonical::MeshCanonicalRecord {
+                        id: id_str,
+                        namespace: namespace_str,
+                        memory_type,
+                        lifecycle_state,
+                        created_at: &created_at,
+                        created_by,
+                        superseded_by,
+                        archived_at: archived_at.as_deref(),
+                        tombstoned_at,
+                        content: &content_str,
+                        eligibility,
+                        source,
+                        tags: &tags,
+                        concept_iri,
+                        relationships: &rels,
+                        update_id: &update_id,
+                        origin_mesh_epoch,
+                        trust,
+                        trigger,
+                        initial_fires,
+                        valid_to,
+                        rehearsal_script,
+                    },
                 );
                 // Honor profile parameter: mesh = canonical N-Quads wire format; local = full MemoryPayload JSON.
                 let result_obj: serde_json::Value = match profile {
@@ -4868,30 +4870,31 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
-            let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &id_str,
-                namespace,
-                memory_type,
-                lifecycle_state,
-                &created_at,
-                created_by,
-                superseded_by,
-                archived_at.as_deref(),
-                tombstoned_at,
-                &content_str,
-                eligibility,
-                source,
-                &tags,
-                concept_iri,
-                &rels,
-                &update_id,
-                origin_mesh_epoch,
-                trust,
-                trigger,
-                initial_fires,
-                valid_to,
-                rehearsal_script,
-            );
+            let (nquads_text, digest_str) =
+                build_mesh_canonical_nquads(crate::rdf::dataset_canonical::MeshCanonicalRecord {
+                    id: &id_str,
+                    namespace,
+                    memory_type,
+                    lifecycle_state,
+                    created_at: &created_at,
+                    created_by,
+                    superseded_by,
+                    archived_at: archived_at.as_deref(),
+                    tombstoned_at,
+                    content: &content_str,
+                    eligibility,
+                    source,
+                    tags: &tags,
+                    concept_iri,
+                    relationships: &rels,
+                    update_id: &update_id,
+                    origin_mesh_epoch,
+                    trust,
+                    trigger,
+                    initial_fires,
+                    valid_to,
+                    rehearsal_script,
+                });
             let created_by_str = payload.user_id.clone();
             let superseded_uuid = superseded_by.and_then(|s| Uuid::parse_str(s).ok());
             let archived_dt = archived_at.as_ref().and_then(|t_str| {
@@ -6026,20 +6029,20 @@ pub(crate) async fn handle_chat_ask(
         Arc::new(crate::rag_chat::OfflineProvider)
     };
 
-    match crate::rag_chat::ask(
+    match crate::rag_chat::ask(crate::rag_chat::AskParams {
         store,
         emb,
-        &namespace,
+        namespace: &namespace,
         principal,
         question,
-        top_k,
+        limit: top_k,
         system,
-        cfg.max_context_chars,
+        max_context_chars: cfg.max_context_chars,
         provider,
-        false,
-        false,
-        cfg.remote_egress_allowed,
-    )
+        include_tasks: false,
+        include_archived: false,
+        remote_egress_allowed: cfg.remote_egress_allowed,
+    })
     .await
     {
         Ok(resp) => serde_json::to_string(&resp)
@@ -7398,42 +7401,42 @@ async fn handle_search_memory(
             if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
                 .downcast_ref::<crate::store::LadybugStore>()
             {
-                ls.search_tantivy_lexical(
+                ls.search_tantivy_lexical(crate::store::ladybug::SearchTantivyLexicalParams {
                     namespace,
-                    &query,
-                    FETCH_LIMIT,
+                    query: &query,
+                    limit: FETCH_LIMIT,
                     include_tasks,
                     include_archived,
-                    &slugs,
+                    domains: &slugs,
                     principal,
-                )
+                })
                 .await
             } else {
                 store
-                    .search_lexical(
+                    .search_lexical(crate::traits::SearchLexicalParams {
                         namespace,
-                        &query,
-                        FETCH_LIMIT,
+                        query: &query,
+                        limit: FETCH_LIMIT,
                         include_tasks,
                         include_archived,
-                        &slugs,
+                        domains: &slugs,
                         principal,
                         fuzzy_max_distance,
-                    )
+                    })
                     .await
             }
         } else {
             store
-                .search_lexical(
+                .search_lexical(crate::traits::SearchLexicalParams {
                     namespace,
-                    &query,
-                    FETCH_LIMIT,
+                    query: &query,
+                    limit: FETCH_LIMIT,
                     include_tasks,
                     include_archived,
-                    &slugs,
+                    domains: &slugs,
                     principal,
                     fuzzy_max_distance,
-                )
+                })
                 .await
         };
         let outcome = match outcome_res {
@@ -7588,16 +7591,16 @@ async fn handle_search_memory(
         }
     };
     if let Ok(outcome) = store
-        .search_with_domain(
+        .search_with_domain(crate::traits::SearchWithDomainParams {
             namespace,
-            vec,
-            FETCH_LIMIT,
+            vector: vec,
+            limit: FETCH_LIMIT,
             include_tasks,
             include_archived,
-            &slugs,
-            Some(query),
+            domains: &slugs,
+            query_text: Some(query),
             exact,
-        )
+        })
         .await
     {
         let mode = outcome.mode;
@@ -7668,16 +7671,16 @@ async fn handle_search_memory(
         // substitute worst-case lexical distance 1.0; lexical-only rows
         // substitute worst-case vector distance 1.0.
         let lexical_outcome = store
-            .search_lexical(
+            .search_lexical(crate::traits::SearchLexicalParams {
                 namespace,
-                &query,
-                FETCH_LIMIT,
+                query: &query,
+                limit: FETCH_LIMIT,
                 include_tasks,
                 include_archived,
-                &slugs,
+                domains: &slugs,
                 principal,
                 fuzzy_max_distance,
-            )
+            })
             .await;
         if let Err(e) = &lexical_outcome {
             tracing::warn!("search_lexical blend failed for '{namespace}': {e}");

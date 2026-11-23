@@ -499,30 +499,31 @@ fn build_record(
         _ => serde_json::to_string(&content).unwrap_or_default(),
     };
 
-    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-        &id.to_string(),
-        &entry.namespace,
-        &entry.memory_type,
-        &format!("{:?}", state).to_lowercase(),
-        &created_at_str,
-        &node_id,
-        superseded_by_str.as_deref(),
-        archived_at_str.as_deref(),
-        tombstoned_at_str.as_deref(),
-        &content_str,
-        eligibility,
-        source,
-        &tags,
-        concept_iri,
-        &rdf_relationships,
-        &update_id_str,
-        epoch,
-        &trust_val,
-        trigger.as_deref(),
-        initial_fires,
-        valid_to.as_deref(),
-        rehearsal_script.as_deref(),
-    );
+    let (nquads_text, digest_str) =
+        build_mesh_canonical_nquads(crate::rdf::dataset_canonical::MeshCanonicalRecord {
+            id: &id.to_string(),
+            namespace: &entry.namespace,
+            memory_type: &entry.memory_type,
+            lifecycle_state: &format!("{:?}", state).to_lowercase(),
+            created_at: &created_at_str,
+            created_by: &node_id,
+            superseded_by: superseded_by_str.as_deref(),
+            archived_at: archived_at_str.as_deref(),
+            tombstoned_at: tombstoned_at_str.as_deref(),
+            content: &content_str,
+            eligibility,
+            source,
+            tags: &tags,
+            concept_iri,
+            relationships: &rdf_relationships,
+            update_id: &update_id_str,
+            origin_mesh_epoch: epoch,
+            trust: &trust_val,
+            trigger: trigger.as_deref(),
+            initial_fires,
+            valid_to: valid_to.as_deref(),
+            rehearsal_script: rehearsal_script.as_deref(),
+        });
 
     let patch_op = if matches!(state, LifecycleState::Archived | LifecycleState::Tombstoned) {
         crate::streaming::PatchOp::Delete
@@ -717,30 +718,31 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
         (None, None, None, None)
     };
 
-    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-        &id_str,
-        namespace,
-        memory_type,
-        &state_str,
-        &created_at_str,
-        created_by,
-        superseded_by_str.as_deref(),
-        archived_at_str.as_deref(),
-        tombstoned_at_str.as_deref(),
-        &content_str,
-        eligibility,
-        source,
-        &tags,
-        concept_iri,
-        &rdf_relationships,
-        &update_id_str,
-        epoch,
-        &trust_val,
-        trigger.as_deref(),
-        initial_fires,
-        valid_to.as_deref(),
-        rehearsal_script.as_deref(),
-    );
+    let (nquads_text, digest_str) =
+        build_mesh_canonical_nquads(crate::rdf::dataset_canonical::MeshCanonicalRecord {
+            id: &id_str,
+            namespace,
+            memory_type,
+            lifecycle_state: &state_str,
+            created_at: &created_at_str,
+            created_by,
+            superseded_by: superseded_by_str.as_deref(),
+            archived_at: archived_at_str.as_deref(),
+            tombstoned_at: tombstoned_at_str.as_deref(),
+            content: &content_str,
+            eligibility,
+            source,
+            tags: &tags,
+            concept_iri,
+            relationships: &rdf_relationships,
+            update_id: &update_id_str,
+            origin_mesh_epoch: epoch,
+            trust: &trust_val,
+            trigger: trigger.as_deref(),
+            initial_fires,
+            valid_to: valid_to.as_deref(),
+            rehearsal_script: rehearsal_script.as_deref(),
+        });
     Some(RdfBlock {
         // The rebuilt block retains the existing block's schema/format
         // identifiers — a rebuilt block is the same projection, refreshed.

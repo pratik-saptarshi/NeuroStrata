@@ -438,21 +438,38 @@ fn scan_for_ingest(text: &str) -> Option<String> {
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
 /// and streams owned results through `tx`. Runs on the blocking thread pool
 /// so filesystem I/O never stalls the async runtime.
+/// Parameters for `run_producer`, in the function's original
+/// parameter order.
+struct RunProducerParams {
+    pub dir_path: std::path::PathBuf,
+    pub ext_to_lang: HashMap<String, String>,
+    pub schema: crate::parser::schema::ParserSchema,
+    pub tx: mpsc::Sender<IngestItem>,
+    pub namespace: String,
+    pub generation: u64,
+    pub prev_file_map: std::collections::HashMap<String, String>,
+    pub force_reparse: bool,
+    pub observer: Option<std::sync::Arc<dyn IngestObserver>>,
+}
+
 fn run_producer(
-    dir_path: std::path::PathBuf,
-    ext_to_lang: HashMap<String, String>,
-    schema: crate::parser::schema::ParserSchema,
-    tx: mpsc::Sender<IngestItem>,
-    namespace: String,
-    generation: u64,
-    prev_file_map: std::collections::HashMap<String, String>,
-    force_reparse: bool,
-    observer: Option<std::sync::Arc<dyn IngestObserver>>,
+    params: RunProducerParams,
 ) -> anyhow::Result<(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<String>>,
 )> {
+    let RunProducerParams {
+        dir_path,
+        ext_to_lang,
+        schema,
+        tx,
+        namespace,
+        generation,
+        prev_file_map,
+        force_reparse,
+        observer,
+    } = params;
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_hashes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -808,18 +825,34 @@ fn with_relative_path(
 
 /// Async consumer: receives owned items from the producer, embeds symbols,
 /// and upserts everything to the vector store.
-async fn run_consumer(
-    mut rx: mpsc::Receiver<IngestItem>,
-    embedder: Arc<dyn Embedder>,
-    vector_store: Arc<dyn VectorStore>,
-    namespace: &str,
-    observer: Option<Arc<dyn IngestObserver>>,
-    zero_vector: Vec<f32>,
-    generation: u64,
-    source_identity: serde_json::Value,
-    ingest_version: &str,
-    node_set: &[String],
-) -> anyhow::Result<()> {
+/// Parameters for `run_consumer`, in the function's original
+/// parameter order.
+struct RunConsumerParams<'a> {
+    pub rx: mpsc::Receiver<IngestItem>,
+    pub embedder: Arc<dyn Embedder>,
+    pub vector_store: Arc<dyn VectorStore>,
+    pub namespace: &'a str,
+    pub observer: Option<Arc<dyn IngestObserver>>,
+    pub zero_vector: Vec<f32>,
+    pub generation: u64,
+    pub source_identity: serde_json::Value,
+    pub ingest_version: &'a str,
+    pub node_set: &'a [String],
+}
+
+async fn run_consumer(params: RunConsumerParams<'_>) -> anyhow::Result<()> {
+    let RunConsumerParams {
+        mut rx,
+        embedder,
+        vector_store,
+        namespace,
+        observer,
+        zero_vector,
+        generation,
+        source_identity,
+        ingest_version,
+        node_set,
+    } = params;
     while let Some(item) = rx.recv().await {
         match item {
             IngestItem::NodeUpsert {
@@ -1253,33 +1286,33 @@ pub async fn ingest_directory(
     let prev_file_map_clone = prev_file_map.clone();
     let observer_clone = observer.clone();
     let producer = tokio::task::spawn_blocking(move || {
-        run_producer(
-            dir_path_owned,
+        run_producer(RunProducerParams {
+            dir_path: dir_path_owned,
             ext_to_lang,
-            schema_clone,
+            schema: schema_clone,
             tx,
-            namespace_owned,
+            namespace: namespace_owned,
             generation,
-            prev_file_map_clone,
+            prev_file_map: prev_file_map_clone,
             force_reparse,
-            observer_clone,
-        )
+            observer: observer_clone,
+        })
     });
 
     // The async consumer embeds and stores each item on the async runtime.
     let observer_clone = observer.clone();
-    let consumer_result = run_consumer(
+    let consumer_result = run_consumer(RunConsumerParams {
         rx,
-        embedder.clone(),
-        vector_store.clone(),
+        embedder: embedder.clone(),
+        vector_store: vector_store.clone(),
         namespace,
-        observer_clone,
+        observer: observer_clone,
         zero_vector,
         generation,
-        source_identity_json,
-        &current_version,
-        &node_set,
-    )
+        source_identity: source_identity_json,
+        ingest_version: &current_version,
+        node_set: &node_set,
+    })
     .await;
 
     let producer_result = producer.await;

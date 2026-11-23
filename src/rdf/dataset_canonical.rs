@@ -2,32 +2,60 @@ use sha2::{Digest, Sha256};
 
 pub const NS_PREFIX: &str = "urn:neurostrata:ns#";
 
+/// The fields of one memory record, in the builder's original
+/// parameter order, grouped for `build_mesh_canonical_nquads`.
+pub struct MeshCanonicalRecord<'a> {
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub memory_type: &'a str,
+    pub lifecycle_state: &'a str,
+    pub created_at: &'a str,
+    pub created_by: &'a str,
+    pub superseded_by: Option<&'a str>,
+    pub archived_at: Option<&'a str>,
+    pub tombstoned_at: Option<&'a str>,
+    pub content: &'a str,
+    pub eligibility: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub tags: &'a [String],
+    pub concept_iri: Option<&'a str>,
+    pub relationships: &'a [(String, String)],
+    pub update_id: &'a str,
+    pub origin_mesh_epoch: u32,
+    pub trust: &'a str,
+    pub trigger: Option<&'a str>,
+    pub initial_fires: Option<i64>,
+    pub valid_to: Option<&'a str>,
+    pub rehearsal_script: Option<&'a str>,
+}
+
 /// Canonical mesh wire N-Quads builder (spec 770f: §5.2, §5.3 Phase 1).
 /// Produces deterministic sorted N-Quads + sha256 digest.
-pub fn build_mesh_canonical_nquads(
-    id: &str,
-    namespace: &str,
-    memory_type: &str,
-    lifecycle_state: &str,
-    created_at: &str,
-    created_by: &str,
-    superseded_by: Option<&str>,
-    archived_at: Option<&str>,
-    tombstoned_at: Option<&str>,
-    content: &str,
-    eligibility: Option<&str>,
-    source: Option<&str>,
-    tags: &[String],
-    concept_iri: Option<&str>,
-    relationships: &[(String, String)],
-    update_id: &str,
-    origin_mesh_epoch: u32,
-    trust: &str,
-    trigger: Option<&str>,
-    initial_fires: Option<i64>,
-    valid_to: Option<&str>,
-    rehearsal_script: Option<&str>,
-) -> (String, String) {
+pub fn build_mesh_canonical_nquads(record: MeshCanonicalRecord<'_>) -> (String, String) {
+    let MeshCanonicalRecord {
+        id,
+        namespace,
+        memory_type,
+        lifecycle_state,
+        created_at,
+        created_by,
+        superseded_by,
+        archived_at,
+        tombstoned_at,
+        content,
+        eligibility,
+        source,
+        tags,
+        concept_iri,
+        relationships,
+        update_id,
+        origin_mesh_epoch,
+        trust,
+        trigger,
+        initial_fires,
+        valid_to,
+        rehearsal_script,
+    } = record;
     let graph = format!("urn:neurostrata:graph:{}:domain:gen:0", namespace);
     let str_dt = "http://www.w3.org/2001/XMLSchema#string";
     let dt_dt = "http://www.w3.org/2001/XMLSchema#dateTime";
@@ -331,30 +359,30 @@ fn rebuild_canonical_nquads(record: &crate::synaptic_mesh::record::MeshRecord) -
     let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
     let update_id = record.update_id.to_string();
     let trust = record.trust.to_string();
-    let (canonical, _digest) = build_mesh_canonical_nquads(
-        &record.id.to_string(),
-        &record.namespace,
-        &record.memory_type,
-        &record.lifecycle.state.to_string(),
-        &created_at,
-        &record.lifecycle.created_by,
-        superseded_by.as_deref(),
-        archived_at.as_deref(),
-        tombstoned_at.as_deref(),
-        &content_str,
+    let (canonical, _digest) = build_mesh_canonical_nquads(MeshCanonicalRecord {
+        id: &record.id.to_string(),
+        namespace: &record.namespace,
+        memory_type: &record.memory_type,
+        lifecycle_state: &record.lifecycle.state.to_string(),
+        created_at: &created_at,
+        created_by: &record.lifecycle.created_by,
+        superseded_by: superseded_by.as_deref(),
+        archived_at: archived_at.as_deref(),
+        tombstoned_at: tombstoned_at.as_deref(),
+        content: &content_str,
         eligibility,
         source,
-        &tags,
+        tags: &tags,
         concept_iri,
-        &rels,
-        &update_id,
-        record.origin_mesh_epoch,
-        &trust,
-        trigger.as_deref(),
+        relationships: &rels,
+        update_id: &update_id,
+        origin_mesh_epoch: record.origin_mesh_epoch,
+        trust: &trust,
+        trigger: trigger.as_deref(),
         initial_fires,
-        valid_to.as_deref(),
-        rehearsal_script.as_deref(),
-    );
+        valid_to: valid_to.as_deref(),
+        rehearsal_script: rehearsal_script.as_deref(),
+    });
     canonical
 }
 
@@ -603,60 +631,60 @@ mod tests {
     #[test]
     fn build_mesh_canonical_nquads_is_deterministic() {
         let tags: Vec<String> = vec!["a".to_string()];
-        let (a, da) = build_mesh_canonical_nquads(
-            "11111111-1111-1111-1111-111111111111",
-            "ns",
-            "rule",
-            "active",
-            "2026-10-29T00:00:00Z",
-            "node-author",
-            None,
-            None,
-            None,
-            "content",
-            Some("shareable"),
-            Some("owner"),
-            tags.as_slice(),
-            Some("https://neurostrata/iri/concept/test"),
-            &[(
+        let (a, da) = build_mesh_canonical_nquads(MeshCanonicalRecord {
+            id: "11111111-1111-1111-1111-111111111111",
+            namespace: "ns",
+            memory_type: "rule",
+            lifecycle_state: "active",
+            created_at: "2026-10-29T00:00:00Z",
+            created_by: "node-author",
+            superseded_by: None,
+            archived_at: None,
+            tombstoned_at: None,
+            content: "content",
+            eligibility: Some("shareable"),
+            source: Some("owner"),
+            tags: tags.as_slice(),
+            concept_iri: Some("https://neurostrata/iri/concept/test"),
+            relationships: &[(
                 "supersedes".to_string(),
                 "22222222-2222-2222-2222-222222222222".to_string(),
             )],
-            "upd-1",
-            1,
-            "trusted",
-            None,
-            None,
-            None,
-            None,
-        );
-        let (b, db) = build_mesh_canonical_nquads(
-            "11111111-1111-1111-1111-111111111111",
-            "ns",
-            "rule",
-            "active",
-            "2026-10-29T00:00:00Z",
-            "node-author",
-            None,
-            None,
-            None,
-            "content",
-            Some("shareable"),
-            Some("owner"),
-            tags.as_slice(),
-            Some("https://neurostrata/iri/concept/test"),
-            &[(
+            update_id: "upd-1",
+            origin_mesh_epoch: 1,
+            trust: "trusted",
+            trigger: None,
+            initial_fires: None,
+            valid_to: None,
+            rehearsal_script: None,
+        });
+        let (b, db) = build_mesh_canonical_nquads(MeshCanonicalRecord {
+            id: "11111111-1111-1111-1111-111111111111",
+            namespace: "ns",
+            memory_type: "rule",
+            lifecycle_state: "active",
+            created_at: "2026-10-29T00:00:00Z",
+            created_by: "node-author",
+            superseded_by: None,
+            archived_at: None,
+            tombstoned_at: None,
+            content: "content",
+            eligibility: Some("shareable"),
+            source: Some("owner"),
+            tags: tags.as_slice(),
+            concept_iri: Some("https://neurostrata/iri/concept/test"),
+            relationships: &[(
                 "supersedes".to_string(),
                 "22222222-2222-2222-2222-222222222222".to_string(),
             )],
-            "upd-1",
-            1,
-            "trusted",
-            None,
-            None,
-            None,
-            None,
-        );
+            update_id: "upd-1",
+            origin_mesh_epoch: 1,
+            trust: "trusted",
+            trigger: None,
+            initial_fires: None,
+            valid_to: None,
+            rehearsal_script: None,
+        });
         assert_eq!(a, b, "N-Quads must be byte-identical");
         assert_eq!(da, db, "SHA-256 must match");
     }
@@ -667,31 +695,11 @@ mod tests {
         let uuid_str = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
         let update_id_val = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a14";
         let (nquads, digest) = build_mesh_canonical_nquads(
-            uuid_str,
-            "test.ns",
-            "memory",
-            "active",
-            "2026-10-30T12:00:00+00:00",
-            "author-1",
-            Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"),
-            Some("2026-10-30T13:00:00+00:00"),
-            None,
-            "test content body",
-            Some("shareable"),
-            Some("owner"),
-            &tags,
-            Some("https://example.com/concept/test"),
-            &[(
+            MeshCanonicalRecord { id: uuid_str, namespace: "test.ns", memory_type: "memory", lifecycle_state: "active", created_at: "2026-10-30T12:00:00+00:00", created_by: "author-1", superseded_by: Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"), archived_at: Some("2026-10-30T13:00:00+00:00"), tombstoned_at: None, content: "test content body", eligibility: Some("shareable"), source: Some("owner"), tags: &tags, concept_iri: Some("https://example.com/concept/test"), relationships: &[(
                 "supersedes".to_string(),
                 "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13".to_string(),
-            )],
-            &update_id_val,
-            3,
-            "trusted", // origin_mesh_epoch=3 matches MeshRecord
-            None,
-            None,
-            None,
-            None,
+            )], update_id: &update_id_val, origin_mesh_epoch: 3, trust: "trusted", trigger: // origin_mesh_epoch=3 matches MeshRecord
+            None, initial_fires: None, valid_to: None, rehearsal_script: None },
         );
         use crate::synaptic_mesh::record::{LifecycleState, MeshRecord, RdfBlock};
         use chrono::{DateTime, Utc};
