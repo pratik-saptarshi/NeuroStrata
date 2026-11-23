@@ -3217,7 +3217,7 @@ mod tests {
         assert_eq!(count_ns_entries(pre, &cmd), 1);
         assert_eq!(
             pre[0].get("matcher").and_then(|m| m.as_str()),
-            Some("Read|Write|Edit|MultiEdit|Bash|Task")
+            Some("Read|Write|Edit|MultiEdit|NotebookEdit|Bash|Task")
         );
         assert_eq!(count_ns_entries(event_entries(&doc, "Stop"), &cmd), 1);
     }
@@ -3354,7 +3354,7 @@ mod tests {
         assert_eq!(
             event_entries(&doc, "PreToolUse"),
             &vec![json!({
-                "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                "matcher": "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|Task",
                 "hooks": [{ "type": "command", "command": cmd }]
             })]
         );
