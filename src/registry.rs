@@ -787,7 +787,6 @@ pub async fn cache_project_root(
             let content = registry_content(namespace);
             let vector = match emb.embed(&content).await {
                 Ok(v) => v,
-                Err(_) => return,
                 Err(e) => {
                     tracing::warn!("cache_project_root embed failed for '{namespace}': {e}");
                     return;

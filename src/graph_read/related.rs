@@ -101,7 +101,6 @@ pub fn parse_direction(raw: Option<&str>) -> Direction {
     match raw {
         Some("outgoing") => Direction::Outgoing,
         Some("incoming") => Direction::Incoming,
-        _ => Direction::Both,
         Some("both" | "") | None => Direction::Both,
         Some(other) => {
             tracing::warn!(
@@ -537,6 +536,62 @@ mod tests {
         assert_eq!(edge_role("CONTAINS"), EdgeRole::Structure);
         assert_eq!(edge_role("RELATES_TO"), EdgeRole::Supporting);
         assert_eq!(edge_role("EXTRACTED_FROM"), EdgeRole::Extraction);
+    }
+
+    /// A `MakeWriter` that appends formatted tracing output to a shared
+    /// buffer, so a test can assert that a log event actually fired.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log capture lock").clone())
+                .expect("captured log output is utf-8")
+        }
+    }
+
+    #[test]
+    fn parse_direction_warns_on_unknown_non_empty_value() {
+        // Regression test for a shadowed warn arm: the doc on
+        // `parse_direction` promises an unrecognized non-empty direction is
+        // warned about (warn-first) and read as `Both`. A guard-free `_` arm
+        // sat above the `Some(other)` warn arm, so the warning never fired.
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .finish();
+        let direction =
+            tracing::subscriber::with_default(subscriber, || parse_direction(Some("sideways")));
+        assert_eq!(direction, Direction::Both);
+        let logs = capture.text();
+        assert!(
+            logs.contains("unknown graph_read direction 'sideways'"),
+            "expected the warn-first log for an unknown direction, captured: {logs:?}"
+        );
     }
 
     #[test]
