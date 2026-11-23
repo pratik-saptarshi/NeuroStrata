@@ -556,7 +556,7 @@ fn build_record(
         &entry.memory_type,
         &format!("{:?}", state).to_lowercase(),
         &created_at_str,
-        &node_id,
+        node_id,
         superseded_by_str.as_deref(),
         archived_at_str.as_deref(),
         tombstoned_at_str.as_deref(),
@@ -656,7 +656,7 @@ fn sign_record_with_keypair(
     record.signature = None;
     let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
     let payload = crate::did::canonical_signing_bytes(&val)?;
-    let sig = crate::did::sign(&payload, &pkey)?;
+    let sig = crate::did::sign(&payload, pkey)?;
     record.signature = Some(crate::did::encode_base64(&sig));
     Ok(())
 }

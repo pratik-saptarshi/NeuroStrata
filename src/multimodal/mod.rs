@@ -409,7 +409,7 @@ fn parse_vp8_lossy(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 30 {
         return None;
     }
-    if bytes.get(23..26)? != &[0x9D, 0x01, 0x2A] {
+    if bytes.get(23..26)? != [0x9D, 0x01, 0x2A] {
         return None;
     }
     let width_raw = u16::from_le_bytes([*bytes.get(26)?, *bytes.get(27)?]) & 0x3FFF;
