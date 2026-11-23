@@ -134,7 +134,7 @@ fn has_unattached_occurrence(text: &str, needle: &str) -> bool {
         let right = text[pos + mat.len()..].chars().next();
         let glued =
             |c: char| matches!(c, '/' | '\\' | ':' | '-' | '_' | '.') || c.is_alphanumeric();
-        if !left.map_or(false, glued) && !right.map_or(false, glued) {
+        if !left.is_some_and(glued) && !right.is_some_and(glued) {
             return true;
         }
     }

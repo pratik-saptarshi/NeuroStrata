@@ -87,8 +87,6 @@ where
     let mut seen_content: HashSet<String> = HashSet::new();
     let mut out: Vec<ContextItem> = Vec::new();
     let mut call_tokens = 0usize;
-    let mut turn_tokens = 0usize;
-    let mut session_tokens = 0usize;
     // Per-turn and per-session ceilings are cumulative: they start from the
     // usage reported on the budget, not from zero.
     let mut turn_tokens = budget.turn_used;

@@ -165,7 +165,7 @@ pub fn public_key_from_did(did: &str) -> Result<Vec<u8>, String> {
     if decoded.len() < ED25519_MULTICODEC_PREFIX.len() {
         return Err("decoded did too short".into());
     }
-    if &decoded[..ED25519_MULTICODEC_PREFIX.len()] != &ED25519_MULTICODEC_PREFIX[..] {
+    if decoded[..ED25519_MULTICODEC_PREFIX.len()] != ED25519_MULTICODEC_PREFIX[..] {
         return Err("invalid ed25519 multicodec prefix".into());
     }
     let pubkey = decoded[ED25519_MULTICODEC_PREFIX.len()..].to_vec();

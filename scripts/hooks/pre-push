@@ -1,20 +1,22 @@
 #!/bin/bash
-# NeuroStrata pre-push hook: (1) upstream-push guard, (2) task gate.
+# NeuroStrata task gate — scaffolded by neurostrata-bootstrap / task_setup.
 #
+# The hook IS the gate. It runs on every push on ANY git host, so it is the
+# required default; CI is vendor-specific and only a defense-in-depth extra.
 # Install once with:  bash scripts/install-hooks.sh
-# The installer copies this file into the directory git actually runs
-# hooks from (core.hooksPath if set, otherwise the common git dir's
-# hooks/ — shared by all worktrees of the clone). Safe to re-run.
-#
+# (`neurostrata-mcp hooks install` writes these exact bytes into the
+# directory git actually runs hooks from, core.hooksPath honored — one
+# hook text for both install paths, so they cannot drift.)
+
 # ── Guard 1: upstream-push guard (Anthropic-Memory Parity, Task 0.2) ──
 # This fork's venue rule: nothing is pushed to upstream
 # Cognilogical/NeuroStrata without Pratik's explicit per-action
 # consent. The guard is mechanical, not prose: it rejects (exit 1) any
 # push whose remote URL's owner/repo path is Cognilogical/NeuroStrata,
 # in any common form and on any host:
-#   https://github.com/Cognilogical/NeuroStrata[.git]
-#   git@github.com:Cognilogical/NeuroStrata.git
-#   ssh://git@github.com/Cognilogical/NeuroStrata[.git]
+#   https://<host>/Cognilogical/NeuroStrata[.git]
+#   git@<host>:Cognilogical/NeuroStrata.git
+#   ssh://git@<host>/Cognilogical/NeuroStrata[.git]
 # Matching is on the path segment after the host, case-insensitive, so
 # a mirror or proxy host carrying that path is rejected too. The fork
 # (pratik-saptarshi/NeuroStrata) and every other remote pass. The
@@ -56,17 +58,7 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
-# ── Guard 2: NeuroStrata task gate ────────────────────────────────────
-# Scaffolded by neurostrata-bootstrap / task_setup.
-# The hook IS the gate. It runs on every push on ANY git host, so it is
-# the required default; CI is vendor-specific and only a defense-in-depth
-# extra. (`neurostrata-mcp hooks install` writes a hook into the
-# directory git actually runs hooks from, core.hooksPath honored; the
-# scaffolded hook text it writes — and that hook hygiene auto-installs
-# over a stale copy — carries the same Guard 1 executable guard above,
-# so either install path, and any hygiene pass, retains the guard.)
-
-command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
+command -v neurostrata-mcp >/dev/null 2>&1 || { echo "error: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 1; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
     exit 0
@@ -81,15 +73,12 @@ NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 neurostrata-mcp task gate "$NAMESPACE" --strict
 code=$?
 if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
+    echo "Push blocked: resolve the tasks above" >&2
     exit 1
 fi
-# A 2 here is never a verdict: under --strict the gate itself exits
-# only 0 or 1, so a 2 means the binary that answered was stale,
-# foreign, or died before it could report. Announced, never silent —
-# and it still does not block (0 and 2 pass, per the exit line below).
-if [ $code -eq 2 ]; then
-    echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
+if [ $code -ne 0 ]; then
+    echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
+    exit 1
 fi
 
 # ── project guards (add yours here) ────────────────────────────────────────
@@ -109,4 +98,5 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
     done
 fi
 
-exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
+exit 0   # the gate passed and all project guards passed
+# neurostrata-hook-sha256: e28405e48fd9a593de4d46d65c2fff12a3a379fbfc089c690ace4b48559e7843
