@@ -16,7 +16,6 @@ use crate::traits::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
-use crate::domain::domain_key;
 
 /// Parse metadata JSON string with error handling and logging
 fn parse_metadata_or_warn(raw: &str, context: &str) -> Value {

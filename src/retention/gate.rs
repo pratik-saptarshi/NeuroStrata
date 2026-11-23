@@ -215,14 +215,14 @@ mod tests {
     use crate::traits::{MemoryPayload, VectorStore};
     use std::time::Instant;
 
-    fn request() -> crate::context::ContextRequest {
-        crate::context::ContextRequest {
+    fn request() -> crate::context::model::ContextRequest {
+        crate::context::model::ContextRequest {
             session_id: "ac5".to_string(),
             context_epoch: 0,
             event_id: "ac5".to_string(),
             trigger: String::new(),
-            source: crate::context::SourceIdentity::default(),
-            policy: crate::context::EgressPolicy::default(),
+            source: crate::context::model::SourceIdentity::default(),
+            policy: crate::context::model::EgressPolicy::default(),
         }
     }
 
