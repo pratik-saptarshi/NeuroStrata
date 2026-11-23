@@ -4150,7 +4150,7 @@ async fn handle_get_snapshot(
                 }
             }
             let mut domain_vec: Vec<(String, usize)> = domains.into_iter().collect();
-            domain_vec.sort_by(|a, b| b.1.cmp(&a.1));
+            domain_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
             let mut top_domains: String = domain_vec
                 .iter()
                 .take(3)
@@ -8415,7 +8415,7 @@ async fn handle_guard_validate(
                 );
             }
         };
-        let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
+        let has_any_task = memories.iter().any(crate::task::gate::is_task);
         if has_any_task {
             let has_in_progress = memories.iter().any(|m| {
                 crate::task::gate::is_task(m)

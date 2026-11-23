@@ -248,7 +248,7 @@ pub fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
             })
             .filter(|e| e.path().is_file() || e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
             .collect();
-        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        entries.sort_by_key(|a| a.file_name());
         for entry in entries {
             let p = entry.path();
             let mut file = File::open(&p)?;

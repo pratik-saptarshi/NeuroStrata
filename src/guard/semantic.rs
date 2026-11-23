@@ -138,7 +138,7 @@ pub(crate) fn rules_from_rows(
 ) -> Vec<BehavioralRule> {
     search_results
         .into_iter()
-        .filter(|result| (result.score as f32) >= MIN_CONSTRAINT_SIMILARITY)
+        .filter(|result| result.score >= MIN_CONSTRAINT_SIMILARITY)
         .filter(|result| RULE_MEMORY_TYPES.contains(&result.payload.memory_type.as_str()))
         .filter_map(|result| {
             // A rule row whose metadata is incomplete is not a rule: it is

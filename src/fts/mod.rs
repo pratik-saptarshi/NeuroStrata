@@ -274,10 +274,7 @@ impl LexicalIndex {
             return;
         }
         let namespace = doc.namespace.clone();
-        self.namespaces
-            .entry(namespace)
-            .or_insert_with(NamespaceIndex::new)
-            .add(doc);
+        self.namespaces.entry(namespace).or_default().add(doc);
     }
 
     /// Insert or replace a document, returning whether it replaced one.

@@ -3531,7 +3531,7 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
         }
         scan.language_counts.push((lang.to_string(), *n));
     }
-    scan.language_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    scan.language_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
     // Manifest-detected languages with no counted files sort last, keeping the
     // order meaningful for everything suggested_rules derives from it.
     scan.languages.sort_by_key(|l| {

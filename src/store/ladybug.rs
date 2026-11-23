@@ -1314,7 +1314,7 @@ async fn search_inner(
                             let kind = crate::traits::EvidenceKind::OneHop;
                             let norm = norm_path(&edges, &kind);
 
-                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                            let entry = by_id.entry(result_id).or_default();
                             if entry.payload.is_none() {
                                 entry.payload = Some(MemoryPayload {
                                     content, user_id, memory_type,
@@ -1393,7 +1393,7 @@ async fn search_inner(
                             let kind = crate::traits::EvidenceKind::Governs2hop;
                             let norm = norm_path(&edges, &kind);
 
-                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                            let entry = by_id.entry(result_id).or_default();
                             if entry.payload.is_none() {
                                 let content: String = format!("{}", row[1]);
                                 let user_id: String = format!("{}", row[2]);
@@ -1476,7 +1476,7 @@ async fn search_inner(
                             let kind = crate::traits::EvidenceKind::Governs2hop;
                             let norm = norm_path(&edges, &kind);
 
-                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                            let entry = by_id.entry(result_id).or_default();
                             if entry.payload.is_none() {
                                 let content: String = format!("{}", row[1]);
                                 let user_id: String = format!("{}", row[2]);
@@ -1552,7 +1552,7 @@ async fn search_inner(
                         ];
                         let kind = crate::traits::EvidenceKind::EpisodeSibling;
 
-                        let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                        let entry = by_id.entry(result_id).or_default();
                         if entry.payload.is_none() {
                             entry.payload = Some(MemoryPayload {
                                 content, user_id, memory_type,
@@ -23907,7 +23907,7 @@ impl LadybugStore {
             .flatten();
         let mut idx = metadata
             .as_ref()
-            .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(m))
+            .map(crate::rdf::OntologyIndex::from_registry_metadata)
             .unwrap_or_default();
         // The shipped vocabulary relations (sub-classes, equivalences,
         // sub-properties, symmetric/transitive properties...) are always in
