@@ -11877,28 +11877,6 @@ async fn handle_search_memory(
                             refs.push(serde_json::json!({"id": r.id, "edge_sources": a}));
                         }
                     }
-                    if has_upgraded_filters
-                        && !crate::search::passes_filters(
-                            &lex.payload.memory_type,
-                            &lex.payload.metadata,
-                            &lex.payload.location,
-                            &search_filters,
-                        )
-                    {
-                        continue;
-                    }
-                    let blended = 0.7 + 0.3 * lex.score;
-                    let mut lex = lex;
-                    lex.score = blended;
-                    if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
-                        lex.evidence = Some(vec![crate::traits::SearchEvidence {
-                            kind: crate::traits::EvidenceKind::DirectMatch,
-                            path: Vec::new(),
-                            explanation: "This memory matched the lexical query.".to_string(),
-                            derivation: vec!["lexical-inhouse".to_string()],
-                        }]);
-                    }
-                    results.push(lex);
                 }
                 if !refs.is_empty() {
                     report.push_str(&format!(

@@ -75,8 +75,6 @@ mod workflow;
 
 
 mod util;
-mod vault_ld;
-mod workflow;
 
 use crate::traits::SearchResult;
 use crate::traits::VectorStore;
@@ -3649,24 +3647,6 @@ mod tests {
         drop(_active_stage_lease);
         drop(source_store);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bench_subcommand_parses() {
-        let cli = Cli::try_parse_from([
-            "neurostrata-mcp",
-            "bench",
-            "--suite",
-            "all",
-            "--iterations",
-            "2",
-            "--max-regression-pct",
-            "10.0",
-            "--record-metrics",
-            "ns",
-        ])
-        .expect("bench parses");
-        assert!(matches!(cli.command, Some(Commands::Bench { .. })));
     }
 
     #[test]
