@@ -361,13 +361,14 @@ fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         let len = ((bytes[i + 2] as usize) << 8 | (bytes[i + 3] as usize)) + 2;
         // SOF markers
-        if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
-            if i + 8 < bytes.len() {
-                let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32);
-                let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32);
-                if height > 0 && width > 0 {
-                    return Some((width, height));
-                }
+        if (0xC0..=0xCF).contains(&marker)
+            && ![0xC4, 0xC8, 0xCC].contains(&marker)
+            && i + 8 < bytes.len()
+        {
+            let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32);
+            let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32);
+            if height > 0 && width > 0 {
+                return Some((width, height));
             }
         }
         i += len.max(2);

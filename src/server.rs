@@ -4782,23 +4782,23 @@ async fn handle_add_memory(
     // caller omitted source (or left it blank), backfill from the location's
     // project-relative spelling when a project root actually places it; raw
     // local paths must not reach mesh peers, otherwise fall back to "agent".
-    if memory_type == "rule" {
-        if metadata.as_object().is_none_or(|o| match o.get("source") {
+    if memory_type == "rule"
+        && metadata.as_object().is_none_or(|o| match o.get("source") {
             None => true,
             Some(Value::String(s)) => s.trim().is_empty(),
             Some(_) => false,
-        }) {
-            let project_root = arguments.get("project_root").and_then(|r| r.as_str());
-            let resolved_source =
-                implicit_source_from_location(&store, namespace, &location, project_root).await;
-            if let Some(o) = metadata.as_object_mut() {
-                o.insert(
-                    "source".to_string(),
-                    serde_json::Value::String(
-                        resolved_source.unwrap_or_else(|| "agent".to_string()),
-                    ),
-                );
-            }
+        })
+    {
+        let project_root = arguments.get("project_root").and_then(|r| r.as_str());
+        let resolved_source =
+            implicit_source_from_location(&store, namespace, &location, project_root).await;
+        if let Some(o) = metadata.as_object_mut() {
+            o.insert(
+                "source".to_string(),
+                serde_json::Value::String(
+                    resolved_source.unwrap_or_else(|| "agent".to_string()),
+                ),
+            );
         }
     }
 
