@@ -63,7 +63,6 @@ impl ReceiptStore {
     }
 
     pub fn get(&self, session_id: &str, task_id: &str, event_id: &str) -> Option<&Receipt> {
-        let key = format!("{}:{}:{}", session_id, task_id, event_id);
         let key = format!(
             "{}:{}:{}",
             key_component(session_id),

@@ -5362,7 +5362,8 @@ impl LadybugStore {
             })?,
             Err(_) => {
                 eprintln!(
-                    "DIAGNOSTIC: publication exceeded its {}s deadline; waiting for its transaction to commit or roll back before reporting an outcome -- engine: {}",
+                    "DIAGNOSTIC: {} exceeded its {}s deadline; waiting for its transaction to commit or roll back before reporting an outcome -- engine: {}",
+                    what,
                     deadline.as_secs(),
                     engine_stats()
                 );
@@ -13064,7 +13065,7 @@ impl VectorStore for LadybugStore {
             // With the pk column present the row is addressed by its
             // derived pk (bound, B1); legacy mode keeps the (namespace,
             // id) property match.
-            let mut result = if pk_ready {
+            let _result = if pk_ready {
                 let mut stmt = conn.prepare(
                     "MATCH (m:Memory {pk: $pk}) RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
                 )?;
@@ -13106,7 +13107,6 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[6]);
                 let metadata_str: String = format!("{}", row[7]);
 
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
                 let metadata_val: Value = match serde_json::from_str(&metadata_str) {
                     Ok(v) => v,
                     Err(e) => {
