@@ -5089,23 +5089,23 @@ async fn handle_add_memory(
     // caller omitted source (or left it blank), backfill from the location's
     // project-relative spelling when a project root actually places it; raw
     // local paths must not reach mesh peers, otherwise fall back to "agent".
-    if memory_type == "rule" {
-        if metadata.as_object().is_none_or(|o| match o.get("source") {
+    if memory_type == "rule"
+        && metadata.as_object().is_none_or(|o| match o.get("source") {
             None => true,
             Some(Value::String(s)) => s.trim().is_empty(),
             Some(_) => false,
-        }) {
-            let project_root = arguments.get("project_root").and_then(|r| r.as_str());
-            let resolved_source =
-                implicit_source_from_location(&store, namespace, &location, project_root).await;
-            if let Some(o) = metadata.as_object_mut() {
-                o.insert(
-                    "source".to_string(),
-                    serde_json::Value::String(
-                        resolved_source.unwrap_or_else(|| "agent".to_string()),
-                    ),
-                );
-            }
+        })
+    {
+        let project_root = arguments.get("project_root").and_then(|r| r.as_str());
+        let resolved_source =
+            implicit_source_from_location(&store, namespace, &location, project_root).await;
+        if let Some(o) = metadata.as_object_mut() {
+            o.insert(
+                "source".to_string(),
+                serde_json::Value::String(
+                    resolved_source.unwrap_or_else(|| "agent".to_string()),
+                ),
+            );
         }
     }
 
@@ -7193,7 +7193,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 let update_id = meta
                     .get("update_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(&id_str)
+                    .unwrap_or(id_str)
                     .to_string();
                 let origin_mesh_epoch = meta
                     .get("origin_mesh_epoch")
@@ -10460,7 +10460,7 @@ async fn handle_supersede_memory(
         }
     }
 
-    let vector = match emb.embed(&content).await {
+    let vector = match emb.embed(content).await {
         Ok(v) => v,
         // The whole point of superseding rather than editing: the new text gets
         // its own embedding, so search stops matching the words we replaced.
@@ -11395,7 +11395,7 @@ async fn handle_search_memory(
             {
                 ls.search_tantivy_lexical_with_options(
                     namespace,
-                    &query,
+                    query,
                     FETCH_LIMIT,
                     include_tasks,
                     include_archived,
@@ -11408,7 +11408,7 @@ async fn handle_search_memory(
                 store
                     .search_lexical(
                         namespace,
-                        &query,
+                        query,
                         FETCH_LIMIT,
                         include_tasks,
                         include_archived,
@@ -11422,7 +11422,7 @@ async fn handle_search_memory(
             store
                 .search_lexical(
                     namespace,
-                    &query,
+                    query,
                     FETCH_LIMIT,
                     include_tasks,
                     include_archived,
@@ -11486,7 +11486,7 @@ async fn handle_search_memory(
                 )
             });
         }
-        if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
+        if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(query) {
             for r in &mut results {
                 let boost = crate::graph_read::temporal::temporal_proximity_boost(
                     q_ts,
@@ -11592,7 +11592,7 @@ async fn handle_search_memory(
             &[],
         );
     }
-    let vec = match emb.embed(&query).await {
+    let vec = match emb.embed(query).await {
         Ok(vec) => vec,
         Err(e) => {
             tracing::warn!("search_memory embedding failed for '{namespace}': {e}");
@@ -11715,7 +11715,7 @@ async fn handle_search_memory(
             let lexical_outcome = store
                 .search_lexical(
                     namespace,
-                    &query,
+                    query,
                     FETCH_LIMIT,
                     include_tasks,
                     include_archived,
@@ -11806,7 +11806,7 @@ async fn handle_search_memory(
                 results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
             }
         }
-        if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
+        if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(query) {
             for r in &mut results {
                 let boost = crate::graph_read::temporal::temporal_proximity_boost(
                     q_ts,

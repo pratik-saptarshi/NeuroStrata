@@ -2508,7 +2508,7 @@ fn write_final_checkpoint_report(mut file: &std::fs::File, report: &str) {
         tracing::warn!("final checkpoint report seek failed: {e}");
         return;
     }
-    if let Err(e) = (&*file).write_all(report.as_bytes()) {
+    if let Err(e) = file.write_all(report.as_bytes()) {
         tracing::warn!("final checkpoint report write failed: {e}");
         return;
     }
@@ -9111,7 +9111,7 @@ async fn run() -> anyhow::Result<()> {
                     let report = crate::parser::ingest::dry_run_directory(
                         &dir_path_owned,
                         &schema,
-                        &dry_run_mode,
+                        dry_run_mode,
                     )
                     .await?;
                     println!("Namespace: {}", namespace);

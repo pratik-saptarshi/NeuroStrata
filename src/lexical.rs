@@ -193,13 +193,8 @@ pub fn code_text_analyzer() -> tantivy::tokenizer::TextAnalyzer {
 fn archived_flag(metadata: &serde_json::Value) -> i64 {
     match metadata.get("archived") {
         Some(v) if v.as_bool() == Some(true) => 1,
-        Some(v) => {
-            if v.as_i64().map(|n| n != 0).unwrap_or(false) {
-                1
-            } else {
-                0
-            }
-        }
+        Some(v) if v.as_i64().map(|n| n != 0).unwrap_or(false) => 1,
+        Some(_) => 0,
         None => 0,
     }
 }

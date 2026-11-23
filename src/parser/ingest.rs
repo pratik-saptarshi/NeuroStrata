@@ -6841,7 +6841,7 @@ pub async fn dry_run_directory(
                                 let mut cursor = tree_sitter::QueryCursor::new();
                                 let mut iter =
                                     cursor.matches(&q, tree.root_node(), content.as_bytes());
-                                while let Some(_) = iter.next() {
+                                while iter.next().is_some() {
                                     symbols += 1;
                                 }
                             }

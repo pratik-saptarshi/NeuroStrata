@@ -86,7 +86,7 @@ pub struct FederationExecutionReport {
 
 fn contains_service(pattern: &GraphPattern) -> bool {
     match pattern {
-        GraphPattern::Service { inner: _, .. } => {
+        GraphPattern::Service { .. } => {
             // The inner itself may contain a nested service — handled by
             // the caller that checks inner specifically.
             true
