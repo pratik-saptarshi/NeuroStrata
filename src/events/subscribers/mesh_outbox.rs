@@ -692,7 +692,7 @@ impl MeshOutbox {
                     ts: chrono::Utc::now().timestamp(),
                     epoch,
                 };
-                outbox.append(&entry).map_err(|e| format!("{}", e))?;
+                outbox.append(&entry).map_err(|e| e.to_string())?;
                 re_emitted += 1;
             }
         }

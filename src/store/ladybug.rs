@@ -4265,7 +4265,6 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 8] = [
 
 /// Row-class predicates for filtering at the store seam.
 /// These are applied BEFORE the candidate budget is spent.
-
 fn is_archived(metadata: &Value) -> bool {
     metadata
         .get("archived")

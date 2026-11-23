@@ -442,7 +442,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let content = json
             .get("choices")
             .and_then(|c| c.as_array())
-            .and_then(|arr| arr.get(0))
+            .and_then(|arr| arr.first())
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|v| v.as_str())

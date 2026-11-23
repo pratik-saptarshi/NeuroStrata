@@ -3352,12 +3352,8 @@ async fn handle_add_memory(
                             let id = linked_id.unwrap_or_default();
                             format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id)
                         }
-                        DedupDecision::BlockedExact => format!(
-                            "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
-                        ),
-                        DedupDecision::BlockedModel => format!(
-                            "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory."
-                        ),
+                        DedupDecision::BlockedExact => "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it.".to_string(),
+                        DedupDecision::BlockedModel => "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory.".to_string(),
                         _ => "Memory was not written.".to_string(),
                     };
                 };
@@ -4469,8 +4465,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 let archived_at = meta
                     .get("archived_at")
                     .and_then(|v| v.as_i64())
-                    .map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()))
-                    .flatten();
+                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()));
                 let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
                 let content_str = payload.content.clone();
                 let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
@@ -4790,8 +4785,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let archived_at = meta
                 .get("archived_at")
                 .and_then(|v| v.as_i64())
-                .map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()))
-                .flatten();
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()));
             let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
             let content_str = payload.content.clone();
             let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
@@ -5624,7 +5618,7 @@ pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String
     }
     let db_path = cfg
         .as_ref()
-        .map(|c| std::path::PathBuf::from(c.db_path.clone()))
+        .map(|c| c.db_path.clone())
         .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
     let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
     serde_json::to_string(&status)
@@ -7131,8 +7125,7 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
         }
         for i in 0..group.len() {
             let a = group[i];
-            for j in (i + 1)..group.len() {
-                let b = group[j];
+            for &b in group.iter().skip(i + 1) {
                 if a.id >= b.id {
                     continue;
                 }

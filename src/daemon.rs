@@ -1138,7 +1138,7 @@ pub(crate) async fn start_daemon_on(
                     // attempt would bury the log without adding anything.
                     if failures == 1 {
                         eprintln!("WARNING: checkpoint failed, so recent writes stay in the log until one succeeds. Retrying: {}", e);
-                    } else if failures % 10 == 0 {
+                    } else if failures.is_multiple_of(10) {
                         eprintln!("WARNING: {} checkpoints in a row have failed -- everything written since the last success would be lost to a hard kill: {}", failures, e);
                     }
                     wait = checkpoint_backoff(failures);

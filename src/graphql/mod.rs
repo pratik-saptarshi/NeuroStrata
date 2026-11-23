@@ -701,7 +701,7 @@ pub fn execute_on_records(
                             let (nested_first, nested_after) =
                                 nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
-                                if id_str == &id_arg && payload.memory_type != "" {
+                                if id_str == &id_arg && !payload.memory_type.is_empty() {
                                     root_result = build_memory_node(
                                         &id_str,
                                         namespace,
@@ -773,7 +773,7 @@ pub fn execute_on_records(
                                 Vec::new();
                             let now = chrono::Utc::now().timestamp();
                             for (id_str, payload) in records.iter() {
-                                if payload.memory_type == "" {
+                                if payload.memory_type.is_empty() {
                                     continue;
                                 }
                                 if is_structural(&payload.memory_type)

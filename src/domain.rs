@@ -805,11 +805,10 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             continue;
         }
         let mut disputed_with = Vec::new();
-        for j in 0..active.len() {
+        for (j, &b) in active.iter().enumerate() {
             if i == j {
                 continue;
             }
-            let b = active[j];
             if b.payload.memory_type != "rule" && b.payload.memory_type != "fact" {
                 continue;
             }

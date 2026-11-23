@@ -607,9 +607,9 @@ fn classify_probe(reached: bool, refused: bool) -> DaemonProbe {
 fn format_bytes_human(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
-    if bytes % GIB == 0 {
+    if bytes.is_multiple_of(GIB) {
         format!("{} GiB", bytes / GIB)
-    } else if bytes % MIB == 0 {
+    } else if bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
     } else {
         format!("{bytes} bytes")
@@ -5927,7 +5927,7 @@ async fn run() -> anyhow::Result<()> {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("Failed to load schema: {}", e);
-                            return Err(e.into());
+                            return Err(e);
                         }
                     };
                     let report = crate::parser::ingest::dry_run_directory(
@@ -6309,7 +6309,7 @@ async fn run() -> anyhow::Result<()> {
                             Ok(s) => s,
                             Err(e) => {
                                 eprintln!("Failed to load schema: {}", e);
-                                return Err(e.into());
+                                return Err(e);
                             }
                         };
                         // Opt-in pre-ingest hygiene: drop the ingester-owned

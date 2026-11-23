@@ -441,7 +441,7 @@ fn build_record(
     // event, so an archived record carries the archive timestamp forward as
     // its tombstone time (the publish-time update stamp).
     let tombstoned_at = if matches!(state, LifecycleState::Archived) {
-        archived_at.clone()
+        archived_at
     } else {
         None
     };
@@ -661,10 +661,9 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
         record
             .lifecycle
             .archived_at
-            .clone()
-            .or_else(|| record.lifecycle.tombstoned_at.clone())
+            .or(record.lifecycle.tombstoned_at)
     } else {
-        record.lifecycle.tombstoned_at.clone()
+        record.lifecycle.tombstoned_at
     };
     let tombstoned_at_str = tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
     let content_str = match &record.content {
