@@ -903,8 +903,8 @@ mod tests {
 
         let (model_path, meta_path) =
             artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
-        assert!(model_path.to_string_lossy().contains("/kge/ns/model.bin"));
-        assert!(meta_path.to_string_lossy().contains("/kge/ns/meta.json"));
+        assert!(model_path.ends_with("kge/ns/model.bin"));
+        assert!(meta_path.ends_with("kge/ns/meta.json"));
     }
 
     #[test]

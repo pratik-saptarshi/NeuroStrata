@@ -3,6 +3,7 @@ pub mod calibration;
 pub mod control;
 pub mod dataset;
 pub mod evaluator;
+pub mod hooks;
 pub mod labels;
 pub mod model_bundle;
 pub mod observation;
@@ -11,6 +12,8 @@ pub mod runtime;
 pub mod split;
 pub mod status;
 pub mod trainer;
+pub mod trajectory;
+pub mod reflection;
 
 pub use blob_store::BlobStore;
 pub use calibration::TemperatureFitter;
