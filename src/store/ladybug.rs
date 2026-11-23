@@ -26572,9 +26572,21 @@ eurostrata\src\daemon.rs",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #363: the reconciler owns both the declared edge and the provenance
-    /// citation for it. An empty replacement set retires the relation without
-    /// touching another relation's entry or an ordinary row.
+    /// #363: the reconciler owns the declared edge. An empty replacement set
+    /// retires the relation without touching another relation's edge or an
+    /// ordinary row.
+    ///
+    /// Re-priced to F6 semantics — owner ruling 2026-11-23, PR #151 Phase 13
+    /// Group B: T9-2 re-priced to F6 semantics; this span was formerly
+    /// byte-identical to main; P50's F6 adjudication stands. Under F6,
+    /// `edge_sources` is never persisted: `upsert` drops it on write and
+    /// `get` synthesizes it at read time from the record's surviving stored
+    /// declarations. Reconcile deletes the edge and retain-filters only
+    /// persisted `edge_sources` — of which there are none — and it does not
+    /// rewrite the stored `related_to` declaration, so the read-time
+    /// synthesis re-derives the RELATES_TO entry for the still-declared,
+    /// still-resolving target even though the edge itself is gone. The
+    /// provenance leg below pins exactly that F6 consequence.
     #[tokio::test]
     async fn reconcile_retires_edge_sources_with_the_edge() {
         let dir = std::env::temp_dir().join(format!("ns-reconcile-prov-{}", uuid::Uuid::new_v4()));
@@ -26629,15 +26641,102 @@ eurostrata\src\daemon.rs",
         let sources = head.metadata["edge_sources"]
             .as_array()
             .expect("edge_sources array");
-        assert!(
-            !sources.iter().any(|s| s["rel_type"] == "RELATES_TO"),
-            "the retired relation's provenance must go: {sources:?}"
+        // F6 consequence (see the doc comment above): synthesis re-derives
+        // one entry per surviving, still-resolving declaration, in
+        // declaration-key order — the retired edge's RELATES_TO declaration
+        // included, because reconcile removed the edge, not the declaration,
+        // and target-b still resolves. Both entries are pinned in full.
+        assert_eq!(sources.len(), 2, "synthesized provenance: {sources:?}");
+        let relates = &sources[0];
+        assert_eq!(
+            relates.get("declaring_id").and_then(|v| v.as_str()),
+            Some("declarer")
+        );
+        assert_eq!(
+            relates.get("rel_type").and_then(|v| v.as_str()),
+            Some("RELATES_TO")
+        );
+        assert_eq!(
+            relates.get("declaration_index").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            relates.get("declared_target").and_then(|v| v.as_str()),
+            Some("target-b")
+        );
+        assert_eq!(
+            relates.get("resolved_target").and_then(|v| v.as_str()),
+            Some("target-b")
+        );
+        assert_eq!(
+            relates.get("logical_target").and_then(|v| v.as_str()),
+            Some("target-b")
+        );
+        assert_eq!(
+            relates.get("orientation").and_then(|v| v.as_str()),
+            Some("self_to_target")
         );
         assert!(
-            sources
-                .iter()
-                .any(|s| s["rel_type"] == "GOVERNS" && s["resolved_target"] == "target-c"),
-            "another relation's provenance must survive: {sources:?}"
+            relates.get("file").map(|v| v.is_null()).unwrap_or(false),
+            "no file anchor was declared: {relates:?}"
+        );
+        assert_eq!(
+            relates.get("content_hash").and_then(|v| v.as_str()),
+            Some("715f495ff7cc0f9d8d1c69441a90aa4ff8541f7b253f7f6ff63d0e82dc0a5319"),
+            "synthesis hashes the declarer's stored content (\"a rule row\")"
+        );
+        assert!(relates
+            .get("line_start")
+            .map(|v| v.is_null())
+            .unwrap_or(false));
+        assert!(relates
+            .get("line_end")
+            .map(|v| v.is_null())
+            .unwrap_or(false));
+        assert_eq!(
+            relates.get("evidence_id").and_then(|v| v.as_str()),
+            Some("declarer")
+        );
+        assert_eq!(
+            relates.get("extractor").and_then(|v| v.as_str()),
+            Some("upsert")
+        );
+        let governs = &sources[1];
+        assert_eq!(
+            governs.get("declaring_id").and_then(|v| v.as_str()),
+            Some("declarer")
+        );
+        assert_eq!(
+            governs.get("rel_type").and_then(|v| v.as_str()),
+            Some("GOVERNS")
+        );
+        assert_eq!(
+            governs.get("declaration_index").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            governs.get("declared_target").and_then(|v| v.as_str()),
+            Some("target-c")
+        );
+        assert_eq!(
+            governs.get("resolved_target").and_then(|v| v.as_str()),
+            Some("target-c")
+        );
+        assert_eq!(
+            governs.get("logical_target").and_then(|v| v.as_str()),
+            Some("target-c")
+        );
+        assert_eq!(
+            governs.get("orientation").and_then(|v| v.as_str()),
+            Some("self_to_target")
+        );
+        assert_eq!(
+            governs.get("evidence_id").and_then(|v| v.as_str()),
+            Some("declarer")
+        );
+        assert_eq!(
+            governs.get("extractor").and_then(|v| v.as_str()),
+            Some("upsert")
         );
         let edges = store.list_edges("probe").await.unwrap();
         assert!(
