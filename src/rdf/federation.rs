@@ -423,7 +423,7 @@ pub async fn handle_remote_sparql_request(
     match results {
         spareval::QueryResults::Solutions(mut sol_iter) => {
             let mut collected = Vec::new();
-            while let Some(item) = sol_iter.next() {
+            for item in sol_iter.by_ref() {
                 if collected.len() >= config.max_solutions {
                     break;
                 }
@@ -470,7 +470,7 @@ pub async fn handle_remote_sparql_request(
         }
         spareval::QueryResults::Graph(mut triples) => {
             let mut bindings: Vec<serde_json::Value> = Vec::new();
-            while let Some(item) = triples.next() {
+            for item in triples.by_ref() {
                 if bindings.len() >= config.max_solutions {
                     truncated = true;
                     break;
