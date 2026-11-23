@@ -1,7 +1,7 @@
 {
   "name": "@neurostrata/plugin-core",
   "version": "0.1.0",
-  "description": "NeuroStrata core plugin — shared implementation for all harness adapters",
+  "description": "NeuroStrata core plugin \u2014 shared implementation for all harness adapters",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,11 +9,17 @@
     "build": "tsc",
     "test": "node --test test.mjs"
   },
-  "keywords": ["neurostrata", "plugin", "core", "task-tracking", "guard"],
+  "keywords": [
+    "neurostrata",
+    "plugin",
+    "core",
+    "task-tracking",
+    "guard"
+  ],
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0",
+    "@types/node": "^26.6.6",
+    "typescript": "~6.0.3",
     "vitest": "^5.1.0"
   },
   "engines": {

@@ -248,6 +248,8 @@ fn is_structural(memory_type: &str) -> bool {
         "community_summary",
         "digital_twin",
         "digital_twin_schema",
+        "action_type",
+        "action_receipt",
     ];
     STRUCTURAL.contains(&memory_type)
 }

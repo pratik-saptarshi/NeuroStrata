@@ -55,6 +55,14 @@ pub struct DrainReport {
     /// idempotent retry after a crash between the file rename and the
     /// mark-committed step. Not a write, not a skip, and never a second commit.
     pub already_applied: usize,
+    /// Entries that collided at export time with an already-present foreign
+    /// record at the same derived mesh UUID (e.g. two nodes independently
+    /// authoring `thesis` v1 or the same `concept` slug+version before
+    /// syncing). The existing mesh file is left untouched and the incoming
+    /// record is preserved in the `.conflicts` overlay.
+    pub conflicted: usize,
+    /// The mesh UUIDs preserved as export conflicts during this drain.
+    pub conflicted_ids: Vec<String>,
     /// Whether `commit_all` recorded a new commit this drain.
     pub committed: bool,
     /// The flattened error when this drain's opt-in compressed-bundle
@@ -73,6 +81,7 @@ enum ApplyOutcome {
     Applied,
     AlreadyApplied,
     Skipped,
+    Conflicted(String),
     Quarantined(String),
 }
 
@@ -123,6 +132,11 @@ pub async fn drain_once(
             }
             ApplyOutcome::Skipped => {
                 report.skipped += 1;
+                committed_ids.push(entry.stable_op_id);
+            }
+            ApplyOutcome::Conflicted(id) => {
+                report.conflicted += 1;
+                report.conflicted_ids.push(id);
                 committed_ids.push(entry.stable_op_id);
             }
             // A quarantine is NOT a consume: the entry stays pending (never
@@ -251,15 +265,15 @@ fn apply_one(
     if !crate::rebac::can_publish_to_mesh(&entry.metadata, &peer_principals) {
         return Ok((ApplyOutcome::Skipped, None));
     }
-    let id = match Uuid::parse_str(&entry.id) {
-        Ok(id) => id,
-        Err(_) => return Ok((ApplyOutcome::Skipped, None)),
+    let id = match parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, &entry.id) {
+        Some(id) => id,
+        None => return Ok((ApplyOutcome::Skipped, None)),
     };
     let superseded_by = match entry.op.as_str() {
         OP_SUPERSEDED => match entry
             .superseded_by
             .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok())
+            .and_then(|s| parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, s))
         {
             Some(target) => Some(target),
             None => return Ok((ApplyOutcome::Skipped, None)),
@@ -329,6 +343,41 @@ fn apply_one(
             // mark-committed). Idempotent: nothing to write, nothing to commit.
             return Ok((ApplyOutcome::AlreadyApplied, None));
         }
+        // Guard against silent overwrite of independently authored records
+        // that map to the same deterministic UUID (#249):
+        // - If the on-disk record was created by a different node (`created_by != node_id`)
+        //   and this entry is an `OP_CREATED` or a taxonomy record (`thesis`/`concept`),
+        //   or if a taxonomy `OP_CREATED` arrives for an already-existing record with
+        //   different content, this is a concurrent independent definition, not a
+        //   same-lineage lifecycle transition. Preserve the candidate in `.conflicts`
+        //   and leave the first author's file untouched.
+        let is_taxonomy = matches!(entry.memory_type.as_str(), "thesis" | "concept");
+        let foreign_author = existing.lifecycle.created_by != node_id;
+        let independent_collision = (foreign_author && (entry.op == OP_CREATED || is_taxonomy))
+            || (is_taxonomy && entry.op == OP_CREATED && existing.content != record.content);
+        if independent_collision {
+            if let Some((pkey, did, pubkey)) = &signing_keypair {
+                if let Err(e) = sign_record_with_keypair(&mut record, pkey, did, pubkey) {
+                    return Err(format!("SynapticMesh record signing failed: {e}"));
+                }
+            }
+            let reason = format!(
+                "independent {} record collision at {} (existing author '{}', incoming author '{}')",
+                record.memory_type, record.id, existing.lifecycle.created_by, node_id
+            );
+            super::conflict::register_conflict(
+                mesh.root(),
+                &record.namespace,
+                &record.id.to_string(),
+                &record.update_id.to_string(),
+                &reason,
+                super::conflict::ConflictKind::Unresolved,
+                &record,
+            )
+            .map_err(|e| format!("conflict overlay write failed for {}: {e}", record.id))?;
+            return Ok((ApplyOutcome::Conflicted(record.id.to_string()), None));
+        }
+
         // A lifecycle transition (superseded/archived) re-exports the SAME
         // record: preserve the origin fields that must not drift with each
         // revision.
@@ -426,7 +475,9 @@ fn build_record(
 
     let mut relationships: Vec<Relationship> = Vec::new();
     if let Some(supersedes) = entry.metadata.get("supersedes").and_then(|v| v.as_str()) {
-        if let Ok(target) = Uuid::parse_str(supersedes) {
+        if let Some(target) =
+            parse_or_derive_mesh_uuid(&entry.namespace, &entry.memory_type, supersedes)
+        {
             relationships.push(Relationship {
                 kind: "supersedes".to_string(),
                 target,
@@ -751,6 +802,26 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
     })
 }
 
+/// Resolve a record's UUID for SynapticMesh storage. Plain UUIDs parse directly;
+/// deterministic non-UUID taxonomy row IDs (`thesis-v*`, `concept-*-v*`) map
+/// deterministically via UUIDv5 over `neurostrata:taxonomy:{namespace}:{raw_id}`.
+pub fn parse_or_derive_mesh_uuid(namespace: &str, memory_type: &str, raw_id: &str) -> Option<Uuid> {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(u) = Uuid::parse_str(trimmed) {
+        Some(u)
+    } else if matches!(memory_type, "thesis" | "concept") {
+        Some(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("neurostrata:taxonomy:{namespace}:{trimmed}").as_bytes(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// The record's `metadata` object: the spec's curated subset. Eligibility is
 /// always present (defaulting to `private`); `source` and `tags` are carried
 /// through when the memory declares them. Everything else — runtime counters,
@@ -771,6 +842,32 @@ fn projected_metadata(metadata: &Value) -> Value {
     // concept_iri is shareable (alignment across namespaces); domain/aliases stay private.
     if let Some(concept_iri) = metadata.get("concept_iri") {
         out.insert("concept_iri".to_string(), concept_iri.clone());
+    }
+    // Carry structured Project Thesis and SKOS Concept payloads when explicitly shareable.
+    let is_taxonomy = metadata.get("thesis").is_some() || metadata.get("concept").is_some();
+    if let Some(thesis) = metadata.get("thesis") {
+        out.insert("thesis".to_string(), thesis.clone());
+    }
+    if let Some(tv) = metadata.get("thesis_version") {
+        out.insert("thesis_version".to_string(), tv.clone());
+    }
+    if let Some(concept) = metadata.get("concept") {
+        out.insert("concept".to_string(), concept.clone());
+    }
+    if let Some(cv) = metadata.get("concept_version") {
+        out.insert("concept_version".to_string(), cv.clone());
+    }
+    if is_taxonomy {
+        for key in ["domain", "valid_from", "valid_to", "supersedes"] {
+            if let Some(val) = metadata.get(key) {
+                out.insert(key.to_string(), val.clone());
+            }
+        }
+    }
+    // Shareable kinetic action_type definitions carry their declarative schema;
+    // action_receipt is strictly private and never projected onto mesh records.
+    if let Some(action_type) = metadata.get("action_type") {
+        out.insert("action_type".to_string(), action_type.clone());
     }
     Value::Object(out)
 }
@@ -2477,6 +2574,83 @@ mod tests {
             outbox.pending().unwrap().len(),
             1,
             "the entry stays pending — nothing half-acknowledged"
+        );
+    }
+
+    /// Issue #249: when two nodes independently create taxonomy records
+    /// (`thesis` or `concept`) that derive the same deterministic mesh UUID,
+    /// the second node's drain must NOT overwrite the first author's mesh file
+    /// or masquerade as the first author. Instead, it preserves the second
+    /// variant in the `.conflicts` overlay while leaving the original mesh
+    /// file untouched.
+    #[tokio::test]
+    async fn independent_taxonomy_creation_at_same_derived_uuid_preserves_conflict_without_overwrite() {
+        let (mesh, outbox) = fixture("taxonomy-conflict-249", None).await;
+        let raw_id = "concept-ns--graph-rag-v1";
+        let derived_uuid =
+            parse_or_derive_mesh_uuid("ns", "concept", raw_id).expect("derived taxonomy uuid");
+
+        let entry_a = OutboxEntry {
+            stable_op_id: Uuid::now_v7(),
+            op: OP_CREATED.to_string(),
+            id: raw_id.to_string(),
+            namespace: "ns".to_string(),
+            memory_type: "concept".to_string(),
+            content: "Node A concept definition".to_string(),
+            metadata: json!({
+                "eligibility": "shareable",
+                "concept": { "slug": "graph-rag", "version": 1 }
+            }),
+            superseded_by: None,
+            ts: 1_700_000_000,
+            epoch: 1,
+        };
+        outbox.append(&entry_a).unwrap();
+        let rep_a = drain_once(&outbox, &mesh, "node-a").await.unwrap();
+        assert_eq!(rep_a.applied, 1);
+        assert_eq!(rep_a.conflicted, 0);
+
+        let entry_b = OutboxEntry {
+            stable_op_id: Uuid::now_v7(),
+            op: OP_CREATED.to_string(),
+            id: raw_id.to_string(),
+            namespace: "ns".to_string(),
+            memory_type: "concept".to_string(),
+            content: "Node B competing concept definition".to_string(),
+            metadata: json!({
+                "eligibility": "shareable",
+                "concept": { "slug": "graph-rag", "version": 1 }
+            }),
+            superseded_by: None,
+            ts: 1_700_000_100,
+            epoch: 1,
+        };
+        outbox.append(&entry_b).unwrap();
+        let rep_b = drain_once(&outbox, &mesh, "node-b").await.unwrap();
+        assert_eq!(rep_b.applied, 0, "must not overwrite existing record: {rep_b:?}");
+        assert_eq!(rep_b.conflicted, 1, "must record export conflict: {rep_b:?}");
+        assert_eq!(rep_b.conflicted_ids, vec![derived_uuid.to_string()]);
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "conflicted entry is consumed into overlay"
+        );
+
+        // Primary mesh file still holds Node A's record and provenance.
+        let on_disk = stored_record(&mesh, &derived_uuid);
+        assert_eq!(on_disk.lifecycle.created_by, "node-a");
+        assert_eq!(on_disk.content, json!("Node A concept definition"));
+
+        // Conflict overlay holds Node B's variant for operator resolution.
+        let overlay = super::super::conflict::load_overlay(mesh.root());
+        assert_eq!(overlay.unresolved_count(), 1);
+        let variant_path = super::super::conflict::conflicts_dir_for(mesh.root())
+            .join(format!("ns/{derived_uuid}.json"));
+        let variant: MeshRecord =
+            serde_json::from_str(&std::fs::read_to_string(&variant_path).unwrap()).unwrap();
+        assert_eq!(variant.lifecycle.created_by, "node-b");
+        assert_eq!(
+            variant.content,
+            json!("Node B competing concept definition")
         );
     }
 }
