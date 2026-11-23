@@ -14290,10 +14290,13 @@ impl VectorStore for LadybugStore {
                         conn,
                         rel_type,
                         pairs,
-                        &namespace,
-                        active_gen,
-                        chrono::Utc::now().timestamp(),
-                        "relink",
+                        &EdgeReplay {
+                            namespace: &namespace,
+                            generation: active_gen,
+                            now: chrono::Utc::now().timestamp(),
+                            extractor: "relink",
+                            citations: None,
+                        },
                     )?;
                 }
                 #[cfg(test)]
@@ -36312,10 +36315,13 @@ eurostrata\src\daemon.rs",
                         conn,
                         "RELATES_TO",
                         &[edge],
-                        &edge_ns,
-                        1,
-                        chrono::Utc::now().timestamp(),
-                        "test",
+                        &EdgeReplay {
+                            namespace: &edge_ns,
+                            generation: 1,
+                            now: chrono::Utc::now().timestamp(),
+                            extractor: "test",
+                            citations: None,
+                        },
                     )?;
                     Ok(())
                 }
