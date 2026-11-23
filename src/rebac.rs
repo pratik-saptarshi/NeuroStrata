@@ -75,10 +75,10 @@ pub fn extract_visible_to(metadata: &Value) -> Vec<String> {
                 .filter_map(|v| {
                     if let Some(s) = v.as_str() {
                         Some(s.to_string())
-                    } else if let Some(p) = v.get("principal").and_then(|p| p.as_str()) {
-                        Some(p.to_string())
                     } else {
-                        None
+                        v.get("principal")
+                            .and_then(|p| p.as_str())
+                            .map(|p| p.to_string())
                     }
                 })
                 .collect();

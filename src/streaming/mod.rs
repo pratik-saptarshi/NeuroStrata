@@ -451,7 +451,7 @@ impl Stream {
                     .trim_start_matches('<')
                     .trim_end_matches('>')
                     .to_string(),
-                object: object,
+                object,
                 graph,
             });
         }

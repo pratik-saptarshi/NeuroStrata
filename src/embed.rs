@@ -254,7 +254,7 @@ fn profile_model(profile: crate::config::CapacityProfile) -> AcceptableEmbedder 
 
 /// Model resolution, first match wins (Spec Feature 1):
 /// 1. `NEUROSTRATA_MODEL`; 2. a user-edited `embedders.json`; 3. the
-/// profile default; 4. the auto-generated list's first entry.
+///    profile default; 4. the auto-generated list's first entry.
 pub(crate) fn resolve_configured_model(
     acceptable_models: Vec<AcceptableEmbedder>,
     state: EmbeddersFileState,

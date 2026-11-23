@@ -628,7 +628,7 @@ pub fn self_test_with(expected_kinds: &[&'static str]) -> SelfTestReport {
         .collect();
     let extra: Vec<String> = actual
         .iter()
-        .filter(|a| !expected_kinds.iter().any(|e| *e == a.as_str()))
+        .filter(|a| !expected_kinds.contains(&a.as_str()))
         .cloned()
         .collect();
     SelfTestReport {

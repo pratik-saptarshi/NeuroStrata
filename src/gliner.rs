@@ -74,7 +74,7 @@ fn ends_with_punct(raw: &str) -> bool {
 ///   - punctuation-only token
 ///   - word ending with punctuation (phrase includes that word, then stops)
 ///   - end of input
-/// All candidates are review-only (`review_only = true`).
+///     All candidates are review-only (`review_only = true`).
 pub fn extract_candidates(text: &str) -> Vec<GlinerCandidate> {
     let mut candidates = Vec::new();
     let words: Vec<&str> = text.split_whitespace().collect();

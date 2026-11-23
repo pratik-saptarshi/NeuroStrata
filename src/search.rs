@@ -77,7 +77,7 @@ pub fn decision_shape_boost(metadata: &Value) -> f32 {
 pub fn path_prefix_matches(location: &str, prefix: Option<&str>) -> bool {
     match prefix {
         None => true,
-        Some(p) if p.is_empty() => true,
+        Some("") => true,
         Some(p) => location.starts_with(p),
     }
 }

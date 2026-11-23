@@ -1400,7 +1400,7 @@ pub async fn ingest_directory(
                         generation,
                         crate::parser::generation::NAMESPACE_SEPARATOR
                     );
-                    payload.metadata.as_object_mut().map(|o| {
+                    if let Some(o) = payload.metadata.as_object_mut() {
                         o.insert(
                             "index_generation".to_string(),
                             serde_json::json!(generation),
@@ -1435,7 +1435,7 @@ pub async fn ingest_directory(
                                 .collect();
                             o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
                         }
-                    });
+                    }
                     let new_id =
                         crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
                     if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {

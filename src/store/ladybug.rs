@@ -2341,10 +2341,7 @@ fn strict_wal_verification() -> bool {
     {
         return false;
     }
-    match std::env::var("NEUROSTRATA_STRICT_WAL").as_deref() {
-        Ok("0") => false,
-        _ => true,
-    }
+    !matches!(std::env::var("NEUROSTRATA_STRICT_WAL").as_deref(), Ok("0"))
 }
 
 fn is_wal_integrity_failure(err: &str) -> bool {
@@ -11292,7 +11289,7 @@ fn pick_declared_target(
         active_gen,
         &declared.replace('\\', "/"),
     );
-    if found.iter().any(|id| *id == qualified) {
+    if found.contains(&qualified) {
         return crate::traits::TargetResolution::Resolved(qualified);
     }
     if found.iter().any(|id| id == declared) {

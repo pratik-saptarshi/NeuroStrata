@@ -229,7 +229,9 @@ impl KgeModel {
         let mut entity_bytes = vec![0u8; entity_embedding_count * 4];
         model_file.read_exact(&mut entity_bytes)?;
         let entity_embeddings: Vec<f32> = entity_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
 
@@ -237,7 +239,9 @@ impl KgeModel {
         let mut relation_bytes = vec![0u8; relation_embedding_count * 4];
         model_file.read_exact(&mut relation_bytes)?;
         let relation_embeddings: Vec<f32> = relation_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
 
