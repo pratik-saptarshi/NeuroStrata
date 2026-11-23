@@ -77,6 +77,35 @@ pub struct MemoryHit {
     /// inspect the memory without a second fetch.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
+    /// Up to 2 cross-domain conceptual bridges where this hit is the seed.
+    /// Populated from 1-hop neighbors whose domain is disjoint from `source_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conceptual_bridges: Vec<ConceptualBridge>,
+    /// How many files the memory is linked to (see `fan_out_bucket`). Used
+    /// for ranking only, so it is not part of the answer.
+    #[serde(skip)]
+    pub linked_files: usize,
+}
+
+/// A cross-domain conceptual bridge connecting a seed memory to a normative target
+/// via a 2-hop path (seed -> via -> target). Used to surface hidden architectural
+/// relationships that are not directly visible through the standard graph edges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptualBridge {
+    /// The seed memory (directly matched to the queried file/symbol).
+    pub source_id: String,
+    /// The intermediate node on the 2-hop path (seed -> via -> target).
+    pub via_id: String,
+    /// The normative target memory in a disjoint domain from `source_id`.
+    pub target_id: String,
+    /// Normalized domain slug of the target (e.g., "rule", "fact", "procedure").
+    pub target_domain: String,
+    /// Human-readable one-sentence summary of the target (max 160 chars).
+    pub target_summary: String,
+    /// Human-readable path description, e.g. "src/server.rs -> via-id -> rule-id".
+    pub path: String,
+    /// Memory type of the target (rule | fact | decision | procedure).
+    pub target_type: String,
 }
 
 /// The memory-type segment of the ranking key (spec §4.1):
@@ -121,8 +150,42 @@ pub fn freshness_priority(metadata: &Value) -> u8 {
     }
 }
 
+/// The fan-out segment of the ranking key: a memory linked to 1-2 files says
+/// more about each of them than one linked to 3-9, or to 10 or more. Lower
+/// is better. It is a *tiebreaker* inside one enforcement class, never a
+/// reason to rank a broad ENFORCED rule below a narrow advisory one (#208).
+pub fn fan_out_bucket(linked_files: usize) -> u8 {
+    match linked_files {
+        0..=2 => 0,
+        3..=9 => 1,
+        _ => 2,
+    }
+}
+
+/// Whether the memory is linked to the queried file itself (or to a symbol
+/// in it), rather than to a directory above it or through `RELATES_TO`.
+fn is_direct(kind: GraphMatchKind) -> bool {
+    matches!(
+        kind,
+        GraphMatchKind::ExactSymbol | GraphMatchKind::ExactFile | GraphMatchKind::SymbolTwoHop
+    )
+}
+
+fn valid_from(metadata: &Value) -> i64 {
+    metadata
+        .get("valid_from")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+}
+
 /// Sort hits by the spec's ranking: match kind, then memory-type priority,
-/// then freshness, then `access_count` descending, then id for determinism.
+/// then fan-out bucket, then freshness, then (direct matches) newest
+/// `valid_from` first or (weaker matches) `access_count` descending, then id
+/// for determinism. Type outranks fan-out so a broad ENFORCED rule is never
+/// pushed off the page by narrow advisory rules; fan-out only separates hits
+/// that are equal on kind and type. Newest first for direct matches because an
+/// older memory on the same file has had more time to collect reads, and it is
+/// the newer one that describes the file as it is.
 pub fn rank_hits(hits: &mut [MemoryHit]) {
     hits.sort_by(|a, b| {
         a.match_kind
@@ -132,8 +195,15 @@ pub fn rank_hits(hits: &mut [MemoryHit]) {
                 memory_type_priority(&a.memory_type, &a.metadata)
                     .cmp(&memory_type_priority(&b.memory_type, &b.metadata))
             })
+            .then_with(|| fan_out_bucket(a.linked_files).cmp(&fan_out_bucket(b.linked_files)))
             .then_with(|| freshness_priority(&a.metadata).cmp(&freshness_priority(&b.metadata)))
-            .then_with(|| b.access_count.cmp(&a.access_count))
+            .then_with(|| {
+                if is_direct(a.match_kind) {
+                    valid_from(&b.metadata).cmp(&valid_from(&a.metadata))
+                } else {
+                    b.access_count.cmp(&a.access_count)
+                }
+            })
             .then_with(|| a.id.cmp(&b.id))
     });
 }

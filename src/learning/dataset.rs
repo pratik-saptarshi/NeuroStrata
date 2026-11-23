@@ -493,7 +493,6 @@ pub async fn build_dedup_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn failing_build_dedup_dataset_empty_root() {
