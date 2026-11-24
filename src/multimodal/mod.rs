@@ -442,8 +442,8 @@ fn parse_vp8l_lossless(bytes: &[u8]) -> Option<(u32, u32)> {
         *bytes.get(23)?,
         *bytes.get(24)?,
     ]);
-    let width = ((packed & 0x3FFF) + 1) as u32;
-    let height = (((packed >> 14) & 0x3FFF) + 1) as u32;
+    let width = (packed & 0x3FFF) + 1;
+    let height = ((packed >> 14) & 0x3FFF) + 1;
     if width == 0 || height == 0 {
         return None;
     }

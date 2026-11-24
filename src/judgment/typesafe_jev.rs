@@ -133,14 +133,11 @@ impl TypeSafeJevProvider {
                         .or_else(|| answer.get("verdict"))
                         .or_else(|| answer.get("noul"))
                         .and_then(|v| v.as_str())
-                        .map(|s| {
-                            Some(match s.to_ascii_lowercase().as_str() {
-                                "yes" | "true" | "duplicate" => 0.9,
-                                "no" | "false" => 0.1,
-                                _ => 0.0,
-                            })
-                        })
-                        .flatten(),
+                        .map(|s| match s.to_ascii_lowercase().as_str() {
+                            "yes" | "true" | "duplicate" => 0.9,
+                            "no" | "false" => 0.1,
+                            _ => 0.0,
+                        }),
                 };
                 let confidence = confidence.unwrap_or(0.0) as f32;
 

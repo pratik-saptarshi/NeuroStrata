@@ -355,7 +355,7 @@ impl TimeSeriesStore {
         }
 
         let mut result: Vec<Sample> = merged.into_values().collect();
-        result.sort_by(|a, b| (a.ts, a.seq, a.id.clone()).cmp(&(b.ts, b.seq, b.id.clone())));
+        result.sort_by_key(|a| (a.ts, a.seq, a.id.clone()));
         result
     }
 
@@ -469,7 +469,7 @@ impl TimeSeriesStore {
         for s in all_samples {
             seen.insert(s.id.clone(), s);
         }
-        for (_, samp) in db_map.iter() {
+        for samp in db_map.values() {
             // DB sample ids embed their `namespace`, `metric` and `stage`
             // segments (`namespace::metric::stage::ts::seq`; legacy rows use
             // single colons). Every segment must match the query: a substring
@@ -495,8 +495,7 @@ impl TimeSeriesStore {
         }
 
         let mut result_samples: Vec<Sample> = seen.into_values().collect();
-        result_samples
-            .sort_by(|a, b| (a.ts, a.seq, a.id.clone()).cmp(&(b.ts, b.seq, b.id.clone())));
+        result_samples.sort_by_key(|a| (a.ts, a.seq, a.id.clone()));
 
         // Compute aggregate
         let count = result_samples.len() as u64;

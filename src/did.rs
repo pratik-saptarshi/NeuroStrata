@@ -1,6 +1,5 @@
 use openssl::pkey::{Id, PKey, Private};
 use openssl::sign::{Signer, Verifier};
-use serde_json;
 use std::fs;
 use std::path::Path;
 
@@ -12,7 +11,7 @@ pub const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b: [u8; 3] = match chunk.len() {
             1 => [chunk[0], 0, 0],
@@ -91,7 +90,7 @@ pub fn encode_base58btc(bytes: &[u8]) -> String {
         for &b in &num {
             let v = rem * 256 + (b as u16);
             let digit = (v / 58) as u8;
-            rem = (v % 58) as u16;
+            rem = v % 58;
             if !next.is_empty() || digit != 0 {
                 next.push(digit);
             }
@@ -272,7 +271,7 @@ pub fn canonicalize_json_value(val: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(new_map)
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(|v| canonicalize_json_value(v)).collect())
+            serde_json::Value::Array(arr.iter().map(canonicalize_json_value).collect())
         }
         other => other.clone(),
     }

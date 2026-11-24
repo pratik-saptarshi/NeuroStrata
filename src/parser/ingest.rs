@@ -1457,7 +1457,7 @@ fn run_producer(
         } else if let Some(p) = path.parent() {
             if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
                 let p_str = node_id_for(&dir_path, p);
-                if p_str != "." && p_str != "" && p_str != node_path {
+                if p_str != "." && !p_str.is_empty() && p_str != node_path {
                     Some(p_str)
                 } else {
                     None
@@ -2342,7 +2342,7 @@ pub async fn ingest_directory(
                         generation,
                         crate::parser::generation::NAMESPACE_SEPARATOR
                     );
-                    payload.metadata.as_object_mut().map(|o| {
+                    if let Some(o) = payload.metadata.as_object_mut() {
                         o.insert(
                             "index_generation".to_string(),
                             serde_json::json!(generation),
@@ -2471,7 +2471,7 @@ pub async fn ingest_directory(
                                 .collect();
                             o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
                         }
-                    });
+                    }
                     let new_id =
                         crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
                     if row_kind == "code_ast" {
@@ -6836,7 +6836,7 @@ pub async fn dry_run_directory(
                 if parser.set_language(&ts_lang).is_ok() {
                     if let Some(tree) = parser.parse(&content, None) {
                         let schema_lang = &schema.languages[&ln];
-                        for (_qname, qstr) in &schema_lang.queries {
+                        for qstr in schema_lang.queries.values() {
                             if let Ok(q) = tree_sitter::Query::new(&ts_lang, qstr) {
                                 let mut cursor = tree_sitter::QueryCursor::new();
                                 let mut iter =
@@ -6889,7 +6889,7 @@ pub async fn dry_run_directory(
             }
         }
     }
-    for (_key, path_set) in &stem_dir_map {
+    for path_set in stem_dir_map.values() {
         if path_set.len() > 1 {
             for path_str in path_set {
                 if !version_candidates.contains(path_str) {

@@ -6,9 +6,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Provider selection mode for deduplication.
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DedupProviderMode {
+    #[default]
     Auto,
     Heuristic,
     LayaLocal,
@@ -66,12 +67,6 @@ fn default_cb_backoff_max() -> u64 {
     3600
 }
 
-
-impl Default for DedupProviderMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 impl Default for DeduplicationConfig {
     fn default() -> Self {

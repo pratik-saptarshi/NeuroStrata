@@ -879,7 +879,7 @@ pub fn twin_history_from_rows(
         let state = get_state(payload);
         matched.push((version, valid_from, state));
     }
-    matched.sort_by(|a, b| a.0.cmp(&b.0));
+    matched.sort_by_key(|a| a.0);
     if limit > 0 {
         matched.truncate(limit);
     }

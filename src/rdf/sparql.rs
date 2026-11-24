@@ -489,7 +489,7 @@ fn custom_functions_on(
     .with_custom_function(NamedNode::new("urn:neurostrata:ns#validAt").unwrap(), {
         let meta_map = meta_map.clone();
         move |args: &[Term]| -> Option<Term> {
-            let mem_term = args.get(0)?;
+            let mem_term = args.first()?;
             let ts_term = args.get(1)?;
             let key_str = match mem_term {
                 Term::NamedNode(n) => n.as_str().to_string(),

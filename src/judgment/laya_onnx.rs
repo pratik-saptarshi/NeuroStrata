@@ -313,13 +313,10 @@ impl JudgmentProvider for LayaOnnxProvider {
                 let (similarity, reason) = if let Some(ref session_ref) = session_arc {
                     let mut session = session_ref.lock().unwrap_or_else(|e| e.into_inner());
                     let jaccard_sim = token_overlap;
-                    let feature_vec = [jaccard_sim as f32, (1.0 - score.clamp(0.0, 1.0)) as f32];
+                    let feature_vec = [jaccard_sim, (1.0 - score.clamp(0.0, 1.0))];
                     let feature_array =
                         match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec()) {
-                            Ok(arr) => match ort::value::Value::from_array(arr) {
-                                Ok(v) => Some(v),
-                                Err(_) => None,
-                            },
+                            Ok(arr) => ort::value::Value::from_array(arr).ok(),
                             Err(_) => None,
                         };
                     match feature_array {
@@ -430,7 +427,7 @@ fn tokenize_content(
         match tok.encode(content, false) {
             Ok(encoded) => {
                 for token_id in encoded.get_ids() {
-                    ids.insert(*token_id as u32);
+                    ids.insert(*token_id);
                 }
                 return ids;
             }
