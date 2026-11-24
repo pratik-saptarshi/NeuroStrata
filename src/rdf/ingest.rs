@@ -189,11 +189,6 @@ fn map_vocab_error(err: VocabularySelectionError) -> IngestError {
             IngestError::BudgetExhausted { visited, max_nodes }
         }
         VocabularySelectionError::EmptyVocabulary(d) => IngestError::EmptyVocabulary(d),
-        VocabularySelectionError::MalformedIri(m) => IngestError::MalformedIri {
-            field: "iri",
-            value: m,
-        },
-        VocabularySelectionError::UnknownDatatype(d) => IngestError::UnknownDatatype(d),
     }
 }
 
@@ -213,7 +208,6 @@ pub struct IngestOutcome {
     pub id: String,
     pub turtle: String,
     pub triple_count: usize,
-    pub memory_payload: MemoryPayload,
 }
 
 /// A scheme (`^[A-Za-z][A-Za-z0-9+.-]*:`) with no path/query/fragment
@@ -882,7 +876,6 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         id: report.id,
         turtle: batch.turtle,
         triple_count: batch.triple_count,
-        memory_payload: batch.memory_payload,
     })
 }
 
