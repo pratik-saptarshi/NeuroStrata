@@ -819,6 +819,10 @@ pub struct ActionValidateOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+// Serde-serialized outcome crossing module boundaries (learning hooks,
+// server surface); boxing the receipt would change the public type shape
+// for a transient, one-per-apply value.
+#[allow(clippy::large_enum_variant)]
 pub enum ActionApplyOutcome {
     Applied {
         receipt_id: String,
