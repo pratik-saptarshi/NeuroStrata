@@ -86,14 +86,12 @@ pub fn format_iri(iri: &str) -> Result<String, ParseError> {
     // Reject chars: < > " { } | ^ \ ` and control chars U+0000..=U+0020
     for ch in inner.chars() {
         let c = ch as u32;
-        if c <= 0x0020 {
-            if ch != '<' && ch != '>' {
-                // Reject control chars directly
-                return Err(ParseError::InvalidTerm {
-                    line: 0,
-                    term: format!("<{}>", iri),
-                });
-            }
+        if c <= 0x0020 && ch != '<' && ch != '>' {
+            // Reject control chars directly
+            return Err(ParseError::InvalidTerm {
+                line: 0,
+                term: format!("<{}>", iri),
+            });
         }
         match ch {
             '<' | '>' | '"' | '{' | '}' | '|' | '^' | '\\' | '`' => {

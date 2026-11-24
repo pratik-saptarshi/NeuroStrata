@@ -78,6 +78,15 @@ pub struct LexicalDoc {
     pub registry: bool,
     /// SynapticMesh conflict placeholders stay out of every read surface.
     pub conflicting: bool,
+    /// Staged-ingestion generation of this row (`0` = not generation-scoped).
+    /// A row is visible only while its generation is active for its source.
+    #[serde(default)]
+    pub generation: u64,
+    /// The source (worktree) whose pointer governs this row's generation.
+    /// Empty for rows written before the source stamp or by non-ingest
+    /// writers; those fall back to the namespace's active set.
+    #[serde(default)]
+    pub source_key: String,
 }
 
 impl LexicalDoc {
@@ -108,6 +117,8 @@ impl LexicalDoc {
             structural,
             registry: false,
             conflicting: false,
+            generation: 0,
+            source_key: String::new(),
         }
     }
 
@@ -151,13 +162,6 @@ pub struct NamespaceIndex {
 }
 
 impl NamespaceIndex {
-    pub fn new() -> Self {
-        Self {
-            field_weights: DEFAULT_FIELD_WEIGHTS,
-            ..Self::default()
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.docs.len()
     }
@@ -274,10 +278,7 @@ impl LexicalIndex {
             return;
         }
         let namespace = doc.namespace.clone();
-        self.namespaces
-            .entry(namespace)
-            .or_insert_with(NamespaceIndex::new)
-            .add(doc);
+        self.namespaces.entry(namespace).or_default().add(doc);
     }
 
     /// Insert or replace a document, returning whether it replaced one.
@@ -655,11 +656,14 @@ pub(crate) fn doc_visible(doc: &LexicalDoc, opts: &SearchOptions) -> bool {
 }
 
 fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
+    // Presence, not sign: an absent `valid_to` means "no expiry"; a present
+    // value retires once it is at or before the visible moment (an explicit 0
+    // is in the past). This is the store's `is_retired_at` rule, and the
+    // Tantivy index mirrors it with its `has_valid_to` field, so the query
+    // filter and the per-hit veto cannot disagree and starve a page slot.
     match as_of {
-        None => doc.valid_to.map_or(true, |v| v > 0 && v > now),
-        Some(ts) => {
-            doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.map_or(true, |v| v > 0 && ts < v)
-        }
+        None => doc.valid_to.is_none_or(|v| v > now),
+        Some(ts) => doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.is_none_or(|v| ts < v),
     }
 }
 

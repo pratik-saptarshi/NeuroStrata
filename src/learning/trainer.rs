@@ -2,7 +2,6 @@
 use crate::judgment::laya_onnx::{LocalTrainingRuntime, ModelVersion};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use std::process::Stdio;

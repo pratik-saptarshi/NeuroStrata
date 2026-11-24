@@ -149,15 +149,26 @@ fn is_valid_marker_directory(marker: &Path) -> bool {
     {
         return false;
     }
-    let Ok(metadata) = std::fs::metadata(marker) else {
+    // `symlink_metadata` does not follow the final component: a marker that is
+    // itself a symlink could point anywhere, so exports must not trust it.
+    // Symlinked *parents* are fine (macOS `/var` -> `/private/var`, `/tmp`), so
+    // canonicalize the parent and compare the canonical marker to it instead of
+    // requiring the caller's spelling to already be canonical.
+    let Ok(metadata) = std::fs::symlink_metadata(marker) else {
         return false;
     };
-    if !metadata.is_dir() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return false;
     }
-    std::fs::canonicalize(marker)
-        .map(|canonical| canonical.as_path() == marker)
-        .unwrap_or(false)
+    let Some(parent) = marker.parent() else {
+        return false;
+    };
+    let (Ok(canonical_marker), Ok(canonical_parent)) =
+        (std::fs::canonicalize(marker), std::fs::canonicalize(parent))
+    else {
+        return false;
+    };
+    canonical_marker == canonical_parent.join(".NeuroStrata")
 }
 
 fn is_absolute_location(location: &str, path: &Path) -> bool {
@@ -170,7 +181,10 @@ fn is_absolute_location(location: &str, path: &Path) -> bool {
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\');
     let windows_unc_absolute = bytes.starts_with(b"\\\\");
-    windows_drive_absolute || windows_unc_absolute
+    // A rooted POSIX location stored by a Linux peer is absolute data on a
+    // Windows host even though the OS calls it rooted-but-relative.
+    let posix_absolute = bytes.first() == Some(&b'/');
+    windows_drive_absolute || windows_unc_absolute || posix_absolute
 }
 
 fn normalize_relative(path: &Path) -> Option<PathBuf> {
@@ -314,11 +328,25 @@ mod tests {
     #[test]
     fn resolve_graph_output_path_missing_context_never_falls_back_to_cwd_output_tree() {
         let invocation = temp_root("missing-output-context");
-        let error =
-            resolve_graph_output_path(None, None, &HashMap::new(), None, &invocation).unwrap_err();
+        let result = resolve_graph_output_path(None, None, &HashMap::new(), None, &invocation);
 
-        assert!(error.to_string().contains("--source-id"));
-        assert!(error.to_string().contains("explicit output path"));
+        // The temp dir can sit under a real marker (Windows temp is under the
+        // user profile, which has ~/.NeuroStrata); the walk then legitimately
+        // finds that ancestor. Either way it must not be the cwd output tree.
+        match invocation
+            .ancestors()
+            .map(|a| a.join(".NeuroStrata"))
+            .find(|m| is_valid_marker_directory(m))
+        {
+            Some(ancestor_marker) => {
+                assert_eq!(result.unwrap(), ancestor_marker.join("graph/graph.json"))
+            }
+            None => {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("--source-id"));
+                assert!(error.to_string().contains("explicit output path"));
+            }
+        }
         assert!(!invocation.join(".NeuroStrata").exists());
     }
 
@@ -460,15 +488,80 @@ mod tests {
     }
 
     #[test]
-    fn preserves_stored_path_for_noncanonical_registry_marker() {
+    fn resolves_noncanonical_registry_marker_inside_the_same_project() {
         let temp = temp_root("noncanonical-registry");
         let project_root = temp.join("project");
         let marker = project(&project_root);
         fs::create_dir_all(project_root.join("nested")).unwrap();
-        let noncanonical = project_root.join("nested/../.NeuroStrata");
+        // Spelled without the verbatim prefix: Rust collapses `..` when it
+        // joins onto a verbatim path, which would make this canonical.
+        let plain_root = dunce::simplified(&project_root).to_path_buf();
+        let noncanonical = plain_root.join("nested/../.NeuroStrata");
         assert!(noncanonical.is_dir());
-        assert_ne!(fs::canonicalize(&noncanonical).unwrap(), noncanonical);
-        let contexts = HashMap::from([("source".to_string(), noncanonical)]);
+        assert_ne!(std::fs::canonicalize(&noncanonical).unwrap(), noncanonical);
+        let contexts = HashMap::from([("source".to_string(), noncanonical.clone())]);
+
+        // Join one component at a time: on a non-verbatim Windows root,
+        // join("src/lib.rs") keeps the `/`, while the export joins normalized
+        // components and so uses the native separator.
+        let expected = noncanonical
+            .parent()
+            .unwrap()
+            .join("src")
+            .join("lib.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            expected
+        );
+        assert!(marker.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_marker_through_a_symlinked_project_root() {
+        // macOS `/var` -> `/private/var` and `/tmp` -> `/private/tmp` are the
+        // common case; a symlinked project root must still resolve to the real
+        // project, not fall back to the stored absolute path.
+        let temp = temp_root("symlinked-root");
+        let real_root = temp.join("project");
+        project(&real_root);
+        let alias = temp.join("project-alias");
+        std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+        let marker = alias.join(".NeuroStrata");
+        let contexts = HashMap::from([("source".to_string(), marker)]);
+
+        let expected = alias.join("src/lib.rs").to_string_lossy().into_owned();
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_marker_that_is_itself_a_symlink() {
+        let temp = temp_root("symlinked-marker");
+        let project_root = temp.join("project");
+        let elsewhere = temp.join("elsewhere");
+        let real_marker = project(&elsewhere);
+        fs::create_dir_all(&project_root).unwrap();
+        let linked_marker = project_root.join(".NeuroStrata");
+        std::os::unix::fs::symlink(&real_marker, &linked_marker).unwrap();
+        let contexts = HashMap::from([("source".to_string(), linked_marker)]);
 
         assert_eq!(
             export_absolute_path(
@@ -480,7 +573,6 @@ mod tests {
             ),
             "/stored/lib.rs"
         );
-        assert!(marker.is_dir());
     }
 
     #[test]

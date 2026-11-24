@@ -90,7 +90,7 @@ pub fn encode_base58btc(bytes: &[u8]) -> String {
         for &b in &num {
             let v = rem * 256 + (b as u16);
             let digit = (v / 58) as u8;
-            rem = (v % 58) as u16;
+            rem = v % 58;
             if !next.is_empty() || digit != 0 {
                 next.push(digit);
             }
@@ -164,7 +164,7 @@ pub fn public_key_from_did(did: &str) -> Result<Vec<u8>, String> {
     if decoded.len() < ED25519_MULTICODEC_PREFIX.len() {
         return Err("decoded did too short".into());
     }
-    if &decoded[..ED25519_MULTICODEC_PREFIX.len()] != &ED25519_MULTICODEC_PREFIX[..] {
+    if decoded[..ED25519_MULTICODEC_PREFIX.len()] != ED25519_MULTICODEC_PREFIX[..] {
         return Err("invalid ed25519 multicodec prefix".into());
     }
     let pubkey = decoded[ED25519_MULTICODEC_PREFIX.len()..].to_vec();
@@ -271,7 +271,7 @@ pub fn canonicalize_json_value(val: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(new_map)
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(|v| canonicalize_json_value(v)).collect())
+            serde_json::Value::Array(arr.iter().map(canonicalize_json_value).collect())
         }
         other => other.clone(),
     }

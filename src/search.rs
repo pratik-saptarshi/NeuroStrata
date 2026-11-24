@@ -11,6 +11,7 @@ pub struct SearchFilters {
     pub memory_types: Vec<String>,
     pub fact_shape: Option<String>, // decision/topology/attempt/any
     pub path_prefix: Option<String>,
+    pub path_prefix_forms: Vec<String>,
     pub exclude_stale: bool,
     pub include_code_ast: bool,
 }
@@ -77,9 +78,135 @@ pub fn decision_shape_boost(metadata: &Value) -> f32 {
 pub fn path_prefix_matches(location: &str, prefix: Option<&str>) -> bool {
     match prefix {
         None => true,
-        Some("") => true,
-        Some(p) => location.starts_with(p),
+        Some(p) if p.trim().is_empty() => true,
+        Some(p) => single_prefix_matches(location, p),
     }
+}
+
+/// Canonicalize a value for boundary-aware prefix comparison: host-separator
+/// folding, duplicate-separator collapsing, `./` stripping, and edge `/` trim.
+pub fn normalize_prefix_comparison_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.trim().chars() {
+        let mapped = if ch == '\\' { '/' } else { ch };
+        if mapped == '/' && out.ends_with('/') {
+            continue;
+        }
+        out.push(mapped);
+    }
+    while let Some(rest) = out.strip_prefix("./") {
+        out = rest.to_string();
+    }
+    let trimmed = out.trim_matches('/');
+    if trimmed == "." {
+        return String::new();
+    }
+    let mut normalized = trimmed.to_string();
+    if normalized.len() >= 2
+        && normalized.as_bytes()[0].is_ascii_alphabetic()
+        && normalized.as_bytes()[1] == b':'
+    {
+        normalized.as_mut_str()[..1].make_ascii_uppercase();
+    }
+    normalized
+}
+
+fn is_absolute_any_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
+}
+
+/// Match one prefix against a location using normalized, separator- and
+/// segment-boundary-aware comparison. Relative prefix forms match only relative
+/// locations; absolute prefix forms match only absolute locations.
+pub fn single_prefix_matches(location: &str, prefix: &str) -> bool {
+    if prefix.trim().is_empty() {
+        return true;
+    }
+    if location.trim().is_empty() {
+        return false;
+    }
+    if is_absolute_any_path(location) != is_absolute_any_path(prefix) {
+        return false;
+    }
+    let loc = normalize_prefix_comparison_value(location);
+    if loc.is_empty() {
+        return false;
+    }
+    let pref = normalize_prefix_comparison_value(prefix);
+    if pref.is_empty() {
+        return loc != ".." && !loc.starts_with("../");
+    }
+    loc == pref
+        || loc
+            .strip_prefix(&pref)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// A location matches when any resolved spelling of the requested prefix matches.
+pub fn path_prefix_forms_match(location: &str, forms: &[String]) -> bool {
+    if forms.is_empty() {
+        return true;
+    }
+    forms
+        .iter()
+        .any(|form| path_prefix_matches(location, Some(form.as_str())))
+}
+
+/// Match a row against resolved prefix spellings across its location and the
+/// path-shaped metadata fields used by structural and governance rows.
+pub fn row_matches_prefix_forms(location: &str, metadata: &Value, forms: &[String]) -> bool {
+    if forms.is_empty() {
+        return true;
+    }
+    if !location.trim().is_empty() && path_prefix_forms_match(location, forms) {
+        return true;
+    }
+    for key in ["relative_path", "path"] {
+        if let Some(p) = metadata.get(key).and_then(|v| v.as_str()) {
+            if path_prefix_forms_match(p, forms) {
+                return true;
+            }
+        }
+    }
+    if let Some(locs) = metadata.get("locations").and_then(|v| v.as_array()) {
+        for item in locs {
+            if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
+                if path_prefix_forms_match(p, forms) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(gov) = metadata.get("governs") {
+        match gov {
+            Value::String(p) => {
+                if path_prefix_forms_match(p, forms) {
+                    return true;
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Some(p) = item.as_str() {
+                        if path_prefix_forms_match(p, forms) {
+                            return true;
+                        }
+                    } else if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
+                        if path_prefix_forms_match(p, forms) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// exclude_stale: exclude memories whose source currency is changed AND semantic validation != verified.
@@ -107,20 +234,93 @@ pub fn passes_filters(
     }
     if memory_type == "fact" {
         if let Some(shape) = &filters.fact_shape {
-            if !shape.is_empty() && shape != "any" {
-                if !fact_shape_matches(metadata, shape) {
-                    return false;
-                }
+            if !shape.is_empty() && shape != "any" && !fact_shape_matches(metadata, shape) {
+                return false;
             }
         }
     }
-    if !path_prefix_matches(location, filters.path_prefix.as_deref()) {
-        return false;
+    if !filters.path_prefix_forms.is_empty() {
+        if !row_matches_prefix_forms(location, metadata, &filters.path_prefix_forms) {
+            return false;
+        }
+    } else if let Some(p) = filters
+        .path_prefix
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if !row_matches_prefix_forms(location, metadata, &[p.to_string()]) {
+            return false;
+        }
     }
     if filters.exclude_stale && is_stale_for_filter(metadata) {
         return false;
     }
     true
+}
+
+/// Exact warning emitted when the removed `include_related` alias is used.
+/// `"include_references"` is provenance-only; the alias used to be a silent
+/// no-op, so the correction has to be loud and byte-stable.
+pub const INCLUDE_RELATED_DEPRECATION_WARNING: &str =
+    "'include_related' is deprecated; use 'include_references'";
+
+/// Pure resolution of the `search_memory` argument contract.
+///
+/// Kept independent of the store and embedder so the alias/default rules can
+/// be pinned by a focused test. `graph_expanded_ids` is supplied by the caller:
+/// the IDs come from hybrid graph expansion, never from ranking changes here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SearchMemoryContract {
+    pub mode: String,
+    pub include_references: bool,
+    pub warnings: Vec<String>,
+    pub graph_expanded_ids: Vec<String>,
+}
+
+impl SearchMemoryContract {
+    pub fn from_arguments(arguments: &Value, graph_expanded_ids: Vec<String>) -> Self {
+        let mode = arguments
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("hybrid")
+            .to_string();
+        let include_related = arguments.get("include_related").and_then(|v| v.as_bool());
+        let include_references = arguments
+            .get("include_references")
+            .and_then(|v| v.as_bool());
+        let mut warnings = Vec::new();
+        if arguments.get("include_related").is_some() {
+            warnings.push(INCLUDE_RELATED_DEPRECATION_WARNING.to_string());
+        }
+        // Explicit `include_references` wins when both keys are present;
+        // the deprecated alias only fills in an otherwise absent value.
+        let include_references = include_references.or(include_related).unwrap_or(false);
+        Self {
+            mode,
+            include_references,
+            warnings,
+            graph_expanded_ids,
+        }
+    }
+}
+
+/// Append the additive `search_contract` line to any report, including the
+/// plain strings returned on hard-error paths (missing params, bad mode, init
+/// or embed failure, search failure). Error paths pass no graph-expanded ids,
+/// but the rule set is identical to the success path: `hybrid` default,
+/// `include_related` deprecation warning, and an always-present id array.
+/// Kept crate-free so `upgraded_search_test` can pin the error rendering.
+pub fn append_search_contract_line(
+    mut report: String,
+    arguments: &Value,
+    graph_expanded_ids: Vec<String>,
+) -> String {
+    let contract = SearchMemoryContract::from_arguments(arguments, graph_expanded_ids);
+    report.push_str(&format!(
+        "\n\nsearch_contract: {}",
+        serde_json::to_string(&contract).unwrap_or_default()
+    ));
+    report
 }
 
 #[cfg(test)]
@@ -205,6 +405,19 @@ mod tests {
         assert!(path_prefix_matches("src/a.rs", Some("")));
         assert!(path_prefix_matches("src/a.rs", Some("src/")));
         assert!(!path_prefix_matches("src/a.rs", Some("lib/")));
+    }
+
+    #[test]
+    fn root_prefix_forms_match_in_root_relative_and_absolute_locations_only() {
+        let forms = vec![".".to_string(), "/repo".to_string()];
+        assert!(path_prefix_forms_match("src/lib.rs", &forms));
+        assert!(path_prefix_forms_match("Cargo.toml", &forms));
+        assert!(path_prefix_forms_match("./src/lib.rs", &forms));
+        assert!(path_prefix_forms_match("/repo/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("/repo-other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("/other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("../other/src/lib.rs", &forms));
+        assert!(!path_prefix_forms_match("", &forms));
     }
 
     #[test]

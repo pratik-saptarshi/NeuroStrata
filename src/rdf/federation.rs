@@ -86,7 +86,7 @@ pub struct FederationExecutionReport {
 
 fn contains_service(pattern: &GraphPattern) -> bool {
     match pattern {
-        GraphPattern::Service { inner: _, .. } => {
+        GraphPattern::Service { .. } => {
             // The inner itself may contain a nested service — handled by
             // the caller that checks inner specifically.
             true
@@ -220,7 +220,7 @@ pub async fn project_federated_sparql_dataset_async(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let structural_types: [&str; 8] = [
+    let structural_types: [&str; 10] = [
         "directory",
         "file",
         "markdown",
@@ -229,6 +229,8 @@ pub async fn project_federated_sparql_dataset_async(
         "community_summary",
         "digital_twin",
         "digital_twin_schema",
+        "action_type",
+        "action_receipt",
     ];
 
     let meta_predicate = crate::rdf::namespace::field_predicate("metadata");
@@ -421,7 +423,7 @@ pub async fn handle_remote_sparql_request(
     match results {
         spareval::QueryResults::Solutions(mut sol_iter) => {
             let mut collected = Vec::new();
-            while let Some(item) = sol_iter.next() {
+            for item in sol_iter.by_ref() {
                 if collected.len() >= config.max_solutions {
                     break;
                 }
@@ -464,7 +466,7 @@ pub async fn handle_remote_sparql_request(
         }
         spareval::QueryResults::Graph(mut triples) => {
             let mut bindings: Vec<serde_json::Value> = Vec::new();
-            while let Some(item) = triples.next() {
+            for item in triples.by_ref() {
                 if bindings.len() >= config.max_solutions {
                     truncated = true;
                     break;
@@ -624,10 +626,7 @@ impl HttpServiceHandler {
                         ))),
                     }
                 }
-                Ok(spareval::QuerySolutionIter::new(
-                    variables,
-                    collected.into_iter(),
-                ))
+                Ok(spareval::QuerySolutionIter::new(variables, collected))
             }
             sparesults::SliceQueryResultsParserOutput::Boolean(_) => {
                 let variables: std::sync::Arc<[oxrdf::Variable]> = std::sync::Arc::new([]);

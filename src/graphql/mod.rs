@@ -248,6 +248,8 @@ fn is_structural(memory_type: &str) -> bool {
         "community_summary",
         "digital_twin",
         "digital_twin_schema",
+        "action_type",
+        "action_receipt",
     ];
     STRUCTURAL.contains(&memory_type)
 }
@@ -701,9 +703,9 @@ pub fn execute_on_records(
                             let (nested_first, nested_after) =
                                 nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
-                                if id_str == &id_arg && payload.memory_type != "" {
+                                if id_str == &id_arg && !payload.memory_type.is_empty() {
                                     root_result = build_memory_node(
-                                        &id_str,
+                                        id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,
@@ -767,7 +769,7 @@ pub fn execute_on_records(
                                 Vec::new();
                             let now = chrono::Utc::now().timestamp();
                             for (id_str, payload) in records.iter() {
-                                if payload.memory_type == "" {
+                                if payload.memory_type.is_empty() {
                                     continue;
                                 }
                                 if is_structural(&payload.memory_type)
