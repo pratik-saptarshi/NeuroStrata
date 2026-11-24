@@ -12,6 +12,9 @@ use crate::graph_read::locate::{LocateFailedAttempt, LocateRuleSummary, RULE_SUM
 use crate::rebac::{can_read_memory, resolve_principal};
 use crate::traits::{SearchResult, VectorStore};
 
+/// A seen file hunk, keyed by (path, old line span, new line span).
+type FileHunkKey = (String, Option<(u32, u32)>, Option<(u32, u32)>);
+
 pub const DEFAULT_MAX_BLAST_RADIUS_CALLERS: usize = 15;
 pub const MAX_DIFF_HUNKS: usize = 500;
 
@@ -184,7 +187,7 @@ pub fn parse_unified_diff_spans(diff_text: &str) -> (Vec<ChangedFileSpan>, bool)
 
     // Also scan standard `--- ` / `+++ ` / `@@ ` headers so multi-file diffs that
     // omit `diff --git` separators or have compact hunk bodies never drop files.
-    let mut seen_file_hunks: BTreeSet<(String, Option<(u32, u32)>, Option<(u32, u32)>)> = spans
+    let mut seen_file_hunks: BTreeSet<FileHunkKey> = spans
         .iter()
         .map(|s| (s.path.clone(), s.old_lines, s.new_lines))
         .collect();
