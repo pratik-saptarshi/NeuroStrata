@@ -240,9 +240,17 @@ fi
 # and is covered by the root lockfile for audit). --all-targets: the
 # default lib+bins scope skips #[cfg(test)] modules, integration tests
 # in tests/, and examples/ — new test/example code must be linted too.
-# Diagnostics stay attributed per added line below, so the wider scope
-# costs build time, not false blocks.
-CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --message-format=short 2>&1)"
+# --all-features: without it, feature-gated code is never compiled and
+# gets no coverage at all (e.g. src/synaptic_mesh/nats.rs behind the
+# root package's `nats-mesh` feature). The workspace's feature set is
+# safe to enable wholesale: `nats-mesh = []` enables no dependencies,
+# and crates/ontobug's `cli` only enables its optional clap dependency
+# (already in the lockfile); no feature pulls system dependencies or
+# is mutually exclusive with another. Diagnostics stay attributed per
+# added line below, so the wider scope costs build time, not false
+# blocks — pre-existing warnings in newly-visible gated code sit on
+# untouched lines and never block.
+CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short 2>&1)"
 CLIPPY_CODE=$?
 CLIPPY_DIAG="$(printf '%s\n' "$CLIPPY_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' || true)"
 if [ -z "$CLIPPY_DIAG" ] && [ "$CLIPPY_CODE" -ne 0 ]; then
@@ -280,6 +288,11 @@ fi
 # (src/...), so prefix them back to repo-root form before matching
 # ADDED_FILE. Same fail-closed rule as the workspace run: no
 # diagnostics plus a nonzero exit means quality cannot be verified.
+# Deliberately NO --all-features here, unlike the workspace run: the
+# crate's only feature is `custom-protocol`, which gates no src-tauri
+# source (no cfg(feature) in src/) — it only flips the tauri
+# dependency into release/frontend-bundled build mode, so enabling it
+# would add build-mode risk with zero lint-coverage gain.
 TAURI_CHANGED="$(printf '%s\n' "$CHANGED_RS" | grep '^src-tauri/' || true)"
 TAURI_MANIFEST_CHANGED="$(printf '%s\n' "$CHANGED_MANIFEST" | grep -E '^src-tauri/Cargo\.(toml|lock)$' || true)"
 if [ -n "$TAURI_CHANGED" ] || [ -n "$TAURI_MANIFEST_CHANGED" ]; then

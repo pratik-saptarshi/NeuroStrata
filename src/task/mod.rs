@@ -6275,6 +6275,11 @@ mod tests {
             SCAFFOLDED_RUST_QUALITY_GATE.contains("python3 is required to attribute findings"),
             "the guard must fail closed when python3 is missing or unusable"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("cargo clippy --locked --workspace --all-targets --all-features"),
+            "the guard must enable all features so feature-gated code gets clippy coverage"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();

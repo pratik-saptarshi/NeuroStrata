@@ -53,6 +53,41 @@ EOF
     git -C "$repo" update-ref refs/remotes/origin/develop HEAD
 }
 
+new_feature_repo() {
+    # Fixture with a feature-gated module, mirroring the real tree:
+    # root Cargo.toml's `nats-mesh = []` gates src/synaptic_mesh/nats.rs.
+    # $2 = clean: gated module starts clippy-clean.
+    # $2 = prebad: gated module starts with a pre-existing clippy warning
+    #              (needless_return) already present at the baseline.
+    local repo="$1" gated_state="$2"
+    new_repo "$repo"
+    cat >> "$repo/Cargo.toml" <<'EOF'
+
+[features]
+default = []
+gated = []
+EOF
+    printf '#[cfg(feature = "gated")]\npub mod gated;\n\npub fn clean() -> i32 {\n    1\n}\n' > "$repo/src/lib.rs"
+    if [ "$gated_state" = "prebad" ]; then
+        printf 'pub fn gated_bad() -> String {\n    return "x".to_string();\n}\n' > "$repo/src/gated.rs"
+    else
+        printf 'pub fn gated_clean() -> i32 {\n    42\n}\n' > "$repo/src/gated.rs"
+    fi
+    (cd "$repo" && cargo generate-lockfile >/dev/null 2>&1)
+    git -C "$repo" add Cargo.toml Cargo.lock src/lib.rs src/gated.rs
+    git -C "$repo" commit -q -m 'feature-gated baseline'
+    git -C "$repo" update-ref refs/remotes/origin/develop HEAD
+}
+
+add_gated_dirty_line() {
+    # Formatted cleanly (fmt must not fire) but a clippy needless_return
+    # on the added lines, inside feature-gated code: only a clippy run
+    # that enables the feature can see it.
+    printf '\npub fn gated_bad() -> String {\n    return "x".to_string();\n}\n' >> "$1/src/gated.rs"
+    git -C "$1" add src/gated.rs
+    git -C "$1" commit -q -m 'dirty gated addition'
+}
+
 add_dirty_line() {
     # Misformatted (rustfmt rewrites it) AND a clippy needless_return on
     # the added lines: with attribution working, the gate must block.
@@ -111,6 +146,38 @@ new_repo "$clean"
 add_clean_line "$clean"
 if ! run_gate "$clean" "$PATH" > /dev/null; then
     echo 'FAIL: clean added lines with python3 present must pass the gate' >&2
+    exit 1
+fi
+
+# Leg 4 (regression): a clippy warning on an ADDED line inside
+# feature-gated code must block. Without feature enablement the gated
+# module is never compiled, so the warning passes unchecked.
+gated_dirty="$TMP/gated-dirty"
+new_feature_repo "$gated_dirty" clean
+add_gated_dirty_line "$gated_dirty"
+set +e
+out4=$(run_gate "$gated_dirty" "$PATH")
+st4=$?
+set -e
+if [ "$st4" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line' <<< "$out4"; then
+    printf 'FAIL: clippy warning on an added line in feature-gated code must block the gate\n%s\n' "$out4" >&2
+    exit 1
+fi
+
+# Leg 5 (no false block): a PRE-EXISTING clippy warning inside
+# feature-gated code (present at the baseline, on untouched lines)
+# plus an unrelated clean added line must pass — enabling features
+# surfaces legacy gated warnings, but added-line attribution must
+# keep them from blocking.
+gated_prebad="$TMP/gated-prebad"
+new_feature_repo "$gated_prebad" prebad
+add_clean_line "$gated_prebad"
+set +e
+out5=$(run_gate "$gated_prebad" "$PATH")
+st5=$?
+set -e
+if [ "$st5" -ne 0 ]; then
+    printf 'FAIL: pre-existing feature-gated warning on untouched lines must not block the gate\n%s\n' "$out5" >&2
     exit 1
 fi
 
