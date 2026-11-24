@@ -248,6 +248,8 @@ fn is_structural(memory_type: &str) -> bool {
         "community_summary",
         "digital_twin",
         "digital_twin_schema",
+        "action_type",
+        "action_receipt",
     ];
     STRUCTURAL.contains(&memory_type)
 }
@@ -703,7 +705,7 @@ pub fn execute_on_records(
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && !payload.memory_type.is_empty() {
                                     root_result = build_memory_node(
-                                        &id_str,
+                                        id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,

@@ -220,7 +220,7 @@ impl JudgmentProvider for TypeSafeJevProvider {
         }
         let response = self
             .client
-            .get(&format!("{}/health", self.base_url))
+            .get(format!("{}/health", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await;

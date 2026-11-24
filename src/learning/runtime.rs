@@ -2,14 +2,11 @@
 //! subcommand to bootstrap the local Python/laya-train environment without manual user
 //! steps. Requests use the non-blocking session API.
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 
 /// Re-export runtime types from laya_onnx.
-pub use crate::judgment::laya_onnx::{
-    LearningPaths, LocalTrainingRuntime, ModelVersion, RuntimeState,
-};
+pub use crate::judgment::laya_onnx::{LearningPaths, LocalTrainingRuntime, RuntimeState};
 
 /// Manages the local Laya training/runtime environment: provisioning a pinned
 /// Python runtime, `laya-train`, and the selected base checkpoint; starting

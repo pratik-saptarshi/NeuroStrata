@@ -63,7 +63,7 @@ fn strip_punct(word: &str) -> String {
 
 /// Whether a raw token ends with punctuation (should end phrase after this word).
 fn ends_with_punct(raw: &str) -> bool {
-    raw.chars().last().map(|c| is_punct(c)).unwrap_or(false)
+    raw.chars().last().map(is_punct).unwrap_or(false)
 }
 
 /// Extract capitalised entity-candidate phrases from text.
@@ -120,7 +120,7 @@ pub fn extract_candidates(text: &str) -> Vec<GlinerCandidate> {
             let next_raw = words[j];
 
             // Stop if next token is entirely punctuation
-            if next_raw.chars().all(|c| is_punct(c)) {
+            if next_raw.chars().all(is_punct) {
                 break;
             }
 
@@ -214,7 +214,9 @@ impl GlinerEngine {
         }
 
         let session = if model_path.exists() {
-            match Session::builder() {
+            match crate::embed::shared_ort_environment()
+                .and_then(|env| Session::builder(env).map_err(|e| anyhow::anyhow!("{e}")))
+            {
                 Ok(mut builder) => match builder.commit_from_file(&model_path) {
                     Ok(session) => Some(Mutex::new(session)),
                     Err(e) => {
