@@ -29,7 +29,13 @@ export interface PluginConfig {
         enabled: boolean;
         injectReminder: boolean;
     };
+    /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+    projectRoot?: string;
 }
+/** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
+export type ResolvedConfig = PluginConfig;
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)
@@ -50,11 +56,23 @@ export declare function findProjectRoot(startDir?: string): string;
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export declare function discoverProjectNamespace(startDir?: string): string;
+/**
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
+ */
+export declare function resolveProjectRoot(ctx?: any): string;
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
 export declare function buildHeaders(token: string | null): Record<string, string>;
 export interface JsonRpcRequest {
-    jsonrpc: "2.0";
+    jsonrpc: '2.0';
     id: number;
     method: string;
     params?: unknown;
@@ -84,17 +102,23 @@ export declare class NeuroStrataMCPClient {
     private readonly token;
     private readonly timeoutMs;
     private requestId;
+    /** Daemon memory advisory captured on the last errored tool call, drained by
+     *  the plugin's execute.after handler so the agent sees it as a suffix line
+     *  rather than an opaque throw. Cleared on every callTool. */
+    private pendingDaemonAdvisory;
     constructor(options: {
         endpoint: string;
         token: string | null;
         timeoutMs: number;
     });
+    /** Drain the advisory captured by the last errored callTool, if any. */
+    flushPendingAdvisory(): string | null;
     callTool(name: string, args: unknown): Promise<string>;
     listToolNames(): Promise<string[]>;
     private post;
 }
 export interface GuardValidateResult {
-    verdict: "pass" | "reject";
+    verdict: 'pass' | 'reject';
     bucket: string;
     reasons: string[];
     constraints: string[];
@@ -102,7 +126,7 @@ export interface GuardValidateResult {
     rule_ids: string[];
 }
 export declare function parseGuardValidate(text: string): GuardValidateResult;
-export type AdapterState = "uninitialized" | "ready" | "degraded" | "unavailable";
+export type AdapterState = 'uninitialized' | 'ready' | 'degraded' | 'unavailable';
 export interface AdapterStatus {
     state: AdapterState;
     endpoint: string;
@@ -120,6 +144,71 @@ export interface TaskIntentSignal {
 export declare const MARKERS: readonly [string, string][];
 export declare const NEGATION_PREFIXES: string[];
 export declare function detectTaskIntentsLocal(text: string): TaskIntentSignal[];
+export interface ProvenanceSpan {
+    turn_id?: string;
+    role?: string;
+    source_tool?: string;
+    channel?: string;
+    evidence_quote?: string;
+    quote?: string;
+    char_range?: [number, number];
+    parent_task_id?: string;
+    confidence?: number;
+}
+export interface Turn {
+    role: string;
+    content: string;
+    turn_id?: string;
+    source_tool?: string;
+    channel?: string;
+    parent_task_id?: string;
+}
+export interface TurnCandidate {
+    kind: 'task_obligation' | 'memory_candidate';
+    category?: 'fact' | 'decision' | 'rule_candidate';
+    title: string;
+    description?: string;
+    confidence: number;
+    auto_commit: boolean;
+    provenance: ProvenanceSpan;
+}
+export interface ConceptualBridge {
+    source_id?: string;
+    via_id?: string;
+    target_id?: string;
+    target_domain?: string;
+    target_type?: string;
+    target_summary?: string;
+    path?: string;
+}
+/**
+ * Extract task-obligation candidates from a turn's content. Detects local
+ * task-intent markers (TODO:, FIXME:, follow-up:, ...) via
+ * `detectTaskIntentsLocal` and attaches a provenance span
+ * (turn_id, role, source_tool, channel, evidence_quote, quote, char_range,
+ * confidence) to each. Pure: no daemon interaction. Rule candidates are
+ * never produced here (rule candidates never auto-promote).
+ */
+export declare function extractTurnCandidates(turn: Turn): TurnCandidate[];
+/**
+ * Post turn candidates fail-soft to the intake ledger via
+ * `neurostrata_task_candidates` (`action: "record"`). Never throws: a missing
+ * MCP client or a daemon error is swallowed so a turn is never blocked by
+ * intake-ledger submission.
+ */
+export declare function postTurnCandidates(candidates: TurnCandidate[], namespace: string): Promise<void>;
+/**
+ * Extract de-duplicated conceptual bridges from `memories_for_file` hits.
+ * Each hit may carry a `conceptual_bridges` array (source -> via -> target
+ * 2-hop cross-domain paths). Bridges are de-duplicated by `path`.
+ */
+export declare function extractConceptualBridges(hits: unknown[]): ConceptualBridge[];
+/**
+ * Persist conceptual bridges into `.NeuroStrata/active_session.json` under
+ * the `conceptual_bridges` key, merging with any existing fields so the
+ * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
+ */
+export declare function persistConceptualBridges(projectRoot: string, bridges: ConceptualBridge[]): void;
 export declare const READ_FILE_TOOLS: Set<string>;
 export declare const MUTATING_FILE_TOOLS: Set<string>;
 export declare const SHELL_TOOLS: Set<string>;
@@ -136,8 +225,15 @@ export declare const TOOL_CLASSIFICATION: {
 };
 export declare function isFileTouchTool(name: string): boolean;
 export declare function isMutatingTool(name: string): boolean;
+export declare function isReadOnlyInspectionTool(name: string): boolean;
 export declare function isSubagentTool(name: string): boolean;
 export declare function isCodeExecTool(name: string): boolean;
+/**
+ * True only for shell tools whose payload is provably read-only/verification.
+ * JSON payloads are unwrapped via `command`/`cmd`; substitutions, redirection
+ * and chains containing any mutating segment fail closed.
+ */
+export declare function isZeroActionExemptShellPayload(actionType: string, payloadOrCommand: string): boolean;
 export interface CodeModeInspection {
     id?: string;
     sessionId?: string;
@@ -172,6 +268,7 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
     recordLedgerDir?: string;
+    projectRoot?: string;
 }): Promise<string[]>;
 /**
  * Mark a prefetch as delivered: its memories were handed to the caller, so the
@@ -188,20 +285,38 @@ export declare function confirmPrefetchDelivery(namespace: string, filePath: str
 export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
 export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
-export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string): string;
-export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string): boolean;
+export declare function isReadOnlySubagentAgent(agentId?: string | null): boolean;
+/** Resolve the subagent agent id from the fields harnesses use to name it. */
+export declare function resolveSubagentAgentId(target: Record<string, unknown>): string | undefined;
+/** Code-Mode harnesses (OpenCode V2) expose MCP via `execute` + tools.neurostrata.*. */
+export declare function detectCodeMode(ctx?: any, cfg?: PluginConfig): boolean;
+export interface SubagentHeaderOptions {
+    agentId?: string | null;
+    codeMode?: boolean;
+}
+/**
+ * Render a value inside a markdown backtick code span without allowing a
+ * breakout: backticks close the span and newlines end its line, so both are
+ * collapsed to single spaces. The namespace is not privileged input — it can
+ * arrive from a committed `.NeuroStrata/session_queries.json`, plugin config,
+ * or an environment variable — so every header interpolation goes through
+ * here (issue #316).
+ */
+export declare function markdownCodeSpanValue(value: unknown): string;
+/**
+ * Public header builder: sanitizes the two caller-supplied values before
+ * rendering (issue #316).
+ */
+export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): string;
+export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): boolean;
 export declare function extractRepoFilePaths(promptText: string): string[];
 export declare const cachedTaskInjection: Map<string, string | null>;
 export declare const cachedSubagentPromptByTask: Map<string, string | null>;
 /**
- * Resolve the active task from the daemon (fail-soft). Caches activeTaskId
- * and cachedTaskInjection. A task is adopted only when it is the caller's
- * preferred task or when its claim session matches the caller's own session
- * identity: a foreign session's task (and its session id) is never adopted.
- * activeSessionId is only ever set from the caller's own identity, never
- * from a task record.
+ * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
+ * activeSessionId and cachedTaskInjection.
  */
-export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null, callerSessionId?: string | null): Promise<{
+export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null): Promise<{
     taskId: string | null;
     sessionId: string | null;
     promptInjection: string | null;
@@ -211,7 +326,7 @@ export declare function resolveActiveTaskFromDaemon(namespace: string, preferred
  * inject the daemon's subagent_prompt_injection plus any recalled snippets into the
  * target prompt. Idempotent.
  */
-export declare function enrichAndInjectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId?: string | null, callerSessionId?: string | null): Promise<boolean>;
+export declare function enrichAndInjectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId?: string | null): Promise<boolean>;
 export declare let activeSessionId: string | null;
 export declare let activeTaskId: string | null;
 export declare let mutationsSinceNote: number;
@@ -222,56 +337,58 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
-export declare function mutationCounterFilePath(sessionId?: string): string;
-export declare function readPersistedMutationCounter(sessionId?: string): number | null;
+/** Structured marker the daemon writes on its error/diagnostic channel when
+ *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
+ *  rows never carry it, so matching it can never misfire on user content. */
+export declare const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+export declare function resetAdvisoryStateForTesting(): void;
+/** Drain the live client's pending advisory (if any). Returns-and-clears. */
+export declare function flushPendingDaemonAdvisory(): string | null;
+/** Pull the daemon memory advisory out of the error/diagnostic channel.
+ * Only text carrying the marker is inspected — memory payloads and result
+ * rows are never matched, so a memory that merely discusses
+ * `NEUROSTRATA_BUFFER_POOL_MB` cannot synthesize an advisory. Returns the
+ * guidance string once per 10-minute window, or `null` when already shown
+ * or absent. */
+export declare function extractDaemonMemoryAdvisory(errorChannelText: string | null | undefined, nowMs?: number): string | null;
+export interface SessionEpochState {
+    epoch: number;
+    baselineInjectedEpoch: number;
+    seenFiles: Set<string>;
+}
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export declare function currentSessionEpoch(sessionId: string | null | undefined): number;
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export declare function incrementSessionEpoch(sessionId: string | null | undefined): void;
+export declare function sessionSeenFiles(sessionId: string | null | undefined): Set<string>;
+export declare function resetSessionEpoch(sessionId: string | null | undefined): void;
+export declare function resetAllSessionEpochs(): void;
 /**
- * Increment the persisted counter under its lock and return the new value,
- * or null on any failure (callers fall back to the in-process increment).
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
  */
-export declare function bumpPersistedMutationCounter(sessionId?: string): number | null;
-/** Persist a reset to 0 under the same lock. Best-effort; never throws. */
-export declare function resetPersistedMutationCounter(sessionId?: string): void;
+export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
 /**
- * Checkpoint reset (C2-1): clear the counter of the session the task
- * call named AND the counter the fallback chain resolves to without
- * the call-named slot, when the two differ.
- *
- * The bump paths have no call-named slot: they credit the counter of
- * the identity the hook event itself carries (or the process's active
- * session when the event is silent), and the guard reads and forwards
- * that same counter — it is the one that gates BreathRequired. A
- * checkpoint whose task call names a different session would otherwise
- * clear only the named session's counter and leave the gating counter
- * hot, so the checkpoint never restores progress. The named counter is
- * still cleared, exactly as before: the note was recorded under that
- * session, so its count is zero by definition. When the two identities
- * coincide, or either is absent, this is exactly the single reset the
- * call sites performed before — including the internal active/shared
- * fallback when both are absent. Each reset keeps the same lock
- * discipline and fail-open behavior; the two resets run sequentially,
- * never nested.
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
  */
-export declare function resetPersistedMutationCounterForCheckpoint(callNamedSessionId?: string, chainSessionId?: string): void;
+export declare function sessionCompactionHandler(event: any, config: ResolvedConfig): Promise<void>;
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
 /**
- * Every file path a patch touches, deduped and order-preserving: Codex
- * `*** Update/Add/Delete File:` headers, `*** Move to:` destinations, and
- * unified-diff `--- a/` / `+++ b/` headers.
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
  */
-export declare function extractPatchPaths(raw: unknown): string[];
-/**
- * Multi-path counterpart of extractFilePath, with the same precedence: an
- * explicit file_path/filePath/path wins as a single-element list; otherwise
- * every path from the first patch-bearing source (args patch fields, then
- * the raw patch, then altArgs).
- */
-export declare function extractFilePaths(args: Record<string, unknown>, altArgs?: Record<string, unknown>, rawPatch?: unknown): string[];
+export declare function extractToolName(event: any): string;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;
 export declare function onTurnEnd(turn: {
-    role: "user" | "assistant";
+    role: 'user' | 'assistant';
     content: string;
 }): Promise<void>;
 export declare function fetchContextPlan(opts: {
@@ -280,7 +397,7 @@ export declare function fetchContextPlan(opts: {
     file_path?: string;
     max_items?: number;
     max_bytes?: number;
-    format?: "json" | "text";
+    format?: 'json' | 'text';
 }): Promise<string>;
 export declare function createHarnessPlugin(pluginId?: string, harnessName?: string): {
     id: string;

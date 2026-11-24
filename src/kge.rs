@@ -607,7 +607,7 @@ pub fn cli_train(
                 if all {
                     collected.insert(id_str.clone());
                 } else {
-                    let in_scope = ns_val.map_or(true, |ns| ns == scope || ns.is_empty())
+                    let in_scope = ns_val.is_none_or(|ns| ns == scope || ns.is_empty())
                         || id_str.starts_with(&format!("{}::", scope));
                     if in_scope {
                         collected.insert(id_str.clone());
@@ -903,8 +903,8 @@ mod tests {
 
         let (model_path, meta_path) =
             artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
-        assert!(model_path.to_string_lossy().contains("/kge/ns/model.bin"));
-        assert!(meta_path.to_string_lossy().contains("/kge/ns/meta.json"));
+        assert!(model_path.ends_with("kge/ns/model.bin"));
+        assert!(meta_path.ends_with("kge/ns/meta.json"));
     }
 
     #[test]

@@ -10,7 +10,6 @@ mod episodic_pointer_echo;
 mod export_freshness_dirty;
 mod guard_event_log;
 pub mod mesh_outbox;
-pub mod post_ingest_normalize;
 
 pub use self::episodic_pointer_echo::EpisodicPointerEcho;
 pub use self::export_freshness_dirty::{
@@ -19,3 +18,4 @@ pub use self::export_freshness_dirty::{
 pub use self::guard_event_log::GuardEventLog;
 pub use self::mesh_outbox::MeshOutbox;
 pub use self::post_ingest_normalize::PostIngestNormalize;
+pub mod post_ingest_normalize;

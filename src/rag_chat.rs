@@ -124,15 +124,14 @@ pub async fn retrieve_context_with_egress(
         if !crate::rebac::allowed(principal, &owner, "viewer", &visible) {
             continue;
         }
-        if require_shareable {
-            if r.payload
+        if require_shareable
+            && r.payload
                 .metadata
                 .get("eligibility")
                 .and_then(|v| v.as_str())
                 != Some("shareable")
-            {
-                continue;
-            }
+        {
+            continue;
         }
         results.push(r);
     }
@@ -641,7 +640,7 @@ mod tests {
             },
             evidence: None,
         };
-        let mut v = vec![a.clone(), b.clone()];
+        let mut v = [a.clone(), b.clone()];
         v.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
         assert_eq!(v[0].id, "a");
     }
