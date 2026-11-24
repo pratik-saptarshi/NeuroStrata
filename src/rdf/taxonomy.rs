@@ -6551,4 +6551,48 @@ mod tests {
             .expect("traversal thread must complete without stack overflow");
         assert_eq!(count, 5001);
     }
+
+    // TEMPORARY calibration probe (depth-bound fix wave, PR #153):
+    // directly constructs a nested TaxonomyTreeNode chain of depth D,
+    // then serializes and drops it inside a 2 MiB-stack thread. One
+    // depth per CI run; removed before the final head.
+    #[test]
+    fn probe_depth_calibration() {
+        const D: usize = 1000;
+        fn probe_node(slug: &str, children: Vec<TaxonomyTreeNode>) -> TaxonomyTreeNode {
+            TaxonomyTreeNode {
+                slug: slug.to_string(),
+                pref_label: slug.to_string(),
+                definition: String::new(),
+                domain: None,
+                epistemic_status: String::new(),
+                epistemic_weight_bps: 0,
+                realization_status: String::new(),
+                frontier_leverage_bps: 0,
+                descendant_count: 0,
+                grounding_count: 0,
+                aliases: Vec::new(),
+                broader: Vec::new(),
+                narrower: Vec::new(),
+                related_concepts: Vec::new(),
+                contrasts_with: Vec::new(),
+                children,
+            }
+        }
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut node = probe_node("leaf", Vec::new());
+                for i in 0..D {
+                    node = probe_node(&format!("n{i}"), vec![node]);
+                }
+                let serialized = serde_json::to_string(&node).expect("probe tree must serialize");
+                assert!(!serialized.is_empty());
+                drop(node);
+                D
+            })
+            .expect("spawn probe thread");
+        let d = handle.join().expect("probe thread must complete");
+        assert_eq!(d, D);
+    }
 }
