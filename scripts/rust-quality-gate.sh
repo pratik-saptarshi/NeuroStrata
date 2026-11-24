@@ -49,7 +49,10 @@ fi
 # changes (e.g. a tree-wide reformat), false-blocking as "added" lines.
 # A branch with no upstream takes the same merge-base path, so first
 # pushes check every commit, not just HEAD~1. Last resort
-# (no origin/develop available, e.g. offline): the last commit only.
+# (no origin/develop available, e.g. offline): the last commit only —
+# except a root commit, which has no parent: there HEAD~1 does not
+# exist, so the baseline is the git empty tree and the initial commit
+# diffs in full (the first push of a freshly bootstrapped project).
 BASE=""
 CURBRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
@@ -86,7 +89,16 @@ if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] ||
         BASE="@{u}"
     else
         BASE="$(git merge-base HEAD origin/develop 2>/dev/null || true)"
-        [ -n "$BASE" ] || BASE="HEAD~1"
+        if [ -z "$BASE" ]; then
+            if git rev-parse --verify --quiet "HEAD~1" >/dev/null 2>&1; then
+                BASE="HEAD~1"
+            else
+                # Root commit: no parent exists, so diff against the
+                # git empty tree — the initial commit is evaluated in
+                # full instead of failing on a nonexistent baseline.
+                BASE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            fi
+        fi
     fi
 fi
 

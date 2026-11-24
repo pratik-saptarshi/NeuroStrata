@@ -6280,6 +6280,11 @@ mod tests {
                 .contains("cargo clippy --locked --workspace --all-targets --all-features"),
             "the guard must enable all features so feature-gated code gets clippy coverage"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("4b825dc642cb6eb9a060e54bf8d69288fbee4904"),
+            "the guard must diff a root commit against the git empty tree so a fresh repo's first push is evaluated, not blocked on the nonexistent HEAD~1"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();
