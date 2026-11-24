@@ -6360,4 +6360,115 @@ mod tests {
         );
         assert!(unknown_taxonomy_request_fields(&json!({})).is_empty());
     }
+
+    fn synthetic_concept(
+        slug: &str,
+        broader: Vec<String>,
+        narrower: Vec<String>,
+    ) -> HydratedConcept {
+        HydratedConcept {
+            id: slug.to_string(),
+            slug: slug.to_string(),
+            pref_label: slug.to_string(),
+            definition: String::new(),
+            content: String::new(),
+            domain: None,
+            aliases: Vec::new(),
+            broader,
+            narrower,
+            related_concepts: Vec::new(),
+            contrasts_with: Vec::new(),
+            tradeoffs: Vec::new(),
+            references: Vec::new(),
+            comparable_implementations: Vec::new(),
+            realization_status: String::new(),
+            current_limitations: Vec::new(),
+            frontier_opportunities: Vec::new(),
+            implemented_interfaces: Vec::new(),
+            linked_action_types: Vec::new(),
+            evaluation_scores: BTreeMap::new(),
+            evidence_refs: Vec::new(),
+            governs: Vec::new(),
+            locations: Vec::new(),
+            concept_iri: None,
+            not_definition: None,
+            deprecation: None,
+            deprecation_banner: None,
+            epistemic_status: String::new(),
+            epistemic_weight_bps: 0,
+            descendant_count: 0,
+            grounding_count: 0,
+            verified_grounding_ids: Vec::new(),
+            axis_alignment_bps: 0,
+            frontier_leverage_bps: 0,
+            is_public: false,
+        }
+    }
+
+    /// Codex P1 on PR #153: under R9, expansion is governed by minimum
+    /// root distance, so a root directly linked to every node of a long
+    /// chain gives each chain node minimum distance 1 and the recursive
+    /// DFS follows the whole chain -- recursion depth O(concepts),
+    /// unbounded by `max_hops`. Traversal, serialization and drop of
+    /// the resulting tree must all complete on a 2 MiB stack.
+    #[test]
+    fn tree_deep_chain_expansion_is_stack_safe() {
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                const N: usize = 5000;
+                let chain: Vec<String> = (1..=N).map(|i| format!("c{i}")).collect();
+                let mut concepts: BTreeMap<String, HydratedConcept> = BTreeMap::new();
+                concepts.insert(
+                    "root".to_string(),
+                    synthetic_concept("root", Vec::new(), chain.clone()),
+                );
+                for (idx, slug) in chain.iter().enumerate() {
+                    let mut broader = vec!["root".to_string()];
+                    if idx > 0 {
+                        broader.push(chain[idx - 1].clone());
+                    }
+                    let narrower = if idx + 1 < N {
+                        vec![chain[idx + 1].clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    concepts.insert(slug.clone(), synthetic_concept(slug, broader, narrower));
+                }
+                let allowed: BTreeSet<String> = concepts.keys().cloned().collect();
+                let root_slugs = vec!["root".to_string()];
+                let min_distances = min_root_distances(&root_slugs, &concepts, &allowed);
+                let mut visited = BTreeSet::new();
+                let mut budget = usize::MAX;
+                let node = build_tree_node(
+                    "root",
+                    &concepts,
+                    &allowed,
+                    &mut visited,
+                    0,
+                    Some(2),
+                    &mut budget,
+                    &min_distances,
+                )
+                .expect("root node must be emitted");
+                let roots = vec![node];
+                // Count emitted nodes iteratively (no recursion here).
+                let mut count = 0usize;
+                let mut stack: Vec<&TaxonomyTreeNode> = roots.iter().collect();
+                while let Some(n) = stack.pop() {
+                    count += 1;
+                    stack.extend(n.children.iter());
+                }
+                assert_eq!(count, N + 1, "every chain node must be emitted once");
+                let serialized = serde_json::to_string(&roots).expect("deep tree must serialize");
+                assert!(!serialized.is_empty());
+                drop(roots);
+                count
+            })
+            .expect("spawn traversal thread");
+        let count = handle
+            .join()
+            .expect("traversal thread must complete without stack overflow");
+        assert_eq!(count, 5001);
+    }
 }
