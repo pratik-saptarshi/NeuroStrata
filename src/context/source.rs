@@ -72,7 +72,6 @@ pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceId
     let root_canonical = canonical(root);
     let repo_id = git_output(root, &["remote", "get-url", "origin"])
         .unwrap_or_else(|| root_canonical.clone());
-    let checkout_id = root_canonical.clone();
     // Linked worktrees share one common checkout: `--git-common-dir` points
     // every worktree at the main repository's git dir, so they agree on
     // `checkout_id` while `worktree_id` keeps them distinct. The path git

@@ -142,15 +142,14 @@ pub async fn retrieve_context_with_egress(
         if !crate::rebac::allowed(principal, &owner, "viewer", &visible) {
             continue;
         }
-        if require_shareable {
-            if r.payload
+        if require_shareable
+            && r.payload
                 .metadata
                 .get("eligibility")
                 .and_then(|v| v.as_str())
                 != Some("shareable")
-            {
-                continue;
-            }
+        {
+            continue;
         }
         results.push(r);
     }
@@ -475,7 +474,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let content = json
             .get("choices")
             .and_then(|c| c.as_array())
-            .and_then(|arr| arr.get(0))
+            .and_then(|arr| arr.first())
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|v| v.as_str())
@@ -691,7 +690,7 @@ mod tests {
             },
             evidence: None,
         };
-        let mut v = vec![a.clone(), b.clone()];
+        let mut v = [a.clone(), b.clone()];
         v.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
         assert_eq!(v[0].id, "a");
     }

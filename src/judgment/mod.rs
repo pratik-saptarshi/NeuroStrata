@@ -217,9 +217,7 @@ impl DeduplicationChecker {
         new_memory: &MemoryPayload,
         candidates: &[SearchResult],
     ) -> Option<Vec<DuplicateJudgment>> {
-        let Some(active) = self.provider_set.active.as_ref() else {
-            return None;
-        };
+        let active = self.provider_set.active.as_ref()?;
         if !self.circuit_breaker.allow_request() {
             tracing::debug!(
                 provider = active.name(),

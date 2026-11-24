@@ -248,6 +248,8 @@ fn is_structural(memory_type: &str) -> bool {
         "community_summary",
         "digital_twin",
         "digital_twin_schema",
+        "action_type",
+        "action_receipt",
     ];
     STRUCTURAL.contains(&memory_type)
 }
@@ -345,7 +347,7 @@ fn build_memory_node(params: BuildMemoryNodeParams<'_>) -> Option<Value> {
         })
         .collect();
 
-    let first = variable_first.unwrap_or(20).max(1).min(100);
+    let first = variable_first.unwrap_or(20).clamp(1, 100);
     // Edge cursors encode the edge's index (`{node_id}:{idx}`), so an `after`
     // cursor can resume at exactly the edge that follows it.
     let skipped = match variable_after {
@@ -716,7 +718,7 @@ pub fn execute_on_records(
                             let (nested_first, nested_after) =
                                 nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
-                                if id_str == &id_arg && payload.memory_type != "" {
+                                if id_str == &id_arg && !payload.memory_type.is_empty() {
                                     root_result = build_memory_node(BuildMemoryNodeParams {
                                         id: &id_str,
                                         namespace,
@@ -767,13 +769,7 @@ pub fn execute_on_records(
                                 ) });
                                 return GraphQLResponse { data: None, errors };
                             }
-                            let first = if var_first < 1 {
-                                1
-                            } else if var_first > 100 {
-                                100
-                            } else {
-                                var_first
-                            };
+                            let first = var_first.clamp(1, 100);
                             if var_first > 100 {
                                 errors.push(GraphQLError {
                                     message: "first clamped to 100".into(),
@@ -788,7 +784,7 @@ pub fn execute_on_records(
                                 Vec::new();
                             let now = chrono::Utc::now().timestamp();
                             for (id_str, payload) in records.iter() {
-                                if payload.memory_type == "" {
+                                if payload.memory_type.is_empty() {
                                     continue;
                                 }
                                 if is_structural(&payload.memory_type)
