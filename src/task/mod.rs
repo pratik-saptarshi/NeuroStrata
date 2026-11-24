@@ -6149,15 +6149,18 @@ mod tests {
         );
 
         // Comments and blank lines are not gates; only live array entries are.
+        // The block ends at the line that closes the array (a `)` at line
+        // start, the same rule hook_project_guards parses by): a `)` inside
+        // a gate comment — e.g. "(the quality-baseline file owns that)" in
+        // the Rust gate's comment — must not truncate the parse.
         let open = "PROJECT_GATES=(";
         let start = SCAFFOLDED_PRE_PUSH_HOOK
             .find(open)
             .expect("PROJECT_GATES block in the scaffolded hook")
             + open.len();
-        let block = &SCAFFOLDED_PRE_PUSH_HOOK[start..];
-        let end = block.find(')').expect("closing paren of PROJECT_GATES");
-        let live_gates: Vec<&str> = block[..end]
+        let live_gates: Vec<&str> = SCAFFOLDED_PRE_PUSH_HOOK[start..]
             .lines()
+            .take_while(|line| !line.trim_start().starts_with(')'))
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .collect();
