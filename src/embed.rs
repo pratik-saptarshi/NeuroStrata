@@ -734,9 +734,6 @@ impl Embedder for FastEmbedder {
         &self.model_name
     }
 
-    fn session_loaded_snapshot(&self) -> Option<bool> {
-        Some(self.session.snapshot_loaded())
-    }
 
     fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
         crate::traits::EmbeddingDescriptor {

@@ -7276,20 +7276,12 @@ fn normative_slot_limit(limit: usize) -> usize {
     usize::min(3, limit.div_ceil(2))
 }
 
-/// Graph-expansion slot quota when `limit >= 4`: `(limit / 4).clamp(1, 4)`.
-pub fn expansion_slot_limit(limit: usize) -> usize {
-    if limit < 4 {
-        0
-    } else {
-        (limit / 4).clamp(1, 4)
-    }
-}
 
 /// Two-pool slot reservation (`neurostrata-5xjo` §4.3), backed by the formally
 /// verified `crate::formal_kernel::allocate_hybrid_slots` allocator:
 /// 1. Primary Normative Quota (`normative_slot_limit(limit)`) for `DirectMatch`
 ///    normative rows (`rule`, `fact`, `decision`, `procedure`) passing `MAX_NORMATIVE_DISTANCE`.
-/// 2. Graph-Expansion Quota (`expansion_slot_limit(limit)`) for graph-expanded rows
+/// 2. Graph-Expansion Quota (`(limit / 4).clamp(1, 4)` when `limit >= 4`) for graph-expanded rows
 ///    (`OneHop`, `EpisodeSibling`, `Governs2hop`), prioritizing `GOVERNS` edges.
 /// 3. Remaining Slots filled in ascending hybrid distance order across all leftover
 ///    candidates, deduplicated by logical ID (`bare_id_of`).
@@ -17591,138 +17583,8 @@ impl crate::traits::IntakeStore for LadybugStore {
         .map_err(|e| format!("Failed to resolve candidate: {}", e))
     }
 
-    async fn get_receipt(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeReceipt>, String> {
-        let namespace = namespace.to_string();
-        let id = id.to_string();
 
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
-
-            let query = format!(
-                "MATCH (r:IntakeReceipt) WHERE r.id = '{}' AND r.namespace = '{}' RETURN r.id, r.namespace, r.source_kind, r.source_revision, r.source_digest, r.detected_intents, r.raw_text, r.created_at",
-                safe_id, safe_ns
-            );
-            let mut result = conn.query(&query)?;
-
-            if let Some(row) = result.next() {
-                let receipt_id: String = format!("{}", row[0]);
-                let ns: String = format!("{}", row[1]);
-                let source_kind_str: String = format!("{}", row[2]);
-                let source_revision: String = format!("{}", row[3]);
-                let source_digest: String = format!("{}", row[4]);
-                let detected_intents_str: String = format!("{}", row[5]);
-                let raw_text: String = format!("{}", row[6]);
-                let created_at: String = format!("{}", row[7]);
-
-                let source_kind = match source_kind_str.as_str() {
-                    "conversation" => crate::task::intake::SourceKind::Conversation,
-                    "manual" => crate::task::intake::SourceKind::Manual,
-                    "imported" => crate::task::intake::SourceKind::Imported,
-                    "tool" => crate::task::intake::SourceKind::Tool,
-                    _ => crate::task::intake::SourceKind::Conversation,
-                };
-
-                let detected_intents: Vec<crate::task::intake::DetectedIntent> =
-                    serde_json::from_str(&detected_intents_str).unwrap_or_default();
-
-                Ok(Some(crate::task::intake::IntakeReceipt {
-                    id: receipt_id,
-                    namespace: ns,
-                    source_kind,
-                    source_revision,
-                    source_digest,
-                    detected_intents,
-                    raw_text,
-                    created_at,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(|e| format!("Failed to get receipt: {}", e))
-    }
-
-    async fn get_candidate(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeCandidate>, String> {
-        let namespace = namespace.to_string();
-        let id = id.to_string();
-
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
-
-            let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at",
-                safe_id, safe_ns
-            );
-            let mut result = conn.query(&query)?;
-
-            if let Some(row) = result.next() {
-                let cand_id: String = format!("{}", row[0]);
-                let ns: String = format!("{}", row[1]);
-                let receipt_id: String = format!("{}", row[2]);
-                let title: String = format!("{}", row[3]);
-                let description: String = format!("{}", row[4]);
-                let review_state_str: String = format!("{}", row[5]);
-                let disposition_str: String = format!("{}", row[6]);
-                let task_id: String = format!("{}", row[7]);
-                let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
-                let created_at: String = format!("{}", row[9]);
-                let updated_at: String = format!("{}", row[10]);
-
-                let review_state = match review_state_str.as_str() {
-                    "pending" => crate::task::intake::ReviewState::Pending,
-                    "inreview" => crate::task::intake::ReviewState::InReview,
-                    "accepted" => crate::task::intake::ReviewState::Accepted,
-                    "dismissed" => crate::task::intake::ReviewState::Dismissed,
-                    _ => crate::task::intake::ReviewState::Pending,
-                };
-
-                let disposition = match disposition_str.as_str() {
-                    "pending" => crate::task::intake::Disposition::Pending,
-                    "created" => crate::task::intake::Disposition::Created,
-                    "linked" => crate::task::intake::Disposition::Linked,
-                    "dismissed" => crate::task::intake::Disposition::Dismissed,
-                    _ => crate::task::intake::Disposition::Pending,
-                };
-
-                Ok(Some(crate::task::intake::IntakeCandidate {
-                    id: cand_id,
-                    namespace: ns,
-                    receipt_id,
-                    title,
-                    description: if description.is_empty() { None } else { Some(description) },
-                    review_state,
-                    disposition,
-                    task_id: if task_id.is_empty() { None } else { Some(task_id) },
-                    cas_version: cas_version as u64,
-                    created_at,
-                    updated_at,
-                    candidate_kind: "task".to_string(),
-                    kind: "task_obligation".to_string(),
-                    category: None,
-                    payload: serde_json::Value::Null,
-                    confidence: None,
-                    source_span: None,
-                    provenance: None,
-                    extractor_fingerprint: None,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(|e| format!("Failed to get candidate: {}", e))
-    }}
+}
 
 
 /// Diagnostic counters for work handed to the engine.
@@ -41521,28 +41383,7 @@ mod wal_preservation {
 
 
 impl LadybugStore {
-    /// Returns the ontobug catalog registered for this store's database.
-    ///
-    /// Acquires `write_lock` while initializing the schema tables (`SchemaEntry`, `OntologyClass`,
-    /// `OntologyProperty`, `ShaclShape`, `ShaclProperty`, `Namespace`, `RdfNode`, `Statement`),
-    /// and returns `ontobug::Catalog::from_database(self.db.clone(), &self.local_path)`.
-    pub async fn ontobug_catalog(&self) -> anyhow::Result<ontobug::Catalog> {
-        let _guard = self.write_lock.lock().await;
-        ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
-            .map_err(|e| anyhow::anyhow!(e))
-    }
 
-    /// Executes `f` against an `ontobug::Catalog` while holding `self.write_lock`
-    /// across both schema initialization and the caller's catalog operation.
-    pub async fn with_ontobug_catalog<F, R>(&self, f: F) -> anyhow::Result<R>
-    where
-        F: FnOnce(&mut ontobug::Catalog) -> ontobug::Result<R>,
-    {
-        let _guard = self.write_lock.lock().await;
-        let mut catalog = ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        f(&mut catalog).map_err(|e| anyhow::anyhow!(e))
-    }
 
     pub async fn list_edges(
         &self,
@@ -43386,22 +43227,6 @@ fn test_publish_crash_barrier(db_path: &Path, phase: &str) {
     }
 }
 
-/// Width and, for newly marked databases, model identity used to create a DB.
-///
-/// The `Memory` table stores `embedding FLOAT[N]`, sized from the embedder at
-/// creation time. The fixed width can be read from the catalog, but the schema
-/// does not record which model produced each vector. A sidecar records both for
-/// new stores; a legacy store without identity adopts its current model with a
-/// visible warning, then blocks subsequent identity changes. The adoption is
-/// itself recorded in the persisted marker as provenance (see
-/// `PersistedEmbeddingMarker`); adopting never refuses the open.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct EmbeddingMarker {
-    version: u8,
-    dimensions: usize,
-    #[serde(default)]
-    embedder_id: Option<String>,
-}
 pub(crate) fn width_marker_path(db_path: &Path) -> PathBuf {
     let canonical = canonical_database_path(db_path);
     let mut marker = canonical.as_os_str().to_os_string();
@@ -43409,57 +43234,8 @@ pub(crate) fn width_marker_path(db_path: &Path) -> PathBuf {
     PathBuf::from(marker)
 }
 
-/// Adoption provenance recorded in a marker's JSON, if any. Legacy numeric
-/// markers and markers written before provenance existed carry none.
-fn adopted_from_in_marker_bytes(bytes: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    value.get("adopted_from")?.as_str().map(str::to_string)
-}
 
-fn persisted_embedding_width(db: &Database) -> Result<Option<usize>> {
-    let conn = Connection::new(db)?;
-    let rows = match conn.query("CALL table_info('Memory') RETURN *") {
-        Ok(rows) => rows,
-        Err(error) if error.to_string().contains("does not exist in catalog") => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut has_properties = false;
-    for row in rows {
-        has_properties = true;
-        if format!("{}", row[1]) != "embedding" {
-            continue;
-        }
-        let property_type = format!("{}", row[2]);
-        let Some((_, raw_width)) = property_type.split_once('[') else {
-            anyhow::bail!("Memory.embedding has unsupported schema type {property_type}");
-        };
-        let width = raw_width
-            .trim_end_matches(']')
-            .parse::<usize>()
-            .map_err(|e| {
-                anyhow::anyhow!("Memory.embedding has unsupported schema type {property_type}: {e}")
-            })?;
-        return Ok(Some(width));
-    }
-    if has_properties {
-        anyhow::bail!("Memory table exists but has no embedding property");
-    }
-    Ok(None)
-}
 
-/// The marker's serialization form. `adopted_from` records that this store's
-/// identity was adopted from a legacy marker (`"width-only"`) or from its
-/// fixed-width schema alone (`"schema-only"`); it is serialized only when an
-/// adoption occurred, so natively marked stores keep the pre-existing shape
-/// and markers written before it existed parse unchanged.
-#[derive(serde::Serialize)]
-struct PersistedEmbeddingMarker {
-    version: u8,
-    dimensions: usize,
-    embedder_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adopted_from: Option<String>,
-}
 
 /// Marks a write attempt dirty before its cross-process writer lock is
 /// released. Checkpoint acquires the same lock before taking this flag, so a
@@ -44231,51 +44007,6 @@ pub fn is_store_busy(err: &anyhow::Error) -> bool {
     err.downcast_ref::<StoreBusy>().is_some()
 }
 
-/// Resolves a declared edge target while a memory is being written, in one read.
-///
-/// The exact id stays unscoped, as edges always have been; everything inferred
-/// from it is confined to the memory's own namespace, so a bare `src/lib.rs`
-/// cannot land on another project's file.
-/// How an edge target binds to exactly one row (Task 7).
-enum RowBind {
-    /// The namespace of the row the edge lands on.
-    Bound(String),
-    /// No row carries the id (or the lookup itself failed — edge
-    /// materialization is best-effort and reports through the deferred
-    /// list either way).
-    Gone,
-    /// The id lives in several namespaces, none of them the preferred
-    /// one: a true tie, deferred rather than sprayed.
-    Ambiguous(Vec<String>),
-}
-
-/// Resolve the namespace of the row an edge should land on: the row whose
-/// id is `id`, preferring `preferred` (the source memory's namespace)
-/// when the id lives there, else the single namespace holding it.
-fn bind_row_namespace(conn: &Connection, id: &str, preferred: &str) -> RowBind {
-    let query = format!(
-        "MATCH (b:Memory) WHERE b.id = '{}' AND b.namespace IS NOT NULL RETURN DISTINCT b.namespace",
-        escape_ladybug_string(id)
-    );
-    let mut namespaces = Vec::new();
-    match conn.query(&query) {
-        Ok(rows) => {
-            for row in rows {
-                namespaces.push(format!("{}", row[0]));
-            }
-        }
-        Err(_) => return RowBind::Gone,
-    }
-    if namespaces.iter().any(|ns| ns == preferred) {
-        RowBind::Bound(preferred.to_string())
-    } else if namespaces.len() == 1 {
-        RowBind::Bound(namespaces.into_iter().next().unwrap())
-    } else if namespaces.is_empty() {
-        RowBind::Gone
-    } else {
-        RowBind::Ambiguous(namespaces)
-    }
-}
 
 #[cfg(test)]
 fn action_batch_fail_map() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, usize>> {
