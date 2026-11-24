@@ -6558,7 +6558,7 @@ mod tests {
     // depth per CI run; removed before the final head.
     #[test]
     fn probe_depth_calibration() {
-        const D: usize = 1750;
+        const D: usize = 2125;
         fn probe_node(slug: &str, children: Vec<TaxonomyTreeNode>) -> TaxonomyTreeNode {
             TaxonomyTreeNode {
                 slug: slug.to_string(),
