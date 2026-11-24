@@ -78,7 +78,7 @@ pub fn build_candidates(index: &KnownIds) -> HashMap<String, String> {
         // Symbol name after kind: (e.g. functions:bar -> bar)
         let rest = logical.split('#').nth(1).unwrap_or("");
         let name = if rest.contains(':') {
-            rest.split(':').last().unwrap_or(rest)
+            rest.split(':').next_back().unwrap_or(rest)
         } else {
             rest
         };

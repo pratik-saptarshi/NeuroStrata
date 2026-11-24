@@ -630,10 +630,7 @@ impl HttpServiceHandler {
                         ))),
                     }
                 }
-                Ok(spareval::QuerySolutionIter::new(
-                    variables,
-                    collected.into_iter(),
-                ))
+                Ok(spareval::QuerySolutionIter::new(variables, collected))
             }
             sparesults::SliceQueryResultsParserOutput::Boolean(_) => {
                 let variables: std::sync::Arc<[oxrdf::Variable]> = std::sync::Arc::new([]);

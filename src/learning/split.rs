@@ -78,8 +78,8 @@ impl UnionFind {
     fn new(n: usize) -> Self {
         let mut parent = vec![0; n];
         let rank = vec![0; n];
-        for i in 0..n {
-            parent[i] = i;
+        for (i, p) in parent.iter_mut().enumerate().take(n) {
+            *p = i;
         }
         Self { parent, rank }
     }

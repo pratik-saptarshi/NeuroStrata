@@ -469,7 +469,7 @@ impl TimeSeriesStore {
         for s in all_samples {
             seen.insert(s.id.clone(), s);
         }
-        for (_, samp) in db_map.iter() {
+        for samp in db_map.values() {
             // DB sample ids embed their `namespace`, `metric` and `stage`
             // segments (`namespace::metric::stage::ts::seq`; legacy rows use
             // single colons). Every segment must match the query: a substring
