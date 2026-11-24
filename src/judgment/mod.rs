@@ -87,6 +87,13 @@ pub struct ProviderSet {
     pub shadow: Option<Arc<dyn JudgmentProvider>>,
 }
 
+/// The (active, shadow) provider pair selected before it is wrapped in a
+/// [`ProviderSet`].
+type ProviderPair = (
+    Option<Arc<dyn JudgmentProvider>>,
+    Option<Arc<dyn JudgmentProvider>>,
+);
+
 /// Select judgment providers based on config mode and provided Laya/Jev candidates.
 /// When config.provider is None or explicit Jev without a key, no provider is selected
 /// and the baseline write path is allowed (per Step 6: no automatic Jev failover).
@@ -95,10 +102,7 @@ pub fn select_dedup_providers(
     laya: Option<Arc<dyn JudgmentProvider>>,
     jev: Option<Arc<dyn JudgmentProvider>>,
 ) -> Result<ProviderSet> {
-    let (active, shadow): (
-        Option<Arc<dyn JudgmentProvider>>,
-        Option<Arc<dyn JudgmentProvider>>,
-    ) = match config.provider {
+    let (active, shadow): ProviderPair = match config.provider {
         DedupProviderMode::Auto => {
             // Auto: local heuristic as active, Laya local as shadow if available
             let active = Some(
