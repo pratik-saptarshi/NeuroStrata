@@ -414,6 +414,17 @@ pub type TaxonomyResponse = Value;
 pub const MAX_COMPARE_SLUGS: usize = 64;
 pub const MAX_COMPARE_AXES: usize = 32;
 
+/// Hard cap on the emitted depth of a `tree` result (root = depth 0):
+/// a node at this depth is emitted without children. R9 expansion is
+/// governed by minimum root distance, which does not bound the DFS
+/// depth of the emitted tree; a deeply nested `TaxonomyTreeNode` then
+/// overflows bounded stacks in recursive `serde_json` serialization
+/// and in recursive drop. The cap is calibrated empirically on a
+/// 2 MiB stack (nested serialize + drop safe at depth 1750, aborting
+/// at 2125) and set below half the largest safe depth for margin.
+/// Owner ruling 2026-11-23 (PR #153 depth-safety bound).
+pub const MAX_TREE_DEPTH: usize = 512;
+
 fn normalize_slug_vec(raw: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
     for item in raw {
@@ -2150,7 +2161,12 @@ fn tree_build_frame<'a>(
     // and allowed-set filtering).
     let min_distance = min_distances.get(&concept.slug).copied().unwrap_or(depth);
     static NO_CHILDREN: &[String] = &[];
-    let child_iter = if max_hops.map_or(true, |h| min_distance < h) {
+    // Depth safety bound: regardless of the R9 min-distance rule, a
+    // node at MAX_TREE_DEPTH never expands, so the emitted tree's
+    // depth is bounded and recursive serialization / drop of the
+    // result stay within bounded stacks. Below the cap the R9 rule
+    // alone decides expansion, unchanged.
+    let child_iter = if depth < MAX_TREE_DEPTH && max_hops.map_or(true, |h| min_distance < h) {
         concept.narrower.iter()
     } else {
         NO_CHILDREN.iter()
@@ -6489,8 +6505,11 @@ mod tests {
     /// root distance, so a root directly linked to every node of a long
     /// chain gives each chain node minimum distance 1 and the recursive
     /// DFS follows the whole chain -- recursion depth O(concepts),
-    /// unbounded by `max_hops`. Traversal, serialization and drop of
-    /// the resulting tree must all complete on a 2 MiB stack.
+    /// unbounded by `max_hops`. With the MAX_TREE_DEPTH safety bound,
+    /// traversal, serialization and drop of the resulting (bounded)
+    /// tree must all complete on a 2 MiB stack, with every node still
+    /// emitted exactly once (unreached chain nodes are emitted as
+    /// further children of the root, whose `narrower` lists them all).
     #[test]
     fn tree_deep_chain_expansion_is_stack_safe() {
         let handle = std::thread::Builder::new()
@@ -6532,67 +6551,90 @@ mod tests {
                 )
                 .expect("root node must be emitted");
                 let roots = vec![node];
-                // Count emitted nodes iteratively (no recursion here).
+                // Count emitted nodes and their maximum depth
+                // iteratively (no recursion here).
                 let mut count = 0usize;
-                let mut stack: Vec<&TaxonomyTreeNode> = roots.iter().collect();
-                while let Some(n) = stack.pop() {
+                let mut max_depth = 0usize;
+                let mut stack: Vec<(&TaxonomyTreeNode, usize)> =
+                    roots.iter().map(|n| (n, 0)).collect();
+                while let Some((n, d)) = stack.pop() {
                     count += 1;
-                    stack.extend(n.children.iter());
+                    max_depth = max_depth.max(d);
+                    stack.extend(n.children.iter().map(|c| (c, d + 1)));
                 }
                 assert_eq!(count, N + 1, "every chain node must be emitted once");
+                assert!(
+                    max_depth <= MAX_TREE_DEPTH,
+                    "emitted depth {max_depth} must stay within the depth safety bound"
+                );
                 let serialized = serde_json::to_string(&roots).expect("deep tree must serialize");
                 assert!(!serialized.is_empty());
                 drop(roots);
-                count
+                (count, max_depth)
             })
             .expect("spawn traversal thread");
-        let count = handle
+        let (count, max_depth) = handle
             .join()
             .expect("traversal thread must complete without stack overflow");
         assert_eq!(count, 5001);
+        assert!(max_depth <= MAX_TREE_DEPTH);
     }
 
-    // TEMPORARY calibration probe (depth-bound fix wave, PR #153):
-    // directly constructs a nested TaxonomyTreeNode chain of depth D,
-    // then serializes and drops it inside a 2 MiB-stack thread. One
-    // depth per CI run; removed before the final head.
+    /// Depth safety bound boundary: a single chain longer than
+    /// MAX_TREE_DEPTH, with no `max_hops` cap, emits down to exactly
+    /// MAX_TREE_DEPTH and no deeper; the deepest node is childless.
     #[test]
-    fn probe_depth_calibration() {
-        const D: usize = 2125;
-        fn probe_node(slug: &str, children: Vec<TaxonomyTreeNode>) -> TaxonomyTreeNode {
-            TaxonomyTreeNode {
-                slug: slug.to_string(),
-                pref_label: slug.to_string(),
-                definition: String::new(),
-                domain: None,
-                epistemic_status: String::new(),
-                epistemic_weight_bps: 0,
-                realization_status: String::new(),
-                frontier_leverage_bps: 0,
-                descendant_count: 0,
-                grounding_count: 0,
-                aliases: Vec::new(),
-                broader: Vec::new(),
-                narrower: Vec::new(),
-                related_concepts: Vec::new(),
-                contrasts_with: Vec::new(),
-                children,
-            }
+    fn tree_depth_cap_emits_down_to_cap_and_no_deeper() {
+        let extra = 100usize;
+        let chain_len = MAX_TREE_DEPTH + extra;
+        let chain: Vec<String> = (1..=chain_len).map(|i| format!("c{i}")).collect();
+        let mut concepts: BTreeMap<String, HydratedConcept> = BTreeMap::new();
+        concepts.insert(
+            "root".to_string(),
+            synthetic_concept("root", Vec::new(), vec![chain[0].clone()]),
+        );
+        for (idx, slug) in chain.iter().enumerate() {
+            let broader = if idx == 0 {
+                vec!["root".to_string()]
+            } else {
+                vec![chain[idx - 1].clone()]
+            };
+            let narrower = if idx + 1 < chain_len {
+                vec![chain[idx + 1].clone()]
+            } else {
+                Vec::new()
+            };
+            concepts.insert(slug.clone(), synthetic_concept(slug, broader, narrower));
         }
-        let handle = std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn(|| {
-                let mut node = probe_node("leaf", Vec::new());
-                for i in 0..D {
-                    node = probe_node(&format!("n{i}"), vec![node]);
-                }
-                let serialized = serde_json::to_string(&node).expect("probe tree must serialize");
-                assert!(!serialized.is_empty());
-                drop(node);
-                D
-            })
-            .expect("spawn probe thread");
-        let d = handle.join().expect("probe thread must complete");
-        assert_eq!(d, D);
+        let allowed: BTreeSet<String> = concepts.keys().cloned().collect();
+        let root_slugs = vec!["root".to_string()];
+        let min_distances = min_root_distances(&root_slugs, &concepts, &allowed);
+        let mut visited = BTreeSet::new();
+        let mut budget = usize::MAX;
+        let node = build_tree_node(
+            "root",
+            &concepts,
+            &allowed,
+            &mut visited,
+            0,
+            None,
+            &mut budget,
+            &min_distances,
+        )
+        .expect("root node must be emitted");
+        // Walk the single-child chain to the deepest emitted node.
+        let mut depth = 0usize;
+        let mut count = 1usize;
+        let mut current = &node;
+        while let Some(child) = current.children.first() {
+            assert_eq!(current.children.len(), 1, "chain nodes have one child");
+            depth += 1;
+            count += 1;
+            current = child;
+        }
+        assert_eq!(depth, MAX_TREE_DEPTH, "emission stops exactly at the cap");
+        assert_eq!(count, MAX_TREE_DEPTH + 1, "root plus one node per depth");
+        assert!(current.children.is_empty(), "deepest node is childless");
+        assert_eq!(current.slug, chain[MAX_TREE_DEPTH - 1]);
     }
 }
