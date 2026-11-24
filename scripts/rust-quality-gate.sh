@@ -94,8 +94,14 @@ fi
 # HEAD): rustfmt/clippy/audit all inspect worktree files, so attribution
 # must use worktree numbering too — otherwise uncommitted edits could
 # hide findings in the code actually being pushed (or vice versa).
-CHANGED_RS="$(git diff --name-only "$BASE" -- '*.rs' || true)"
-CHANGED_MANIFEST="$(git diff --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' 'src-tauri/Cargo.toml' 'src-tauri/Cargo.lock' || true)"
+CHANGED_RS="$(git diff --name-only "$BASE" -- '*.rs')" || {
+    echo "$GATE: FAIL: cannot compute the changed-file set against $BASE — quality NOT verified for this push" >&2
+    exit 1
+}
+CHANGED_MANIFEST="$(git diff --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' 'src-tauri/Cargo.toml' 'src-tauri/Cargo.lock')" || {
+    echo "$GATE: FAIL: cannot compute the changed-manifest set against $BASE — quality NOT verified for this push" >&2
+    exit 1
+}
 
 if [ -z "$CHANGED_RS" ] && [ -z "$CHANGED_MANIFEST" ]; then
     echo "$GATE: no Rust sources or manifests changed — nothing to check"
@@ -109,14 +115,26 @@ fi
 
 FAIL=0
 
+# python3 is a hard prerequisite, not an optional filter: it builds the
+# added-line attribution set below and parses every finding filter
+# (fmt overlap, audit advisories). If it is missing or unusable, those
+# filters would run on silently emptied inputs and the gate could
+# report a pass it never verified — FAIL CLOSED instead, before any
+# code path can reach the pass verdict.
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys' >/dev/null 2>&1; then
+    echo "$GATE: FAIL: python3 is required to attribute findings to added lines, but it is missing or unusable in PATH — quality NOT verified for this push" >&2
+    exit 1
+fi
+
 # Added-line set for every touched .rs file (format "path:lineno",
 # worktree numbering — the same files rustfmt/clippy inspect). Both the
 # fmt and clippy attributions below match findings against this set, so
 # legacy findings in touched files never block the push — only lines
 # this push adds. Mirrors task-coverage-gate.sh (+-line inspection).
 # Kept in a temp file, not the environment: large diffs exceed the
-# per-string environment limit and python would fail to start — and the
-# `|| true` guard would then pass everything silently.
+# per-string environment limit and python would fail to start. The
+# pipeline's exit status is checked explicitly below: a failed
+# attribution run must fail closed, never pass on an empty set.
 ADDED_FILE="$(mktemp -t rustgate-added.XXXXXX)"
 trap 'rm -f "$ADDED_FILE"' EXIT
 git diff -U0 "$BASE" -- '*.rs' | python3 -c '
@@ -139,7 +157,12 @@ for raw in sys.stdin:
     elif line.startswith(" "):
         new_line += 1
 print("\n".join(sorted(out)))
-' > "$ADDED_FILE" 2>/dev/null || true
+' > "$ADDED_FILE" 2>/dev/null
+ADDED_RC=${PIPESTATUS[1]}
+if [ "$ADDED_RC" -ne 0 ]; then
+    echo "$GATE: FAIL: could not build the added-line attribution set (python3 exited $ADDED_RC) — quality NOT verified for this push" >&2
+    exit 1
+fi
 
 # ── 1. fmt: fail only when added lines are misformatted ──────────────────
 # rustfmt --check prints its OWN diff format ("Diff in <file>:<line>:" +
@@ -192,7 +215,13 @@ for raw in sys.stdin:
 flush()
 print("MATCH" if out else "no")
 print("\n".join(out))
-' || true)"
+')"
+        OVERLAP_RC=$?
+        if [ "$OVERLAP_RC" -ne 0 ]; then
+            echo "$GATE: FAIL: could not attribute rustfmt findings for $f (python3 exited $OVERLAP_RC) — fmt NOT verified for this file" >&2
+            FAIL=1
+            continue
+        fi
         if [ "$(printf '%s\n' "$OVERLAP" | head -n 1)" = "MATCH" ]; then
             echo "$GATE: FAIL: touched file needs formatting on added lines (run \`cargo fmt\`): $f" >&2
             printf '%s\n' "$OVERLAP" | tail -n +2 | head -n 20 >&2
@@ -308,10 +337,23 @@ for block in re.split(r"\n\s*\n", text):
     if not m_sev:
         m_sev = re.search(r"^Severity:\s*(\w+)", block, re.M)
     print(m_id.group(1), (m_sev.group(1).lower() if m_sev else "unknown"))
-' 2>/dev/null || true
+' 2>/dev/null
             }
-            NEW_IDS="$(parse_advisories "$AUDIT_TEXT" | awk '$2=="high"||$2=="critical"{print $1}')"
-            if [ -z "$NEW_IDS" ]; then
+            # A failed parse must never read as "no advisories": warn
+            # loudly that the audit is NOT verified (this section's
+            # established unverifiable-audit posture) instead of
+            # proceeding on an emptied advisory set.
+            PARSED_ADVISORIES="$(parse_advisories "$AUDIT_TEXT")"
+            PARSE_RC=$?
+            NEW_IDS=""
+            if [ "$PARSE_RC" -ne 0 ]; then
+                echo "$GATE: warning: could not parse the cargo audit report (python3 exited $PARSE_RC) — audit NOT verified (CI audit remains backstop)" >&2
+            else
+                NEW_IDS="$(printf '%s\n' "$PARSED_ADVISORIES" | awk '$2=="high"||$2=="critical"{print $1}')"
+            fi
+            if [ "$PARSE_RC" -ne 0 ]; then
+                : # parse failed: warning above already said NOT verified
+            elif [ -z "$NEW_IDS" ]; then
                 echo "$GATE: no new high/critical advisories in this push"
             elif ! git rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
                 echo "$GATE: warning: origin/develop unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
@@ -331,8 +373,12 @@ for block in re.split(r"\n\s*\n", text):
                         # high/critical ID in the push is therefore new.
                         BASE_OK=1
                     elif [ -n "$BASE_TEXT" ]; then
-                        BASE_SEV="$(parse_advisories "$BASE_TEXT")"
-                        BASE_OK=1
+                        # Only a successful parse counts as a verified
+                        # baseline; a failed one leaves BASE_OK=0 and
+                        # falls into the NOT-verified warning below.
+                        if BASE_SEV="$(parse_advisories "$BASE_TEXT")"; then
+                            BASE_OK=1
+                        fi
                     fi
                 fi
                 rm -f "$TMPBASE"

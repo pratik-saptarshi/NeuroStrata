@@ -6271,6 +6271,10 @@ mod tests {
             SCAFFOLDED_RUST_QUALITY_GATE.contains("cargo clippy --locked --workspace"),
             "the guard must carry the workspace clippy marker"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("python3 is required to attribute findings"),
+            "the guard must fail closed when python3 is missing or unusable"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();
