@@ -6,7 +6,6 @@
 
 use crate::learning::labels::{derive_labels, LabelRule, LabelTier};
 use crate::learning::observation::{DecisionObservation, LearningOutcome, LearningOutcomeKind};
-use crate::learning::split::DatasetSplits;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -494,7 +493,6 @@ pub async fn build_dedup_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn failing_build_dedup_dataset_empty_root() {
