@@ -413,9 +413,17 @@ pub type TaxonomyResponse = Value;
 /// pairwise/ancestor work without a bound (#334/C1).
 pub const MAX_COMPARE_SLUGS: usize = 64;
 pub const MAX_COMPARE_AXES: usize = 32;
-/// Tree query controls (#334/C2).
-pub const MAX_TREE_HOPS: usize = 4;
-pub const MAX_TREE_ROOTS: usize = 50;
+
+/// Hard cap on the emitted depth of a `tree` result (root = depth 0):
+/// a node at this depth is emitted without children. R9 expansion is
+/// governed by minimum root distance, which does not bound the DFS
+/// depth of the emitted tree; a deeply nested `TaxonomyTreeNode` then
+/// overflows bounded stacks in recursive `serde_json` serialization
+/// and in recursive drop. The cap is calibrated empirically on a
+/// 2 MiB stack (nested serialize + drop safe at depth 1750, aborting
+/// at 2125) and set below half the largest safe depth for margin.
+/// Owner ruling 2026-11-23 (PR #153 depth-safety bound).
+pub const MAX_TREE_DEPTH: usize = 512;
 
 fn normalize_slug_vec(raw: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
@@ -2085,58 +2093,200 @@ async fn execute_upsert_concept(
     }))
 }
 
-fn build_tree_node(
-    slug: &str,
+/// Minimum graph distance (hops) from any tree root to each reachable
+/// concept, computed by bounded BFS over the loaded concept graph
+/// following the same child relation (`narrower`) and allowed-set
+/// filtering `build_tree_node` uses. Roots are distance 0. Ruling R9:
+/// `max_hops` bounds this minimum distance, not the depth at which the
+/// pre-order DFS happens to first reach a node -- in a polyhierarchy a
+/// node first reached by a long DFS path may also be reachable by a
+/// shorter path, and its in-range descendants must not be suppressed
+/// by the longer first visit.
+fn min_root_distances(
+    root_slugs: &[String],
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
-    visited: &mut BTreeMap<String, usize>,
-    remaining_hops: Option<usize>,
-) -> Option<TaxonomyTreeNode> {
-    // Track the greatest remaining budget seen per node, not a boolean:
-    // a DAG node first reached by a longer path must be revisited when a
-    // shorter path leaves more hops for its descendants (#334/C2 follow-up).
-    let budget = remaining_hops.unwrap_or(usize::MAX);
-    if let Some(best) = visited.get(slug) {
-        if *best >= budget {
-            return None;
+) -> BTreeMap<String, usize> {
+    let mut distances: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for root in root_slugs {
+        if allowed_set.contains(root)
+            && concepts.contains_key(root)
+            && !distances.contains_key(root)
+        {
+            distances.insert(root.clone(), 0);
+            queue.push_back(root.clone());
         }
     }
-    visited.insert(slug.to_string(), budget);
-    let c = concepts.get(slug)?;
-    let mut children = Vec::new();
-    if remaining_hops != Some(0) {
-        for child_slug in &c.narrower {
-            if allowed_set.contains(child_slug) {
-                if let Some(child_node) = build_tree_node(
-                    child_slug,
-                    concepts,
-                    allowed_set,
-                    visited,
-                    remaining_hops.map(|hops| hops.saturating_sub(1)),
-                ) {
-                    children.push(child_node);
+    while let Some(slug) = queue.pop_front() {
+        let distance = distances[&slug];
+        if let Some(c) = concepts.get(&slug) {
+            for child_slug in &c.narrower {
+                if allowed_set.contains(child_slug)
+                    && concepts.contains_key(child_slug)
+                    && !distances.contains_key(child_slug)
+                {
+                    distances.insert(child_slug.clone(), distance + 1);
+                    queue.push_back(child_slug.clone());
                 }
             }
         }
     }
-    Some(TaxonomyTreeNode {
-        slug: c.slug.clone(),
-        pref_label: c.pref_label.clone(),
-        definition: c.definition.clone(),
-        domain: c.domain.clone(),
-        epistemic_status: c.epistemic_status.clone(),
-        epistemic_weight_bps: c.epistemic_weight_bps,
-        realization_status: c.realization_status.clone(),
-        frontier_leverage_bps: c.frontier_leverage_bps,
-        descendant_count: c.descendant_count,
-        grounding_count: c.grounding_count,
-        aliases: c.aliases.clone(),
-        broader: c.broader.clone(),
-        narrower: c.narrower.clone(),
-        related_concepts: c.related_concepts.clone(),
-        contrasts_with: c.contrasts_with.clone(),
-        children,
-    })
+    distances
+}
+
+/// One in-progress node entry on `build_tree_node`'s explicit work
+/// stack: the iterative form of one recursive call frame. `child_iter`
+/// yields the not-yet-considered `narrower` children (empty when the
+/// node does not expand); `children` accumulates emitted child nodes
+/// in consideration order.
+struct TreeBuildFrame<'a> {
+    concept: &'a HydratedConcept,
+    depth: usize,
+    child_iter: std::slice::Iter<'a, String>,
+    children: Vec<TaxonomyTreeNode>,
+}
+
+fn tree_build_frame<'a>(
+    concept: &'a HydratedConcept,
+    depth: usize,
+    max_hops: Option<usize>,
+    min_distances: &BTreeMap<String, usize>,
+) -> TreeBuildFrame<'a> {
+    // R9: expansion is capped by the node's MINIMUM distance from a
+    // root, not by this visit's DFS depth. Emission order, the visited
+    // set and the `limit` budget remain pre-order DFS first-visit,
+    // unchanged. The DFS-depth fallback covers any node the BFS did
+    // not reach (not expected: BFS and DFS share roots, child relation
+    // and allowed-set filtering).
+    let min_distance = min_distances.get(&concept.slug).copied().unwrap_or(depth);
+    static NO_CHILDREN: &[String] = &[];
+    // Depth safety bound: regardless of the R9 min-distance rule, a
+    // node at MAX_TREE_DEPTH never expands, so the emitted tree's
+    // depth is bounded and recursive serialization / drop of the
+    // result stay within bounded stacks. Below the cap the R9 rule
+    // alone decides expansion, unchanged.
+    let child_iter = if depth < MAX_TREE_DEPTH && max_hops.map_or(true, |h| min_distance < h) {
+        concept.narrower.iter()
+    } else {
+        NO_CHILDREN.iter()
+    };
+    TreeBuildFrame {
+        concept,
+        depth,
+        child_iter,
+        children: Vec::new(),
+    }
+}
+
+fn build_tree_node(
+    slug: &str,
+    concepts: &BTreeMap<String, HydratedConcept>,
+    allowed_set: &BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+    depth: usize,
+    max_hops: Option<usize>,
+    budget: &mut usize,
+    min_distances: &BTreeMap<String, usize>,
+) -> Option<TaxonomyTreeNode> {
+    // Iterative simulation of the previous recursive traversal, with
+    // an explicit heap work stack instead of the call stack: under R9
+    // a node's expansion is governed by its minimum root distance, so
+    // a root linked directly to every node of a long chain makes the
+    // DFS path follow the whole chain -- recursion depth O(concepts),
+    // unbounded by `max_hops`, which aborted the host process with a
+    // stack overflow (Codex P1 on PR #153). The simulation preserves
+    // the recursion's exact order of operations per node: budget==0
+    // check first, then visited insert, then concept lookup (a missing
+    // concept emits nothing, decrements no budget, and leaves visited
+    // marked), then budget decrement; children are considered in
+    // `narrower` order, skipping not-allowed and already-visited
+    // slugs at call time; emission is pre-order first-visit.
+    // CWE-400 bound: `visited` is a first-visit set, so each allowed
+    // concept is emitted at most once; together with the finite allowed
+    // concept set, that bounds total emission even when the caller
+    // supplies no `limit` (a supplied limit caps it directly, via the
+    // budget decremented per emitted node).
+    if *budget == 0 {
+        return None;
+    }
+    if !visited.insert(slug.to_string()) {
+        return None;
+    }
+    let c = concepts.get(slug)?;
+    *budget -= 1;
+    let mut stack: Vec<TreeBuildFrame<'_>> =
+        vec![tree_build_frame(c, depth, max_hops, min_distances)];
+    loop {
+        // Advance the top frame to its next child candidate, applying
+        // the call-time allowed/visited filter exactly as the
+        // recursive loop did before each recursive call.
+        let candidate: Option<&str> = {
+            let top = stack.last_mut().expect("work stack is non-empty");
+            let mut found = None;
+            for child_slug in top.child_iter.by_ref() {
+                if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
+                    found = Some(child_slug.as_str());
+                    break;
+                }
+            }
+            found
+        };
+        match candidate {
+            Some(child_slug) => {
+                // Enter the child: same check order as a recursive
+                // call. Any refusal (budget exhausted, visited race,
+                // missing concept) simply moves the parent frame on
+                // to its next candidate.
+                if *budget == 0 {
+                    continue;
+                }
+                if !visited.insert(child_slug.to_string()) {
+                    continue;
+                }
+                let Some(child_concept) = concepts.get(child_slug) else {
+                    continue;
+                };
+                *budget -= 1;
+                let child_depth = stack.last().expect("work stack is non-empty").depth + 1;
+                stack.push(tree_build_frame(
+                    child_concept,
+                    child_depth,
+                    max_hops,
+                    min_distances,
+                ));
+            }
+            None => {
+                // Exit the top frame: build its node from the
+                // accumulated children and hand it to its parent
+                // frame, or return it when the stack empties.
+                let frame = stack.pop().expect("work stack is non-empty");
+                let c = frame.concept;
+                let node = TaxonomyTreeNode {
+                    slug: c.slug.clone(),
+                    pref_label: c.pref_label.clone(),
+                    definition: c.definition.clone(),
+                    domain: c.domain.clone(),
+                    epistemic_status: c.epistemic_status.clone(),
+                    epistemic_weight_bps: c.epistemic_weight_bps,
+                    realization_status: c.realization_status.clone(),
+                    frontier_leverage_bps: c.frontier_leverage_bps,
+                    descendant_count: c.descendant_count,
+                    grounding_count: c.grounding_count,
+                    aliases: c.aliases.clone(),
+                    broader: c.broader.clone(),
+                    narrower: c.narrower.clone(),
+                    related_concepts: c.related_concepts.clone(),
+                    contrasts_with: c.contrasts_with.clone(),
+                    children: frame.children,
+                };
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(node),
+                    None => return Some(node),
+                }
+            }
+        }
+    }
 }
 
 async fn execute_tree(
@@ -2197,22 +2347,24 @@ async fn execute_tree(
             .collect()
     };
 
-    let mut visited = BTreeMap::new();
-    let max_hops = req.max_hops.map(|hops| hops.clamp(1, MAX_TREE_HOPS));
+    let min_distances = min_root_distances(&root_slugs, &view.concepts, &allowed_slugs);
+
+    let mut visited = BTreeSet::new();
     let mut roots = Vec::new();
+    let mut budget = req.limit.unwrap_or(usize::MAX);
     for r_slug in root_slugs {
         if let Some(node) = build_tree_node(
             &r_slug,
             &view.concepts,
             &allowed_slugs,
             &mut visited,
-            max_hops,
+            0,
+            req.max_hops,
+            &mut budget,
+            &min_distances,
         ) {
             roots.push(node);
         }
-    }
-    if let Some(limit) = req.limit.map(|limit| limit.clamp(1, MAX_TREE_ROOTS)) {
-        roots.truncate(limit);
     }
 
     Ok(json!({
@@ -5941,6 +6093,352 @@ mod tests {
         );
     }
 
+    // ── C2 (fork #124): execute_tree honours limit / max_hops ──
+
+    /// Seeds a 3-level chain: tree-root -> tree-child -> tree-grandchild.
+    async fn seed_three_level_chain(store: &LadybugStore, embedder: &DummyEmbedder, ns: &str) {
+        for (slug, label, broader) in [
+            ("tree-root", "Tree Root", None),
+            ("tree-child", "Tree Child", Some("tree-root")),
+            ("tree-grandchild", "Tree Grandchild", Some("tree-child")),
+        ] {
+            execute_taxonomy(
+                store,
+                embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(format!("Definition for {label}")),
+                    domain: Some("testing".to_string()),
+                    broader: broader.map(|b| vec![b.to_string()]),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed chain concept");
+        }
+    }
+
+    fn count_tree_nodes(nodes: &[Value]) -> usize {
+        nodes
+            .iter()
+            .map(|n| 1 + n["children"].as_array().map_or(0, |c| count_tree_nodes(c)))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn tree_max_hops_one_truncates_grandchildren() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-max-hops-one-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=1");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["slug"], "tree-child");
+        assert!(
+            children[0]["children"]
+                .as_array()
+                .expect("child children array")
+                .is_empty(),
+            "max_hops=1 must emit depth-1 nodes with no children (grandchild absent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_max_hops_zero_returns_roots_without_children() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-max-hops-zero-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(0),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=0");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        assert!(
+            roots[0]["children"]
+                .as_array()
+                .expect("root children array")
+                .is_empty(),
+            "max_hops=0 must emit roots with empty children"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_limit_two_caps_total_nodes_across_forest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-limit-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                limit: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with limit=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(
+            count_tree_nodes(roots),
+            2,
+            "limit=2 must cap the total emitted nodes across the forest at 2"
+        );
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["slug"], "tree-child");
+    }
+
+    #[tokio::test]
+    async fn tree_without_caps_returns_all_three_levels() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-uncapped-ns";
+        store.init(ns).await.expect("init");
+        seed_three_level_chain(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("uncapped tree");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        assert_eq!(count_tree_nodes(roots), 3);
+        assert_eq!(roots[0]["slug"], "tree-root");
+        assert_eq!(roots[0]["children"][0]["slug"], "tree-child");
+        assert_eq!(
+            roots[0]["children"][0]["children"][0]["slug"],
+            "tree-grandchild"
+        );
+    }
+
+    // ── R9 (Codex P2, PR #129): max_hops bounds MINIMUM graph distance ──
+
+    /// Seeds the Codex polyhierarchy: poly-root -> poly-a -> poly-x ->
+    /// poly-y plus poly-root -> poly-x, modelled as broader edges
+    /// (x broader=[root, a], y broader=[x], a broader=[root]) exactly
+    /// as the chain seeder models parentage. Derived `narrower` is a
+    /// sorted set, so poly-root's children iterate [poly-a, poly-x]:
+    /// the DFS reaches poly-x via poly-a (depth 2) before the direct
+    /// root -> poly-x edge (depth 1).
+    async fn seed_polyhierarchy(store: &LadybugStore, embedder: &DummyEmbedder, ns: &str) {
+        for (slug, label, broader) in [
+            ("poly-root", "Poly Root", None),
+            ("poly-a", "Poly A", Some(vec!["poly-root"])),
+            ("poly-x", "Poly X", Some(vec!["poly-root", "poly-a"])),
+            ("poly-y", "Poly Y", Some(vec!["poly-x"])),
+        ] {
+            execute_taxonomy(
+                store,
+                embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(label.to_string()),
+                    definition: Some(format!("Definition for {label}")),
+                    domain: Some("testing".to_string()),
+                    broader: broader.map(|bs| bs.iter().map(|b| b.to_string()).collect()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed polyhierarchy concept");
+        }
+    }
+
+    fn collect_tree_slugs(nodes: &[Value], out: &mut Vec<String>) {
+        for n in nodes {
+            out.push(n["slug"].as_str().expect("slug").to_string());
+            if let Some(children) = n["children"].as_array() {
+                collect_tree_slugs(children, out);
+            }
+        }
+    }
+
+    fn find_tree_node<'a>(nodes: &'a [Value], slug: &str) -> Option<&'a Value> {
+        for n in nodes {
+            if n["slug"].as_str() == Some(slug) {
+                return Some(n);
+            }
+            if let Some(children) = n["children"].as_array() {
+                if let Some(found) = find_tree_node(children, slug) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Codex P2 (thread PRRT_kwDOVS6VQM66PoLr): with DFS-depth capping,
+    /// poly-x is first visited at depth 2 (via poly-a), emitted
+    /// childless under max_hops=2, and the depth-1 path root -> poly-x
+    /// is skipped as already visited, so poly-y (2 hops via
+    /// root -> poly-x -> poly-y) disappears. RED basis on the
+    /// unmodified tree: build_tree_node expanded children iff
+    /// `depth < max_hops` with the DFS visit depth. Reproduced
+    /// standalone (/tmp/sim_taxonomy.rs, faithful port): CURRENT
+    /// emitted=[root, a, x], has_y=false; with BFS minimum distances
+    /// {root:0, a:1, x:1, y:2} the same DFS emits y.
+    #[tokio::test]
+    async fn tree_max_hops_polyhierarchy_keeps_in_range_descendant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-polyhierarchy-ns";
+        store.init(ns).await.expect("init");
+        seed_polyhierarchy(&store, &embedder, ns).await;
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        let mut slugs = Vec::new();
+        collect_tree_slugs(roots, &mut slugs);
+        assert!(
+            slugs.contains(&"poly-y".to_string()),
+            "poly-y is 2 hops from the root via root -> poly-x -> poly-y \
+             and must be present under max_hops=2: {slugs:?}"
+        );
+        assert_eq!(
+            count_tree_nodes(roots),
+            4,
+            "all four polyhierarchy concepts must be emitted: {slugs:?}"
+        );
+    }
+
+    /// R9 pin: a node whose MINIMUM distance equals max_hops still
+    /// emits, childless -- its children (minimum distance max_hops+1)
+    /// do not. In the polyhierarchy poly-y sits at minimum distance 2;
+    /// its child poly-z (minimum distance 3) must stay absent under
+    /// max_hops=2 while poly-y itself is present with no children.
+    #[tokio::test]
+    async fn tree_max_hops_node_at_min_distance_cap_emits_childless() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-polyhierarchy-cap-ns";
+        store.init(ns).await.expect("init");
+        seed_polyhierarchy(&store, &embedder, ns).await;
+        execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("poly-z".to_string()),
+                pref_label: Some("Poly Z".to_string()),
+                definition: Some("Definition for Poly Z".to_string()),
+                domain: Some("testing".to_string()),
+                broader: Some(vec!["poly-y".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("seed poly-z");
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops=2");
+
+        let roots = tree["roots"].as_array().expect("roots array");
+        let mut slugs = Vec::new();
+        collect_tree_slugs(roots, &mut slugs);
+        assert!(
+            !slugs.contains(&"poly-z".to_string()),
+            "poly-z is 3 hops from the root and must be absent under max_hops=2: {slugs:?}"
+        );
+        let y_node = find_tree_node(roots, "poly-y").expect("poly-y must be present");
+        assert!(
+            y_node["children"]
+                .as_array()
+                .expect("y children array")
+                .is_empty(),
+            "poly-y sits at minimum distance == max_hops and must emit childless"
+        );
+    }
+
     /// #334/C3: unknown request keys are reported; aliases are recognised.
     #[test]
     fn unknown_taxonomy_request_fields_reports_only_unrecognised_keys() {
@@ -5957,5 +6455,186 @@ mod tests {
             vec!["typo_field".to_string()]
         );
         assert!(unknown_taxonomy_request_fields(&json!({})).is_empty());
+    }
+
+    fn synthetic_concept(
+        slug: &str,
+        broader: Vec<String>,
+        narrower: Vec<String>,
+    ) -> HydratedConcept {
+        HydratedConcept {
+            id: slug.to_string(),
+            slug: slug.to_string(),
+            pref_label: slug.to_string(),
+            definition: String::new(),
+            content: String::new(),
+            domain: None,
+            aliases: Vec::new(),
+            broader,
+            narrower,
+            related_concepts: Vec::new(),
+            contrasts_with: Vec::new(),
+            tradeoffs: Vec::new(),
+            references: Vec::new(),
+            comparable_implementations: Vec::new(),
+            realization_status: String::new(),
+            current_limitations: Vec::new(),
+            frontier_opportunities: Vec::new(),
+            implemented_interfaces: Vec::new(),
+            linked_action_types: Vec::new(),
+            evaluation_scores: BTreeMap::new(),
+            evidence_refs: Vec::new(),
+            governs: Vec::new(),
+            locations: Vec::new(),
+            concept_iri: None,
+            not_definition: None,
+            deprecation: None,
+            deprecation_banner: None,
+            epistemic_status: String::new(),
+            epistemic_weight_bps: 0,
+            descendant_count: 0,
+            grounding_count: 0,
+            verified_grounding_ids: Vec::new(),
+            axis_alignment_bps: 0,
+            frontier_leverage_bps: 0,
+            is_public: false,
+        }
+    }
+
+    /// Codex P1 on PR #153: under R9, expansion is governed by minimum
+    /// root distance, so a root directly linked to every node of a long
+    /// chain gives each chain node minimum distance 1 and the recursive
+    /// DFS follows the whole chain -- recursion depth O(concepts),
+    /// unbounded by `max_hops`. With the MAX_TREE_DEPTH safety bound,
+    /// traversal, serialization and drop of the resulting (bounded)
+    /// tree must all complete on a 2 MiB stack, with every node still
+    /// emitted exactly once (unreached chain nodes are emitted as
+    /// further children of the root, whose `narrower` lists them all).
+    #[test]
+    fn tree_deep_chain_expansion_is_stack_safe() {
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                const N: usize = 5000;
+                let chain: Vec<String> = (1..=N).map(|i| format!("c{i}")).collect();
+                let mut concepts: BTreeMap<String, HydratedConcept> = BTreeMap::new();
+                concepts.insert(
+                    "root".to_string(),
+                    synthetic_concept("root", Vec::new(), chain.clone()),
+                );
+                for (idx, slug) in chain.iter().enumerate() {
+                    let mut broader = vec!["root".to_string()];
+                    if idx > 0 {
+                        broader.push(chain[idx - 1].clone());
+                    }
+                    let narrower = if idx + 1 < N {
+                        vec![chain[idx + 1].clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    concepts.insert(slug.clone(), synthetic_concept(slug, broader, narrower));
+                }
+                let allowed: BTreeSet<String> = concepts.keys().cloned().collect();
+                let root_slugs = vec!["root".to_string()];
+                let min_distances = min_root_distances(&root_slugs, &concepts, &allowed);
+                let mut visited = BTreeSet::new();
+                let mut budget = usize::MAX;
+                let node = build_tree_node(
+                    "root",
+                    &concepts,
+                    &allowed,
+                    &mut visited,
+                    0,
+                    Some(2),
+                    &mut budget,
+                    &min_distances,
+                )
+                .expect("root node must be emitted");
+                let roots = vec![node];
+                // Count emitted nodes and their maximum depth
+                // iteratively (no recursion here).
+                let mut count = 0usize;
+                let mut max_depth = 0usize;
+                let mut stack: Vec<(&TaxonomyTreeNode, usize)> =
+                    roots.iter().map(|n| (n, 0)).collect();
+                while let Some((n, d)) = stack.pop() {
+                    count += 1;
+                    max_depth = max_depth.max(d);
+                    stack.extend(n.children.iter().map(|c| (c, d + 1)));
+                }
+                assert_eq!(count, N + 1, "every chain node must be emitted once");
+                assert!(
+                    max_depth <= MAX_TREE_DEPTH,
+                    "emitted depth {max_depth} must stay within the depth safety bound"
+                );
+                let serialized = serde_json::to_string(&roots).expect("deep tree must serialize");
+                assert!(!serialized.is_empty());
+                drop(roots);
+                (count, max_depth)
+            })
+            .expect("spawn traversal thread");
+        let (count, max_depth) = handle
+            .join()
+            .expect("traversal thread must complete without stack overflow");
+        assert_eq!(count, 5001);
+        assert!(max_depth <= MAX_TREE_DEPTH);
+    }
+
+    /// Depth safety bound boundary: a single chain longer than
+    /// MAX_TREE_DEPTH, with no `max_hops` cap, emits down to exactly
+    /// MAX_TREE_DEPTH and no deeper; the deepest node is childless.
+    #[test]
+    fn tree_depth_cap_emits_down_to_cap_and_no_deeper() {
+        let extra = 100usize;
+        let chain_len = MAX_TREE_DEPTH + extra;
+        let chain: Vec<String> = (1..=chain_len).map(|i| format!("c{i}")).collect();
+        let mut concepts: BTreeMap<String, HydratedConcept> = BTreeMap::new();
+        concepts.insert(
+            "root".to_string(),
+            synthetic_concept("root", Vec::new(), vec![chain[0].clone()]),
+        );
+        for (idx, slug) in chain.iter().enumerate() {
+            let broader = if idx == 0 {
+                vec!["root".to_string()]
+            } else {
+                vec![chain[idx - 1].clone()]
+            };
+            let narrower = if idx + 1 < chain_len {
+                vec![chain[idx + 1].clone()]
+            } else {
+                Vec::new()
+            };
+            concepts.insert(slug.clone(), synthetic_concept(slug, broader, narrower));
+        }
+        let allowed: BTreeSet<String> = concepts.keys().cloned().collect();
+        let root_slugs = vec!["root".to_string()];
+        let min_distances = min_root_distances(&root_slugs, &concepts, &allowed);
+        let mut visited = BTreeSet::new();
+        let mut budget = usize::MAX;
+        let node = build_tree_node(
+            "root",
+            &concepts,
+            &allowed,
+            &mut visited,
+            0,
+            None,
+            &mut budget,
+            &min_distances,
+        )
+        .expect("root node must be emitted");
+        // Walk the single-child chain to the deepest emitted node.
+        let mut depth = 0usize;
+        let mut count = 1usize;
+        let mut current = &node;
+        while let Some(child) = current.children.first() {
+            assert_eq!(current.children.len(), 1, "chain nodes have one child");
+            depth += 1;
+            count += 1;
+            current = child;
+        }
+        assert_eq!(depth, MAX_TREE_DEPTH, "emission stops exactly at the cap");
+        assert_eq!(count, MAX_TREE_DEPTH + 1, "root plus one node per depth");
+        assert!(current.children.is_empty(), "deepest node is childless");
+        assert_eq!(current.slug, chain[MAX_TREE_DEPTH - 1]);
     }
 }
