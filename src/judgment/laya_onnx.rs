@@ -854,6 +854,9 @@ impl ContradictionQueue {
         use fs2::FileExt;
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            // Lock file only: its content is never read or written, so
+            // existing bytes must survive the open untouched.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&self.lock_path)?;

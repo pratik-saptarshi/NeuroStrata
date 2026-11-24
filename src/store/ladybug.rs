@@ -42980,6 +42980,9 @@ pub(crate) fn acquire_database_writer_lock(db_path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        // Writer lock file only: it is flocked, never written, so
+        // existing bytes must survive the open untouched.
+        .truncate(false)
         .open(&path)
         .map_err(|error| {
             anyhow::anyhow!(
