@@ -2069,7 +2069,7 @@ fn dispatch_project_context(
         }
         ProjectContextCommands::List => {
             let mut entries: Vec<_> = config.project_contexts.iter().collect();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             let output = if entries.is_empty() {
                 "No project contexts configured.".to_string()
             } else {
