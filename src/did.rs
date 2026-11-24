@@ -1,6 +1,5 @@
 use openssl::pkey::{Id, PKey, Private};
 use openssl::sign::{Signer, Verifier};
-use serde_json;
 use std::fs;
 use std::path::Path;
 
@@ -12,7 +11,7 @@ pub const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b: [u8; 3] = match chunk.len() {
             1 => [chunk[0], 0, 0],

@@ -17848,7 +17848,7 @@ fn pick_declared_target(
         active_gen,
         &declared.replace('\\', "/"),
     );
-    if found.iter().any(|id| *id == qualified) {
+    if found.contains(&qualified) {
         return crate::traits::TargetResolution::Resolved(qualified);
     }
     if found.iter().any(|id| id == declared) {

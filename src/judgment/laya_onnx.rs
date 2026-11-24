@@ -316,10 +316,7 @@ impl JudgmentProvider for LayaOnnxProvider {
                     let feature_vec = [jaccard_sim, (1.0 - score.clamp(0.0, 1.0))];
                     let feature_array =
                         match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec()) {
-                            Ok(arr) => match ort::value::Value::from_array(arr) {
-                                Ok(v) => Some(v),
-                                Err(_) => None,
-                            },
+                            Ok(arr) => ort::value::Value::from_array(arr).ok(),
                             Err(_) => None,
                         };
                     match feature_array {

@@ -583,7 +583,7 @@ pub fn tokenize_whitespace(text: &str) -> Vec<String> {
 /// boundaries, lowercase, and strip punctuation from the edges.
 pub fn tokenize_code(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for segment in text.split(|c: char| matches!(c, '/' | '\\' | '.' | ':' | '_' | '-')) {
+    for segment in text.split(['/', '\\', '.', ':', '_', '-']) {
         let segment = segment.trim_matches(|c: char| !c.is_alphanumeric());
         if segment.is_empty() {
             continue;
