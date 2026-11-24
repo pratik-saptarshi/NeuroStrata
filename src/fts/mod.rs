@@ -151,13 +151,6 @@ pub struct NamespaceIndex {
 }
 
 impl NamespaceIndex {
-    pub fn new() -> Self {
-        Self {
-            field_weights: DEFAULT_FIELD_WEIGHTS,
-            ..Self::default()
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.docs.len()
     }
