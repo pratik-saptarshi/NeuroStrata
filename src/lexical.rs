@@ -193,13 +193,8 @@ pub fn code_text_analyzer() -> tantivy::tokenizer::TextAnalyzer {
 fn archived_flag(metadata: &serde_json::Value) -> i64 {
     match metadata.get("archived") {
         Some(v) if v.as_bool() == Some(true) => 1,
-        Some(v) => {
-            if v.as_i64().map(|n| n != 0).unwrap_or(false) {
-                1
-            } else {
-                0
-            }
-        }
+        Some(v) if v.as_i64().map(|n| n != 0).unwrap_or(false) => 1,
+        Some(_) => 0,
         None => 0,
     }
 }
@@ -902,7 +897,7 @@ impl TantivyLexicalIndex {
         }
         let filtered_query = BooleanQuery::new(clauses);
 
-        let fetch_limit = (limit.max(1) * 8) as usize;
+        let fetch_limit = limit.max(1) * 8;
         let searcher = self.reader.searcher();
         let top_docs = TopDocs::with_limit(fetch_limit).order_by_score();
         let hits: Vec<(f32, tantivy::DocAddress)> = searcher.search(&filtered_query, &top_docs)?;

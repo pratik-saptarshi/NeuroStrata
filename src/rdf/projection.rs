@@ -1004,7 +1004,9 @@ pub fn memory_to_quads(
     quads.push(Quad {
         subject: subject.clone(),
         predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
-        object: Term::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:Memory"))),
+        object: Term::NamedNode(NamedNode::new_unchecked(
+            "urn:neurostrata:Memory".to_string(),
+        )),
         graph_name: graph.clone(),
     });
 

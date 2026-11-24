@@ -162,13 +162,6 @@ pub struct NamespaceIndex {
 }
 
 impl NamespaceIndex {
-    pub fn new() -> Self {
-        Self {
-            field_weights: DEFAULT_FIELD_WEIGHTS,
-            ..Self::default()
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.docs.len()
     }
@@ -285,10 +278,7 @@ impl LexicalIndex {
             return;
         }
         let namespace = doc.namespace.clone();
-        self.namespaces
-            .entry(namespace)
-            .or_insert_with(NamespaceIndex::new)
-            .add(doc);
+        self.namespaces.entry(namespace).or_default().add(doc);
     }
 
     /// Insert or replace a document, returning whether it replaced one.
@@ -593,7 +583,7 @@ pub fn tokenize_whitespace(text: &str) -> Vec<String> {
 /// boundaries, lowercase, and strip punctuation from the edges.
 pub fn tokenize_code(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for segment in text.split(|c: char| matches!(c, '/' | '\\' | '.' | ':' | '_' | '-')) {
+    for segment in text.split(['/', '\\', '.', ':', '_', '-']) {
         let segment = segment.trim_matches(|c: char| !c.is_alphanumeric());
         if segment.is_empty() {
             continue;

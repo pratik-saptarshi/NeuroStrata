@@ -361,13 +361,14 @@ fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         let len = ((bytes[i + 2] as usize) << 8 | (bytes[i + 3] as usize)) + 2;
         // SOF markers
-        if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
-            if i + 8 < bytes.len() {
-                let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32);
-                let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32);
-                if height > 0 && width > 0 {
-                    return Some((width, height));
-                }
+        if (0xC0..=0xCF).contains(&marker)
+            && ![0xC4, 0xC8, 0xCC].contains(&marker)
+            && i + 8 < bytes.len()
+        {
+            let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32);
+            let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32);
+            if height > 0 && width > 0 {
+                return Some((width, height));
             }
         }
         i += len.max(2);
@@ -409,7 +410,7 @@ fn parse_vp8_lossy(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 30 {
         return None;
     }
-    if bytes.get(23..26)? != &[0x9D, 0x01, 0x2A] {
+    if bytes.get(23..26)? != [0x9D, 0x01, 0x2A] {
         return None;
     }
     let width_raw = u16::from_le_bytes([*bytes.get(26)?, *bytes.get(27)?]) & 0x3FFF;
@@ -441,8 +442,8 @@ fn parse_vp8l_lossless(bytes: &[u8]) -> Option<(u32, u32)> {
         *bytes.get(23)?,
         *bytes.get(24)?,
     ]);
-    let width = ((packed & 0x3FFF) + 1) as u32;
-    let height = (((packed >> 14) & 0x3FFF) + 1) as u32;
+    let width = (packed & 0x3FFF) + 1;
+    let height = ((packed >> 14) & 0x3FFF) + 1;
     if width == 0 || height == 0 {
         return None;
     }
