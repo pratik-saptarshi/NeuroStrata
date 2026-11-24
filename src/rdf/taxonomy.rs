@@ -413,9 +413,6 @@ pub type TaxonomyResponse = Value;
 /// pairwise/ancestor work without a bound (#334/C1).
 pub const MAX_COMPARE_SLUGS: usize = 64;
 pub const MAX_COMPARE_AXES: usize = 32;
-/// Tree query controls (#334/C2).
-pub const MAX_TREE_HOPS: usize = 4;
-pub const MAX_TREE_ROOTS: usize = 50;
 
 fn normalize_slug_vec(raw: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
@@ -2085,34 +2082,91 @@ async fn execute_upsert_concept(
     }))
 }
 
+/// Minimum graph distance (hops) from any tree root to each reachable
+/// concept, computed by bounded BFS over the loaded concept graph
+/// following the same child relation (`narrower`) and allowed-set
+/// filtering `build_tree_node` uses. Roots are distance 0. Ruling R9:
+/// `max_hops` bounds this minimum distance, not the depth at which the
+/// pre-order DFS happens to first reach a node -- in a polyhierarchy a
+/// node first reached by a long DFS path may also be reachable by a
+/// shorter path, and its in-range descendants must not be suppressed
+/// by the longer first visit.
+fn min_root_distances(
+    root_slugs: &[String],
+    concepts: &BTreeMap<String, HydratedConcept>,
+    allowed_set: &BTreeSet<String>,
+) -> BTreeMap<String, usize> {
+    let mut distances: BTreeMap<String, usize> = BTreeMap::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for root in root_slugs {
+        if allowed_set.contains(root)
+            && concepts.contains_key(root)
+            && !distances.contains_key(root)
+        {
+            distances.insert(root.clone(), 0);
+            queue.push_back(root.clone());
+        }
+    }
+    while let Some(slug) = queue.pop_front() {
+        let distance = distances[&slug];
+        if let Some(c) = concepts.get(&slug) {
+            for child_slug in &c.narrower {
+                if allowed_set.contains(child_slug)
+                    && concepts.contains_key(child_slug)
+                    && !distances.contains_key(child_slug)
+                {
+                    distances.insert(child_slug.clone(), distance + 1);
+                    queue.push_back(child_slug.clone());
+                }
+            }
+        }
+    }
+    distances
+}
+
 fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
-    visited: &mut BTreeMap<String, usize>,
-    remaining_hops: Option<usize>,
+    visited: &mut BTreeSet<String>,
+    depth: usize,
+    max_hops: Option<usize>,
+    budget: &mut usize,
+    min_distances: &BTreeMap<String, usize>,
 ) -> Option<TaxonomyTreeNode> {
-    // Track the greatest remaining budget seen per node, not a boolean:
-    // a DAG node first reached by a longer path must be revisited when a
-    // shorter path leaves more hops for its descendants (#334/C2 follow-up).
-    let budget = remaining_hops.unwrap_or(usize::MAX);
-    if let Some(best) = visited.get(slug) {
-        if *best >= budget {
-            return None;
-        }
+    if *budget == 0 {
+        return None;
     }
-    visited.insert(slug.to_string(), budget);
+    if !visited.insert(slug.to_string()) {
+        return None;
+    }
     let c = concepts.get(slug)?;
+    *budget -= 1;
     let mut children = Vec::new();
-    if remaining_hops != Some(0) {
+    // CWE-400 bound: `visited` is a first-visit set, so each allowed
+    // concept is emitted at most once; together with the finite allowed
+    // concept set, that bounds total emission even when the caller
+    // supplies no `limit` (a supplied limit caps it directly, via the
+    // budget decremented per emitted node).
+    // R9: expansion is capped by the node's MINIMUM distance from a
+    // root, not by this visit's DFS depth. Emission order, the visited
+    // set and the `limit` budget remain pre-order DFS first-visit,
+    // unchanged. The DFS-depth fallback covers any node the BFS did
+    // not reach (not expected: BFS and DFS share roots, child relation
+    // and allowed-set filtering).
+    let min_distance = min_distances.get(slug).copied().unwrap_or(depth);
+    if max_hops.map_or(true, |h| min_distance < h) {
         for child_slug in &c.narrower {
-            if allowed_set.contains(child_slug) {
+            if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
                 if let Some(child_node) = build_tree_node(
                     child_slug,
                     concepts,
                     allowed_set,
                     visited,
-                    remaining_hops.map(|hops| hops.saturating_sub(1)),
+                    depth + 1,
+                    max_hops,
+                    budget,
+                    min_distances,
                 ) {
                     children.push(child_node);
                 }
@@ -2197,22 +2251,24 @@ async fn execute_tree(
             .collect()
     };
 
-    let mut visited = BTreeMap::new();
-    let max_hops = req.max_hops.map(|hops| hops.clamp(1, MAX_TREE_HOPS));
+    let min_distances = min_root_distances(&root_slugs, &view.concepts, &allowed_slugs);
+
+    let mut visited = BTreeSet::new();
     let mut roots = Vec::new();
+    let mut budget = req.limit.unwrap_or(usize::MAX);
     for r_slug in root_slugs {
         if let Some(node) = build_tree_node(
             &r_slug,
             &view.concepts,
             &allowed_slugs,
             &mut visited,
-            max_hops,
+            0,
+            req.max_hops,
+            &mut budget,
+            &min_distances,
         ) {
             roots.push(node);
         }
-    }
-    if let Some(limit) = req.limit.map(|limit| limit.clamp(1, MAX_TREE_ROOTS)) {
-        roots.truncate(limit);
     }
 
     Ok(json!({
