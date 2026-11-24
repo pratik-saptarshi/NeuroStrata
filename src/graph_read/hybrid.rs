@@ -44,7 +44,6 @@ pub const RRF_K: f32 = 60.0;
 /// Multi-retriever candidate input for Reciprocal Rank Fusion (`neurostrata-5xjo`).
 #[derive(Clone, Debug)]
 pub struct RankedCandidate {
-    pub id: String,
     pub vec_rank: Option<usize>,
     pub vec_distance: Option<f32>,
     pub lex_rank: Option<usize>,
@@ -241,7 +240,6 @@ mod tests {
     fn rrf_dual_track_ranks_strictly_better_than_single_track_at_same_rank() {
         let weights = (0.5, 0.3, 0.2);
         let dual = RankedCandidate {
-            id: "dual".to_string(),
             vec_rank: Some(2),
             vec_distance: Some(0.25),
             lex_rank: Some(2),
@@ -253,7 +251,6 @@ mod tests {
             feedback_gain: 0.0,
         };
         let vec_only = RankedCandidate {
-            id: "vec-only".to_string(),
             vec_rank: Some(2),
             vec_distance: Some(0.25),
             lex_rank: None,
@@ -265,7 +262,6 @@ mod tests {
             feedback_gain: 0.0,
         };
         let lex_only = RankedCandidate {
-            id: "lex-only".to_string(),
             vec_rank: None,
             vec_distance: None,
             lex_rank: Some(2),
@@ -295,7 +291,6 @@ mod tests {
     fn rrf_exact_symbol_and_lexical_match_beats_distant_vector_only() {
         let weights = (0.5, 0.3, 0.2);
         let symbol_hit = RankedCandidate {
-            id: "code-ast-sym".to_string(),
             vec_rank: Some(15),
             vec_distance: Some(0.85),
             lex_rank: Some(1),
@@ -307,7 +302,6 @@ mod tests {
             feedback_gain: 0.0,
         };
         let vec_top = RankedCandidate {
-            id: "vec-1".to_string(),
             vec_rank: Some(1),
             vec_distance: Some(0.20),
             lex_rank: None,
@@ -331,7 +325,6 @@ mod tests {
     fn rrf_expansion_respects_edge_priority_and_parent_rank() {
         let weights = (0.5, 0.3, 0.2);
         let governs_from_rank1 = RankedCandidate {
-            id: "exp-governs".to_string(),
             vec_rank: None,
             vec_distance: None,
             lex_rank: None,
@@ -343,7 +336,6 @@ mod tests {
             feedback_gain: 0.0,
         };
         let depends_from_rank5 = RankedCandidate {
-            id: "exp-depends".to_string(),
             vec_rank: None,
             vec_distance: None,
             lex_rank: None,

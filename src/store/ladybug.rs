@@ -1394,7 +1394,6 @@ let incomplete = result_count >= fetch_limit;
                             (None, 0.0, 1.0)
                         };
                     let ranked_cand = crate::graph_read::hybrid::RankedCandidate {
-                        id: sr.id.clone(),
                         vec_rank: vec_info.map(|(r, _)| r),
                         vec_distance: vec_info.map(|(_, d)| d),
                         lex_rank: lex_info.map(|(r, _)| r),
