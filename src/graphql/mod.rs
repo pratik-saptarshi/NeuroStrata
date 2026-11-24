@@ -720,7 +720,7 @@ pub fn execute_on_records(
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && !payload.memory_type.is_empty() {
                                     root_result = build_memory_node(BuildMemoryNodeParams {
-                                        id: &id_str,
+                                        id: id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,
