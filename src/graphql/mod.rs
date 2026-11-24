@@ -10,6 +10,9 @@ pub struct GraphQLError {
     pub message: String,
 }
 
+/// Edges grouped by source id: each edge is (target id, relation, extractor).
+pub type EdgesBySource = HashMap<String, Vec<(String, String, Option<String>)>>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphQLResponse {
     pub data: Option<Value>,
@@ -276,7 +279,7 @@ fn build_memory_node(
     id: &str,
     namespace: &str,
     payload: &crate::traits::MemoryPayload,
-    edges_by_source: &HashMap<String, Vec<(String, String, Option<String>)>>,
+    edges_by_source: &EdgesBySource,
     principal: &str,
     variable_first: Option<i32>,
     variable_after: Option<&str>,
@@ -391,7 +394,7 @@ fn build_memory_node(
 
 pub fn execute_on_records(
     records: &[(String, crate::traits::MemoryPayload)],
-    edges_by_source: &std::collections::HashMap<String, Vec<(String, String, Option<String>)>>,
+    edges_by_source: &EdgesBySource,
     namespace: &str,
     principal: &str,
     query: &str,
