@@ -2124,6 +2124,45 @@ fn min_root_distances(
     distances
 }
 
+/// One in-progress node entry on `build_tree_node`'s explicit work
+/// stack: the iterative form of one recursive call frame. `child_iter`
+/// yields the not-yet-considered `narrower` children (empty when the
+/// node does not expand); `children` accumulates emitted child nodes
+/// in consideration order.
+struct TreeBuildFrame<'a> {
+    concept: &'a HydratedConcept,
+    depth: usize,
+    child_iter: std::slice::Iter<'a, String>,
+    children: Vec<TaxonomyTreeNode>,
+}
+
+fn tree_build_frame<'a>(
+    concept: &'a HydratedConcept,
+    depth: usize,
+    max_hops: Option<usize>,
+    min_distances: &BTreeMap<String, usize>,
+) -> TreeBuildFrame<'a> {
+    // R9: expansion is capped by the node's MINIMUM distance from a
+    // root, not by this visit's DFS depth. Emission order, the visited
+    // set and the `limit` budget remain pre-order DFS first-visit,
+    // unchanged. The DFS-depth fallback covers any node the BFS did
+    // not reach (not expected: BFS and DFS share roots, child relation
+    // and allowed-set filtering).
+    let min_distance = min_distances.get(&concept.slug).copied().unwrap_or(depth);
+    static NO_CHILDREN: &[String] = &[];
+    let child_iter = if max_hops.map_or(true, |h| min_distance < h) {
+        concept.narrower.iter()
+    } else {
+        NO_CHILDREN.iter()
+    };
+    TreeBuildFrame {
+        concept,
+        depth,
+        child_iter,
+        children: Vec::new(),
+    }
+}
+
 fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
@@ -2134,6 +2173,24 @@ fn build_tree_node(
     budget: &mut usize,
     min_distances: &BTreeMap<String, usize>,
 ) -> Option<TaxonomyTreeNode> {
+    // Iterative simulation of the previous recursive traversal, with
+    // an explicit heap work stack instead of the call stack: under R9
+    // a node's expansion is governed by its minimum root distance, so
+    // a root linked directly to every node of a long chain makes the
+    // DFS path follow the whole chain -- recursion depth O(concepts),
+    // unbounded by `max_hops`, which aborted the host process with a
+    // stack overflow (Codex P1 on PR #153). The simulation preserves
+    // the recursion's exact order of operations per node: budget==0
+    // check first, then visited insert, then concept lookup (a missing
+    // concept emits nothing, decrements no budget, and leaves visited
+    // marked), then budget decrement; children are considered in
+    // `narrower` order, skipping not-allowed and already-visited
+    // slugs at call time; emission is pre-order first-visit.
+    // CWE-400 bound: `visited` is a first-visit set, so each allowed
+    // concept is emitted at most once; together with the finite allowed
+    // concept set, that bounds total emission even when the caller
+    // supplies no `limit` (a supplied limit caps it directly, via the
+    // budget decremented per emitted node).
     if *budget == 0 {
         return None;
     }
@@ -2142,55 +2199,78 @@ fn build_tree_node(
     }
     let c = concepts.get(slug)?;
     *budget -= 1;
-    let mut children = Vec::new();
-    // CWE-400 bound: `visited` is a first-visit set, so each allowed
-    // concept is emitted at most once; together with the finite allowed
-    // concept set, that bounds total emission even when the caller
-    // supplies no `limit` (a supplied limit caps it directly, via the
-    // budget decremented per emitted node).
-    // R9: expansion is capped by the node's MINIMUM distance from a
-    // root, not by this visit's DFS depth. Emission order, the visited
-    // set and the `limit` budget remain pre-order DFS first-visit,
-    // unchanged. The DFS-depth fallback covers any node the BFS did
-    // not reach (not expected: BFS and DFS share roots, child relation
-    // and allowed-set filtering).
-    let min_distance = min_distances.get(slug).copied().unwrap_or(depth);
-    if max_hops.map_or(true, |h| min_distance < h) {
-        for child_slug in &c.narrower {
-            if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
-                if let Some(child_node) = build_tree_node(
-                    child_slug,
-                    concepts,
-                    allowed_set,
-                    visited,
-                    depth + 1,
+    let mut stack: Vec<TreeBuildFrame<'_>> =
+        vec![tree_build_frame(c, depth, max_hops, min_distances)];
+    loop {
+        // Advance the top frame to its next child candidate, applying
+        // the call-time allowed/visited filter exactly as the
+        // recursive loop did before each recursive call.
+        let candidate: Option<&str> = {
+            let top = stack.last_mut().expect("work stack is non-empty");
+            let mut found = None;
+            for child_slug in top.child_iter.by_ref() {
+                if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
+                    found = Some(child_slug.as_str());
+                    break;
+                }
+            }
+            found
+        };
+        match candidate {
+            Some(child_slug) => {
+                // Enter the child: same check order as a recursive
+                // call. Any refusal (budget exhausted, visited race,
+                // missing concept) simply moves the parent frame on
+                // to its next candidate.
+                if *budget == 0 {
+                    continue;
+                }
+                if !visited.insert(child_slug.to_string()) {
+                    continue;
+                }
+                let Some(child_concept) = concepts.get(child_slug) else {
+                    continue;
+                };
+                *budget -= 1;
+                let child_depth = stack.last().expect("work stack is non-empty").depth + 1;
+                stack.push(tree_build_frame(
+                    child_concept,
+                    child_depth,
                     max_hops,
-                    budget,
                     min_distances,
-                ) {
-                    children.push(child_node);
+                ));
+            }
+            None => {
+                // Exit the top frame: build its node from the
+                // accumulated children and hand it to its parent
+                // frame, or return it when the stack empties.
+                let frame = stack.pop().expect("work stack is non-empty");
+                let c = frame.concept;
+                let node = TaxonomyTreeNode {
+                    slug: c.slug.clone(),
+                    pref_label: c.pref_label.clone(),
+                    definition: c.definition.clone(),
+                    domain: c.domain.clone(),
+                    epistemic_status: c.epistemic_status.clone(),
+                    epistemic_weight_bps: c.epistemic_weight_bps,
+                    realization_status: c.realization_status.clone(),
+                    frontier_leverage_bps: c.frontier_leverage_bps,
+                    descendant_count: c.descendant_count,
+                    grounding_count: c.grounding_count,
+                    aliases: c.aliases.clone(),
+                    broader: c.broader.clone(),
+                    narrower: c.narrower.clone(),
+                    related_concepts: c.related_concepts.clone(),
+                    contrasts_with: c.contrasts_with.clone(),
+                    children: frame.children,
+                };
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(node),
+                    None => return Some(node),
                 }
             }
         }
     }
-    Some(TaxonomyTreeNode {
-        slug: c.slug.clone(),
-        pref_label: c.pref_label.clone(),
-        definition: c.definition.clone(),
-        domain: c.domain.clone(),
-        epistemic_status: c.epistemic_status.clone(),
-        epistemic_weight_bps: c.epistemic_weight_bps,
-        realization_status: c.realization_status.clone(),
-        frontier_leverage_bps: c.frontier_leverage_bps,
-        descendant_count: c.descendant_count,
-        grounding_count: c.grounding_count,
-        aliases: c.aliases.clone(),
-        broader: c.broader.clone(),
-        narrower: c.narrower.clone(),
-        related_concepts: c.related_concepts.clone(),
-        contrasts_with: c.contrasts_with.clone(),
-        children,
-    })
 }
 
 async fn execute_tree(
