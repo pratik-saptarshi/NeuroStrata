@@ -698,9 +698,7 @@ impl LearningRuntimeManager {
             }
         };
         let model_artifact = runtime.model_cache.join("model.onnx");
-        if model_artifact.exists() {
-            LayaReadiness::Ready
-        } else if runtime.laya_train.exists() {
+        if model_artifact.exists() || runtime.laya_train.exists() {
             LayaReadiness::Ready
         } else {
             LayaReadiness::Degraded {
