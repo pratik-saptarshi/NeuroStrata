@@ -234,6 +234,39 @@ elif [ -n "$CLIPPY_DIAG" ]; then
     done <<< "$CLIPPY_DIAG"
 fi
 
+# ── 2b. clippy (src-tauri): the excluded standalone crate ────────────────
+# The root workspace EXCLUDES src-tauri (standalone package, own
+# lockfile), so the --workspace run above never checks it: a push
+# touching only src-tauri sources passed with new warnings there.
+# When this push touches src-tauri .rs files, run clippy for that
+# crate on its own and attribute its diagnostics exactly like the
+# workspace ones. Cargo emits its paths relative to src-tauri/
+# (src/...), so prefix them back to repo-root form before matching
+# ADDED_FILE. Same fail-closed rule as the workspace run: no
+# diagnostics plus a nonzero exit means quality cannot be verified.
+TAURI_CHANGED="$(printf '%s\n' "$CHANGED_RS" | grep '^src-tauri/' || true)"
+if [ -n "$TAURI_CHANGED" ]; then
+    TAURI_OUT="$(cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --message-format=short 2>&1)"
+    TAURI_CODE=$?
+    TAURI_DIAG="$(printf '%s\n' "$TAURI_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' | sed -e '/^src-tauri\//b' -e 's|^|src-tauri/|' || true)"
+    if [ -z "$TAURI_DIAG" ] && [ "$TAURI_CODE" -ne 0 ]; then
+        echo "$GATE: FAIL: src-tauri crate does not build — clippy produced no diagnostics (exit $TAURI_CODE)" >&2
+        printf '%s\n' "$TAURI_OUT" | tail -n 20 >&2
+        FAIL=1
+    elif [ -n "$TAURI_DIAG" ]; then
+        while IFS= read -r diag; do
+            [ -n "$diag" ] || continue
+            dpath="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs' || true)"
+            dline="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs:[0-9]+' | grep -oE '[0-9]+$' || true)"
+            if [ -n "$dpath" ] && [ -n "$dline" ] \
+                && grep -qxF "$dpath:$dline" "$ADDED_FILE" 2>/dev/null; then
+                echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2
+                FAIL=1
+            fi
+        done <<< "$TAURI_DIAG"
+    fi
+fi
+
 # ── 3. audit: fail only on NEW high/critical advisories vs base ──────────
 # Severity source: the human-readable `cargo audit` report (`Severity:
 # 7.5 (high)`). The JSON advisory objects carry `cvss` but NO `severity`
