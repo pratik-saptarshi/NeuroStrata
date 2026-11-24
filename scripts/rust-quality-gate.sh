@@ -95,7 +95,7 @@ fi
 # must use worktree numbering too — otherwise uncommitted edits could
 # hide findings in the code actually being pushed (or vice versa).
 CHANGED_RS="$(git diff --name-only "$BASE" -- '*.rs' || true)"
-CHANGED_MANIFEST="$(git diff --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' || true)"
+CHANGED_MANIFEST="$(git diff --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' 'src-tauri/Cargo.toml' 'src-tauri/Cargo.lock' || true)"
 
 if [ -z "$CHANGED_RS" ] && [ -z "$CHANGED_MANIFEST" ]; then
     echo "$GATE: no Rust sources or manifests changed — nothing to check"
@@ -238,14 +238,22 @@ fi
 # The root workspace EXCLUDES src-tauri (standalone package, own
 # lockfile), so the --workspace run above never checks it: a push
 # touching only src-tauri sources passed with new warnings there.
-# When this push touches src-tauri .rs files, run clippy for that
-# crate on its own and attribute its diagnostics exactly like the
-# workspace ones. Cargo emits its paths relative to src-tauri/
+# When this push touches src-tauri .rs files or its manifests, run
+# clippy for that crate on its own and attribute its diagnostics
+# exactly like the workspace ones. The manifests count as a touch:
+# a dependency-only change (src-tauri/Cargo.toml or Cargo.lock) can
+# break the crate or change what it compiles, and the change
+# detection above must name those files explicitly — the plain
+# 'Cargo.toml'/'Cargo.lock' pathspecs match only the root files, so
+# a Tauri-only manifest push otherwise exits above as "no Rust
+# sources or manifests changed" and is never checked at all.
+# Cargo emits its paths relative to src-tauri/
 # (src/...), so prefix them back to repo-root form before matching
 # ADDED_FILE. Same fail-closed rule as the workspace run: no
 # diagnostics plus a nonzero exit means quality cannot be verified.
 TAURI_CHANGED="$(printf '%s\n' "$CHANGED_RS" | grep '^src-tauri/' || true)"
-if [ -n "$TAURI_CHANGED" ]; then
+TAURI_MANIFEST_CHANGED="$(printf '%s\n' "$CHANGED_MANIFEST" | grep -E '^src-tauri/Cargo\.(toml|lock)$' || true)"
+if [ -n "$TAURI_CHANGED" ] || [ -n "$TAURI_MANIFEST_CHANGED" ]; then
     TAURI_OUT="$(cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --message-format=short 2>&1)"
     TAURI_CODE=$?
     TAURI_DIAG="$(printf '%s\n' "$TAURI_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' | sed -e '/^src-tauri\//b' -e 's|^|src-tauri/|' || true)"
