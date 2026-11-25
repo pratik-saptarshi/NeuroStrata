@@ -1510,6 +1510,54 @@ fn declaration_signature(kind: &str, line: &str) -> String {
     }
 }
 
+/// Parses one line as a fragment of an MCP tool `inputSchema`, returning
+/// its (key, signature) pair. Three shapes, all matched on the original
+/// line (schema keys and values live inside string literals that the
+/// blanking pipeline erases): a single-line property carrying its type
+/// (`"query": { "type": "string", ... }`, keyed by property name, with
+/// the description deliberately excluded so a description-only edit does
+/// not fire); a standalone `"type": "<t>"` line (a property whose value
+/// object opened on a previous line, or the schema's own type); and a
+/// `"required": [...]` line, whose array contents are the signature.
+/// Property lines without a same-line type and non-schema JSON lines
+/// (`"name":`, `"description":`, `"properties": {`) extract nothing.
+fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('"')?;
+    let (key, after) = rest.split_once('"')?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let after = after.trim_start().strip_prefix(':')?.trim_start();
+    if key == "required" {
+        let end = after.find(']')?;
+        return Some((
+            "mcp-schema:required".to_string(),
+            normalized_line(&after[..=end]),
+        ));
+    }
+    if key == "type" {
+        let value = after.strip_prefix('"')?;
+        let end = value.find('"')?;
+        return Some((
+            "mcp-schema:type".to_string(),
+            value[..end].to_string(),
+        ));
+    }
+    if after.starts_with('{') {
+        let type_idx = after.find("\"type\":")?;
+        let value = after[type_idx + "\"type\":".len()..]
+            .trim_start()
+            .strip_prefix('"')?;
+        let end = value.find('"')?;
+        return Some((
+            format!("mcp-schema:{key}"),
+            format!("{key}:{}", &value[..end]),
+        ));
+    }
+    None
+}
+
 /// Extracts the public surface as a map from declaration key to the set
 /// of normalized signatures seen for that key. SS7 identifiers enter as
 /// key = signature = identifier, so a changed line carrying one still
@@ -1524,6 +1572,16 @@ fn extract_public_surface_signatures(
     // on the comment/string-blanked text.
     for ident in extract_public_surface_identifiers(text) {
         signatures.entry(ident.clone()).or_default().insert(ident);
+    }
+    // MCP input schemas, from the original text alongside SS7 (their
+    // keys and values are string contents): a tool's parameter types
+    // and required set are user-facing API surface, so a schema-only
+    // change to an existing tool must register even though the tool
+    // name line itself is unchanged.
+    for line in text.lines() {
+        if let Some((key, signature)) = parse_mcp_schema_line(line) {
+            signatures.entry(key).or_default().insert(signature);
+        }
     }
     // Pipeline step 2, as in `extract_public_surface_declarations`:
     // route registrations from the comments-blanked-but-strings-
@@ -3766,7 +3824,7 @@ pub struct AfterAll {}
     }
 
     #[test]
-    fn probe_f5_mcp_schema_property_change_differs() {
+    fn mcp_schema_property_and_required_changes_differ() {
         let before =
             extract_public_surface_signatures("                                \"query\": { \"type\": \"string\" },");
         let after =
