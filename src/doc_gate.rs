@@ -898,18 +898,302 @@ fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
     None
 }
 
+/// Which non-code regions the blanking scanner erases. The
+/// comments-only mode produces the intermediate reserved for the
+/// pre-blanking extraction point (pipeline step 2 in
+/// `extract_public_surface_declarations`): comments blanked, string
+/// literal contents preserved, because a route registration's identity
+/// is its path string literal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlankMode {
+    CommentsAndStrings,
+    CommentsOnly,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlankState {
+    Normal,
+    LineComment,
+    /// Nesting depth of `/* … */` (Rust block comments nest).
+    BlockComment(u32),
+    Str,
+    /// Hash count of the opening `r#…#"` delimiter.
+    RawString(usize),
+    Template,
+}
+
+/// Blanks comments and string literals in `text`: every character of a
+/// comment or string literal (delimiters included) becomes a space,
+/// while every `\n` survives at its original offset, so the line-based
+/// declaration parsers see the same line structure — and the same
+/// leading-whitespace shape — with comment/string contents erased. A
+/// declaration-shaped line inside a block comment or a multiline string
+/// therefore extracts nothing. Unterminated constructs blank to the end
+/// of input (fail-closed toward not extracting).
+fn blank_comments_and_strings(text: &str) -> String {
+    blank_non_code(text, BlankMode::CommentsAndStrings)
+}
+
+/// Blanks comments only, preserving string literal contents. String
+/// states are still tracked, so comment markers inside a string literal
+/// start no comment here either. This is the intermediate the reserved
+/// pre-blanking extraction point consumes; it is a by-product of the
+/// same scan, not a second scanner.
+fn blank_comments_only(text: &str) -> String {
+    blank_non_code(text, BlankMode::CommentsOnly)
+}
+
+fn blank_non_code(text: &str, mode: BlankMode) -> String {
+    let bytes = text.as_bytes();
+    let blank_strings = mode == BlankMode::CommentsAndStrings;
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut state = BlankState::Normal;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            BlankState::Normal => {
+                if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    state = BlankState::LineComment;
+                } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    state = BlankState::BlockComment(1);
+                } else if b == b'"' {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                    state = BlankState::Str;
+                } else if b == b'`' {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                    state = BlankState::Template;
+                } else if b == b'\'' {
+                    match char_literal_len(text, i) {
+                        Some(len) => {
+                            if blank_strings {
+                                out.extend(std::iter::repeat_n(b' ', len));
+                            } else {
+                                out.extend_from_slice(&bytes[i..i + len]);
+                            }
+                            i += len;
+                        }
+                        None => {
+                            // A lifetime (`'a`, `'static`): not a
+                            // literal; emit and stay in Normal.
+                            out.push(b);
+                            i += 1;
+                        }
+                    }
+                } else if b == b'r' || (b == b'b' && bytes.get(i + 1) == Some(&b'r')) {
+                    match raw_string_open(bytes, i) {
+                        Some((prefix_len, hashes)) => {
+                            if blank_strings {
+                                out.extend(std::iter::repeat_n(b' ', prefix_len));
+                            } else {
+                                out.extend_from_slice(&bytes[i..i + prefix_len]);
+                            }
+                            i += prefix_len;
+                            state = BlankState::RawString(hashes);
+                        }
+                        None => {
+                            out.push(b);
+                            i += 1;
+                        }
+                    }
+                } else {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+            BlankState::LineComment => {
+                if b == b'\n' {
+                    out.push(b'\n');
+                    state = BlankState::Normal;
+                } else {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            BlankState::BlockComment(depth) => {
+                if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    state = BlankState::BlockComment(depth + 1);
+                } else if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    state = if depth == 1 {
+                        BlankState::Normal
+                    } else {
+                        BlankState::BlockComment(depth - 1)
+                    };
+                } else if b == b'\n' {
+                    out.push(b'\n');
+                    i += 1;
+                } else {
+                    out.push(b' ');
+                    i += 1;
+                }
+            }
+            BlankState::Str => {
+                if b == b'\\' {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                    if i < bytes.len() {
+                        let escaped = bytes[i];
+                        if escaped == b'\n' {
+                            out.push(b'\n');
+                        } else {
+                            out.push(if blank_strings { b' ' } else { escaped });
+                        }
+                        i += 1;
+                    }
+                } else if b == b'"' {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                    state = BlankState::Normal;
+                } else if b == b'\n' {
+                    out.push(b'\n');
+                    i += 1;
+                } else {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                }
+            }
+            BlankState::RawString(hashes) => {
+                if b == b'"' {
+                    let mut following = 0;
+                    while bytes.get(i + 1 + following) == Some(&b'#') {
+                        following += 1;
+                    }
+                    if following >= hashes {
+                        for k in 0..1 + hashes {
+                            let c = bytes[i + k];
+                            out.push(if blank_strings { b' ' } else { c });
+                        }
+                        i += 1 + hashes;
+                        state = BlankState::Normal;
+                    } else {
+                        out.push(if blank_strings { b' ' } else { b });
+                        i += 1;
+                    }
+                } else if b == b'\n' {
+                    out.push(b'\n');
+                    i += 1;
+                } else {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                }
+            }
+            BlankState::Template => {
+                if b == b'\\' {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                    if i < bytes.len() {
+                        let escaped = bytes[i];
+                        if escaped == b'\n' {
+                            out.push(b'\n');
+                        } else {
+                            out.push(if blank_strings { b' ' } else { escaped });
+                        }
+                        i += 1;
+                    }
+                } else if b == b'`' {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                    state = BlankState::Normal;
+                } else if b == b'\n' {
+                    out.push(b'\n');
+                    i += 1;
+                } else {
+                    out.push(if blank_strings { b' ' } else { b });
+                    i += 1;
+                }
+            }
+        }
+    }
+    // Blanking only substitutes ASCII spaces for non-newline bytes and
+    // copies Normal-state bytes verbatim, so the output is valid UTF-8
+    // whenever the input is.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// If the `'` at byte `start` opens a char literal, returns its byte
+/// length: `'\X'` (backslash, one char, closing quote) or `'c'` (one
+/// char that is not `'` or `\n`, closing quote). Anything else — `'a`,
+/// `'static` — is a lifetime and returns `None`, so the scanner stays in
+/// Normal state rather than blanking real code to the next quote.
+fn char_literal_len(text: &str, start: usize) -> Option<usize> {
+    let rest = &text[start + 1..];
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\\' {
+        let (_, _escaped) = chars.next()?;
+        let (end, closing) = chars.next()?;
+        (closing == '\'').then_some(1 + end + 1)
+    } else if first == '\'' || first == '\n' {
+        None
+    } else {
+        let (end, closing) = chars.next()?;
+        (closing == '\'').then_some(1 + end + 1)
+    }
+}
+
+/// If a raw string opens at byte `start` — an `r` (optionally preceded
+/// by a `b` byte-string prefix that is not part of a longer identifier)
+/// followed by zero or more `#` and a `"` — returns the opener's byte
+/// length and its hash count. The `r` must not be preceded by an
+/// identifier character, so identifiers ending in `r` never qualify;
+/// raw identifiers (`r#type`) fail the closing-quote check.
+fn raw_string_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    if start > 0 && is_ident(bytes[start - 1]) {
+        return None;
+    }
+    let r_idx = if bytes[start] == b'r' {
+        start
+    } else {
+        start + 1
+    };
+    let mut j = r_idx + 1;
+    while bytes.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    Some((j + 1 - start, j - r_idx - 1))
+}
+
 /// Extracts public surface declarations from source text or diff lines:
 /// everything `extract_public_surface_identifiers` returns, plus public item
 /// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
 /// const / default qualifiers, over struct/enum/trait/fn/type/const/static/
 /// mod/use/union). For `use`, the declared names come from the
 /// use-tree parser: every member of a grouped use, honouring `as`
-/// renames, nested groups, `self`, and globs.
+/// renames, nested groups, `self`, and globs. Declaration parsing runs
+/// on text whose comments and string literals have been blanked, so
+/// declaration-shaped text inside a comment or string extracts nothing;
+/// the SS7 identifiers are taken from the original text first, because
+/// SS7 reads identifiers out of string contents.
 pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTreeSet<String> {
+    // Pipeline step 1: SS7 identifiers, from the ORIGINAL text (SS7
+    // extracts identifiers from string contents, which step 3 erases).
     let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
         .into_iter()
         .collect();
-    for line in text.lines() {
+    // Pipeline step 2 (reserved): pre-blanking extraction point. Route
+    // registrations are extracted here by a later cluster, from the
+    // comments-blanked-but-strings-preserved intermediate produced by
+    // `blank_comments_only`, because a route's identity is a string
+    // literal that step 3 erases. Empty in this cluster; nothing else
+    // may use this slot without a design note.
+    // Pipeline step 3: blank comments and string literals.
+    let cleaned = blank_comments_and_strings(text);
+    // Pipeline step 4: all declaration parsing runs on the blanked text.
+    for line in cleaned.lines() {
         if let Some(pairs) = parse_use_declarations(line) {
             for (name, _full_path) in pairs {
                 decls.insert(name);
@@ -972,10 +1256,14 @@ fn extract_public_surface_signatures(
 ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
     let mut signatures: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
+    // Same pipeline as `extract_public_surface_declarations`: SS7
+    // identifiers from the original text, then all declaration parsing
+    // on the comment/string-blanked text.
     for ident in extract_public_surface_identifiers(text) {
         signatures.entry(ident.clone()).or_default().insert(ident);
     }
-    for line in text.lines() {
+    let cleaned = blank_comments_and_strings(text);
+    for line in cleaned.lines() {
         if let Some(pairs) = parse_use_declarations(line) {
             for (name, full_path) in pairs {
                 signatures
@@ -1921,6 +2209,102 @@ struct PrivateStruct {}
             .map(|name| name.to_string())
             .collect();
         assert_eq!(renamed, expected_renamed);
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_block_comment_contents() {
+        let text = "\
+/*
+pub struct CommentExample {}
+*/
+pub struct RealExample {}
+";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("CommentExample"), "{decls:?}");
+        assert!(decls.contains("RealExample"), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_multiline_string_contents() {
+        let text = "let s = \"\npub struct StringExample {}\n\";\npub struct RealExample {}\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("StringExample"), "{decls:?}");
+        assert!(decls.contains("RealExample"), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_line_comment_and_doc_comment_contents() {
+        let text = "// pub struct LineExample {}\n/// pub struct DocExample {}\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.is_empty(), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_member_lines_in_block_comment() {
+        let text = "/*\n    fn fetch(&self, id: u64);\n*/\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("fetch"), "{decls:?}");
+    }
+
+    #[test]
+    fn blank_comments_and_strings_preserves_code_around_strings_with_comment_markers() {
+        let decls =
+            extract_public_surface_declarations("pub const URL: &str = \"http://x/*y*/\";");
+        assert!(decls.contains("URL"), "{decls:?}");
+    }
+
+    #[test]
+    fn blank_comments_and_strings_handles_nested_block_comments_and_raw_strings() {
+        let text = "\
+/* outer
+/* inner */
+pub struct Hidden {}
+*/
+let doc = r#\"
+pub struct RawHidden {}
+\"#;
+pub struct AfterAll {}
+";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("Hidden"), "{decls:?}");
+        assert!(!decls.contains("RawHidden"), "{decls:?}");
+        assert!(decls.contains("AfterAll"), "{decls:?}");
+    }
+
+    #[test]
+    fn blank_comments_and_strings_lifetime_is_not_a_string_start() {
+        let text = "pub fn get(&'a self) -> &'a str { \"\" }";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.contains("get"), "{decls:?}");
+        let signatures = extract_public_surface_signatures(text);
+        let expected_signature: std::collections::BTreeSet<String> =
+            ["pub fn get(&'a self) -> &'a str"]
+                .iter()
+                .map(|sig| sig.to_string())
+                .collect();
+        assert_eq!(
+            signatures.get("get"),
+            Some(&expected_signature),
+            "{signatures:?}"
+        );
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ss7_identifiers_survive_blanking() {
+        let text = "\"name\": \"neurostrata_some_tool\"";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.contains("neurostrata_some_tool"), "{decls:?}");
+    }
+
+    #[test]
+    fn blank_comments_only_preserves_string_contents() {
+        // The intermediate reserved for the pre-blanking extraction
+        // point: comments blanked, string literal contents preserved.
+        let text = "/* pub struct Hidden {} */\nlet path = \"/health\"; // route\n";
+        let cleaned = blank_comments_only(text);
+        assert!(!cleaned.contains("Hidden"), "{cleaned:?}");
+        assert!(cleaned.contains("\"/health\""), "{cleaned:?}");
+        assert!(!cleaned.contains("route"), "{cleaned:?}");
     }
 
     #[test]
