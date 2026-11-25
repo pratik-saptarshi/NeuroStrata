@@ -173,6 +173,48 @@ EOF
     fi
 }
 
+new_nested_repo() {
+    # Fixture for a bootstrapped repo whose crate lives under native/
+    # with NO root Cargo.toml: the baseline commit is the clean nested
+    # crate itself, with origin/develop pinned at it.
+    local repo="$1"
+    mkdir -p "$repo/native/src"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email test@example.com
+    git -C "$repo" config user.name test
+    cat > "$repo/native/Cargo.toml" <<'EOF'
+[package]
+name = "nested-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+    printf 'pub fn clean() -> i32 {\n    1\n}\n' > "$repo/native/src/lib.rs"
+    (cd "$repo/native" && cargo generate-lockfile >/dev/null 2>&1)
+    git -C "$repo" add native
+    git -C "$repo" commit -q -m 'nested crate baseline'
+    git -C "$repo" update-ref refs/remotes/origin/develop HEAD
+    if [ -e "$repo/Cargo.toml" ]; then
+        echo 'FAIL: nested fixture must have no root Cargo.toml' >&2; exit 1
+    fi
+}
+
+add_nested_dirty_line() {
+    # Formatted cleanly (fmt must not fire) but a clippy needless_return
+    # on the added lines, inside the nested crate.
+    printf '\npub fn bad() -> String {\n    return "x".to_string();\n}\n' >> "$1/native/src/lib.rs"
+    git -C "$1" add native/src/lib.rs
+    git -C "$1" commit -q -m 'dirty nested addition'
+}
+
+add_nested_clean_line() {
+    printf '\npub fn also_clean() -> i32 {\n    2\n}\n' >> "$1/native/src/lib.rs"
+    git -C "$1" add native/src/lib.rs
+    git -C "$1" commit -q -m 'clean nested addition'
+}
+
 drop_origin_develop() {
     git -C "$1" update-ref -d refs/remotes/origin/develop
 }
@@ -567,6 +609,41 @@ st19=$?
 set -e
 if [ "$st19" -eq 0 ] || ! grep -q 'FAIL' <<< "$out19"; then
     printf 'FAIL: dirty added lines under a -diff attribute must block the gate (text diff forcing)\n%s\n' "$out19" >&2
+    exit 1
+fi
+
+# Leg 20 (regression, Codex P1 — nested manifest): a bootstrapped
+# repo whose crate lives under native/ with NO root Cargo.toml. The
+# gate's clippy leg must resolve the owning manifest instead of
+# assuming a root workspace: a CLEAN push in the nested crate passes
+# on the merits (pre-fix it blocked with "workspace does not build —
+# clippy produced no diagnostics" because cargo found no root
+# manifest).
+nested_clean="$TMP/nested-clean"
+new_nested_repo "$nested_clean"
+add_nested_clean_line "$nested_clean"
+set +e
+out20=$(run_gate "$nested_clean" "$PATH")
+st20=$?
+set -e
+if [ "$st20" -ne 0 ] || ! grep -q 'pass' <<< "$out20"; then
+    printf 'FAIL: clean push in a nested crate (native/, no root Cargo.toml) must pass the gate\n%s\n' "$out20" >&2
+    exit 1
+fi
+
+# Leg 21 (converse): a clippy warning on an ADDED line inside the
+# nested crate still BLOCKS — proving the nested clippy run actually
+# lints the crate and attributes its diagnostics (with the native/
+# path prefix restored), rather than silently skipping it.
+nested_dirty="$TMP/nested-dirty"
+new_nested_repo "$nested_dirty"
+add_nested_dirty_line "$nested_dirty"
+set +e
+out21=$(run_gate "$nested_dirty" "$PATH")
+st21=$?
+set -e
+if [ "$st21" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: native/src/lib.rs' <<< "$out21"; then
+    printf 'FAIL: clippy warning on an added line in the nested crate must block the gate\n%s\n' "$out21" >&2
     exit 1
 fi
 

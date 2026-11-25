@@ -6294,6 +6294,11 @@ mod tests {
                 .contains("git diff --default-prefix --no-color --no-ext-diff --no-textconv --text"),
             "the guard must neutralize user git config and attributes on the attribution diff (color escapes, external diff drivers, textconv drivers, and -diff binary notices each silently empty the added-line set the same way non-default prefixes do)"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("resolve the owning manifest for each changed .rs file"),
+            "the guard must resolve the owning manifest for each changed .rs file when no root Cargo.toml exists, so a bootstrapped repo whose crate lives under a subdirectory (e.g. native/) is linted instead of blocked on the missing root manifest"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();

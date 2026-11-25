@@ -281,16 +281,33 @@ fi
 # added line below, so the wider scope costs build time, not false
 # blocks — pre-existing warnings in newly-visible gated code sit on
 # untouched lines and never block.
-CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short 2>&1)"
-CLIPPY_CODE=$?
-CLIPPY_DIAG="$(printf '%s\n' "$CLIPPY_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' || true)"
-if [ -z "$CLIPPY_DIAG" ] && [ "$CLIPPY_CODE" -ne 0 ]; then
-    echo "$GATE: FAIL: workspace does not build — clippy produced no diagnostics (exit $CLIPPY_CODE)" >&2
-    printf '%s\n' "$CLIPPY_OUT" | tail -n 20 >&2
-    FAIL=1
-elif [ -n "$CLIPPY_DIAG" ]; then
+# Shared attribution for one clippy run: $1 = raw output, $2 = exit
+# code, $3 = subject for the build-failure message, $4 = path prefix
+# cargo emitted diagnostic paths relative to ("" for the root
+# workspace run; the crate's directory for --manifest-path runs,
+# whose paths come out relative to the manifest's directory and must
+# be prefixed back to repo-root form before matching ADDED_FILE).
+# Same fail-closed rule everywhere: no diagnostics plus a nonzero
+# exit means quality cannot be verified.
+clippy_leg() {
+    local out="$1" code="$2" subject="$3" prefix="$4"
+    local diags diag dpath dline
+    diags="$(printf '%s\n' "$out" | grep -E ':[0-9]+:[0-9]+: (warning|error)' || true)"
+    if [ -z "$diags" ] && [ "$code" -ne 0 ]; then
+        echo "$GATE: FAIL: $subject does not build — clippy produced no diagnostics (exit $code)" >&2
+        printf '%s\n' "$out" | tail -n 20 >&2
+        FAIL=1
+        return
+    fi
+    [ -n "$diags" ] || return 0
     while IFS= read -r diag; do
         [ -n "$diag" ] || continue
+        if [ -n "$prefix" ]; then
+            case "$diag" in
+                "$prefix"*) ;;
+                *) diag="$prefix$diag" ;;
+            esac
+        fi
         # short format: path:line:col: warning|error: message
         dpath="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs' || true)"
         dline="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs:[0-9]+' | grep -oE '[0-9]+$' || true)"
@@ -299,7 +316,64 @@ elif [ -n "$CLIPPY_DIAG" ]; then
             echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2
             FAIL=1
         fi
-    done <<< "$CLIPPY_DIAG"
+    done <<< "$diags"
+}
+
+if [ -f Cargo.toml ]; then
+    CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short 2>&1)"
+    clippy_leg "$CLIPPY_OUT" "$?" "workspace" ""
+else
+    # No root manifest: a bootstrapped repo may keep its crate under a
+    # subdirectory (e.g. native/) with no root Cargo.toml at all. The
+    # workspace invocation above then fails with "could not find
+    # `Cargo.toml`" and blocks EVERY push, clean or not. Instead,
+    # resolve the owning manifest for each changed .rs file — the
+    # nearest Cargo.toml in the file's directory or any ancestor up
+    # to the repo root — and run clippy once per distinct owning
+    # manifest. A changed file with no owning manifest anywhere above
+    # it is reported NOT verified rather than silently skipped; if no
+    # changed file has an owning manifest, fall back to the root
+    # workspace invocation, which fails closed exactly as before.
+    OWNING_MANIFESTS=""
+    UNCOVERED_RS=""
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        d="$(dirname "$f")"
+        found=""
+        while :; do
+            if [ -f "$d/Cargo.toml" ]; then
+                found="$d/Cargo.toml"
+                break
+            fi
+            [ "$d" = "." ] && break
+            d="$(dirname "$d")"
+        done
+        if [ -n "$found" ]; then
+            OWNING_MANIFESTS="${OWNING_MANIFESTS}${found}
+"
+        else
+            UNCOVERED_RS="${UNCOVERED_RS}${f}
+"
+        fi
+    done <<< "$CHANGED_RS"
+    OWNING_MANIFESTS="$(printf '%s' "$OWNING_MANIFESTS" | sort -u)"
+    if [ -z "$OWNING_MANIFESTS" ]; then
+        CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short 2>&1)"
+        clippy_leg "$CLIPPY_OUT" "$?" "workspace" ""
+    else
+        while IFS= read -r m; do
+            [ -n "$m" ] || continue
+            mdir="$(dirname "$m")"
+            mprefix=""
+            [ "$mdir" != "." ] && mprefix="$mdir/"
+            M_OUT="$(cargo clippy --locked --manifest-path "$m" --all-targets --all-features --message-format=short 2>&1)"
+            clippy_leg "$M_OUT" "$?" "crate at $m" "$mprefix"
+        done <<< "$OWNING_MANIFESTS"
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            echo "$GATE: warning: no Cargo.toml found above $f — clippy NOT verified for this file (CI remains backstop)" >&2
+        done <<< "$UNCOVERED_RS"
+    fi
 fi
 
 # ── 2b. clippy (src-tauri): the excluded standalone crate ────────────────
