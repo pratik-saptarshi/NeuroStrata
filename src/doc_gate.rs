@@ -1747,6 +1747,41 @@ fn parse_serde_attribute(line: &str) -> Option<String> {
     }
 }
 
+/// Parses one line as an `impl` block header, returning the name of
+/// the type the block implements methods for (`impl Foo`,
+/// `impl<T> Foo<T>`, `impl Trait for Foo` — the target type in each
+/// case). Used only to attribute member signatures to their enclosing
+/// type; the impl block itself is not a declaration kind the surface
+/// extractor records.
+fn parse_impl_enclosing(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("impl")?;
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '<') {
+        return None;
+    }
+    let head = rest.split('{').next()?.trim();
+    // `impl Trait for Type`: the enclosing type follows `for`.
+    let target = match head.rsplit_once(" for ") {
+        Some((_, ty)) => ty.trim(),
+        None => head,
+    };
+    // Skip a leading generic parameter list (`impl<T> Foo`).
+    let target = if target.starts_with('<') {
+        target[balanced_group_end(target)?..].trim()
+    } else {
+        target
+    };
+    // Drop the type's own generic arguments (`Foo<T>`).
+    let target = target.split('<').next()?.trim();
+    let token = target.split_whitespace().next()?;
+    let segment = token.rsplit("::").next()?;
+    let (name, len) = leading_identifier(segment)?;
+    if len != segment.len() {
+        return None;
+    }
+    Some(name)
+}
+
 /// Extracts the public surface as a map from declaration key to the set
 /// of normalized signatures seen for that key. SS7 identifiers enter as
 /// key = signature = identifier, so a changed line carrying one still
@@ -1817,14 +1852,39 @@ fn extract_public_surface_signatures(
     // keep it pending; any other code line drops it), mirroring how
     // clap attributes sit on the fields/items they annotate.
     let mut pending_serde: Vec<String> = Vec::new();
+    // The enclosing container (struct / enum / trait / union / mod,
+    // an `impl` target type, or a TypeScript class / interface /
+    // enum / namespace) most recently declared in the text. Member
+    // signature keys are qualified with it (`field:<Owner>.<name>`),
+    // so moving an unchanged member between two containers in one
+    // file changes the map instead of cancelling out under a bare
+    // `field:<name>` key — and same-named members of two containers
+    // no longer merge into one key's signature set. A member with no
+    // preceding container in the text (the common -U0 diff shape,
+    // where the header line is unchanged context) keeps its bare
+    // key. The declarations name set is deliberately not qualified:
+    // the gate compares only this signature map (step 8 of
+    // `evaluate_doc_gate`); the name set is not consumed by the gate,
+    // so qualifying it would change no enforcement outcome.
+    let mut enclosing: Option<String> = None;
     for ((line, original_line), preserved_line) in
         cleaned.lines().zip(text.lines()).zip(route_text.lines())
     {
         if let Some(attribute) = parse_serde_attribute(preserved_line) {
             pending_serde.push(attribute);
         }
+        // A closing brace at column 0 ends the enclosing container.
+        if !line.starts_with([' ', '\t']) && line.trim_start().starts_with('}') {
+            enclosing = None;
+        }
         let mut attach_keys: Vec<String> = Vec::new();
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
+            if let Some((name, _)) = pairs.first() {
+                let container = line
+                    .split_whitespace()
+                    .any(|token| ["class", "interface", "enum", "namespace"].contains(&token));
+                enclosing = if container { Some(name.clone()) } else { None };
+            }
             for (name, signature) in pairs {
                 signatures
                     .entry(format!("ts:{name}"))
@@ -1832,6 +1892,7 @@ fn extract_public_surface_signatures(
                     .insert(signature);
             }
         } else if let Some(pairs) = parse_use_declarations(line) {
+            enclosing = None;
             for (name, full_path) in pairs {
                 signatures
                     .entry(format!("use:{name}"))
@@ -1840,16 +1901,35 @@ fn extract_public_surface_signatures(
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
             let signature = signature_line(&kind, line, preserved_line);
+            enclosing = if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
+                Some(name.clone())
+            } else {
+                None
+            };
             attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
             .filter(|(name, _kind)| reexported.contains(name))
         {
             let signature = signature_line(&kind, line, preserved_line);
+            enclosing = if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
+                Some(name.clone())
+            } else {
+                None
+            };
             attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
+        } else if let Some(owner) = parse_impl_enclosing(line) {
+            enclosing = Some(owner);
         }
         if let Some((_name, key, signature)) = parse_member_declaration(line) {
+            let key = match &enclosing {
+                Some(owner) => match key.split_once(':') {
+                    Some((prefix, rest)) => format!("{prefix}:{owner}.{rest}"),
+                    None => key,
+                },
+                None => key,
+            };
             attach_keys.push(key.clone());
             signatures.entry(key).or_default().insert(signature);
         }
@@ -4211,6 +4291,63 @@ pub struct AfterAll {}
             "pub enum Kind {\n    #[serde(rename = \"b\")]\n    Alpha,\n}",
         );
         assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn member_moved_between_structs_differs() {
+        let before = extract_public_surface_signatures(
+            "pub struct A {\n    pub x: u32,\n}\npub struct B {\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub struct A {\n}\npub struct B {\n    pub x: u32,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("field:A.x"), "{before:?}");
+        assert!(after.contains_key("field:B.x"), "{after:?}");
+    }
+
+    #[test]
+    fn member_moved_between_traits_and_enums_differs() {
+        let before = extract_public_surface_signatures(
+            "pub trait A {\n    fn fetch(&self);\n}\npub trait B {\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub trait A {\n}\npub trait B {\n    fn fetch(&self);\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("fn:A.fetch"), "{before:?}");
+        assert!(after.contains_key("fn:B.fetch"), "{after:?}");
+        let before =
+            extract_public_surface_signatures("pub enum A {\n    Alpha,\n}\npub enum B {\n}");
+        let after =
+            extract_public_surface_signatures("pub enum A {\n}\npub enum B {\n    Alpha,\n}");
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("member:A.Alpha"), "{before:?}");
+        assert!(after.contains_key("member:B.Alpha"), "{after:?}");
+    }
+
+    #[test]
+    fn same_named_fields_in_two_structs_do_not_collide() {
+        let sigs = extract_public_surface_signatures(
+            "pub struct A {\n    pub x: u32,\n}\npub struct B {\n    pub x: String,\n}",
+        );
+        assert_eq!(sigs.get("field:A.x").map(|s| s.len()), Some(1), "{sigs:?}");
+        assert_eq!(sigs.get("field:B.x").map(|s| s.len()), Some(1), "{sigs:?}");
+    }
+
+    #[test]
+    fn member_without_enclosing_declaration_keeps_bare_key() {
+        // A member line with no preceding container declaration in the
+        // text (the common -U0 diff shape) keeps its bare key.
+        let sigs = extract_public_surface_signatures("    fn fetch(&self, id: u64);");
+        assert!(sigs.contains_key("fn:fetch"), "{sigs:?}");
+        // The enclosing scope ends at the closing brace: a member
+        // after it is not attributed to the closed container.
+        let sigs = extract_public_surface_signatures(
+            "pub struct A {\n    pub x: u32,\n}\n    pub y: u32,",
+        );
+        assert!(sigs.contains_key("field:A.x"), "{sigs:?}");
+        assert!(sigs.contains_key("field:y"), "{sigs:?}");
     }
 
     #[test]
