@@ -1912,9 +1912,9 @@ fn shacl_summaries(
     Ok((report.conforms, violations))
 }
 
-fn subject_iri(s: &oxrdf::Subject) -> Option<String> {
+fn subject_iri(s: &oxrdf::NamedOrBlankNode) -> Option<String> {
     match s {
-        oxrdf::Subject::NamedNode(n) => Some(n.as_str().to_string()),
+        oxrdf::NamedOrBlankNode::NamedNode(n) => Some(n.as_str().to_string()),
         _ => None,
     }
 }
