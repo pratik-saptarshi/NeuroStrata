@@ -1868,6 +1868,28 @@ fn parse_serde_attribute(line: &str) -> Option<String> {
     }
 }
 
+/// Parses one line as a clap command attribute (`#[command(...)]`),
+/// returning the normalized attribute contents. A command's name,
+/// alias / visible_alias, about text, and subcommand wiring are CLI
+/// surface, so the whole attribute is the signature; SS7 extracts
+/// only the `name = "..."` value, so an alias-only change otherwise
+/// produced identical maps. Matched on the comments-blanked-but-
+/// strings-preserved line, like serde, because the argument values
+/// are string literals the full blanking pipeline erases — and a
+/// command-shaped text inside a comment must not count. The closing
+/// `)]` is located rather than required at end of line, since the
+/// attribute may share its line with the declaration it annotates.
+fn parse_command_attribute(line: &str) -> Option<String> {
+    let inner_start = line.find("#[command(")? + "#[command(".len();
+    let inner_end = line[inner_start..].find(")]")? + inner_start;
+    let inner = normalized_line(&line[inner_start..inner_end]);
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
 /// Parses one line as an `impl` block header, returning the name of
 /// the type the block implements methods for (`impl Foo`,
 /// `impl<T> Foo<T>`, `impl Trait for Foo` — the target type in each
@@ -1943,6 +1965,18 @@ fn extract_public_surface_signatures(
         if let Some((key, signature)) = parse_http_route_registration(line) {
             signatures.entry(key).or_default().insert(signature);
         }
+        // Clap command attributes enter the shared `command` key
+        // unconditionally, following the clap-arg pattern: the
+        // declaration a `#[command(...)]` annotates (an enum variant
+        // opening a brace block, say) is not always itself an
+        // attachable signature line, and in the -U0 diff shape the
+        // attribute line is the only changed line there is.
+        if let Some(attribute) = parse_command_attribute(line) {
+            signatures
+                .entry("command".to_string())
+                .or_default()
+                .insert(attribute);
+        }
     }
     let cleaned = blank_comments_and_strings(text);
     // Same re-export transitivity as in
@@ -1973,6 +2007,13 @@ fn extract_public_surface_signatures(
     // keep it pending; any other code line drops it), mirroring how
     // clap attributes sit on the fields/items they annotate.
     let mut pending_serde: Vec<String> = Vec::new();
+    // Clap command attributes awaiting their declaration, with the
+    // same placement rule as pending_serde: a `#[command(...)]` line
+    // contributes its contents to the enclosing declaration's
+    // signature only when it directly precedes a declaration or
+    // member (stacked attribute lines and blank lines keep it
+    // pending; any other code line drops it).
+    let mut pending_command: Vec<String> = Vec::new();
     // The enclosing container (struct / enum / trait / union / mod,
     // an `impl` target type, or a TypeScript class / interface /
     // enum / namespace) most recently declared in the text. Member
@@ -2006,6 +2047,9 @@ fn extract_public_surface_signatures(
     {
         if let Some(attribute) = parse_serde_attribute(preserved_line) {
             pending_serde.push(attribute);
+        }
+        if let Some(attribute) = parse_command_attribute(preserved_line) {
+            pending_command.push(attribute);
         }
         let indent = line.len() - line.trim_start().len();
         if fn_body_indent.map(|i| indent <= i).unwrap_or(false) {
@@ -2149,10 +2193,25 @@ fn extract_public_surface_signatures(
                     .insert(attribute.clone());
             }
             pending_serde.clear();
+            // The pending command contents likewise enter the
+            // enclosing declaration's signature set (as a
+            // `command(...)` signature); the shared `command` key
+            // was already populated unconditionally above, following
+            // the clap-arg pattern.
+            for key in &attach_keys {
+                for attribute in &pending_command {
+                    signatures
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(format!("command({attribute})"));
+                }
+            }
+            pending_command.clear();
         } else {
             let preserved_trimmed = preserved_line.trim();
             if !preserved_trimmed.is_empty() && !preserved_trimmed.starts_with("#[") {
                 pending_serde.clear();
+                pending_command.clear();
             }
         }
     }
@@ -4733,6 +4792,75 @@ pub struct AfterAll {}
             "pub fn helper() {\n    #[serde(tag = \"b\")]\n    let x = 1;\n}",
         );
         assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn command_alias_change_differs() {
+        // W3 probe (Codex PR #162): the alias on the synaptic-mesh
+        // command declaration is CLI surface, but only the command
+        // name entered the map (via SS7), so an alias-only change
+        // produced identical maps.
+        let before = extract_public_surface_signatures(
+            "#[command(name = \"synaptic-mesh\", alias = \"mesh\")]\npub struct SynapticMesh;",
+        );
+        let after = extract_public_surface_signatures(
+            "#[command(name = \"synaptic-mesh\", alias = \"connector\")]\npub struct SynapticMesh;",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert_ne!(
+            before.get("SynapticMesh"),
+            after.get("SynapticMesh"),
+            "attribute must enter the enclosing declaration's signature: {before:?} vs {after:?}"
+        );
+    }
+
+    #[test]
+    fn command_alias_only_attribute_change_differs() {
+        let before =
+            extract_public_surface_signatures("#[command(alias = \"mesh\")]\npub struct Thing;");
+        let after = extract_public_surface_signatures(
+            "#[command(alias = \"connector\")]\npub struct Thing;",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        // The attribute line alone (the -U0 diff shape for an
+        // alias-only edit, where the annotated variant line itself
+        // is unchanged context) must already register.
+        let before_line =
+            extract_public_surface_signatures("#[command(alias = \"mesh\")]");
+        let after_line =
+            extract_public_surface_signatures("#[command(alias = \"connector\")]");
+        assert_ne!(
+            before_line, after_line,
+            "before={before_line:?} after={after_line:?}"
+        );
+    }
+
+    #[test]
+    fn command_visible_alias_change_differs() {
+        let before = extract_public_surface_signatures(
+            "#[command(name = \"x\", visible_alias = \"a\")]\npub struct Thing;",
+        );
+        let after = extract_public_surface_signatures(
+            "#[command(name = \"x\", visible_alias = \"b\")]\npub struct Thing;",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn command_attribute_not_preceding_a_declaration_is_ignored_for_attach() {
+        // Placement parity with serde: an attribute over a `let`
+        // inside a fn body does not attach to a declaration. (The
+        // shared `command` key still records the attribute itself,
+        // following the clap pattern, so both sides below carry it
+        // identically only when the attribute is unchanged.)
+        let before = extract_public_surface_signatures(
+            "pub fn helper() {\n    #[command(alias = \"a\")]\n    let x = 1;\n}",
+        );
+        assert!(
+            !before.contains_key("helper")
+                || !before["helper"].iter().any(|s| s.starts_with("command(")),
+            "attribute attached to a non-declaration: {before:?}"
+        );
     }
 
     #[test]
