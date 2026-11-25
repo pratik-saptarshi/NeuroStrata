@@ -12,6 +12,7 @@ pub enum MetricKind {
     RetrievalDistance,
     MemoryCount,
     IngestLatencyMs,
+    ArchitecturalInsight,
 }
 
 #[allow(non_upper_case_globals)]
@@ -26,6 +27,7 @@ impl MetricKind {
             MetricKind::RetrievalDistance => "retrieval_distance",
             MetricKind::MemoryCount => "memory_count",
             MetricKind::IngestLatencyMs => "ingest_latency_ms",
+            MetricKind::ArchitecturalInsight => "architectural_insight",
         }
     }
 }
@@ -40,6 +42,7 @@ impl std::str::FromStr for MetricKind {
             "retrieval_distance" => Ok(MetricKind::RetrievalDistance),
             "memory_count" => Ok(MetricKind::MemoryCount),
             "ingest_latency_ms" => Ok(MetricKind::IngestLatencyMs),
+            "architectural_insight" => Ok(MetricKind::ArchitecturalInsight),
             _ => Err(format!("unknown MetricKind: {}", s)),
         }
     }

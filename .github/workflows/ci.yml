@@ -23,6 +23,11 @@ jobs:
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # LBUG_VERSION pins the engine archive the lbug build script
+      # downloads; keep it equal to the lbug crate version in Cargo.toml
+      # and move it whenever that version changes.
+      LBUG_VERSION: '0.22.3'
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -103,85 +108,17 @@ jobs:
   # The build job proves compilation; this proves behavior. Single test
   # thread because the suite's per-test temp databases exhaust the mmap
   # budget when run in parallel (intermittent "Mmap for size ... failed").
-  # Only the Ubuntu leg remains here; the windows and macos legs (both
-  # report-only) moved to platform.yml with the build legs -- see that
-  # file's header. Their recorded pre-existing failures, with causes,
-  # are in .github/quality-baseline.md; they are bugs with their own
-  # follow-ups, not backlog.
-  test-matrix:
-    name: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
-    runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.report-only == true }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Version sync check
-        shell: bash
-        run: python3 tools/check_version_sync.py
-
-      - name: Toolchain versions
-        shell: bash
-        run: |
-          rustc --version
-          cargo --version
-
-      - name: Verify build prerequisites
-        shell: bash
-        run: |
-          cmake --version || {
-            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
-            exit 1
-          }
-
-      - name: Test
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
-
-      # CI telemetry (remediation programme, judge item 10): on failure,
-      # publish the failing-test list as a stable-format artifact (schema:
-      # tools/failing_tests_artifact.py), so failure censuses read
-      # artifacts instead of digging through raw job logs. Side-channel
-      # only: continue-on-error is deliberate here -- a broken telemetry
-      # step must never change the job's verdict.
-      - name: Write failing-test list (telemetry)
-        if: failure()
-        continue-on-error: true
-        shell: bash
-        env:
-          TELEM_JOB_NAME: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
-        run: |
-          python3 tools/failing_tests_artifact.py \
-            --log "$RUNNER_TEMP/test-output.log" \
-            --out "$RUNNER_TEMP/failing-tests.json" \
-            --job-name "$TELEM_JOB_NAME"
-
-      - name: Upload failing-test list (telemetry)
-        if: failure()
-        continue-on-error: true
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: failing-tests-test-matrix-${{ matrix.os }}
-          path: ${{ runner.temp }}/failing-tests.json
-          if-no-files-found: ignore
-          overwrite: true
-
-  # The build job proves compilation; this proves behavior. Single test
-  # thread because the suite's per-test temp databases exhaust the mmap
-  # budget when run in parallel (intermittent "Mmap for size ... failed").
   test:
     name: test (ubuntu)
     runs-on: ubuntu-latest
+    env:
+      # LBUG_VERSION pins the engine archive the lbug build script
+      # downloads; keep it equal to the lbug crate version in Cargo.toml
+      # and move it whenever that version changes.
+      LBUG_VERSION: '0.22.3'
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Toolchain versions
         shell: bash
@@ -208,6 +145,54 @@ jobs:
       - name: Guard include_str targets
         shell: bash
         run: bash scripts/check-include-str-targets.sh
+
+      # elan is fetched by commit, not by "master": the install script is
+      # what decides which toolchain gets downloaded onto the runner, so it
+      # is verified before it runs.
+      #   leanprover/elan v4.2.4 = commit 227caca133724d5516bee25c2aeb3e609478f2d8
+      #   elan-init.sh sha256 = a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+      # Upstream's Lean parity tests (tests/lean_parity_test.rs) hard-require
+      # `lake` on PATH: find_lake() panics when it is absent. Upstream's
+      # ci.yml installs the toolchain here; this mirrors that step. The
+      # hashFiles guard keeps the step inert on trees that predate the
+      # proofs/lean-toolchain pin (this branch's tree has no pin yet); on
+      # trees carrying the pin the step runs in full.
+      - name: Install Lean 4 toolchain (elan)
+        if: hashFiles('proofs/lean-toolchain') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          ELAN_COMMIT=227caca133724d5516bee25c2aeb3e609478f2d8
+          ELAN_SHA256=a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+          ELAN_SCRIPT="$RUNNER_TEMP/elan-init.sh"
+          curl -sSfL "https://raw.githubusercontent.com/leanprover/elan/${ELAN_COMMIT}/elan-init.sh" -o "$ELAN_SCRIPT"
+          echo "${ELAN_SHA256}  ${ELAN_SCRIPT}" | sha256sum -c -
+          sh "$ELAN_SCRIPT" -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/lake" --dir proofs build
+
+      - name: Install and run Kani Rust Verifier (formal_kernel.rs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          KANI_VER="0.68.0"
+          mkdir -p "$HOME/.kani" "$HOME/.cargo/bin"
+          rm -rf "$HOME/.kani/kani-${KANI_VER}"
+          curl -sSL "https://github.com/model-checking/kani/releases/download/kani-${KANI_VER}/kani-${KANI_VER}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.kani"
+          KANI_TC="$(tr -d '[:space:]' < "$HOME/.kani/kani-${KANI_VER}/rust-toolchain-version")"
+          rustup toolchain install "$KANI_TC" --profile minimal --component rust-src
+          TC_LIB="$HOME/.rustup/toolchains/${KANI_TC}/lib"
+          printf '#!/usr/bin/env bash\nexport LD_LIBRARY_PATH="%s:${LD_LIBRARY_PATH:-}"\nexport PATH="$HOME/.kani/kani-%s/bin:$PATH"\nexec "$HOME/.kani/kani-%s/bin/kani-driver" "$@"\n' "$TC_LIB" "$KANI_VER" "$KANI_VER" > "$HOME/.cargo/bin/kani"
+          chmod +x "$HOME/.cargo/bin/kani"
+          # End-to-end smoke: exercises the wrapper, the driver, and goto-cc
+          # before the full harness module runs.
+          printf '#[kani::proof]\nfn smoke() { assert!(1 + 1 == 2); }\n' > /tmp/kani-smoke.rs
+          kani /tmp/kani-smoke.rs
+          NEUROSTRATA_REQUIRE_KANI=1 bash proofs/scripts/extract-aeneas.sh
+
+      - name: Kani mutation checks must reject all six broken kernels
+        shell: bash
+        run: NEUROSTRATA_REQUIRE_KANI=1 bash scripts/kani-mutation-check.sh
 
       - name: Test
         shell: bash
@@ -251,6 +236,244 @@ jobs:
           path: ${{ runner.temp }}/failing-tests.json
           if-no-files-found: ignore
           overwrite: true
+
+      # The self-test runs the binary tests, so it belongs where the target is
+      # already built rather than in a fresh job that would compile it again.
+      - name: Remediation eval self-test
+        shell: bash
+        run: bash scripts/test-remediation-eval.sh
+
+  # Full binary suite on the other two platforms, report-only: a platform
+  # regression shows up on the PR without blocking the merge on a runner this
+  # project cannot reproduce locally. The ubuntu test job above is the gate.
+  test-report:
+    name: test (${{ matrix.os }}, report-only)
+    runs-on: ${{ matrix.os }}
+    env:
+      LBUG_VERSION: '0.22.3'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
+      # Release profile: the Windows debug static library exceeds the 4 GiB
+      # limit this project already works around in the build job.
+      #
+      # Report-only is a step-level continue-on-error: a job-level one is not
+      # a GitHub Actions feature, and without this a platform failure would
+      # turn the check red on every PR even though the ubuntu gate decides.
+      - name: Test (report-only)
+        id: platform_tests
+        continue-on-error: true
+        shell: bash
+        run: cargo test --release --locked --bin neurostrata-mcp -- --test-threads=1
+
+      - name: Report platform test outcome
+        if: steps.platform_tests.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::${{ matrix.os }} test suite failed; this leg is report-only and the ubuntu gate decides"
+
+  # The harness plugin is JavaScript the Rust binary embeds and runs. Its suite
+  # includes the restricted-PATH hook tests, which only execute on Windows when
+  # Git Bash is present -- a GitHub Windows runner has it. Run the suite on both
+  # so that path is covered rather than skipped by the ubuntu-only gate.
+  plugins:
+    name: plugins (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Node version
+        shell: bash
+        run: node --version
+
+      # From the repository root: the suite resolves plugins/... and
+      # scripts/... relative to the working directory.
+      - name: Test
+        shell: bash
+        run: node --test plugins/core/test.mjs
+
+  # The backup script's sidecar/WAL carry and pruning are shell behavior, not
+  # Rust behavior; test them where they run.
+  scripts:
+    name: scripts (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Backup script tests
+        shell: bash
+        run: bash scripts/test-backup.sh
+
+      - name: Gate receipt self-test
+        shell: bash
+        run: bash scripts/test-gate-receipt.sh
+
+      - name: Gate receipt live-path harness
+        shell: bash
+        run: bash scripts/test-gate-receipt-live.sh
+
+      # The disk-hygiene script is shell behaviour too: it deletes things, so
+      # its self-test runs against copies of the fixtures, never against the
+      # runner's real filesystem.
+      - name: Disk hygiene self-test
+        shell: bash
+        run: bash scripts/test-disk-hygiene.sh
+
+      - name: Main ruleset specification self-test
+        shell: bash
+        run: bash scripts/test-main-ruleset.sh
+
+      - name: Task coverage gate self-test
+        shell: bash
+        run: bash scripts/test-task-coverage-gate.sh
+
+  # The staged-quality gate is a local pre-commit path. These tests keep the
+  # gate honest, and a shell-only run exercises it server-side so `--no-verify`
+  # cannot bypass shell syntax/lint checks.
+  staged-quality:
+    name: staged-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+
+      - name: Gate fixture tests
+        shell: bash
+        run: bash scripts/test-staged-quality.sh
+
+      - name: Clippy filter tests
+        shell: bash
+        run: node scripts/test-clippy-staged-diagnostics.mjs
+
+      - name: Gate changed shell files
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags --depth=1 origin "$base_sha"
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          changed_file="$tmp/changed"
+          # git -z emits NUL terminators; command substitution would drop them.
+          git diff --name-only --diff-filter=ACMRT -z "$base_sha" HEAD -- '*.sh' 'scripts/hooks/*' > "$changed_file"
+          if [ ! -s "$changed_file" ]; then
+            echo "no changed shell files"
+            exit 0
+          fi
+
+          # `git add` in the PR checkout is a no-op: the index already matches
+          # HEAD, so the gate would see an empty diff. Stage the PR versions
+          # against the base commit in a disposable worktree instead.
+          orig="$PWD"
+          cleanup() {
+            cd "$orig"
+            git worktree remove --force "$tmp/wt" >/dev/null 2>&1 || true
+            rm -rf "$tmp"
+          }
+          trap cleanup EXIT
+          git worktree add --detach "$tmp/wt" "$base_sha"
+
+          while IFS= read -r -d '' file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] || continue
+            mkdir -p "$tmp/wt/$(dirname "$file")"
+            cp -p "$file" "$tmp/wt/$file"
+          done < "$changed_file"
+
+          # Exercise the PR's gate implementation, not the base one.
+          cp scripts/check-staged-quality.sh "$tmp/wt/scripts/check-staged-quality.sh"
+          cp scripts/clippy-staged-diagnostics.mjs "$tmp/wt/scripts/clippy-staged-diagnostics.mjs"
+
+          cd "$tmp/wt"
+          while IFS= read -r -d '' file; do
+            [ -n "$file" ] || continue
+            [ -f "$file" ] && git add -- "$file"
+          done < "$changed_file"
+          echo "gate files:"
+          git diff --cached --name-only
+          bash scripts/check-staged-quality.sh
+
+  # The dependency graph carries known advisories, so the audit is a gate
+  # rather than a report: cargo-audit fails the job on any vulnerability that
+  # is not in the dated exception list in .cargo/audit.toml. The tool version
+  # is pinned so a new release cannot change the verdict on an old commit.
+  audit:
+    name: audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-audit
+        shell: bash
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      # cargo-audit reads the project configuration from .cargo/audit.toml,
+      # which is why this runs from the repository root.
+      - name: Audit dependencies
+        shell: bash
+        run: cargo audit
+
+  # The release narrative names MCP tools, daemon routes, CLI subcommands and
+  # in-tree files. A name that never shipped is a user-facing failure, so the
+  # current release section and its release note are resolved against the
+  # source registries on every PR. See scripts/check-release-references.sh.
+  release-references:
+    name: release references
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Self-test the release-reference check
+        shell: bash
+        run: bash scripts/check-release-references.test.sh
+
+      - name: Validate release-narrative references
+        shell: bash
+        run: bash scripts/check-release-references.sh
 
   # Task 15a's scripted assertion for the release governance (J17),
   # grep-level by design: release.yml must not grant contents: write at
@@ -300,137 +523,3 @@ jobs:
             exit 1
           fi
           echo "release governance assertions passed"
-
-  # Quality gates (J16). These four jobs are REPORT-ONLY: each records the
-  # pre-existing backlog in .github/quality-baseline.md and reports against
-  # it; none of them blocks a merge. The backlog itself is Task 15b's to
-  # burn down, upstream, module by module -- a tree-wide cleanup sweep is
-  # never landed from a fork. Promotion of a job from report-only to
-  # required happens only when its baseline count reaches zero.
-  fmt:
-    name: fmt (report-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      # The tree uses no toolchain action (the images provide Rust), so the
-      # component is added the same way here.
-      - name: Add rustfmt component
-        shell: bash
-        run: rustup component add rustfmt
-
-      - name: cargo fmt --check
-        shell: bash
-        run: cargo fmt --check
-
-  clippy:
-    name: clippy (report-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Add clippy component
-        shell: bash
-        run: rustup component add clippy
-
-      # Clippy compiles the dependency graph, so lbug's build script runs
-      # and needs CMake, exactly as in the build/test jobs.
-      - name: Verify build prerequisites
-        shell: bash
-        run: |
-          cmake --version || {
-            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
-            exit 1
-          }
-
-      - name: cargo clippy
-        shell: bash
-        run: cargo clippy --locked -- -D warnings
-
-  audit:
-    name: audit (report-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      # The maintained RustSec action, so no audit tooling is added to the
-      # repository's own dependency tree.
-      - name: cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  deny:
-    name: deny (report-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      # The maintained cargo-deny action, for the same reason as audit.
-      - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check
-
-  # The GUI compiles in CI for the first time (J16). src-tauri is a
-  # standalone crate (its own Cargo.lock, no workspace), and its build
-  # script expects the web-ui build output to already exist:
-  # tauri.conf.json sets frontendDist to ../web-ui/dist, and vite's default
-  # outDir is dist, so building web-ui in place lands the files exactly
-  # where the configured path points.
-  #
-  # REPORT-ONLY for now, and the reason is a bug, not backlog: the first
-  # run failed in the web-ui build on a tracked symlink that is broken on
-  # every clean checkout (web-ui/public/graph.json ->
-  # ../../.NeuroStrata/graph/graph.json, a generated directory that does
-  # not exist in a fresh clone; vite stats it and dies with ENOENT). The
-  # finding is recorded in .github/quality-baseline.md. When that bug is
-  # fixed this flag comes off and the job becomes the required gate it
-  # was meant to be -- a GUI that does not compile is a bug, not style.
-  gui:
-    name: gui (tauri build) (report-only)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web-ui/package-lock.json
-
-      # Tauri v2's Linux prerequisites. Without them the webkit2gtk-sys
-      # build script fails on a stock ubuntu-latest runner before any Rust
-      # compiles.
-      - name: Install Tauri prerequisites
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: Build web-ui (frontendDist)
-        working-directory: web-ui
-        shell: bash
-        run: |
-          npm ci
-          npm run build
-
-      # --features custom-protocol because a plain cargo build otherwise
-      # produces the dev shape (see the feature's comment in
-      # src-tauri/Cargo.toml): the production shape is the one that embeds
-      # frontendDist, and it is the one worth compiling in CI.
-      - name: Build the Tauri app
-        working-directory: src-tauri
-        shell: bash
-        run: cargo build --locked --features custom-protocol

@@ -34,6 +34,12 @@ jobs:
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # LBUG_VERSION pins the engine archive the lbug build script
+      # downloads; keep it equal to the lbug crate version in Cargo.toml
+      # and move it whenever that version changes. (Mirrored from ci.yml
+      # on develop, which added the pin after this file was authored.)
+      LBUG_VERSION: '0.22.3'
     strategy:
       fail-fast: false
       matrix:
@@ -152,6 +158,12 @@ jobs:
   test-matrix:
     name: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
     runs-on: ${{ matrix.os }}
+    env:
+      # LBUG_VERSION pins the engine archive the lbug build script
+      # downloads; keep it equal to the lbug crate version in Cargo.toml
+      # and move it whenever that version changes. (Mirrored from ci.yml
+      # on develop, which added the pin after this file was authored.)
+      LBUG_VERSION: '0.22.3'
     continue-on-error: ${{ matrix.report-only == true }}
     strategy:
       fail-fast: false

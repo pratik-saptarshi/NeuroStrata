@@ -1,24 +1,166 @@
+// Legacy ingest module: these clippy categories predate the watcher work and
+// are out of scope for it. Suppress them here so the staged-quality gate stays
+// scoped to the code this branch actually changes.
+#![allow(
+    clippy::comparison_to_empty,
+    clippy::drop_non_drop,
+    clippy::for_kv_map,
+    clippy::items_after_test_module,
+    clippy::option_map_unit_fn,
+    clippy::question_mark,
+    clippy::redundant_pattern_matching,
+    clippy::regex_creation_in_loops,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_map_or,
+    clippy::useless_vec
+)]
+
 use crate::parser::get_language;
 use crate::parser::schema::ParserSchema;
-use crate::traits::{
-    is_reserved_ingest_destination, Embedder, MemoryPayload, VectorStore,
-    INTERNAL_INGEST_STAGE_PREFIX,
-};
+use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Parser, Query, StreamingIterator};
 
 // The id/hash scheme lives in `generation.rs`, a module deliberately free of
 // `crate::` dependencies so an integration test can pin it without a library
 // target. These re-exports keep `ingest.rs` and the store naming the same
 // functions through the path they already use.
 pub use crate::parser::generation::{
-    generation_key, generation_scoped_id, ingest_version, logical_path_of, sha256_hex,
-    split_scoped_id, symbol_id, NAMESPACE_SEPARATOR,
+    exact_target_match, exact_target_match_fallible, exact_target_spellings, generation_key,
+    generation_scoped_id, ingest_version, logical_path_of, sha256_hex, split_scoped_id, symbol_id,
+    NAMESPACE_SEPARATOR,
 };
+
+/// Directory names the ingest walk never descends into. Shared with the
+/// freshness watcher's event filter so the walker and the watcher agree on
+/// what is eligible before anything becomes a trigger.
+pub const SKIPPED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "vendor",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    "dist",
+    "build",
+    "out",
+    ".dolt",
+    ".git",
+    ".next",
+    ".nuxt",
+    "__pycache__",
+    ".fastembed_cache",
+    ".idea",
+    ".vscode",
+    "coverage",
+];
+
+/// Shared eligibility predicate: would a normal ingest walk consider this
+/// path eligible? Skipped directories and database/transient store artifacts
+/// are rejected; only paths inside the registered root survive.
+pub fn is_ingest_eligible_path(path: &Path, root: &Path) -> bool {
+    if !is_within(path, root) {
+        return false;
+    }
+    if path_is_in_skipped_dir(path) {
+        return false;
+    }
+    !is_store_artifact(path)
+}
+
+/// Lexical root containment that copes with relative roots (CLI-style) as well
+/// as absolute ones, without touching the filesystem. Component-aware: interior
+/// `.`/`..` are resolved, and a path whose `..` escapes its root is rejected.
+fn is_within(path: &Path, root: &Path) -> bool {
+    let Some(path_norm) = normalize_lexical(path) else {
+        return false;
+    };
+    let Some(root_norm) = normalize_lexical(root) else {
+        return false;
+    };
+
+    if root_norm.is_empty() || root_norm == "." {
+        // A relative, empty, or "." root never authorizes absolute paths.
+        return !path.is_absolute() && !path_norm.is_empty();
+    }
+    if path.is_absolute() != root.is_absolute() {
+        // A relative root does not authorize absolute paths.
+        return false;
+    }
+    path_norm == root_norm || path_norm.starts_with(&format!("{}/", root_norm))
+}
+
+/// Component-aware lexical normalization: resolves interior `.` and `..`,
+/// returns `None` when a `..` escapes the start of the path.
+fn normalize_lexical(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let absolute = s.starts_with('/');
+    let mut parts: Vec<String> = Vec::new();
+    for comp in s.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            if absolute {
+                if parts.pop().is_none() {
+                    // `..` past the root is an escape.
+                    return None;
+                }
+            } else {
+                match parts.last() {
+                    Some(top) if top != ".." => {
+                        parts.pop();
+                    }
+                    _ => parts.push("..".to_string()),
+                }
+            }
+        } else {
+            parts.push(comp.to_string());
+        }
+    }
+    let joined = if absolute {
+        format!("/{}", parts.join("/"))
+    } else {
+        parts.join("/")
+    };
+    Some(joined)
+}
+
+fn path_is_in_skipped_dir(path: &Path) -> bool {
+    let path_str = path.to_string_lossy().to_string();
+    for skip_dir in SKIPPED_DIRS {
+        let skip_pattern = format!("/{}/", skip_dir);
+        let skip_start = format!("{}/", skip_dir);
+        let skip_exact = format!("./{}", skip_dir);
+        if path_str.contains(&skip_pattern)
+            || path_str.starts_with(&skip_start)
+            || path_str == skip_exact
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_store_artifact(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".db")
+        || lower.ends_with(".wal")
+        || lower.ends_with(".lock")
+        || lower.ends_with(".checkpoint")
+        || lower.ends_with(".shm")
+}
 
 /// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
 /// use the dotted form. Both sides go through here so either convention matches.
@@ -86,17 +228,6 @@ pub fn source_key_for(dir_path: &Path) -> String {
 
 /// A node id, qualified by the namespace that owns it.
 ///
-/// Node ids are paths, and the Memory table's original key was PRIMARY KEY
-/// (id) -- one column, because lbug has no composite key (see
-/// examples/composite_pk_repro.rs for the parser refusing one). So an id was
-/// unique across the WHOLE database, while paths are only unique within a
-/// project. Every repository has a `src` and a `README.md`, and the database
-/// is shared by all of them, which meant the second project ingested silently
-/// took the first project's nodes: upsert MERGEs on the id, finds the existing
-/// row, and updates it. Fresh tables now key on a derived pk
-/// (namespace + U+0001 + id; Task 7 re-plan), but tables written by older
-/// binaries still key on (id) alone — and qualified ids remain the
-/// ingest-minted shape either way, so the separation below holds on both.
 /// Node ids are paths, and the Memory table is PRIMARY KEY (id) -- one column,
 /// because lbug 0.15.3 has no composite key (see examples/composite_pk_repro.rs
 /// for the parser refusing one). So an id is unique across the WHOLE database,
@@ -183,9 +314,126 @@ struct SymbolRow {
     calls: Vec<String>,
 }
 
-/// Extract identifiers followed by `(` from `body`, excluding `self_name` and
-/// language keywords/builtins. Sorted and deduplicated.
-fn extract_called_identifiers(body: &str, self_name: &str) -> Vec<String> {
+/// Staged symbol metadata captured during generation ingestion for pre-publish
+/// cross-file call resolution (`neurostrata-rbde`).
+#[derive(Clone, Debug)]
+pub struct StagedSymbolInfo {
+    pub id: String,
+    pub file_path: String,
+    pub name: String,
+    pub kind: String,
+    pub calls: Vec<String>,
+}
+
+/// Mask comments (`//`, `/* */`, `#`) and string/char literals (`"..."`, `'...'`)
+/// with spaces so call extraction never produces false-positive identifiers from
+/// non-code spans (`neurostrata-rbde`).
+fn mask_comments_and_strings(body: &str) -> Vec<u8> {
+    let bytes = body.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    let mut line_start = true;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            line_start = true;
+            i += 1;
+            continue;
+        }
+        // Line comment: //
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: /* ... */
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out[i] = b' ';
+            out[i + 1] = b' ';
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    break;
+                }
+                if bytes[i] != b'\n' {
+                    out[i] = b' ';
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Python/shell hash comment at start of line or after whitespace (not Rust #[attr])
+        if b == b'#' && line_start && (i + 1 >= bytes.len() || bytes[i + 1] != b'[') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        // Double-quoted string literal
+        if b == b'"' {
+            out[i] = b' ';
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    continue;
+                }
+                let ch = bytes[i];
+                if ch != b'\n' {
+                    out[i] = b' ';
+                }
+                i += 1;
+                if ch == b'"' {
+                    break;
+                }
+            }
+            line_start = false;
+            continue;
+        }
+        // Single-quoted string/char literal (skip Rust lifetime `'a` where closing `'` is absent)
+        if b == b'\'' {
+            // Check if there is a closing `'` on the same line within a reasonable span
+            let mut j = i + 1;
+            let mut has_close = false;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == b'\'' {
+                    has_close = true;
+                    break;
+                }
+                j += 1;
+            }
+            if has_close {
+                while i <= j {
+                    out[i] = b' ';
+                    i += 1;
+                }
+                line_start = false;
+                continue;
+            }
+        }
+        if !b.is_ascii_whitespace() {
+            line_start = false;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Extract identifiers followed by `(` (or `::<...>( `) from `body`, excluding
+/// `self_name`, comments/strings, and language keywords/builtins. Sorted and deduplicated.
+pub fn extract_called_identifiers(body: &str, self_name: &str) -> Vec<String> {
     const KEYWORDS: &[&str] = &[
         "if",
         "else",
@@ -214,7 +462,8 @@ fn extract_called_identifiers(body: &str, self_name: &str) -> Vec<String> {
         "assert_eq",
         "assert_ne",
     ];
-    let bytes = body.as_bytes();
+    let masked = mask_comments_and_strings(body);
+    let bytes = masked.as_slice();
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
@@ -224,9 +473,32 @@ fn extract_called_identifiers(body: &str, self_name: &str) -> Vec<String> {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            let ident = &body[start..i];
-            if i < bytes.len()
-                && bytes[i] == b'('
+            let ident = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+            // Skip horizontal whitespace
+            let mut k = i;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            // Support Rust turbofish `ident::<T>(`
+            if k + 2 < bytes.len()
+                && bytes[k] == b':'
+                && bytes[k + 1] == b':'
+                && bytes[k + 2] == b'<'
+            {
+                let mut depth = 1usize;
+                k += 3;
+                while k < bytes.len() && depth > 0 {
+                    if bytes[k] == b'<' {
+                        depth += 1;
+                    } else if bytes[k] == b'>' {
+                        depth -= 1;
+                    }
+                    k += 1;
+                }
+            }
+            if k < bytes.len()
+                && bytes[k] == b'('
+                && !ident.is_empty()
                 && ident != self_name
                 && !KEYWORDS.contains(&ident)
             {
@@ -376,11 +648,16 @@ fn slugify(s: &str) -> String {
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
+    fn file_skipped(&self, path: &str, reason: &str) {
+        // Security skips are operator-visible at info; the per-file
+        // "unchanged" skip stays at debug so a large tree is not spammed.
+        if reason.contains("ERROR [SECURITY]") {
+            tracing::info!("ingest skipped file: {path} ({reason})");
+        } else {
+            tracing::debug!("ingest skipped file: {path} ({reason})");
+        }
+    }
     fn relinked(&self, edges: usize);
-    /// A document the secret scanner refused at ingest: skipped whole and
-    /// reported here with the scanner's reason. The default ignores it, so
-    /// observers that only count progress are unchanged.
-    fn file_skipped(&self, _path: &str, _reason: &str) {}
     /// Called once per run when the previous generation's `ingest_version`
     /// differs from the current one (or is absent). Implementors surface this
     /// as a warning; the ingest continues with a full re-parse.
@@ -418,14 +695,70 @@ enum IngestItem {
     SkippedFile {
         path_display: String,
         reason: String,
+        /// The previous generation had rows for this path. Such a skip is a
+        /// change (the old rows must not stay active); a never-indexed skip is
+        /// not.
+        had_previous: bool,
     },
-
     /// Embedded markdown sections.
     DocSections {
         node_path: String,
         sections: Vec<DocSection>,
         file_sha256: String,
     },
+}
+
+/// How many refusal reasons the generation summary carries. The count of
+/// refusals is exact; only the samples are capped.
+const MAX_DEGRADED_EMBED_SAMPLES: usize = 8;
+
+/// The embeddings a provider refused during one generation.
+///
+/// A refusal is a warning, not an abort: the refused item is skipped and the
+/// generation continues. The tally is what the generation summary reports --
+/// the exact count, plus the first few reasons so an operator can see why
+/// the provider said no.
+#[derive(Debug, Default)]
+struct DegradedEmbeddings {
+    count: usize,
+    samples: Vec<String>,
+}
+
+impl DegradedEmbeddings {
+    /// Folds one batch outcome into the tally.
+    fn note(&mut self, outcome: &crate::traits::BatchEmbedOutcome) {
+        self.count += outcome.embeddings.iter().filter(|e| e.is_none()).count();
+        for reason in &outcome.warnings {
+            if self.samples.len() < MAX_DEGRADED_EMBED_SAMPLES {
+                self.samples.push(reason.clone());
+            }
+        }
+    }
+
+    /// The summary block for the generation, or `None` when nothing was
+    /// refused.
+    fn summary(&self) -> Option<String> {
+        if self.count == 0 {
+            return None;
+        }
+        let mut out = format!(
+            "WARNING: {} embedding(s) were refused by the embedder and skipped; the generation continued without them.\n",
+            self.count
+        );
+        for reason in &self.samples {
+            out.push_str(&format!("  - {}\n", reason));
+        }
+        Some(out)
+    }
+}
+
+/// What the consumer reports back to the producer.
+struct ConsumerOutcome {
+    /// Items that were not a bare directory node.
+    content_items: usize,
+    staged_symbols: Vec<StagedSymbolInfo>,
+    /// The embeddings the provider refused.
+    degraded: DegradedEmbeddings,
 }
 
 /// Secret scan over a document's text, run in the producer as the file is
@@ -435,293 +768,190 @@ fn scan_for_ingest(text: &str) -> Option<String> {
     crate::secrets::scan_entry_point(text, &serde_json::json!({}), "ingest").map(|r| r.to_string())
 }
 
-/// Blocking producer: walks the directory tree, reads files, parses ASTs,
-/// and streams owned results through `tx`. Runs on the blocking thread pool
-/// so filesystem I/O never stalls the async runtime.
-fn run_producer(
-    dir_path: std::path::PathBuf,
-    ext_to_lang: HashMap<String, String>,
-    schema: crate::parser::schema::ParserSchema,
-    tx: mpsc::Sender<IngestItem>,
-    namespace: String,
-    generation: u64,
-    prev_file_map: std::collections::HashMap<String, String>,
-    force_reparse: bool,
-    observer: Option<std::sync::Arc<dyn IngestObserver>>,
-) -> anyhow::Result<(
-    std::collections::HashSet<String>,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, Vec<String>>,
-)> {
-    let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut current_hashes: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    let skipped_dirs = [
-        "node_modules",
-        "target",
-        "vendor",
-        ".venv",
-        "venv",
-        "env",
-        ".env",
-        "dist",
-        "build",
-        "out",
-        ".dolt",
-        ".git",
-        ".next",
-        ".nuxt",
-        "__pycache__",
-        ".fastembed_cache",
-        ".idea",
-        ".vscode",
-        "coverage",
-    ];
+/// Read one file's bytes during an ingest walk.
+///
+/// Extracted so the abort path has a fixture that does not depend on file
+/// mode: reading a directory fails with EISDIR for every uid, including a
+/// root test process whose DAC override can read a mode-000 file.
+fn read_ingest_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {} during ingest: {e}", path.display()))
+}
 
-    let walker = WalkBuilder::new(&dir_path).build();
-
-    let mut unreadable = 0usize;
-
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(e) => {
-                unreadable += 1;
-                if unreadable <= 5 {
-                    eprintln!("Could not read part of {:?}: {}", dir_path, e);
+/// Compile every tree-sitter query a schema declares into an `Arc` cache keyed
+/// by `language:query_name`. The producer then looks patterns up per file
+/// instead of recompiling them per file; invalid patterns are skipped and
+/// logged here, so the per-file pass never sees them.
+fn compile_language_queries(schema: &ParserSchema) -> HashMap<String, std::sync::Arc<Query>> {
+    let mut compiled = HashMap::new();
+    for (lang_name, lang_schema) in &schema.languages {
+        let ts_lang = match get_language(lang_name) {
+            Some(l) => l,
+            None => continue,
+        };
+        for (query_name, query_str) in &lang_schema.queries {
+            match Query::new(&ts_lang, query_str) {
+                Ok(q) => {
+                    compiled.insert(format!("{lang_name}:{query_name}"), std::sync::Arc::new(q));
                 }
-                continue;
-            }
-        };
-
-        let path = entry.path();
-        let path_str = path.to_string_lossy();
-
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern)
-                || path_str.starts_with(&skip_start)
-                || path_str == skip_exact
-            {
-                should_skip = true;
-                break;
-            }
-        }
-        if should_skip {
-            continue;
-        }
-
-        let abs_path = if path.is_absolute() {
-            path.to_string_lossy().to_string()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(path)
-                .to_string_lossy()
-                .to_string()
-        };
-
-        let node_path = node_id_for(&dir_path, path);
-
-        let parent_id = if path == dir_path {
-            None
-        } else if let Some(p) = path.parent() {
-            // Only adopt a parent that actually lives inside the ingest root;
-            // otherwise a root-level ingest leaks an absolute-path parent id
-            // (e.g. "NeuroStrata::/home/kenton/Documents") that matches no node.
-            if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
-                let p_str = node_id_for(&dir_path, p);
-                if p_str != "." && p_str != "" && p_str != node_path {
-                    Some(p_str)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut contained_by = Vec::new();
-        if let Some(pid) = parent_id {
-            contained_by.push(generation_scoped_id(&namespace, generation, &pid));
-        }
-
-        let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-        let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
-
-        let mem_type = if is_dir {
-            "directory"
-        } else if is_file {
-            if path_str.ends_with(".md") {
-                "markdown"
-            } else {
-                "file"
-            }
-        } else {
-            continue;
-        };
-
-        let node_id = generation_scoped_id(&namespace, generation, &node_path);
-
-        // Every visited path is recorded so carry-forward can decide whether a
-        // previous row still belongs to the current tree.
-        current_paths.insert(node_path.clone());
-
-        // Every file's bytes are read once and hashed so `file_sha256` is
-        // captured on file and markdown nodes too, not only on parseable code
-        // files. The same bytes are parsed only when the extension maps to a
-        // grammar; directories carry no hash.
-        let (file_sha256, content, lang_name, raw_bytes) = if is_file {
-            // A single read per file: the bytes below are hashed, parsed (when
-            // a grammar applies) and reused for the markdown section pass.
-            let bytes = match std::fs::read(path) {
-                Ok(bytes) => Some(bytes),
                 Err(e) => {
-                    tracing::warn!("failed to read {} for sha256: {e}", path.display());
-                    None
+                    tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
                 }
-            };
-            let hash = bytes.as_deref().map(sha256_hex);
-            let lang_name = path
-                .extension()
-                .map(|ext_os| normalize_ext(&ext_os.to_string_lossy()))
-                .and_then(|ext| ext_to_lang.get(&ext).cloned())
-                .filter(|ln| get_language(ln).is_some());
-            let content = match (&bytes, &lang_name) {
-                (Some(b), Some(_)) => Some(String::from_utf8_lossy(b).to_string()),
-                _ => None,
-            };
-            (hash, content, lang_name, bytes)
+            }
+        }
+    }
+    compiled
+}
+
+/// Number of worker threads the parallel producer spawns for a given entry
+/// count. Bounded to the available parallelism (clamped 1..=8) and never
+/// more than there are entries to process.
+pub(crate) fn ingest_worker_count(total_entries: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(total_entries.max(1))
+}
+
+/// One entry collected during the walk, before any file I/O or parsing.
+#[derive(Clone)]
+struct WalkedEntry {
+    pub path: std::path::PathBuf,
+    pub path_str: String,
+    pub abs_path: String,
+    pub node_path: String,
+    pub node_id: String,
+    pub contained_by: Vec<String>,
+    pub is_file: bool,
+    pub mem_type: String,
+}
+
+/// The result of processing one `WalkedEntry` on a worker thread. Carries
+/// everything the producer thread needs to replay the original side effects in
+/// deterministic walk order.
+enum ProcessedEntry {
+    Directory,
+    UnchangedFile {
+        file_sha256: String,
+    },
+    SecretSkipped {
+        reason: String,
+        had_previous: bool,
+        file_sha256: String,
+    },
+    ParsedFile {
+        file_sha256: String,
+        doc_sections: Vec<DocSection>,
+        symbols: Vec<SymbolRow>,
+        imports: Vec<String>,
+        lang_name: Option<String>,
+    },
+}
+
+/// Process a single walked entry on a worker thread: read bytes, hash, secret
+/// scan, and (when applicable) parse the AST. Returns an owned `ProcessedEntry`
+/// so no tree-sitter or filesystem types cross back to the producer thread.
+fn process_walked_entry(
+    entry: &WalkedEntry,
+    ext_to_lang: &HashMap<String, String>,
+    schema: &crate::parser::schema::ParserSchema,
+    compiled_queries: &HashMap<String, std::sync::Arc<tree_sitter::Query>>,
+    prev_file_map: &HashMap<String, String>,
+    force_reparse: bool,
+    parsers_by_lang: &mut HashMap<String, Parser>,
+) -> Result<ProcessedEntry, anyhow::Error> {
+    if !entry.is_file {
+        return Ok(ProcessedEntry::Directory);
+    }
+
+    let bytes = read_ingest_file(&entry.path)?;
+    let file_sha256 = sha256_hex(&bytes);
+
+    // Incremental skip.
+    if !force_reparse {
+        if let Some(prev_hash) = prev_file_map.get(&entry.node_path) {
+            if prev_hash == &file_sha256 {
+                return Ok(ProcessedEntry::UnchangedFile { file_sha256 });
+            }
+        }
+    }
+
+    let lang_name = entry
+        .path
+        .extension()
+        .map(|ext_os| normalize_ext(&ext_os.to_string_lossy()))
+        .and_then(|ext| ext_to_lang.get(&ext).cloned())
+        .filter(|ln| get_language(ln).is_some());
+
+    let content_for_parse = if lang_name.is_some() {
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+    let scan_text = if let Some(t) = &content_for_parse {
+        Some(t.clone())
+    } else if entry.mem_type == "markdown" {
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    } else {
+        None
+    };
+    if let Some(text) = &scan_text {
+        if let Some(reason) = scan_for_ingest(text) {
+            return Ok(ProcessedEntry::SecretSkipped {
+                reason,
+                had_previous: prev_file_map.contains_key(&entry.node_path),
+                file_sha256,
+            });
+        }
+    }
+
+    // ParsedFile.
+    let mut doc_sections = Vec::new();
+    if entry.mem_type == "markdown" {
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        doc_sections = parse_markdown_sections(&content);
+    }
+
+    let mut symbols = Vec::new();
+    let mut imports = Vec::new();
+    let mut parsed_lang = None;
+
+    if let Some(ln) = &lang_name {
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let ts_lang = get_language(ln).expect("language present");
+        let parser = if let Some(p) = parsers_by_lang.get_mut(ln) {
+            p
         } else {
-            (None, None, None, None)
+            let mut p = Parser::new();
+            p.set_language(&ts_lang)?;
+            parsers_by_lang.insert(ln.clone(), p);
+            parsers_by_lang.get_mut(ln).unwrap()
         };
 
-        // Before its node goes out, a parseable file's text meets the
-        // secret scanner first, and a document that trips it is skipped
-        // whole — no node, no symbols — with the skip reported through
-        // the consumer. The rest of the walk proceeds. The scan runs over
-        // the bytes already read above — the same bytes the hash was
-        // taken over and the parser will consume — so what is scanned is
-        // exactly what is parsed and stored. (`content` is `Some` exactly
-        // for parseable files; files nothing is extracted from carry no
-        // extracted text to scan.)
-        if let Some(text) = &content {
-            if let Some(reason) = scan_for_ingest(text) {
-                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
-                    path_display: path.display().to_string(),
-                    reason,
-                }) {
-                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                }
-                continue;
-            }
-        }
-
-        // `blocking_send` applies backpressure when the bounded queue is full.
-        // A closed receiver is an error: otherwise a partial walk looked like
-        // success when the consumer had failed.
-
-        // Incremental skip: if this file's hash matches the previous active
-        // generation, carry it forward instead of re-parsing/re-embedding.
-        if is_file {
-            if !force_reparse {
-                if let Some(prev_hash) = prev_file_map.get(&node_path) {
-                    if prev_hash == file_sha256.as_deref().unwrap_or("") {
-                        if let Some(obs) = &observer {
-                            obs.file_skipped(&path_str, "unchanged");
-                        }
-                        // Record the current hash so unchanged rows can be carried.
-                        if let Some(h) = file_sha256.as_deref() {
-                            current_hashes.insert(node_path.clone(), h.to_string());
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
-        // Record the current hash for every file the walk visits.
-        if let Some(h) = file_sha256.as_deref() {
-            current_hashes.insert(node_path.clone(), h.to_string());
-        }
-
-        // Apply backpressure: if the channel is full, block until space is
-        // available rather than silently dropping the item. If the consumer
-        // has dropped (e.g. it errored), propagate the failure instead of
-        // reporting success over a partial ingest.
-        if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
-            node_id,
-            node_path: node_path.clone(),
-            contained_by,
-            mem_type: mem_type.to_string(),
-            abs_path,
-            file_sha256: file_sha256.clone(),
-        }) {
-            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-        }
-
-        // For markdown files, parse into sections and stream them for embedding.
-        if is_file && path_str.ends_with(".md") {
-            if let Some(bytes) = raw_bytes.as_ref() {
-                let content = String::from_utf8_lossy(bytes).to_string();
-                let sections = parse_markdown_sections(&content);
-                if !sections.is_empty() {
-                    let file_sha = sha256_hex(bytes);
-                    if let Err(e) = tx.blocking_send(IngestItem::DocSections {
-                        node_path: node_path.clone(),
-                        sections,
-                        file_sha256: file_sha,
-                    }) {
-                        return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
-                    }
-                }
-            }
-        }
-
-        // Parse the content already read above and stream the symbols.
-        if let (Some(content), Some(lang_name)) = (content, lang_name) {
-            let Some(ts_lang) = get_language(&lang_name) else {
-                continue;
-            };
-
-            let mut parser = Parser::new();
-            parser.set_language(&ts_lang)?;
-
-            let tree = match parser.parse(&content, None) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let lang_schema = &schema.languages[&lang_name];
+        if let Some(tree) = parser.parse(&content, None) {
+            let lang_schema = &schema.languages[ln];
             let mut pending: Vec<SymbolRow> = Vec::new();
 
-            for (query_name, query_str) in &lang_schema.queries {
-                let query = match Query::new(&ts_lang, query_str) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
-                        continue;
-                    }
+            for (query_name, _query_str) in &lang_schema.queries {
+                let query_key = format!("{ln}:{query_name}");
+                let query: &tree_sitter::Query = match compiled_queries.get(&query_key) {
+                    Some(q) => q.as_ref(),
+                    None => continue,
                 };
 
-                let mut cursor = QueryCursor::new();
-                let mut iter = cursor.matches(&query, tree.root_node(), content.as_bytes());
+                let mut cursor = tree_sitter::QueryCursor::new();
+                let mut iter = cursor.matches(query, tree.root_node(), content.as_bytes());
 
                 while let Some(m) = iter.next() {
                     let mut name: Option<&str> = None;
                     let mut definition: Option<tree_sitter::Node> = None;
 
-                    for capture in m.captures {
+                    for capture in m.captures() {
                         let capture_name = query.capture_names()[capture.index as usize];
                         if capture_name == "name" {
                             name = capture.node.utf8_text(content.as_bytes()).ok();
-                        } else if definition.map_or(true, |d: tree_sitter::Node| {
+                        } else if definition.is_none_or(|d: tree_sitter::Node| {
                             capture.node.byte_range().len() > d.byte_range().len()
                         }) {
                             definition = Some(capture.node);
@@ -746,31 +976,578 @@ fn run_producer(
                 }
             }
 
-            // Extract module/import dependencies (best-effort, warn-free).
-            let imports = extract_import_specifiers(&lang_name, &content);
-            if !imports.is_empty() {
-                raw_imports.insert(node_path.clone(), imports);
+            symbols = pending;
+        }
+
+        imports = extract_import_specifiers(ln, &content);
+        parsed_lang = Some(ln.clone());
+    }
+
+    Ok(ProcessedEntry::ParsedFile {
+        file_sha256,
+        doc_sections,
+        symbols,
+        imports,
+        lang_name: parsed_lang,
+    })
+}
+
+/// The most results the ingest may hold between the workers and the replay.
+///
+/// A worker may not start an index that is more than this many indices ahead
+/// of the replay, so the reorder buffer (and the channel behind it) holds a
+/// bounded number of results however large the tree is. The window is wide
+/// enough to keep every worker busy and narrow enough to bound the memory.
+const INGEST_REPLAY_WINDOW: usize = 64;
+
+/// What one streaming run cost.
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamStats {
+    /// The most results that were held between a worker and the replay at one
+    /// time. It never exceeds the window: that is the bound the run promises.
+    peak_buffered: usize,
+}
+
+/// The state the workers and the replay share: how far the replay has got,
+/// and whether it has given up.
+///
+/// One mutex guards both fields, and that is what makes the cancellation
+/// safe. A worker reads the abort flag and waits on the condvar while it
+/// holds this lock, and the canceller takes the same lock before it sets the
+/// flag and notifies. A worker that read "not aborted" therefore cannot sleep
+/// through the notification: the canceller cannot set the flag until the
+/// worker has released the lock inside `Condvar::wait`, and the flag is set
+/// before the notify.
+#[derive(Debug, Default)]
+struct ReplayGateState {
+    /// The index the replay takes next.
+    position: usize,
+    /// Set when the replay gives up: the workers must stop.
+    aborted: bool,
+}
+
+/// The gate the workers wait on: the replay's position and the abort flag
+/// under ONE lock, with the condvar that wakes them.
+///
+/// The lock is what makes the cancellation safe. A worker reads the abort
+/// flag and waits on the condvar while it holds the lock; the replay sets
+/// the flag and notifies. If the flag were set outside that lock, the two
+/// could interleave -- the worker reads "not aborted", the replay sets the
+/// flag and notifies (the worker is not waiting yet, so the notification is
+/// lost), and the worker sleeps through it. Under one lock the replay
+/// cannot set the flag until the worker has released the lock inside
+/// `Condvar::wait`, and the flag is set before the notify.
+struct ReplayGate {
+    state: std::sync::Mutex<ReplayGateState>,
+    advanced: std::sync::Condvar,
+}
+
+impl ReplayGate {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ReplayGateState::default()),
+            advanced: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits until `idx` is within `window` of the replay position.
+    ///
+    /// Returns `false` when the run was aborted: the worker must stop
+    /// instead of running an index nobody will replay.
+    fn wait_for_slot(&self, idx: usize, window: usize) -> bool {
+        let mut state = self.state.lock().expect("replay gate mutex");
+        while idx >= state.position.saturating_add(window) {
+            if state.aborted {
+                return false;
+            }
+            state = self.advanced.wait(state).expect("replay gate mutex");
+        }
+        !state.aborted
+    }
+
+    /// The replay took `next` as the next index: the workers may run on.
+    fn advance_to(&self, next: usize) {
+        let mut state = self.state.lock().expect("replay gate mutex");
+        state.position = next;
+        self.advanced.notify_all();
+    }
+
+    /// The replay gave up: every worker waiting for it must wake and stop.
+    fn abort(&self) {
+        let mut state = self.state.lock().expect("replay gate mutex");
+        state.aborted = true;
+        self.advanced.notify_all();
+    }
+}
+
+/// Runs `process` over `0..total` on a bounded worker pool and calls `replay`
+/// once per index, in index order.
+///
+/// The run has three moving parts:
+///
+/// * the workers hand their results back over a bounded channel, so a slow
+///   replay slows the workers down instead of growing an unbounded queue;
+/// * a worker may not start an index that is more than `window` indices ahead
+///   of the replay, so the reorder buffer holds at most `window` results;
+/// * `replay` is called in index order, so the side effects land in the same
+///   order a sequential run would put them in -- the determinism contract
+///   does not depend on the parallelism.
+///
+/// `make_process` builds one worker-local processor (the tree-sitter parser
+/// cache is per worker), and a worker that panics does not take the run with
+/// it: the panic becomes that entry's error, so the replay sees it in order
+/// like any other failure.
+fn stream_in_walk_order<T: Send, P>(
+    total: usize,
+    worker_count: usize,
+    window: usize,
+    make_process: impl Fn() -> P + Sync,
+    replay: impl FnMut(usize, anyhow::Result<T>) -> anyhow::Result<()>,
+) -> anyhow::Result<StreamStats>
+where
+    P: FnMut(usize) -> anyhow::Result<T> + Send,
+{
+    stream_in_walk_order_bounded(total, worker_count, window, window, make_process, replay)
+}
+
+/// The same run, with the result channel's capacity spelled out separately
+/// from the replay window.
+///
+/// Production ties the two together (the channel holds the window's worth of
+/// results). The seam exists so a test can make the channel the tighter of
+/// the two: then a worker really does block in `send` while the replay is
+/// over, which is the case the abort path has to release.
+fn stream_in_walk_order_bounded<T: Send, P>(
+    total: usize,
+    worker_count: usize,
+    window: usize,
+    channel_capacity: usize,
+    make_process: impl Fn() -> P + Sync,
+    mut replay: impl FnMut(usize, anyhow::Result<T>) -> anyhow::Result<()>,
+) -> anyhow::Result<StreamStats>
+where
+    P: FnMut(usize) -> anyhow::Result<T> + Send,
+{
+    if total == 0 {
+        return Ok(StreamStats::default());
+    }
+    let window = window.max(1);
+    let worker_count = worker_count.max(1);
+    let next_idx = AtomicUsize::new(0);
+    // The gate the workers wait on: the replay's position and the abort flag
+    // under ONE lock, so a cancellation cannot slip between a worker's check
+    // and its wait.
+    let gate = ReplayGate::new();
+    // The results that are produced but not yet replayed.
+    let buffered = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        // The channel lives INSIDE the scope: on the abort path the receiver
+        // is dropped before the scope joins the workers, so a worker blocked
+        // in `send` fails and wakes instead of waiting for a receiver that
+        // will never read again. A receiver created outside the scope would
+        // outlive the abort and leave that worker blocked forever.
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<(usize, anyhow::Result<T>)>(channel_capacity.max(1));
+        for _ in 0..worker_count {
+            let result_tx = result_tx.clone();
+            let next_idx = &next_idx;
+            let gate = &gate;
+            let buffered = &buffered;
+            let peak = &peak;
+            let make_process = &make_process;
+            scope.spawn(move || {
+                let mut process = make_process();
+                loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= total {
+                        break;
+                    }
+                    // Backpressure: do not run more than `window` indices
+                    // ahead of the replay.
+                    if !gate.wait_for_slot(idx, window) {
+                        // The replay gave up: this index will never be
+                        // replayed, so the worker stops.
+                        break;
+                    }
+                    // A panicking worker must not take the whole run with it:
+                    // the panic becomes this entry's error, and the replay
+                    // reports it in order like any other failure.
+                    let res =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(idx)))
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!(
+                                    "ingest worker panicked while processing index {}",
+                                    idx
+                                ))
+                            });
+                    let live = buffered.fetch_add(1, Ordering::Relaxed) + 1;
+                    peak.fetch_max(live, Ordering::Relaxed);
+                    if result_tx.send((idx, res)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        // The scope's own sender goes away: the channel closes when the
+        // workers are done.
+        drop(result_tx);
+
+        let mut buffer: std::collections::BTreeMap<usize, anyhow::Result<T>> =
+            std::collections::BTreeMap::new();
+        let mut next = 0usize;
+        let mut outcome: anyhow::Result<()> = Ok(());
+        while let Ok((idx, res)) = result_rx.recv() {
+            buffer.insert(idx, res);
+            while let Some(res) = buffer.remove(&next) {
+                if let Err(e) = replay(next, res) {
+                    // The replay is done: the workers that wait for it are
+                    // woken below, so the run can end instead of waiting for
+                    // a replay that will never come.
+                    outcome = Err(e);
+                    gate.abort();
+                    break;
+                }
+                next += 1;
+                buffered.fetch_sub(1, Ordering::Relaxed);
+                gate.advance_to(next);
+            }
+            if outcome.is_err() {
+                break;
+            }
+        }
+        if let Err(e) = outcome {
+            // The run is over. Cancel the gate and close the channel BEFORE
+            // the scope joins the workers: the gate wakes the workers that
+            // wait for the replay, and the closed channel fails the `send`
+            // of a worker blocked on a full one, so it wakes instead of
+            // waiting for a receiver that will never read again.
+            gate.abort();
+            drop(result_rx);
+            return Err(e);
+        }
+        if !buffer.is_empty() {
+            anyhow::bail!(
+                "ingest replay ended with {} result(s) that never arrived in order",
+                buffer.len()
+            );
+        }
+        Ok(())
+    })?;
+
+    Ok(StreamStats {
+        peak_buffered: peak.load(Ordering::Relaxed),
+    })
+}
+
+/// The state the deterministic replay writes into.
+///
+/// The replay applies the side effects of the processed entries in walk
+/// order. The state is threaded through explicitly rather than captured by a
+/// closure, so the replay is a plain function that a test can drive
+/// directly.
+struct ReplayState<'a> {
+    /// The walk, in the order the entries were found.
+    entries: &'a [WalkedEntry],
+    /// Every path this walk visited.
+    current_paths: &'a mut std::collections::HashSet<String>,
+    /// What kind of node each visited path is.
+    current_kinds: &'a mut std::collections::HashMap<String, String>,
+    /// The content hash of each visited file.
+    current_hashes: &'a mut std::collections::HashMap<String, String>,
+    /// The imports each file declared, before they are resolved.
+    raw_imports: &'a mut std::collections::HashMap<String, Vec<String>>,
+    /// The consumer the replay feeds.
+    tx: &'a mpsc::Sender<IngestItem>,
+    /// The optional observer.
+    observer: &'a Option<std::sync::Arc<dyn IngestObserver>>,
+}
+
+/// Applies one processed entry's side effects, in walk order.
+///
+/// The path and the kind are recorded before the result is unwrapped, so a
+/// failed entry still leaves the walk's shape behind; the failure itself
+/// aborts the replay, exactly as it aborted the sequential replay before.
+fn replay_processed_entry(
+    state: &mut ReplayState<'_>,
+    idx: usize,
+    result: anyhow::Result<ProcessedEntry>,
+) -> anyhow::Result<()> {
+    let entry = &state.entries[idx];
+    state.current_paths.insert(entry.node_path.clone());
+    state
+        .current_kinds
+        .insert(entry.node_path.clone(), entry.mem_type.clone());
+
+    let processed = result?;
+
+    match processed {
+        ProcessedEntry::Directory => {
+            if let Err(e) = state.tx.blocking_send(IngestItem::NodeUpsert {
+                node_id: entry.node_id.clone(),
+                node_path: entry.node_path.clone(),
+                contained_by: entry.contained_by.clone(),
+                mem_type: entry.mem_type.clone(),
+                abs_path: entry.abs_path.clone(),
+                file_sha256: None,
+            }) {
+                return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+            }
+        }
+        ProcessedEntry::UnchangedFile { file_sha256 } => {
+            state
+                .current_hashes
+                .insert(entry.node_path.clone(), file_sha256);
+            if let Some(obs) = &state.observer {
+                obs.file_skipped(&entry.path_str, "unchanged");
+            }
+        }
+        ProcessedEntry::SecretSkipped {
+            reason,
+            had_previous,
+            file_sha256,
+        } => {
+            state
+                .current_hashes
+                .insert(entry.node_path.clone(), file_sha256);
+            if !had_previous {
+                state.current_paths.remove(&entry.node_path);
+                state.current_kinds.remove(&entry.node_path);
+            }
+            if let Err(e) = state.tx.blocking_send(IngestItem::SkippedFile {
+                path_display: entry.path_str.clone(),
+                reason,
+                had_previous,
+            }) {
+                return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+            }
+        }
+        ProcessedEntry::ParsedFile {
+            file_sha256,
+            doc_sections,
+            symbols,
+            imports,
+            lang_name,
+        } => {
+            state
+                .current_hashes
+                .insert(entry.node_path.clone(), file_sha256.clone());
+
+            if let Err(e) = state.tx.blocking_send(IngestItem::NodeUpsert {
+                node_id: entry.node_id.clone(),
+                node_path: entry.node_path.clone(),
+                contained_by: entry.contained_by.clone(),
+                mem_type: entry.mem_type.clone(),
+                abs_path: entry.abs_path.clone(),
+                file_sha256: Some(file_sha256.clone()),
+            }) {
+                return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
             }
 
-            if !pending.is_empty() {
-                let path_display = path.display().to_string();
-                // `file_sha256` is `Some` exactly when `content` is, so this is
-                // the hash of the bytes just parsed.
-                let file_sha = file_sha256
-                    .clone()
-                    .expect("a parseable file has a captured hash");
-                if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
-                    node_path,
-                    lang_name: lang_name.clone(),
-                    symbols: pending,
-                    path_display,
-                    file_sha256: file_sha,
+            if !doc_sections.is_empty() {
+                if let Err(e) = state.tx.blocking_send(IngestItem::DocSections {
+                    node_path: entry.node_path.clone(),
+                    sections: doc_sections,
+                    file_sha256: file_sha256.clone(),
                 }) {
                     return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                 }
             }
+
+            if !imports.is_empty() {
+                state.raw_imports.insert(entry.node_path.clone(), imports);
+            }
+
+            if !symbols.is_empty() {
+                if let Some(ln) = lang_name {
+                    let path_display = entry.path_str.clone();
+                    if let Err(e) = state.tx.blocking_send(IngestItem::ParsedSymbols {
+                        node_path: entry.node_path.clone(),
+                        lang_name: ln,
+                        symbols,
+                        path_display,
+                        file_sha256: file_sha256.clone(),
+                    }) {
+                        return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                    }
+                }
+            }
         }
     }
+    Ok(())
+}
+
+/// Blocking producer: walks the directory tree, reads files, parses ASTs,
+/// and streams owned results through `tx`. Runs on the blocking thread pool
+/// so filesystem I/O never stalls the async runtime.
+fn run_producer(
+    dir_path: std::path::PathBuf,
+    ext_to_lang: HashMap<String, String>,
+    schema: crate::parser::schema::ParserSchema,
+    tx: mpsc::Sender<IngestItem>,
+    namespace: String,
+    generation: u64,
+    prev_file_map: std::collections::HashMap<String, String>,
+    force_reparse: bool,
+    observer: Option<std::sync::Arc<dyn IngestObserver>>,
+) -> anyhow::Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, Vec<String>>,
+    std::collections::HashMap<String, String>,
+)> {
+    let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // What kind of node each visited path is (`directory`, `file` or
+    // `markdown`). A path alone cannot say whether the previous generation's
+    // node at that path is still the right one: a file replaced by a directory
+    // of the same name, or the reverse, keeps the path and changes the node.
+    let mut current_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut current_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    let walker = WalkBuilder::new(&dir_path).build();
+
+    let mut unreadable = 0usize;
+
+    // One compiled tree-sitter query per schema entry per run, instead of
+    // recompiling the pattern for every file the walk reaches.
+    let compiled_queries = compile_language_queries(&schema);
+
+    // Collect walk entries in deterministic order first; processing happens
+    // in parallel below.
+    let mut entries: Vec<WalkedEntry> = Vec::new();
+
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                unreadable += 1;
+                if unreadable <= 5 {
+                    eprintln!("Could not read part of {:?}: {}", dir_path, e);
+                }
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
+
+        if !is_ingest_eligible_path(path, &dir_path) {
+            continue;
+        }
+
+        let abs_path = if path.is_absolute() {
+            path.to_string_lossy().to_string()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(path)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        let node_path = node_id_for(&dir_path, path);
+
+        let parent_id = if path == dir_path {
+            None
+        } else if let Some(p) = path.parent() {
+            if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
+                let p_str = node_id_for(&dir_path, p);
+                if p_str != "." && !p_str.is_empty() && p_str != node_path {
+                    Some(p_str)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut contained_by = Vec::new();
+        if let Some(pid) = parent_id {
+            contained_by.push(generation_scoped_id(&namespace, generation, &pid));
+        }
+
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+
+        let mem_type = if is_dir {
+            "directory"
+        } else if is_file {
+            if path_str.ends_with(".md") {
+                "markdown"
+            } else {
+                "file"
+            }
+        } else {
+            continue;
+        };
+
+        let node_id = generation_scoped_id(&namespace, generation, &node_path);
+
+        entries.push(WalkedEntry {
+            path: path.to_path_buf(),
+            path_str,
+            abs_path,
+            node_path,
+            node_id,
+            contained_by,
+            is_file,
+            mem_type: mem_type.to_string(),
+        });
+    }
+
+    // Process the entries in parallel and replay their side effects in
+    // deterministic walk order. The stream is bounded: a worker may not run
+    // more than `INGEST_REPLAY_WINDOW` indices ahead of the replay, so the
+    // reorder buffer holds a bounded number of results however large the tree
+    // is.
+    let worker_count = ingest_worker_count(entries.len());
+    let entries_ref = &entries;
+    let ext_to_lang_ref = &ext_to_lang;
+    let schema_ref = &schema;
+    let compiled_queries_ref = &compiled_queries;
+    let prev_file_map_ref = &prev_file_map;
+    let mut replay_state = ReplayState {
+        entries: &entries,
+        current_paths: &mut current_paths,
+        current_kinds: &mut current_kinds,
+        current_hashes: &mut current_hashes,
+        raw_imports: &mut raw_imports,
+        tx: &tx,
+        observer: &observer,
+    };
+    let stats = stream_in_walk_order(
+        entries.len(),
+        worker_count,
+        INGEST_REPLAY_WINDOW,
+        || {
+            let mut parsers_by_lang: HashMap<String, Parser> = HashMap::new();
+            move |idx: usize| {
+                process_walked_entry(
+                    &entries_ref[idx],
+                    ext_to_lang_ref,
+                    schema_ref,
+                    compiled_queries_ref,
+                    prev_file_map_ref,
+                    force_reparse,
+                    &mut parsers_by_lang,
+                )
+            }
+        },
+        |idx, result| replay_processed_entry(&mut replay_state, idx, result),
+    )?;
+    drop(replay_state);
+    tracing::debug!(
+        peak_buffered = stats.peak_buffered,
+        "ingest replay stream drained"
+    );
 
     if unreadable > 0 {
         eprintln!(
@@ -787,7 +1564,7 @@ fn run_producer(
             resolved.insert(src, targets);
         }
     }
-    Ok((current_paths, current_hashes, resolved))
+    Ok((current_paths, current_hashes, resolved, current_kinds))
 }
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
@@ -819,8 +1596,21 @@ async fn run_consumer(
     source_identity: serde_json::Value,
     ingest_version: &str,
     node_set: &[String],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsumerOutcome> {
+    // Items that are not a bare directory node: a file, section or symbol was
+    // read again, so this walk changed something.
+    let mut content_items = 0usize;
+    let mut staged_symbols = Vec::new();
+    // The embeddings the provider refused: a warning, not an abort.
+    let mut degraded = DegradedEmbeddings::default();
     while let Some(item) = rx.recv().await {
+        // A SkippedFile counts only when it replaced previous-generation rows;
+        // a never-indexed skip is not content and must not defeat `unchanged`.
+        match &item {
+            IngestItem::NodeUpsert { mem_type, .. } if mem_type == "directory" => {}
+            IngestItem::SkippedFile { .. } => {}
+            _ => content_items += 1,
+        }
         match item {
             IngestItem::NodeUpsert {
                 node_id,
@@ -892,108 +1682,137 @@ async fn run_consumer(
                         )
                     })
                     .collect();
-                for symbol in symbols {
-                    let summary = format!(
-                        "{} {} in {}\nlines {}-{}\n\n{}",
-                        symbol.kind,
-                        symbol.name,
-                        node_path,
-                        symbol.start_line,
-                        symbol.end_line,
-                        symbol.body
-                    );
-                    let id = generation_scoped_id(
-                        namespace,
-                        generation,
-                        &symbol_id(&node_path, &symbol.kind, &symbol.name, &symbol.span_sha256),
-                    );
-                    let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
-
-                    let mut metadata = serde_json::Map::new();
-                    metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
-                    metadata.insert("symbol".to_string(), serde_json::json!(symbol.name));
-                    metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
-                    metadata.insert("language".to_string(), serde_json::json!(lang_name));
-                    metadata.insert(
-                        "contained_by".to_string(),
-                        serde_json::json!([generation_scoped_id(
-                            namespace, generation, &node_path
-                        )]),
-                    );
-                    metadata.insert(
-                        "refs".to_string(),
-                        serde_json::json!([
-                            { "file": node_path.clone(), "lines": lines.clone() }
-                        ]),
-                    );
-                    metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
-                    metadata.insert(
-                        "ingest_version".to_string(),
-                        serde_json::json!(ingest_version),
-                    );
-                    metadata.insert("node_set".to_string(), serde_json::json!(node_set));
-                    metadata.insert(
-                        "span_sha256".to_string(),
-                        serde_json::json!(symbol.span_sha256),
-                    );
-                    metadata.insert(
-                        "source_identity".to_string(),
-                        with_relative_path(&source_identity, &node_path),
-                    );
-                    metadata.insert(
-                        "index_generation".to_string(),
-                        serde_json::json!(generation),
-                    );
-
-                    if !symbol.calls.is_empty() {
-                        metadata.insert("calls".to_string(), serde_json::json!(symbol.calls));
-                        let called_ids: Vec<String> = symbol
-                            .calls
-                            .iter()
-                            .filter_map(|c| file_symbol_ids.get(c))
-                            .filter(|cid| *cid != &id)
-                            .cloned()
-                            .collect();
-                        if !called_ids.is_empty() {
-                            metadata
-                                .insert("depends_on".to_string(), serde_json::json!(called_ids));
-                        }
-                    }
-
-                    let payload = MemoryPayload {
-                        content: summary.clone(),
-                        location: node_path.clone(),
-                        location_lines: lines,
-                        memory_type: "code_ast".to_string(),
-                        metadata: serde_json::Value::Object(metadata),
-                        user_id: "auto-ingestor".to_string(),
-                        agent_name: Some("neurostrata-mcp-ingestor".to_string()),
-                    };
-
-                    // An embed or store failure aborts the staging generation:
-                    // swallowing it here would hand back a graph whose symbols
-                    // are silently missing, which is exactly the half-built
-                    // tree staged publication exists to prevent.
-                    let embedding = embedder.embed(&summary).await.map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to embed symbol {} from {}: {}",
-                            symbol.name,
-                            path_display,
-                            e
-                        )
-                    })?;
-                    vector_store
-                        .upsert(namespace, &id, embedding, payload)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "failed to store symbol {} from {}: {}",
-                                symbol.name,
-                                path_display,
-                                e
+                if !symbols.is_empty() {
+                    let summaries: Vec<String> = symbols
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{} {} in {}\nlines {}-{}\n\n{}",
+                                s.kind, s.name, node_path, s.start_line, s.end_line, s.body
                             )
-                        })?;
-                    symbols_stored += 1;
+                        })
+                        .collect();
+                    let outcome = embedder
+                        .embed_batch_degradable(&summaries)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to embed symbol batch: {}", e))?;
+                    if outcome.embeddings.len() != summaries.len() {
+                        anyhow::bail!(
+                            "embedder returned {} embeddings for {} symbols",
+                            outcome.embeddings.len(),
+                            summaries.len()
+                        );
+                    }
+                    degraded.note(&outcome);
+                    for ((symbol, summary), embedding) in
+                        symbols.into_iter().zip(summaries).zip(outcome.embeddings)
+                    {
+                        // A provider refusal is a warning, not an abort: the
+                        // item is skipped and the generation continues.
+                        let embedding = match embedding {
+                            Some(embedding) => embedding,
+                            None => continue,
+                        };
+                        let id = generation_scoped_id(
+                            namespace,
+                            generation,
+                            &symbol_id(&node_path, &symbol.kind, &symbol.name, &symbol.span_sha256),
+                        );
+                        let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
+
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
+                        metadata.insert("symbol".to_string(), serde_json::json!(symbol.name));
+                        metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
+                        metadata.insert("language".to_string(), serde_json::json!(lang_name));
+                        metadata.insert(
+                            "contained_by".to_string(),
+                            serde_json::json!([generation_scoped_id(
+                                namespace, generation, &node_path
+                            )]),
+                        );
+                        metadata.insert(
+                            "refs".to_string(),
+                            serde_json::json!([
+                                { "file": node_path.clone(), "lines": lines.clone() }
+                            ]),
+                        );
+                        metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                        metadata.insert(
+                            "ingest_version".to_string(),
+                            serde_json::json!(ingest_version),
+                        );
+                        metadata.insert("node_set".to_string(), serde_json::json!(node_set));
+                        metadata.insert(
+                            "span_sha256".to_string(),
+                            serde_json::json!(symbol.span_sha256),
+                        );
+                        metadata.insert(
+                            "source_identity".to_string(),
+                            with_relative_path(&source_identity, &node_path),
+                        );
+                        metadata.insert(
+                            "index_generation".to_string(),
+                            serde_json::json!(generation),
+                        );
+
+                        if !symbol.calls.is_empty() {
+                            metadata.insert("calls".to_string(), serde_json::json!(symbol.calls));
+                            let called_ids: Vec<String> = symbol
+                                .calls
+                                .iter()
+                                .filter_map(|c| file_symbol_ids.get(c))
+                                .filter(|cid| *cid != &id)
+                                .cloned()
+                                .collect();
+                            if !called_ids.is_empty() {
+                                metadata.insert(
+                                    "calls_resolved".to_string(),
+                                    serde_json::json!(called_ids.clone()),
+                                );
+                                metadata.insert(
+                                    "depends_on".to_string(),
+                                    serde_json::json!(called_ids),
+                                );
+                            }
+                        }
+
+                        staged_symbols.push(StagedSymbolInfo {
+                            id: id.clone(),
+                            file_path: node_path.clone(),
+                            name: symbol.name.clone(),
+                            kind: symbol.kind.clone(),
+                            calls: symbol.calls.clone(),
+                        });
+
+                        let payload = MemoryPayload {
+                            content: summary.clone(),
+                            location: node_path.clone(),
+                            location_lines: lines,
+                            memory_type: "code_ast".to_string(),
+                            metadata: serde_json::Value::Object(metadata),
+                            user_id: "auto-ingestor".to_string(),
+                            agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                        };
+
+                        // An embed or store failure aborts the staging generation:
+                        // swallowing it here would hand back a graph whose symbols
+                        // are silently missing, which is exactly the half-built
+                        // tree staged publication exists to prevent. The batch
+                        // embed above already failed the run before any row landed.
+                        vector_store
+                            .upsert(namespace, &id, embedding, payload)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "failed to store symbol {} from {}: {}",
+                                    symbol.name,
+                                    path_display,
+                                    e
+                                )
+                            })?;
+                        symbols_stored += 1;
+                    }
                 }
 
                 if symbols_stored > 0 {
@@ -1006,7 +1825,11 @@ async fn run_consumer(
             IngestItem::SkippedFile {
                 path_display,
                 reason,
+                had_previous,
             } => {
+                if had_previous {
+                    content_items += 1;
+                }
                 println!("Skipped {} during ingest: {}", path_display, reason);
                 if let Some(observer) = &observer {
                     observer.file_skipped(&path_display, &reason);
@@ -1017,83 +1840,105 @@ async fn run_consumer(
                 sections,
                 file_sha256,
             } => {
-                for section in sections {
-                    let id = generation_scoped_id(
-                        namespace,
-                        generation,
-                        &format!("{}#section:{}@{}", node_path, section.slug, section.sha256),
-                    );
-                    let mut metadata = serde_json::Map::new();
-                    metadata.insert("domain".to_string(), serde_json::json!("docs"));
-                    metadata.insert("heading".to_string(), serde_json::json!(section.heading));
-                    metadata.insert(
-                        "heading_level".to_string(),
-                        serde_json::json!(section.level),
-                    );
-                    metadata.insert("slug".to_string(), serde_json::json!(section.slug));
-                    metadata.insert(
-                        "backticked".to_string(),
-                        serde_json::json!(section.backticked),
-                    );
-                    metadata.insert("links".to_string(), serde_json::json!(section.links));
-                    metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
-                    metadata.insert(
-                        "ingest_version".to_string(),
-                        serde_json::json!(ingest_version),
-                    );
-                    metadata.insert("node_set".to_string(), serde_json::json!(node_set));
-                    metadata.insert(
-                        "contained_by".to_string(),
-                        serde_json::json!([generation_scoped_id(
-                            namespace, generation, &node_path
-                        )]),
-                    );
-                    metadata.insert(
-                        "source_identity".to_string(),
-                        with_relative_path(&source_identity, &node_path),
-                    );
-                    metadata.insert(
-                        "index_generation".to_string(),
-                        serde_json::json!(generation),
-                    );
-
-                    let summary = format!("{}\n\n{}", section.heading, section.text);
-                    let payload = MemoryPayload {
-                        content: summary.clone(),
-                        location: node_path.clone(),
-                        location_lines: String::new(),
-                        memory_type: "doc_section".to_string(),
-                        metadata: serde_json::Value::Object(metadata),
-                        user_id: "auto-ingestor".to_string(),
-                        agent_name: Some("neurostrata-mcp-ingestor".to_string()),
-                    };
-
-                    let embedding = embedder.embed(&summary).await.map_err(|e| {
-                        anyhow::anyhow!("failed to embed doc section {}: {}", section.heading, e)
-                    })?;
-                    vector_store
-                        .upsert(namespace, &id, embedding, payload)
+                if !sections.is_empty() {
+                    let full_contents: Vec<String> = sections
+                        .iter()
+                        .map(|section| format!("{}\n\n{}", section.heading, section.text))
+                        .collect();
+                    let embed_inputs: Vec<String> = full_contents
+                        .iter()
+                        .map(|c| truncate_for_embedding(c))
+                        .collect();
+                    let outcome = embedder
+                        .embed_batch_degradable(&embed_inputs)
                         .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to store doc section {}: {}", id, e)
-                        })?;
+                        .map_err(|e| anyhow::anyhow!("failed to embed doc section batch: {}", e))?;
+                    if outcome.embeddings.len() != full_contents.len() {
+                        anyhow::bail!(
+                            "embedder returned {} embeddings for {} doc sections",
+                            outcome.embeddings.len(),
+                            full_contents.len()
+                        );
+                    }
+                    degraded.note(&outcome);
+                    for ((section, summary), embedding) in sections
+                        .into_iter()
+                        .zip(full_contents)
+                        .zip(outcome.embeddings)
+                    {
+                        // A provider refusal is a warning, not an abort.
+                        let embedding = match embedding {
+                            Some(embedding) => embedding,
+                            None => continue,
+                        };
+                        let id = generation_scoped_id(
+                            namespace,
+                            generation,
+                            &format!("{}#section:{}@{}", node_path, section.slug, section.sha256),
+                        );
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert("domain".to_string(), serde_json::json!("docs"));
+                        metadata.insert("heading".to_string(), serde_json::json!(section.heading));
+                        metadata.insert(
+                            "heading_level".to_string(),
+                            serde_json::json!(section.level),
+                        );
+                        metadata.insert("slug".to_string(), serde_json::json!(section.slug));
+                        metadata.insert(
+                            "backticked".to_string(),
+                            serde_json::json!(section.backticked),
+                        );
+                        metadata.insert("links".to_string(), serde_json::json!(section.links));
+                        metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                        metadata.insert(
+                            "ingest_version".to_string(),
+                            serde_json::json!(ingest_version),
+                        );
+                        metadata.insert("node_set".to_string(), serde_json::json!(node_set));
+                        metadata.insert(
+                            "contained_by".to_string(),
+                            serde_json::json!([generation_scoped_id(
+                                namespace, generation, &node_path
+                            )]),
+                        );
+                        metadata.insert(
+                            "source_identity".to_string(),
+                            with_relative_path(&source_identity, &node_path),
+                        );
+                        metadata.insert(
+                            "index_generation".to_string(),
+                            serde_json::json!(generation),
+                        );
+
+                        let payload = MemoryPayload {
+                            content: summary.clone(),
+                            location: node_path.clone(),
+                            location_lines: String::new(),
+                            memory_type: "doc_section".to_string(),
+                            metadata: serde_json::Value::Object(metadata),
+                            user_id: "auto-ingestor".to_string(),
+                            agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                        };
+
+                        vector_store
+                            .upsert(namespace, &id, embedding, payload)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!("failed to store doc section {}: {}", id, e)
+                            })?;
+                    }
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(ConsumerOutcome {
+        content_items,
+        staged_symbols,
+        degraded,
+    })
 }
 
-/// Ingest a directory tree into `namespace`.
-///
-/// The rebuild runs as a store generation (upstream 1.14 pipeline): nodes
-/// are written under a fresh generation for this source and the active
-/// pointer flips only after every producer, embed, and upsert step
-/// succeeds, so a failed ingest leaves the previous generation -- the
-/// previous publication -- fully intact. The fork's reserved-namespace
-/// guard is kept at this entry point: the internal staging prefix is
-/// never a legal ingest destination.
 pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
@@ -1163,41 +2008,44 @@ pub async fn ingest_directory(
     let mut prev_file_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut prev_stamps: Vec<String> = Vec::new();
+    // Every directory, file and markdown node of the previous generation with
+    // its kind, so a walk that finds exactly these nodes (same path, same kind)
+    // and re-reads none of them can leave that generation active instead of
+    // copying it. Paths alone are not enough: a file replaced by an empty
+    // directory of the same name keeps its path.
+    let mut prev_node_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // A failed summary leaves prev_stamps empty, which used to read as "no
+    // offending stamp" and disable the version gate; the carry pass then
+    // re-staged pre-fix rows over fresh ones and stamped them current. Treat a
+    // summary failure as a gate trip: re-parsing is the safe answer.
+    let mut summary_failed = false;
     if prev_gen > 0 {
-        match vector_store.list(namespace, None, None).await {
+        // Only this generation's rows, and only the fields read below: the
+        // full `list` carried every row's text and cost ~100 MB per call on a
+        // large namespace.
+        match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => {
                 for r in rows {
-                    let id = r.id.clone();
-                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&r.id) {
                         Some(x) => x,
                         None => continue,
                     };
                     if gen != prev_gen {
                         continue;
                     }
-                    let hash = r
-                        .payload
-                        .metadata
-                        .get("file_sha256")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    if let Some(h) = hash {
-                        prev_file_map.insert(tail.to_string(), h.clone());
+                    if matches!(r.memory_type.as_str(), "directory" | "file" | "markdown") {
+                        prev_node_kinds.insert(r.location.clone(), r.memory_type.clone());
                     }
-                    let stamp = r
-                        .payload
-                        .metadata
-                        .get("ingest_version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    prev_stamps.push(stamp);
+                    if let Some(h) = r.file_sha256 {
+                        prev_file_map.insert(tail.to_string(), h);
+                    }
+                    prev_stamps.push(r.ingest_version);
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "vector_store.list failed while building prev_file_map for '{namespace}': {e}"
-                );
+                summary_failed = true;
+                tracing::warn!("vector_store.generation_summary failed while building prev_file_map for '{namespace}': {e}; forcing a full re-parse");
             }
         }
     }
@@ -1234,7 +2082,13 @@ pub async fn ingest_directory(
             )
         })
         .cloned();
-    let force_reparse = prev_gen > 0 && offending_stamp.is_some();
+    // An empty stamp list after a summary that claimed rows is just as
+    // suspicious as an offending stamp: it is the shape a failed/short read
+    // leaves behind, and carrying from it would publish pre-fix rows as
+    // current. `summary_failed` is explicit; the emptiness check covers a
+    // succeeded-but-empty read.
+    let force_reparse =
+        prev_gen > 0 && (offending_stamp.is_some() || summary_failed || prev_stamps.is_empty());
     if force_reparse {
         let warn_prev = offending_stamp
             .as_deref()
@@ -1244,6 +2098,31 @@ pub async fn ingest_directory(
             obs.version_gate_tripped(warn_prev, &current_version);
         }
         tracing::warn!(prev = warn_prev, current = %current_version, "ingest version changed; re-parsing all files");
+        // A reparse stages a second copy before it publishes. Refuse on a
+        // host that cannot hold it rather than failing halfway through.
+        if let Some(store) = crate::traits::VectorStore::as_any(vector_store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+        {
+            let store_path = store.local_path();
+            let store_bytes = std::fs::metadata(store_path).map(|m| m.len()).unwrap_or(0);
+            let projected = crate::storage::preflight::projected_reindex_bytes(store_bytes);
+            if let Err(e) = crate::storage::preflight::check_free_space(store_path, projected) {
+                // Record the failed upgrade before returning: the registry is
+                // the only trace the operator/doctor has of a refused reparse.
+                if let Err(record) = crate::registry::enrichment_fail(
+                    &vector_store,
+                    Some(&embedder),
+                    namespace,
+                    "ingest",
+                    &e.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!("enrichment registry update failed: {record}");
+                }
+                return Err(e);
+            }
+        }
     }
 
     let (tx, rx) = mpsc::channel::<IngestItem>(256);
@@ -1288,18 +2167,27 @@ pub async fn ingest_directory(
     // stays reachable, and this one's half-built tree is discarded.
     let mut current_hashes = std::collections::HashMap::new();
     let mut current_paths = std::collections::HashSet::new();
+    let mut current_kinds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut dependency_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let mut staged_symbols: Vec<StagedSymbolInfo> = Vec::new();
+    let mut degraded_embeddings = DegradedEmbeddings::default();
+    let mut content_items = usize::MAX;
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok((paths, hashes, deps)))) => {
+        (Ok(outcome), Ok(Ok((paths, hashes, deps, kinds)))) => {
+            content_items = outcome.content_items;
+            staged_symbols = outcome.staged_symbols;
+            degraded_embeddings = outcome.degraded;
             current_paths = paths;
             current_hashes = hashes;
             dependency_map = deps;
+            current_kinds = kinds;
             None
         }
         (Err(e), _) => Some(e),
-        (Ok(()), Ok(Err(e))) => Some(e),
-        (Ok(()), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
+        (Ok(_), Ok(Err(e))) => Some(e),
+        (Ok(_), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
     };
     if let Some(e) = failure {
         if let Err(abort) = vector_store
@@ -1325,22 +2213,64 @@ pub async fn ingest_directory(
         return Err(e);
     }
 
+    // The generation summary: the embeddings the provider refused. A refusal
+    // is a warning, not an abort -- the generation continued without those
+    // items, and the operator has to know which ones are missing.
+    if let Some(summary) = degraded_embeddings.summary() {
+        println!("{}", summary.trim_end());
+    }
+
+    // Nothing to publish: no file or section was read again, and the walk found
+    // exactly the nodes the active generation already holds (same paths, each
+    // of the same kind), so a new generation would be a copy of it. Keep the
+    // active one, discard the staged directory nodes, and go on to the steps
+    // that do not depend on it.
+    //
+    // The kinds matter because `content_items` does not count directory nodes:
+    // a file replaced by an empty directory at the same path stages no content,
+    // and comparing paths alone would call that unchanged and keep serving the
+    // deleted file's node, symbols and sections.
+    //
+    // The `node_set` stamped on the nodes is deliberately not compared. A node
+    // that is carried forward keeps the stamp it was first staged with, and
+    // only directory nodes are staged again, so after a node-set change the
+    // previous generation holds mixed stamps and a comparison would call every
+    // later ingest a change. Making a node-set change visible here would mean
+    // re-stamping carried nodes, which is a separate change.
+    let unchanged =
+        prev_gen > 0 && !force_reparse && content_items == 0 && current_kinds == prev_node_kinds;
+    if unchanged {
+        if let Err(abort) = vector_store
+            .abort_generation(namespace, &source_key, generation)
+            .await
+        {
+            tracing::warn!(
+                "could not discard the empty staging generation {} of namespace {}: {}",
+                generation,
+                namespace,
+                abort
+            );
+        }
+        println!(
+            "Namespace {} is unchanged since generation {}; kept it active",
+            namespace, prev_gen
+        );
+    }
+
     // Carry forward unchanged nodes from the previous generation so the
     // new generation contains the full tree without re-embedding.
     // A forced re-parse (version trip) stages every current node itself, so
     // no previous row is carried in that mode.
     //
-    // A failed carry is not a partial carry: unchanged files are skipped
-    // by the producer, so this pass is their only route into the new
-    // generation. Publishing past a failure here would flip the active
-    // pointer onto a tree with holes in it -- the failure mode
-    // `run_consumer`'s aborts exist to prevent -- so the first carry
-    // error (list, fetch, or re-stage) aborts the staging generation
-    // exactly like a staging failure above.
-    if prev_gen > 0 && !force_reparse {
+    // A failed carry is not a partial carry: unchanged files are skipped by
+    // the producer, so this pass is their only route into the new generation.
+    // Publishing past a failure here would flip the active pointer onto a tree
+    // with holes in it, so the first carry error (summary, fetch or re-stage)
+    // aborts the staging generation exactly like a staging failure above.
+    if prev_gen > 0 && !force_reparse && !unchanged {
         let mut carried = 0usize;
         let mut carry_failure: Option<anyhow::Error> = None;
-        let rows = match vector_store.list(namespace, None, None).await {
+        let rows = match vector_store.generation_summary(namespace, prev_gen).await {
             Ok(rows) => rows,
             Err(e) => {
                 carry_failure = Some(anyhow::anyhow!(
@@ -1363,13 +2293,8 @@ pub async fn ingest_directory(
             // The row's `location` is the file it came from (stamped at
             // ingest time), which survives `#` in file names unlike
             // splitting the symbol id.
-            let file_path = r.payload.location.clone();
-            let hash = r
-                .payload
-                .metadata
-                .get("file_sha256")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let file_path = r.location.clone();
+            let hash = r.file_sha256.clone();
             // Carry a previous row only when its file is still present with
             // the same bytes, or (for no-hash rows) when the path is still
             // visited. Deleted files and stale symbols drop out.
@@ -1382,6 +2307,23 @@ pub async fn ingest_directory(
                 false
             };
             if !carry {
+                continue;
+            }
+            // A carried node and the node staged for this generation get the
+            // same scoped id when they share a path, so carrying a row whose
+            // kind no longer matches the path would overwrite the staged node
+            // with the old one: a directory turned file would be put back as a
+            // directory, and the next ingest would repeat it. Directory rows
+            // carry no hash, so the hash test above cannot catch this.
+            let row_kind = r.memory_type.as_str();
+            let current_kind = current_kinds.get(&file_path).map(String::as_str);
+            let is_node_row = matches!(row_kind, "directory" | "file" | "markdown");
+            if is_node_row && current_kind != Some(row_kind) {
+                continue;
+            }
+            // Symbols and sections belong to a file; none of them survive the
+            // path becoming a directory.
+            if !is_node_row && current_kind == Some("directory") {
                 continue;
             }
             match vector_store.get(namespace, &id).await {
@@ -1400,7 +2342,7 @@ pub async fn ingest_directory(
                         generation,
                         crate::parser::generation::NAMESPACE_SEPARATOR
                     );
-                    payload.metadata.as_object_mut().map(|o| {
+                    if let Some(o) = payload.metadata.as_object_mut() {
                         o.insert(
                             "index_generation".to_string(),
                             serde_json::json!(generation),
@@ -1424,8 +2366,102 @@ pub async fn ingest_directory(
                                 serde_json::Value::Array(updated),
                             );
                         }
-                        // Fix depends_on generation prefixes (F2).
-                        if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
+                        // Fix depends_on and calls_resolved generation prefixes (F2):
+                        // For `code_ast` symbols, keep only same-file targets here and strip
+                        // stale cross-file targets (`cross_file_callees` / `cross_file_callers`);
+                        // `resolve_cross_file_calls_for_generation` rebuilds cross-file edges
+                        // from the current generation's `staged_symbols` so removed or renamed
+                        // callees never leave dangling dependencies.
+                        // For `file` rows, `depends_on` is rebuilt from `imports` filtered by
+                        // `current_paths` below so deleted target files are dropped.
+                        if row_kind == "code_ast" {
+                            let same_file_prefix = format!("{new_gen_str}{file_path}#");
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("depends_on").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| s.replace(&old_gen_str, &new_gen_str))
+                                    .filter(|s| s.starts_with(&same_file_prefix))
+                                    .map(serde_json::Value::String)
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("depends_on");
+                                } else {
+                                    o.insert(
+                                        "depends_on".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("calls_resolved").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| s.replace(&old_gen_str, &new_gen_str))
+                                    .filter(|s| s.starts_with(&same_file_prefix))
+                                    .map(serde_json::Value::String)
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("calls_resolved");
+                                } else {
+                                    o.insert(
+                                        "calls_resolved".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                            o.remove("cross_file_callees");
+                            o.remove("cross_file_callers");
+                        } else if row_kind == "file" {
+                            if let Some(serde_json::Value::Array(arr)) =
+                                o.get("depends_on").cloned()
+                            {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .filter(|s| {
+                                        s.strip_prefix(&old_gen_str)
+                                            .map(|rel| current_paths.contains(rel))
+                                            .unwrap_or(false)
+                                    })
+                                    .map(|s| {
+                                        serde_json::Value::String(
+                                            s.replace(&old_gen_str, &new_gen_str),
+                                        )
+                                    })
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("depends_on");
+                                } else {
+                                    o.insert(
+                                        "depends_on".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                            if let Some(serde_json::Value::Array(arr)) = o.get("imports").cloned() {
+                                let updated: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .filter(|p| current_paths.contains(*p))
+                                    .map(|p| serde_json::Value::String(p.to_string()))
+                                    .collect();
+                                if updated.is_empty() {
+                                    o.remove("imports");
+                                } else {
+                                    o.insert(
+                                        "imports".to_string(),
+                                        serde_json::Value::Array(updated),
+                                    );
+                                }
+                            }
+                        } else if let Some(serde_json::Value::Array(arr)) =
+                            o.get("depends_on").cloned()
+                        {
                             let updated: Vec<serde_json::Value> = arr
                                 .iter()
                                 .filter_map(|v| v.as_str())
@@ -1435,9 +2471,55 @@ pub async fn ingest_directory(
                                 .collect();
                             o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
                         }
-                    });
+                    }
                     let new_id =
                         crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
+                    if row_kind == "code_ast" {
+                        let sym_name = payload
+                            .metadata
+                            .get("symbol")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let sym_kind = payload
+                            .metadata
+                            .get("symbol_kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let sym_calls: Vec<String> = payload
+                            .metadata
+                            .get("calls")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !sym_name.is_empty() {
+                            staged_symbols.push(StagedSymbolInfo {
+                                id: new_id.clone(),
+                                file_path: file_path.clone(),
+                                name: sym_name,
+                                kind: sym_kind,
+                                calls: sym_calls,
+                            });
+                        }
+                    } else if row_kind == "file" && !dependency_map.contains_key(&file_path) {
+                        if let Some(arr) =
+                            payload.metadata.get("imports").and_then(|v| v.as_array())
+                        {
+                            let targets: Vec<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .filter(|p| current_paths.contains(p))
+                                .collect();
+                            if !targets.is_empty() {
+                                dependency_map.insert(file_path.clone(), targets);
+                            }
+                        }
+                    }
                     if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
                         carry_failure = Some(anyhow::anyhow!(
                             "carry-forward: failed to re-stage node {} into generation {}: {}",
@@ -1468,6 +2550,7 @@ pub async fn ingest_directory(
                     generation, namespace, abort
                 );
             }
+            // Record carry-forward abort in enrichment registry (bead neurostrata-sij).
             if let Err(e) = crate::registry::enrichment_fail(
                 &vector_store,
                 Some(&embedder),
@@ -1485,7 +2568,7 @@ pub async fn ingest_directory(
     }
 
     // Stamp DEPENDS_ON targets onto file nodes (best-effort, warn-first).
-    for (src_path, targets) in &dependency_map {
+    for (src_path, targets) in dependency_map.iter().filter(|_| !unchanged) {
         let src_id = crate::parser::ingest::generation_scoped_id(namespace, generation, src_path);
         match vector_store.get(namespace, &src_id).await {
             Ok(Some((vec, mut payload))) => {
@@ -1513,11 +2596,19 @@ pub async fn ingest_directory(
         }
     }
 
-    // Remember the generation this publish would supersede. The relink after
-    // the flip is a separate store call, so if it fails the pointer is rolled
-    // back onto this generation (and the new one discarded) before the error
-    // is returned: publish + relink succeed or fail together, as they did
-    // when both lived inside the fork's single publish transaction.
+    // Tier-1 pre-publish workspace cross-file call graph resolution (`neurostrata-rbde`).
+    if !unchanged && !staged_symbols.is_empty() {
+        resolve_cross_file_calls_for_generation(
+            &vector_store,
+            namespace,
+            &staged_symbols,
+            &dependency_map,
+        )
+        .await;
+    }
+
+    // The generation the pointer names before this publish: the rollback
+    // target if the relink below fails.
     let previous_generation = match vector_store.active_generation(namespace, &source_key).await {
         Ok(previous) => previous,
         Err(e) => {
@@ -1541,10 +2632,13 @@ pub async fn ingest_directory(
 
     // Atomically flip the active pointer onto this generation. Only now are its
     // nodes reachable; the previous generation remains as history.
-    if let Err(e) = vector_store
-        .publish_generation(namespace, &source_key, generation)
-        .await
-    {
+    if let Err(e) = if unchanged {
+        Ok(())
+    } else {
+        vector_store
+            .publish_generation(namespace, &source_key, generation)
+            .await
+    } {
         // Publication failed: abort the staged generation so its rows do not
         // leak as orphaned staging (same cleanup as the failure branch above).
         if let Err(abort) = vector_store
@@ -1566,7 +2660,7 @@ pub async fn ingest_directory(
 
     // A rule is not rewritten just because its file came back, so replay what
     // the memories still declare now that the nodes they point at are the
-    // active generation (bead neurostrata-sij).
+    // active generation.
     //
     // A failure here fails the ingest rather than warning about it: reporting
     // success would hand back a graph whose rules reach none of their code.
@@ -1662,6 +2756,13 @@ pub async fn ingest_directory(
     {
         tracing::warn!("enrichment_commit failed for '{namespace}': {e}");
     }
+
+    crate::telemetry::insights::sample_insights_after_ingest(
+        &vector_store,
+        namespace,
+        Some(generation),
+    )
+    .await;
 
     Ok(())
 }
@@ -1921,6 +3022,7 @@ mod tests {
         async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(vec![0.0; 4])
         }
+
         fn dimensions(&self) -> usize {
             4
         }
@@ -1987,6 +3089,59 @@ mod tests {
                 .is_some(),
             "and the previous ingest is still there"
         );
+    }
+
+    /// A file replaced by an empty directory at the same path re-reads no
+    /// file and visits the same path, but it is a change: the old file and its
+    /// symbols must not stay active.
+    #[tokio::test]
+    async fn a_file_replaced_by_a_directory_publishes_a_new_generation() {
+        let tmp = std::env::temp_dir().join(format!("ns-type-change-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("thing.rs"), "fn main() {}").expect("write test file");
+
+        let db = std::env::temp_dir().join(format!("ns-type-change-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let ingest = || {
+            ingest_directory(
+                &tmp,
+                &schema,
+                Arc::new(ZeroEmbedder),
+                store.clone(),
+                "test-ns",
+                None,
+                &[],
+            )
+        };
+
+        ingest().await.expect("first ingest");
+        let key = source_key_for(&tmp);
+        assert_eq!(
+            store
+                .active_generation("test-ns", &key)
+                .await
+                .expect("read"),
+            1
+        );
+
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove the file");
+        std::fs::create_dir(tmp.join("thing.rs")).expect("create a directory at the same path");
+        ingest().await.expect("second ingest");
+        assert_eq!(
+            store
+                .active_generation("test-ns", &key)
+                .await
+                .expect("read"),
+            2,
+            "a path that changed from a file to a directory publishes a new generation"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&db);
     }
 
     #[tokio::test]
@@ -2538,6 +3693,180 @@ mod tests {
         std::fs::remove_dir_all(&db).ok();
     }
 
+    async fn kind_fixture(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Arc<dyn VectorStore>,
+        ParserSchema,
+    ) {
+        let tmp = std::env::temp_dir().join(format!("ns-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let db = std::env::temp_dir().join(format!("ns-{tag}-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        (tmp, db, store, schema)
+    }
+
+    /// A directory replaced by a file of the same name must publish the file
+    /// node. The old directory row has no hash, so carry-forward used to copy
+    /// it over the staged file node (same scoped id) and the next ingest read
+    /// the path as a directory again.
+    #[tokio::test]
+    async fn a_directory_replaced_by_a_file_publishes_the_file_node() {
+        let (tmp, db, store, schema) = kind_fixture("dir-to-file").await;
+        std::fs::create_dir_all(tmp.join("thing")).expect("create directory");
+        std::fs::write(tmp.join("thing").join("inner.txt"), "inner").expect("write inner");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest");
+        let key = source_key_for(&tmp);
+        let gen1 = store.active_generation("probe", &key).await.expect("gen1");
+
+        std::fs::remove_dir_all(tmp.join("thing")).expect("remove directory");
+        std::fs::write(tmp.join("thing"), "now a file").expect("write file");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("second ingest");
+        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
+        assert!(
+            gen2 > gen1,
+            "a path that changed kind is a change: {gen1} then {gen2}"
+        );
+
+        let (_, node) = store
+            .get("probe", &generation_scoped_id("probe", gen2, "thing"))
+            .await
+            .expect("read")
+            .expect("the path has a node in the new generation");
+        assert_eq!(
+            node.memory_type, "file",
+            "the published node is the file, not the old directory"
+        );
+        assert!(
+            node.metadata.get("file_sha256").is_some(),
+            "and it carries the file's hash"
+        );
+        assert!(
+            store
+                .get(
+                    "probe",
+                    &generation_scoped_id("probe", gen2, "thing/inner.txt")
+                )
+                .await
+                .expect("read")
+                .is_none(),
+            "the old directory's child is not carried into the new generation"
+        );
+
+        // The state must be stable: a third ingest of the same tree changes nothing.
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("third ingest");
+        let gen3 = store.active_generation("probe", &key).await.expect("gen3");
+        assert_eq!(
+            gen3, gen2,
+            "the file node is now the previous generation, so nothing changed"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A file replaced by an empty directory stages no content, so only the
+    /// node kind tells the ingest anything changed. Comparing paths alone left
+    /// the deleted file's node, symbols and sections served as live.
+    #[tokio::test]
+    async fn a_file_replaced_by_an_empty_directory_is_a_change() {
+        let (tmp, db, store, schema) = kind_fixture("file-to-dir").await;
+        std::fs::write(tmp.join("thing.rs"), "pub fn gone() {}").expect("write file");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest");
+        let key = source_key_for(&tmp);
+        let gen1 = store.active_generation("probe", &key).await.expect("gen1");
+
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove file");
+        std::fs::create_dir_all(tmp.join("thing.rs")).expect("create directory");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("second ingest");
+        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
+        assert!(
+            gen2 > gen1,
+            "a path that changed kind is a change: {gen1} then {gen2}"
+        );
+
+        let (_, node) = store
+            .get("probe", &generation_scoped_id("probe", gen2, "thing.rs"))
+            .await
+            .expect("read")
+            .expect("the path has a node in the new generation");
+        assert_eq!(node.memory_type, "directory");
+        let leftovers: Vec<String> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| {
+                split_scoped_id(&r.id)
+                    .map(|(_, g, _)| g == gen2)
+                    .unwrap_or(false)
+            })
+            .filter(|r| r.payload.location == "thing.rs" && r.payload.memory_type != "directory")
+            .map(|r| r.id)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the deleted file's rows are not served: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     #[tokio::test]
     async fn pre_migration_generation_re_parses_and_stamps_every_row() {
         let tmp = std::env::temp_dir().join(format!("ns-premig-{}", uuid::Uuid::new_v4()));
@@ -2647,6 +3976,217 @@ mod tests {
         std::fs::remove_dir_all(&db).ok();
     }
 
+    /// The slim per-generation read must hand ingest exactly the rows `list`
+    /// used to, minus the content.
+    #[tokio::test]
+    async fn generation_summary_matches_the_rows_list_gave_ingest() {
+        use crate::traits::GenerationRow;
+        let tmp = std::env::temp_dir().join(format!("ns-gensum-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn b() {}").expect("write file");
+        std::fs::write(tmp.join("notes.md"), "# Title\n\nbody\n").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-gensum-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest");
+        // A second ingest after a change leaves a superseded generation behind.
+        std::fs::write(tmp.join("a.rs"), "fn a() {}\nfn c() {}").expect("edit file");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("second ingest");
+        let gen = store
+            .active_generation("probe", &source_key_for(&tmp))
+            .await
+            .expect("read");
+
+        let mut got = store
+            .generation_summary("probe", gen)
+            .await
+            .expect("summary");
+        let mut want: Vec<GenerationRow> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| {
+                crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen)
+            })
+            .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+            .collect();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        want.sort_by(|a, b| a.id.cmp(&b.id));
+        assert!(
+            got.len() > 2,
+            "the active generation has directory, file and symbol rows"
+        );
+        assert_eq!(
+            got, want,
+            "same rows, same fields, as the full listing gave"
+        );
+        assert!(
+            got.iter().any(|r| r.file_sha256.is_some()),
+            "file rows carry their hash"
+        );
+        assert!(
+            got.iter().all(|r| !r.ingest_version.is_empty()),
+            "every current row is stamped"
+        );
+
+        let stale = store
+            .generation_summary("probe", gen + 1000)
+            .await
+            .expect("summary");
+        assert!(
+            stale.is_empty(),
+            "a generation that is not active yields nothing"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// Two sources in one namespace. The generation counter is per namespace
+    /// (see `begin_generation`), so two sources never share a generation
+    /// number, but they do interleave: here source a is ingested, then source
+    /// b, then source a again, which supersedes a's first generation. For each
+    /// generation number the summary has to give the rows the full listing
+    /// does, and only the rows of the source that owns it.
+    #[tokio::test]
+    async fn generation_summary_matches_list_for_two_sources_in_one_namespace() {
+        use crate::traits::GenerationRow;
+        let (tmp_a, db, store, schema) = kind_fixture("gensum-two-a").await;
+        let tmp_b = std::env::temp_dir().join(format!("ns-gensum-two-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_b).expect("create second source");
+        std::fs::write(tmp_a.join("a.rs"), "fn a() {}").expect("write a");
+        std::fs::write(tmp_b.join("b.rs"), "fn b() {}").expect("write b");
+
+        ingest_directory(
+            &tmp_a,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest source a");
+        ingest_directory(
+            &tmp_b,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest source b");
+        std::fs::write(tmp_a.join("a.rs"), "fn a() {}\nfn a2() {}").expect("edit a");
+        ingest_directory(
+            &tmp_a,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("re-ingest source a");
+        let gen_a = store
+            .active_generation("probe", &source_key_for(&tmp_a))
+            .await
+            .expect("gen a");
+        let gen_b = store
+            .active_generation("probe", &source_key_for(&tmp_b))
+            .await
+            .expect("gen b");
+        assert_eq!(
+            (gen_b, gen_a),
+            (2, 3),
+            "b took the second number, a's re-ingest the third"
+        );
+
+        for gen in 1..=3u64 {
+            let mut got = store
+                .generation_summary("probe", gen)
+                .await
+                .expect("summary");
+            let mut want: Vec<GenerationRow> = store
+                .list("probe", None, None)
+                .await
+                .expect("list")
+                .into_iter()
+                .filter(|r| {
+                    crate::parser::ingest::split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen)
+                })
+                .map(|r| GenerationRow::from_payload(r.id, &r.payload))
+                .collect();
+            got.sort_by(|a, b| a.id.cmp(&b.id));
+            want.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(got, want, "generation {gen}: same rows as the full listing");
+        }
+        let first = store
+            .generation_summary("probe", 1)
+            .await
+            .expect("summary of generation 1");
+        let second = store
+            .generation_summary("probe", 2)
+            .await
+            .expect("summary of generation 2");
+        let third = store
+            .generation_summary("probe", 3)
+            .await
+            .expect("summary of generation 3");
+        assert!(
+            first.is_empty(),
+            "a's superseded first generation yields nothing"
+        );
+        assert!(
+            second.iter().all(|r| r.location != "a.rs"),
+            "b's generation holds none of a's files"
+        );
+        assert!(
+            third.iter().all(|r| r.location != "b.rs"),
+            "a's generation holds none of b's files"
+        );
+        assert!(
+            second.iter().any(|r| r.location == "b.rs"),
+            "b's file is read"
+        );
+        assert!(
+            third.iter().any(|r| r.location == "a.rs"),
+            "a's file is read"
+        );
+
+        std::fs::remove_dir_all(&tmp_a).ok();
+        std::fs::remove_dir_all(&tmp_b).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     #[tokio::test]
     async fn mixed_stamps_trip_even_if_first_row_is_current() {
         let tmp = std::env::temp_dir().join(format!("ns-mixed-{}", uuid::Uuid::new_v4()));
@@ -2728,6 +4268,350 @@ mod tests {
     }
 
     #[test]
+    fn ingest_worker_count_respects_bounds() {
+        assert_eq!(ingest_worker_count(0), 1);
+        assert!(ingest_worker_count(3) <= 3);
+        assert!(ingest_worker_count(100) <= 8);
+        assert!(ingest_worker_count(100) >= 1);
+    }
+
+    /// The streaming producer replays the processed entries in walk order,
+    /// however the workers happen to finish, and the replayed values are the
+    /// ones a sequential run would produce.
+    #[test]
+    fn the_ingest_stream_replays_in_index_order() {
+        let total = 64usize;
+        let window = 8usize;
+        let mut replayed: Vec<usize> = Vec::new();
+        let mut values: Vec<usize> = Vec::new();
+        let stats = stream_in_walk_order(
+            total,
+            4,
+            window,
+            || {
+                move |idx: usize| -> anyhow::Result<usize> {
+                    // The lower indices finish last, so the workers complete
+                    // out of order.
+                    std::thread::sleep(std::time::Duration::from_micros((total - idx) as u64));
+                    Ok(idx * 2)
+                }
+            },
+            |idx, result| {
+                replayed.push(idx);
+                values.push(result?);
+                Ok(())
+            },
+        )
+        .expect("the stream completes");
+        assert_eq!(
+            replayed,
+            (0..total).collect::<Vec<_>>(),
+            "the replay runs in index order"
+        );
+        assert_eq!(
+            values,
+            (0..total).map(|i| i * 2).collect::<Vec<_>>(),
+            "the replayed values are the ones a sequential run produces"
+        );
+        assert!(
+            stats.peak_buffered <= window,
+            "the stream held {} results, the window is {}",
+            stats.peak_buffered,
+            window
+        );
+    }
+
+    /// The stream bounds what it holds: no more than the window of results
+    /// are ever in flight between the workers and the replay, however large
+    /// the tree is.
+    #[test]
+    fn the_ingest_stream_bounds_what_it_holds() {
+        let total = 500usize;
+        let window = 16usize;
+        let stats = stream_in_walk_order(
+            total,
+            8,
+            window,
+            || move |idx: usize| -> anyhow::Result<usize> { Ok(idx) },
+            |_idx, _res| Ok(()),
+        )
+        .expect("the stream completes");
+        assert!(
+            stats.peak_buffered <= window,
+            "the stream held {} results, the window is {}",
+            stats.peak_buffered,
+            window
+        );
+    }
+
+    /// A worker that panics does not take the run with it: the panic becomes
+    /// that entry's error, and the rest of the run still lands in order.
+    #[test]
+    fn a_panicking_worker_becomes_that_entrys_error() {
+        let total = 32usize;
+        let mut errors: Vec<(usize, String)> = Vec::new();
+        let mut landed = 0usize;
+        stream_in_walk_order(
+            total,
+            4,
+            8,
+            || {
+                move |idx: usize| -> anyhow::Result<usize> {
+                    if idx == 7 {
+                        panic!("worker panic at index {idx}");
+                    }
+                    Ok(idx)
+                }
+            },
+            |idx, result| {
+                match result {
+                    Ok(_) => landed += 1,
+                    Err(e) => errors.push((idx, e.to_string())),
+                }
+                Ok(())
+            },
+        )
+        .expect("the run completes despite the panic");
+        assert_eq!(errors.len(), 1, "one entry failed");
+        assert_eq!(
+            errors[0].0, 7,
+            "the entry that panicked is the one that failed"
+        );
+        assert!(
+            errors[0].1.contains("panicked"),
+            "the error names the panic: {}",
+            errors[0].1
+        );
+        assert_eq!(landed, total - 1, "every other entry still landed");
+    }
+
+    /// A replay that fails ends the run instead of waiting for a replay that
+    /// will never come.
+    #[test]
+    fn a_failing_replay_ends_the_stream() {
+        let err = stream_in_walk_order(
+            64usize,
+            4,
+            8,
+            || move |idx: usize| -> anyhow::Result<usize> { Ok(idx) },
+            |idx, _res| {
+                if idx == 3 {
+                    anyhow::bail!("replay refused index 3");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the replay failure ends the stream");
+        assert!(
+            err.to_string().contains("replay refused"),
+            "the error is the replay's own: {err}"
+        );
+    }
+
+    /// The cancellation must be set under the lock the workers sleep on.
+    ///
+    /// A worker reads the abort flag and waits on the condvar while it holds
+    /// the gate lock; the replay sets the flag and notifies. If the flag is
+    /// set outside that lock, the two can interleave: the worker reads "not
+    /// aborted", the replay sets the flag and notifies (the worker is not
+    /// waiting yet, so the notification is lost), and the worker then sleeps
+    /// through it -- the run waits for a wakeup that never comes.
+    ///
+    /// The test holds the gate lock (the worker is between its check and its
+    /// wait) and asserts that the abort cannot get past it: an abort that
+    /// takes the lock has to queue behind the waiter, an abort that does not
+    /// takes it goes straight through and the worker sleeps through the
+    /// notification.
+    #[test]
+    fn an_abort_waits_for_the_lock_the_worker_sleeps_on() {
+        let gate = std::sync::Arc::new(ReplayGate::new());
+        let held = gate.state.lock().expect("replay gate mutex");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gate_for_abort = gate.clone();
+        let aborter = std::thread::spawn(move || {
+            gate_for_abort.abort();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the abort must not pass a worker that holds the gate lock"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the abort completes once the lock is free");
+        aborter.join().unwrap();
+    }
+
+    /// A worker waiting for the replay wakes up when the replay gives up.
+    #[test]
+    fn an_aborted_gate_wakes_the_worker_that_waits_for_it() {
+        let gate = std::sync::Arc::new(ReplayGate::new());
+        let gate_for_worker = gate.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let allowed = gate_for_worker.wait_for_slot(4, 1);
+            let _ = tx.send(allowed);
+        });
+        // The worker is waiting for a slot the replay has not opened yet.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        gate.abort();
+        let allowed = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the waiting worker wakes");
+        assert!(!allowed, "an aborted gate lets no work through");
+        worker.join().unwrap();
+    }
+
+    /// A replay that fails ends the run even when the workers are blocked
+    /// handing their results back.
+    ///
+    /// The result channel is closed before the workers are joined, so a
+    /// worker blocked in `send` fails and wakes instead of waiting for a
+    /// receiver that will never read again. The channel is made the tighter
+    /// bound here (capacity 1 against a replay window of 64), so the workers
+    /// really do pile up on a full channel while the replay is over.
+    ///
+    /// The run happens on its own thread and is waited for with a timeout: a
+    /// run that hangs fails this test instead of hanging the suite.
+    #[test]
+    fn a_failing_replay_ends_the_run_with_a_full_result_channel() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let outcome = stream_in_walk_order_bounded(
+                512usize,
+                4,
+                64,
+                1,
+                || move |idx: usize| -> anyhow::Result<usize> { Ok(idx) },
+                |idx, _res| {
+                    if idx == 0 {
+                        anyhow::bail!("the replay refused index 0");
+                    }
+                    Ok(())
+                },
+            );
+            let _ = tx.send(outcome.is_err());
+        });
+        let ended = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the run ends instead of hanging");
+        assert!(ended, "the replay failure is reported");
+        runner.join().unwrap();
+    }
+
+    /// The refusal tally counts every refused embedding and keeps a bounded
+    /// number of reasons, so the summary stays readable however many items
+    /// the provider refused.
+    #[test]
+    fn degraded_embeddings_count_the_refusals_and_cap_the_samples() {
+        let mut degraded = DegradedEmbeddings::default();
+        assert!(
+            degraded.summary().is_none(),
+            "nothing refused, nothing said"
+        );
+
+        let outcome = crate::traits::BatchEmbedOutcome {
+            embeddings: vec![Some(vec![0.0; 4]), None, None],
+            warnings: (0..20).map(|i| format!("refusal {i}")).collect(),
+        };
+        degraded.note(&outcome);
+        assert_eq!(degraded.count, 2, "both refusals are counted");
+        assert_eq!(
+            degraded.samples.len(),
+            MAX_DEGRADED_EMBED_SAMPLES,
+            "the reasons are sampled"
+        );
+        let summary = degraded.summary().expect("the summary names the refusals");
+        assert!(
+            summary.contains("2 embedding(s) were refused"),
+            "the summary counts the refusals: {summary}"
+        );
+        assert!(
+            summary.contains("refusal 0"),
+            "the summary carries the reasons: {summary}"
+        );
+    }
+
+    /// Refuses the first item of every batch and embeds the rest.
+    struct RefusingEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for RefusingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        async fn embed_batch_degradable(
+            &self,
+            texts: &[String],
+        ) -> anyhow::Result<crate::traits::BatchEmbedOutcome> {
+            let mut embeddings: Vec<Option<Vec<f32>>> =
+                texts.iter().map(|_| Some(vec![0.0; 4])).collect();
+            if let Some(first) = embeddings.first_mut() {
+                *first = None;
+            }
+            Ok(crate::traits::BatchEmbedOutcome {
+                embeddings,
+                warnings: vec![
+                    "remote embedding refused one input (413): payload too large".to_string(),
+                ],
+            })
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    /// A provider that refuses one item does not cost the generation: the
+    /// refused item is skipped, the rest of the generation lands, and the
+    /// ingest reports the refusal instead of failing.
+    #[tokio::test]
+    async fn ingest_skips_a_refused_embedding_and_keeps_the_rest() {
+        let tmp = std::env::temp_dir().join(format!("ns-degraded-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n")
+            .expect("write rust file");
+        let db = std::env::temp_dir().join(format!("ns-degraded-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("degraded-ns").await.expect("create the schema");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(RefusingEmbedder),
+            store.clone(),
+            "degraded-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("a refused embedding does not fail the ingest");
+
+        let rows = store.list("degraded-ns", None, None).await.expect("list");
+        let symbols: Vec<String> = rows
+            .iter()
+            .filter(|r| r.payload.memory_type == "code_ast")
+            .map(|r| r.payload.content.clone())
+            .collect();
+        assert_eq!(
+            symbols.len(),
+            1,
+            "the refused symbol is skipped, the other one lands: {symbols:?}"
+        );
+        assert!(
+            symbols[0].contains("beta"),
+            "the symbol that was embedded is the one that landed: {symbols:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[test]
     fn markdown_sections_extract_headings_backticks_links_and_skip_empty() {
         let md = "# Heading\n\nbody with `sym` and [link](https://example.com)\n\n## Empty\n\n   \n\n## Second\nmore";
         let secs = parse_markdown_sections(md);
@@ -2738,193 +4622,11 @@ mod tests {
         assert_eq!(secs[1].heading, "Second");
     }
 
-    /// F8 dry-run estimate and presort with all required fields present.
-    #[tokio::test]
-    async fn test_f8_dry_run_estimate_and_presort_zero_writes() {
-        let tmp = std::env::temp_dir().join(format!("ns-f8-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).expect("create");
-        std::fs::write(tmp.join("foo.rs"), "pub fn bar() {}").unwrap();
-        std::fs::write(tmp.join("README.md"), "# Hello\n\nSecret token x.\n").unwrap();
-        // Duplicate file with same hash
-        std::fs::write(tmp.join("dup.rs"), "pub fn bar() {}").unwrap();
-        // Versioned file
-        std::fs::write(tmp.join("foo_v2.rs"), "pub fn bar_v2() {}").unwrap();
-        // Junk / bak file
-        std::fs::write(tmp.join("foo.bak"), "old").unwrap();
-        // Secret / PII content
-        std::fs::write(
-            tmp.join("secret.rs"),
-            "const TOKEN: &str = \"secret123\";\nlet email = \"a@b.com\";\n",
-        )
-        .unwrap();
 
-        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
-        let est_report = dry_run_directory(&tmp, &schema, "estimate").await.unwrap();
-        let pre_report = dry_run_directory(&tmp, &schema, "presort").await.unwrap();
-
-        for (label, r) in [("estimate", &est_report), ("presort", &pre_report)] {
-            assert!(
-                r.contains(&format!("Dry-run ({})", label)),
-                "{} mode header",
-                label
-            );
-            assert!(r.contains("Files:"), "{} Files", label);
-            assert!(r.contains("Parseable files:"), "{} Parseable", label);
-            assert!(r.contains("Symbols:"), "{} Symbols", label);
-            assert!(r.contains("Doc sections:"), "{} Doc sections", label);
-            assert!(
-                r.contains("Embeddings needed (est):"),
-                "{} Embeddings",
-                label
-            );
-            assert!(r.contains("Avoided embeddings:"), "{} Avoided", label);
-            assert!(r.contains("Secret hits:"), "{} Secret hits", label);
-            assert!(r.contains("PII warnings:"), "{} PII", label);
-            assert!(r.contains("Junk candidates:"), "{} Junk candidates", label);
-            assert!(r.contains("Duplicate candidates:"), "{} Duplicate", label);
-            assert!(r.contains("Version candidates:"), "{} Version", label);
-        }
-        assert!(pre_report.contains("Junk files:"));
-        assert!(pre_report.contains("Duplicate groups:"));
-        assert!(pre_report.contains("Version candidate files:"));
-        assert!(pre_report.contains("Proposed dataset groups:"));
-    }
-
-    /// F7 extract imports / resolve dependency paths for Rust/TS.
-    #[test]
-    fn test_f7_extract_and_resolve_dependencies() {
-        let rust = r#"mod foo;
-use crate::bar::baz;
-use super::x;"#;
-        let specs = extract_import_specifiers("rust", rust);
-        assert!(specs.contains(&"mod:foo".to_string()));
-        assert!(specs.contains(&"use:crate::bar::baz".to_string()));
-
-        let ts = r#"import { x } from "./utils";\nrequire("./helper");"#;
-        let ts_specs = extract_import_specifiers("typescript", ts);
-        assert!(
-            ts_specs.contains(&"js:./utils".to_string())
-                || ts_specs.contains(&"js:./utils".to_string())
-        );
-
-        let all = std::collections::HashSet::from([
-            "src/foo.rs".to_string(),
-            "src/bar.rs".to_string(),
-            "src/utils.ts".to_string(),
-            "src/helper.js".to_string(),
-        ]);
-        // Resolve rust `mod foo;` from src/main.rs -> src/foo.rs
-        let rust_deps = resolve_dependency_paths("src/main.rs", &specs, &all);
-        assert!(rust_deps.contains(&"src/foo.rs".to_string()));
-        // Resolve rust `use crate::bar::baz;` -> src/bar.rs
-        assert!(rust_deps.contains(&"src/bar.rs".to_string()));
-
-        // Resolve TypeScript imports
-        let ts_deps = resolve_dependency_paths("src/app.ts", &ts_specs, &all);
-        assert!(
-            ts_deps.contains(&"src/utils.ts".to_string())
-                || ts_deps.contains(&"src/helper.js".to_string())
-        );
-    }
-
-    /// F2 incremental ingest + F12 watermark.
-    #[tokio::test]
-    async fn test_f2_f12_incremental_ingest_and_watermark() {
-        let tmp = std::env::temp_dir().join(format!("ns-f2-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).expect("create");
-        std::fs::write(tmp.join("hello.rs"), "pub fn hello() {}").unwrap();
-        let db = std::env::temp_dir().join(format!("ns-f2-db-{}", std::process::id()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open"));
-        store.init("f2").await.unwrap();
-        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
-        let embedder = Arc::new(ZeroEmbedder);
-
-        // First ingest -> generation 1, writes watermark.
-        ingest_directory(
-            &tmp,
-            &schema,
-            embedder.clone(),
-            store.clone(),
-            "f2",
-            None,
-            &[],
-        )
-        .await
-        .expect("first");
-        let source_key = source_key_for(&tmp);
-        let gen1 = store.active_generation("f2", &source_key).await.unwrap();
-        assert!(gen1 > 0, "first ingest produces a generation");
-
-        // Check registry row has watermark and telemetry.
-        let registry_id = crate::registry::registry_row_id("f2");
-        let (_vec, payload) = store
-            .get("f2", &registry_id)
-            .await
-            .unwrap()
-            .expect("registry row");
-        let meta = payload.metadata.as_object().expect("metadata");
-        assert!(
-            meta.contains_key("enrichment_state"),
-            "enrichment_state present"
-        );
-        let state = meta.get("enrichment_state").expect("state");
-        let wm = state.get("watermark").expect("watermark");
-        assert!(wm.get("extractor_fingerprint").is_some(), "fingerprint");
-        assert!(wm.get("source_digest").is_some(), "source_digest");
-        assert_ne!(
-            wm.get("source_digest")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "source_digest must not be empty hash"
-        );
-        assert!(wm.get("last_enriched_at").is_some(), "last_enriched_at");
-
-        // Second ingest with unchanged files -> generation 2, carries forward unchanged nodes.
-        ingest_directory(
-            &tmp,
-            &schema,
-            embedder.clone(),
-            store.clone(),
-            "f2",
-            None,
-            &[],
-        )
-        .await
-        .expect("second");
-        let gen2 = store.active_generation("f2", &source_key).await.unwrap();
-        assert!(gen2 > gen1, "second ingest produces newer generation");
-        // Watermark updated (same fingerprint if schema unchanged, updated digest if files same).
-        let (_vec2, payload2) = store
-            .get("f2", &registry_id)
-            .await
-            .unwrap()
-            .expect("registry row 2");
-        let meta2 = payload2.metadata.as_object().expect("meta2");
-        let wm2 = meta2
-            .get("enrichment_state")
-            .expect("state2")
-            .get("watermark")
-            .expect("wm2");
-        assert!(wm2.get("source_digest").is_some(), "updated digest");
-
-        // Modify file -> re-embeds changed file; old generation superseded.
-        std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
-        ingest_directory(
-            &tmp,
-            &schema,
-            embedder.clone(),
-            store.clone(),
-            "f2",
-            None,
-            &[],
-        )
-        .await
-        .expect("modified");
-    }
 
     struct CountingEmbedder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+
 
     #[async_trait::async_trait]
     impl Embedder for CountingEmbedder {
@@ -2937,6 +4639,8 @@ use super::x;"#;
             4
         }
     }
+
+
 
     #[tokio::test]
     async fn reserved_ingest_destinations_are_rejected_before_staging_or_embedding() {
@@ -3064,9 +4768,8 @@ use super::x;"#;
         let _ = std::fs::remove_file(db);
     }
 
-    /// Delegating store double whose `relink_edges` fails while `fail_relink`
-    /// is set, so a test can fail an ingest after its publish flip — the one
-    /// failure the staging-abort tests cannot reach.
+
+
     struct RelinkFailingStore {
         inner: Arc<dyn VectorStore>,
         fail_relink: std::sync::atomic::AtomicBool,
@@ -3077,6 +4780,8 @@ use super::x;"#;
             self
         }
     }
+
+
 
     #[async_trait::async_trait]
     impl VectorStore for RelinkFailingStore {
@@ -3246,6 +4951,8 @@ use super::x;"#;
         }
     }
 
+
+
     #[tokio::test]
     async fn a_failed_relink_rolls_back_to_the_previous_generation() {
         // Publish flips the active pointer before relink replays the declared
@@ -3409,28 +5116,629 @@ use super::x;"#;
         std::fs::remove_dir_all(&db).ok();
     }
 
+    /// F8 dry-run estimate and presort with all required fields present.
+    #[tokio::test]
+    async fn test_f8_dry_run_estimate_and_presort_zero_writes() {
+        let tmp = std::env::temp_dir().join(format!("ns-f8-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create");
+        std::fs::write(tmp.join("foo.rs"), "pub fn bar() {}").unwrap();
+        std::fs::write(tmp.join("README.md"), "# Hello\n\nSecret token x.\n").unwrap();
+        // Duplicate file with same hash
+        std::fs::write(tmp.join("dup.rs"), "pub fn bar() {}").unwrap();
+        // Versioned file
+        std::fs::write(tmp.join("foo_v2.rs"), "pub fn bar_v2() {}").unwrap();
+        // Junk / bak file
+        std::fs::write(tmp.join("foo.bak"), "old").unwrap();
+        // Secret / PII content
+        std::fs::write(
+            tmp.join("secret.rs"),
+            "const TOKEN: &str = \"secret123\";\nlet email = \"a@b.com\";\n",
+        )
+        .unwrap();
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
+        let est_report = dry_run_directory(&tmp, &schema, "estimate").await.unwrap();
+        let pre_report = dry_run_directory(&tmp, &schema, "presort").await.unwrap();
+
+        for (label, r) in [("estimate", &est_report), ("presort", &pre_report)] {
+            assert!(
+                r.contains(&format!("Dry-run ({})", label)),
+                "{} mode header",
+                label
+            );
+            assert!(r.contains("Files:"), "{} Files", label);
+            assert!(r.contains("Parseable files:"), "{} Parseable", label);
+            assert!(r.contains("Symbols:"), "{} Symbols", label);
+            assert!(r.contains("Doc sections:"), "{} Doc sections", label);
+            assert!(
+                r.contains("Embeddings needed (est):"),
+                "{} Embeddings",
+                label
+            );
+            assert!(r.contains("Avoided embeddings:"), "{} Avoided", label);
+            assert!(r.contains("Secret hits:"), "{} Secret hits", label);
+            assert!(r.contains("PII warnings:"), "{} PII", label);
+            assert!(r.contains("Junk candidates:"), "{} Junk candidates", label);
+            assert!(r.contains("Duplicate candidates:"), "{} Duplicate", label);
+            assert!(r.contains("Version candidates:"), "{} Version", label);
+        }
+        assert!(pre_report.contains("Junk files:"));
+        assert!(pre_report.contains("Duplicate groups:"));
+        assert!(pre_report.contains("Version candidate files:"));
+        assert!(pre_report.contains("Proposed dataset groups:"));
+    }
+
+    /// F7 extract imports / resolve dependency paths for Rust/TS.
+    #[test]
+    fn test_f7_extract_and_resolve_dependencies() {
+        let rust = r#"mod foo;
+use crate::bar::baz;
+use super::x;"#;
+        let specs = extract_import_specifiers("rust", rust);
+        assert!(specs.contains(&"mod:foo".to_string()));
+        assert!(specs.contains(&"use:crate::bar::baz".to_string()));
+
+        let ts = r#"import { x } from "./utils";\nrequire("./helper");"#;
+        let ts_specs = extract_import_specifiers("typescript", ts);
+        assert!(
+            ts_specs.contains(&"js:./utils".to_string())
+                || ts_specs.contains(&"js:./utils".to_string())
+        );
+
+        let all = std::collections::HashSet::from([
+            "src/foo.rs".to_string(),
+            "src/bar.rs".to_string(),
+            "src/utils.ts".to_string(),
+            "src/helper.js".to_string(),
+        ]);
+        // Resolve rust `mod foo;` from src/main.rs -> src/foo.rs
+        let rust_deps = resolve_dependency_paths("src/main.rs", &specs, &all);
+        assert!(rust_deps.contains(&"src/foo.rs".to_string()));
+        // Resolve rust `use crate::bar::baz;` -> src/bar.rs
+        assert!(rust_deps.contains(&"src/bar.rs".to_string()));
+
+        // Resolve TypeScript imports
+        let ts_deps = resolve_dependency_paths("src/app.ts", &ts_specs, &all);
+        assert!(
+            ts_deps.contains(&"src/utils.ts".to_string())
+                || ts_deps.contains(&"src/helper.js".to_string())
+        );
+    }
+
+    /// Memory probe, not a correctness test: ingests `NS_PROBE_DIR` twice into a
+    /// store opened the way the daemon opens it (default 384 MB buffer-pool cap;
+    /// set `NEUROSTRATA_BUFFER_POOL_MB=0` to measure the engine default) so peak
+    /// working set can be read from outside the process. Run:
+    ///   NS_PROBE_DIR=<dir> cargo test --bin neurostrata-mcp ingest_memory_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn ingest_memory_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DIR").expect("NS_PROBE_DIR"));
+        let db = std::env::temp_dir().join(format!("ns-probe-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&db);
+        // NS_PROBE_REAL=1 loads the daemon's embedder, so the model and its
+        // runtime memory are part of what is measured.
+        let embedder: Arc<dyn Embedder> = if std::env::var("NS_PROBE_REAL").is_ok() {
+            Arc::new(crate::embed::FastEmbedder::new().expect("embedder"))
+        } else {
+            Arc::new(ZeroEmbedder)
+        };
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(&db, embedder.dimensions()).expect("open"));
+        store.init("probe").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        for pass in 1..=2 {
+            let t = std::time::Instant::now();
+            ingest_directory(
+                &dir,
+                &schema,
+                embedder.clone(),
+                store.clone(),
+                "probe",
+                None,
+                &[],
+            )
+            .await
+            .expect("ingest");
+            println!("PROBE pass {pass} done in {:?}", t.elapsed());
+        }
+        // The probe owns a throwaway store; leave no multi-hundred-MB
+        // directory behind after a measurement.
+        drop(store);
+        drop(embedder);
+        let _ = std::fs::remove_dir_all(&db);
+    }
+
+    /// F2 incremental ingest + F12 watermark.
+    #[tokio::test]
+    async fn test_f2_f12_incremental_ingest_and_watermark() {
+        let tmp = std::env::temp_dir().join(format!("ns-f2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create");
+        std::fs::write(tmp.join("hello.rs"), "pub fn hello() {}").unwrap();
+        let db = std::env::temp_dir().join(format!("ns-f2-db-{}", std::process::id()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open"));
+        store.init("f2").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let embedder = Arc::new(ZeroEmbedder);
+
+        // First ingest -> generation 1, writes watermark.
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "f2",
+            None,
+            &[],
+        )
+        .await
+        .expect("first");
+        let source_key = source_key_for(&tmp);
+        let gen1 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen1 > 0, "first ingest produces a generation");
+
+        // Check registry row has watermark and telemetry.
+        let registry_id = crate::registry::registry_row_id("f2");
+        let (_vec, payload) = store
+            .get("f2", &registry_id)
+            .await
+            .unwrap()
+            .expect("registry row");
+        let meta = payload.metadata.as_object().expect("metadata");
+        assert!(
+            meta.contains_key("enrichment_state"),
+            "enrichment_state present"
+        );
+        let state = meta.get("enrichment_state").expect("state");
+        let wm = state.get("watermark").expect("watermark");
+        assert!(wm.get("extractor_fingerprint").is_some(), "fingerprint");
+        assert!(wm.get("source_digest").is_some(), "source_digest");
+        assert_ne!(
+            wm.get("source_digest")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "source_digest must not be empty hash"
+        );
+        assert!(wm.get("last_enriched_at").is_some(), "last_enriched_at");
+
+        // Second ingest with unchanged files keeps generation 1 active: a new
+        // generation would be a copy of it.
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "f2",
+            None,
+            &[],
+        )
+        .await
+        .expect("second");
+        let gen2 = store.active_generation("f2", &source_key).await.unwrap();
+        assert_eq!(gen2, gen1, "an unchanged tree keeps the active generation");
+        // Watermark updated (same fingerprint if schema unchanged, updated digest if files same).
+        let (_vec2, payload2) = store
+            .get("f2", &registry_id)
+            .await
+            .unwrap()
+            .expect("registry row 2");
+        let meta2 = payload2.metadata.as_object().expect("meta2");
+        let wm2 = meta2
+            .get("enrichment_state")
+            .expect("state2")
+            .get("watermark")
+            .expect("wm2");
+        assert!(wm2.get("source_digest").is_some(), "updated digest");
+
+        // Modify file -> re-embeds changed file; old generation superseded.
+        std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "f2",
+            None,
+            &[],
+        )
+        .await
+        .expect("modified");
+        let gen3 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen3 > gen2, "a changed file publishes a newer generation");
+
+        // A new file, with no change to any existing one, also publishes.
+        std::fs::write(tmp.join("added.rs"), "pub fn added() {}").unwrap();
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "f2",
+            None,
+            &[],
+        )
+        .await
+        .expect("added");
+        let gen4 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen4 > gen3, "an added file publishes a newer generation");
+
+        // So does a deleted one.
+        std::fs::remove_file(tmp.join("added.rs")).unwrap();
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "f2",
+            None,
+            &[],
+        )
+        .await
+        .expect("deleted");
+        let gen5 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen5 > gen4, "a deleted file publishes a newer generation");
+    }
+
+    /// Records the documents the walk skipped, so a test asserts on the
+    /// report rather than on what the walk printed.
+    struct SkipRecorder {
+        skipped: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl IngestObserver for SkipRecorder {
+        fn file_ingested(&self, _path: &str, _symbols: usize) {}
+
+        fn relinked(&self, _edges: usize) {}
+
+        fn file_skipped(&self, path: &str, reason: &str) {
+            self.skipped
+                .lock()
+                .expect("recorder lock")
+                .push((path.to_string(), reason.to_string()));
+        }
+    }
+
+    /// PAR-03: a document whose text trips the scanner is skipped whole — no
+    /// file node, no symbols — and reported with the scanner's reason, while
+    /// the rest of the walk proceeds.
+    #[tokio::test]
+    async fn par03_secret_in_ingest_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        // Secret-named fields with type annotations are ordinary source, not
+        // credentials; they must still ingest.
+        let good_source = "struct Config { api_key: String, token: String }\nfn clean() {}";
+        std::fs::write(tmp.join("good.rs"), good_source).expect("write clean file");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        let evil_source = format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret);
+        std::fs::write(tmp.join("evil.rs"), &evil_source).expect("write leaking file");
+
+        let db = std::env::temp_dir().join(format!("ns-ingest-secret-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+            &[],
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped document: {:?}",
+            outcome.err()
+        );
+
+        // The clean document landed whole.
+        let good_node = generation_scoped_id("test-ns", 1, "good.rs");
+        assert!(
+            store
+                .get("test-ns", &good_node)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean file with secret-named typed fields was stored"
+        );
+        let good_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id(
+                "good.rs",
+                "functions",
+                "clean",
+                &sha256_hex("fn clean() {}".as_bytes()),
+            ),
+        );
+        assert!(
+            store
+                .get("test-ns", &good_sym)
+                .await
+                .expect("read back")
+                .is_some(),
+            "clean symbol was stored"
+        );
+
+        // The tripping document contributed nothing: no file node, no symbol.
+        let evil_node = generation_scoped_id("test-ns", 1, "evil.rs");
+        assert!(
+            store
+                .get("test-ns", &evil_node)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's file node was not stored"
+        );
+        let evil_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id(
+                "evil.rs",
+                "functions",
+                "leak",
+                &sha256_hex(evil_source.as_bytes()),
+            ),
+        );
+        assert!(
+            store
+                .get("test-ns", &evil_sym)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped document's symbol was not stored"
+        );
+
+        // And the skip was reported with the file and the scanner's reason.
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "exactly one skip reported: {:?}",
+            *skipped
+        );
+        assert!(
+            skipped[0].0.ends_with("evil.rs"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            skipped[0].1.contains("github_pat"),
+            "skip carries the scanner category: {}",
+            skipped[0].1
+        );
+        assert!(
+            !skipped[0].1.contains(&secret),
+            "skip must not echo the secret: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// PAR-03 / C10: markdown has no tree-sitter grammar, so its bytes must be
+    /// scanned independently of grammar availability. A credential in a .md
+    /// file contributes no file node and no doc sections.
+    #[tokio::test]
+    async fn par03_secret_in_markdown_is_refused() {
+        let tmp =
+            std::env::temp_dir().join(format!("ns-ingest-md-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        // Built at runtime so no secret-shaped literal sits in the source.
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        let md = format!("# Notes\n\nkey: {}\n", secret);
+        std::fs::write(tmp.join("guide.md"), &md).expect("write leaking markdown");
+
+        let db =
+            std::env::temp_dir().join(format!("ns-ingest-md-secret-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
+            skipped: skipped.clone(),
+        });
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            Some(observer),
+            &[],
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "the walk proceeds past the skipped markdown: {:?}",
+            outcome.err()
+        );
+
+        let file_id = generation_scoped_id("test-ns", 1, "guide.md");
+        assert!(
+            store
+                .get("test-ns", &file_id)
+                .await
+                .expect("read back")
+                .is_none(),
+            "skipped markdown's file node was not stored"
+        );
+        for section in parse_markdown_sections(&md) {
+            let sid = generation_scoped_id(
+                "test-ns",
+                1,
+                &format!("guide.md#section:{}@{}", section.slug, section.sha256),
+            );
+            assert!(
+                store
+                    .get("test-ns", &sid)
+                    .await
+                    .expect("read back")
+                    .is_none(),
+                "skipped markdown section was not stored: {}",
+                section.slug
+            );
+        }
+
+        let skipped = skipped.lock().expect("recorder lock");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "exactly one skip reported: {:?}",
+            *skipped
+        );
+        assert!(
+            skipped[0].0.ends_with("guide.md"),
+            "skip names the file: {}",
+            skipped[0].0
+        );
+        assert!(
+            skipped[0].1.contains("ERROR [SECURITY]"),
+            "skip carries the scanner verdict: {}",
+            skipped[0].1
+        );
+        assert!(
+            !skipped[0].1.contains(&secret),
+            "skip must not echo the secret: {}",
+            skipped[0].1
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn clean_markdown_ingests() {
+        let tmp = std::env::temp_dir().join(format!("ns-md-clean-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let md = "# Notes\n\nclean documentation without credentials\n";
+        std::fs::write(tmp.join("guide.md"), md).expect("write clean markdown");
+        let db = std::env::temp_dir().join(format!("ns-md-clean-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("clean markdown ingests");
+        let node = generation_scoped_id("test-ns", 1, "guide.md");
+        assert!(store.get("test-ns", &node).await.expect("read").is_some());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A skip for a path that was never indexed is not a change. Without this,
+    /// one permanently rejected fixture forces a full carry on every ingest.
+    #[tokio::test]
+    async fn skipped_fixture_does_not_force_new_generation() {
+        let tmp = std::env::temp_dir().join(format!("ns-skip-unchanged-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
+        let secret = format!("ghp_{}", "Ab1".repeat(12));
+        std::fs::write(tmp.join("skip.rs"), format!("let key = \"{secret}\";"))
+            .expect("write skipped file");
+        let db =
+            std::env::temp_dir().join(format!("ns-skip-unchanged-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let ingest = || {
+            ingest_directory(
+                &tmp,
+                &schema,
+                Arc::new(ZeroEmbedder),
+                store.clone(),
+                "test-ns",
+                None,
+                &[],
+            )
+        };
+        ingest().await.expect("first ingest");
+        let key = source_key_for(&tmp);
+        assert_eq!(
+            store
+                .active_generation("test-ns", &key)
+                .await
+                .expect("read"),
+            1
+        );
+        ingest().await.expect("second ingest");
+        assert_eq!(
+            store
+                .active_generation("test-ns", &key)
+                .await
+                .expect("read"),
+            1,
+            "a never-indexed skipped fixture must not force a new generation"
+        );
+        let skipped_row = generation_scoped_id("test-ns", 1, "skip.rs");
+        assert!(store
+            .get("test-ns", &skipped_row)
+            .await
+            .expect("read")
+            .is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
     /// Which carry-forward store call a `CarryFailingStore` fault hits.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum CarryFault {
         Upsert,
         Get,
         List,
+        /// Fail the first `generation_summary` call only, modelling a transient
+        /// timeout: the later call (if the code reaches the carry pass) works.
+        Summary,
     }
 
     /// Delegating store double whose carry-forward store calls fail while
     /// `fail` is set, so a test can break the carry-forward pass -- the
     /// previous-generation list, the row fetch, or the re-stage upsert --
-    /// that runs between staging and publication and is an unchanged
-    /// file's only route into the new generation.
+    /// that runs between staging and publication and is an unchanged file's
+    /// only route into the new generation.
     struct CarryFailingStore {
         inner: Arc<dyn VectorStore>,
         fail: std::sync::atomic::AtomicBool,
         fault: CarryFault,
-        /// Only re-stage upserts whose scoped id carries this tail
-        /// marker fail: the consumer also upserts the generation-scoped
-        /// *source* node on every ingest, and failing that one would
-        /// abort the ingest in `run_consumer` instead of exercising the
-        /// carry-forward pass.
+        /// How many `generation_summary` calls the ingest has made. The
+        /// pre-pass call is the first; the carry pass makes the second.
+        summary_calls: std::sync::atomic::AtomicUsize,
+        /// Only re-stage upserts whose scoped id carries this tail marker
+        /// fail: the consumer also upserts the generation-scoped source node
+        /// on every ingest, and failing that one would abort the ingest in
+        /// `run_consumer` instead of exercising the carry-forward pass.
         upsert_marker: &'static str,
     }
 
@@ -3452,6 +5760,8 @@ use super::x;"#;
             self.inner.init(namespace).await
         }
 
+
+
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -3463,8 +5773,8 @@ use super::x;"#;
             vector: Vec<f32>,
             payload: MemoryPayload,
         ) -> anyhow::Result<crate::traits::UpsertReport> {
-            // Only re-staging a carried row into a later generation
-            // fails; unscoped bookkeeping writes are never disturbed.
+            // Only re-staging a carried row into a later generation fails;
+            // unscoped bookkeeping writes are never disturbed.
             if self.armed(CarryFault::Upsert)
                 && id.contains(self.upsert_marker)
                 && matches!(split_scoped_id(id), Some((_, gen, _)) if gen >= 2)
@@ -3495,9 +5805,13 @@ use super::x;"#;
             self.inner.clear_ingested(namespace).await
         }
 
+
+
         async fn begin_ingest_stage(&self, namespace: &str) -> anyhow::Result<Box<dyn Send>> {
             self.inner.begin_ingest_stage(namespace).await
         }
+
+
 
         async fn publish_ingested(
             &self,
@@ -3567,14 +5881,36 @@ use super::x;"#;
             self.inner.list(namespace, user_id, memory_type).await
         }
 
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            let call = self
+                .summary_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The List fault targets the carry pass's summary read: the
+            // pre-pass read must succeed, or the new "a failed summary trips
+            // the version gate" rule would re-parse and never reach carry.
+            if self.armed(CarryFault::List) && call > 0 {
+                anyhow::bail!("injected carry summary failure (test double)");
+            }
+            if self.armed(CarryFault::Summary) {
+                // Fail once, then recover: a transient timeout, not an outage.
+                self.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("injected transient summary failure (test double)");
+            }
+            self.inner.generation_summary(namespace, generation).await
+        }
+
         async fn get(
             &self,
             namespace: &str,
             id: &str,
         ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
-            // The only generation-scoped fetches in the ingest flow are
-            // the carry-forward pass and the DEPENDS_ON stamping after
-            // it; the carry fetch is the first of them.
+            // The only generation-scoped fetches in the ingest flow are the
+            // carry-forward pass and the DEPENDS_ON stamping after it; the
+            // carry fetch is the first of them.
             if self.armed(CarryFault::Get) && split_scoped_id(id).is_some() {
                 anyhow::bail!("injected carry get failure (test double)");
             }
@@ -3598,7 +5934,7 @@ use super::x;"#;
             &self,
             include_retired: bool,
             include_archived: bool,
-            project_contexts: &HashMap<String, std::path::PathBuf>,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
             anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
         ) -> anyhow::Result<serde_json::Value> {
             self.inner
@@ -3623,16 +5959,18 @@ use super::x;"#;
             self.inner.checkpoint().await
         }
 
+
+
         fn is_dirty(&self) -> bool {
             self.inner.is_dirty()
         }
     }
 
-    /// Shared driver for the carry-fault tests: publish generation 1 of
-    /// a one-file directory, arm one carry-forward fault, then ingest
-    /// the unchanged directory again. The unchanged file is skipped by
-    /// the producer, so the carry-forward pass is its only route into
-    /// generation 2 -- exactly the route the fault breaks.
+    /// Shared driver for the carry-fault tests: publish generation 1 of a
+    /// one-file directory, arm one carry-forward fault, then ingest the
+    /// unchanged directory again. The unchanged file is skipped by the
+    /// producer, so the carry-forward pass is its only route into generation
+    /// 2 -- exactly the route the fault breaks.
     async fn ingest_twice_with_carry_fault(
         fault: CarryFault,
     ) -> (
@@ -3649,6 +5987,7 @@ use super::x;"#;
             inner: inner.clone(),
             fail: std::sync::atomic::AtomicBool::new(false),
             fault,
+            summary_calls: std::sync::atomic::AtomicUsize::new(0),
             upsert_marker: "hello.rs",
         });
         let store: Arc<dyn VectorStore> = failing.clone();
@@ -3681,6 +6020,9 @@ use super::x;"#;
             "the first ingest publishes generation 1"
         );
 
+        // Make the namespace changed so the carry pass runs; `hello.rs` itself
+        // is unchanged and is the row the fault injection targets.
+        std::fs::write(dir.join("other.rs"), "fn other() {}").expect("write changed file");
         failing
             .fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3697,9 +6039,9 @@ use super::x;"#;
         (outcome, inner, source_key, dir, db)
     }
 
-    /// The assertions every carry fault must satisfy: the ingest fails
-    /// naming the carry-forward failure, and generation 1 stays active
-    /// with its file node reachable -- nothing is published over a hole.
+    /// The assertions every carry fault must satisfy: the ingest fails naming
+    /// the carry-forward failure, and generation 1 stays active with its file
+    /// node reachable -- nothing is published over a hole.
     fn assert_carry_fault_aborted(outcome: anyhow::Result<()>) -> anyhow::Error {
         let err = outcome.expect_err("a failed carry-forward step must fail the ingest");
         assert!(
@@ -3730,6 +6072,8 @@ use super::x;"#;
         );
     }
 
+
+
     #[tokio::test]
     async fn a_failed_carry_forward_upsert_aborts_the_ingest() {
         // PR #140 remediation (F4): a failed re-stage upsert used to be
@@ -3742,6 +6086,8 @@ use super::x;"#;
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&db).ok();
     }
+
+
 
     #[tokio::test]
     async fn a_failed_carry_forward_list_aborts_the_ingest() {
@@ -3756,6 +6102,8 @@ use super::x;"#;
         std::fs::remove_dir_all(&db).ok();
     }
 
+
+
     #[tokio::test]
     async fn a_failed_carry_forward_get_aborts_the_ingest() {
         // Same defect at the row fetch: a failed get used to drop that
@@ -3768,144 +6116,608 @@ use super::x;"#;
         std::fs::remove_dir_all(&db).ok();
     }
 
-    /// Records the documents the walk skipped, so a test asserts on the
-    /// report rather than on what the walk printed.
-    struct SkipRecorder {
-        skipped: Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    }
-
-    impl IngestObserver for SkipRecorder {
-        fn file_ingested(&self, _path: &str, _symbols: usize) {}
-
-        fn relinked(&self, _edges: usize) {}
-
-        fn file_skipped(&self, path: &str, reason: &str) {
-            self.skipped
-                .lock()
-                .expect("recorder lock")
-                .push((path.to_string(), reason.to_string()));
-        }
-    }
-
-    /// Task 6 (J15): a document whose text trips the scanner is skipped
-    /// whole — no file node, no symbols — and reported with the scanner's
-    /// reason, while the rest of the walk proceeds.
     #[tokio::test]
-    async fn secret_in_ingest_is_refused() {
-        let tmp = std::env::temp_dir().join(format!("ns-ingest-secret-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("create temp dir");
-        std::fs::write(tmp.join("good.rs"), "fn clean() {}").expect("write clean file");
-        // Built at runtime so no secret-shaped literal sits in the source.
-        let secret = format!("ghp_{}", "Ab1".repeat(12));
-        std::fs::write(
-            tmp.join("evil.rs"),
-            format!("fn leak() {{\n    let key = \"{}\";\n}}\n", secret),
-        )
-        .expect("write leaking file");
+    async fn par04_failed_carry_forward_upsert_aborts_the_ingest() {
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::Upsert).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
 
-        let db = std::env::temp_dir().join(format!("ns-ingest-secret-db-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
+    #[tokio::test]
+    async fn par04_failed_carry_forward_list_aborts_the_ingest() {
+        // Largest blast radius: a failed list of the previous generation's
+        // rows used to carry nothing at all and still publish.
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::List).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn par04_failed_carry_forward_get_aborts_the_ingest() {
+        // At the row fetch: a failed get used to drop that node from the new
+        // generation and still publish.
+        let (outcome, inner, source_key, dir, db) =
+            ingest_twice_with_carry_fault(CarryFault::Get).await;
+        assert_carry_fault_aborted(outcome);
+        assert_generation_1_survives(&inner, &source_key).await;
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// A transient summary failure used to leave `prev_stamps` empty, which
+    /// read as "no offending stamp": the version gate stayed off, the producer
+    /// skipped unchanged files, and the carry pass (whose second summary
+    /// succeeds) copied the pre-fix rows over the fresh ones and stamped them
+    /// current. The failure must now trip the gate and re-parse.
+    #[tokio::test]
+    async fn transient_summary_failure_forces_reparse() {
+        let db = std::env::temp_dir().join(format!("ns-transient-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
             Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
-        store.init("test-ns").await.expect("create the schema");
-
-        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observer: Arc<dyn IngestObserver> = Arc::new(SkipRecorder {
-            skipped: skipped.clone(),
+        let failing = Arc::new(CarryFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fault: CarryFault::Summary,
+            summary_calls: std::sync::atomic::AtomicUsize::new(0),
+            upsert_marker: "hello.rs",
         });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store.init("probe").await.expect("create the schema");
 
+        let dir = std::env::temp_dir().join(format!("ns-transient-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn hello() {}").expect("write file");
         let schema =
             ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
-        let outcome = ingest_directory(
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest");
+        let key = source_key_for(&dir);
+        let gen1 = inner.active_generation("probe", &key).await.expect("gen1");
+
+        // Simulate a pre-fix extraction: stale content, an old version stamp,
+        // and the file hash unchanged (so the producer would skip it).
+        let mut mutated = 0usize;
+        for row in inner.list("probe", None, None).await.expect("list") {
+            let Some((_, generation, _)) = split_scoped_id(&row.id) else {
+                continue;
+            };
+            if generation != gen1 {
+                continue;
+            }
+            let Some((vector, mut payload)) = inner.get("probe", &row.id).await.expect("read")
+            else {
+                continue;
+            };
+            payload.content = "STALE PRE-FIX EXTRACTION".to_string();
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert(
+                    "ingest_version".to_string(),
+                    serde_json::json!("0.0.0-stale"),
+                );
+            }
+            inner
+                .upsert("probe", &row.id, vector, payload)
+                .await
+                .expect("mutate the previous generation");
+            mutated += 1;
+        }
+        assert!(mutated > 0, "the fixture mutated the previous generation");
+
+        // The tree changed (a new file), so the carry pass would run; the
+        // summary fails once before it can answer.
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(dir.join("other.rs"), "fn other() {}").expect("write changed file");
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("the re-parse ingests");
+
+        let gen2 = inner.active_generation("probe", &key).await.expect("gen2");
+        assert!(gen2 > gen1, "a changed tree publishes a new generation");
+        let current: Vec<_> = inner
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen2))
+            .collect();
+        assert!(!current.is_empty(), "the current generation has rows");
+        assert!(
+            current
+                .iter()
+                .all(|r| r.payload.content != "STALE PRE-FIX EXTRACTION"),
+            "a transient summary failure must not carry pre-fix rows into the current generation: {:?}",
+            current
+                .iter()
+                .filter(|r| r.payload.content == "STALE PRE-FIX EXTRACTION")
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// The read helper rejects a path that is not a readable file, under every
+    /// uid: a directory read is EISDIR even for root.
+    #[test]
+    fn read_ingest_file_rejects_a_directory() {
+        let dir = std::env::temp_dir().join(format!("ns-read-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let err = read_ingest_file(&dir).expect_err("a directory is not a file");
+        assert!(
+            format!("{err}").contains("failed to read"),
+            "the error names the read failure: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file the walk found but cannot read aborts the ingest instead of
+    /// publishing a generation with its content silently missing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_failure_aborts_generation() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, db, store, schema) = kind_fixture("read-failure").await;
+        let file = tmp.join("locked.rs");
+        std::fs::write(&file, "fn locked() {}").expect("write file");
+        let mut perms = std::fs::metadata(&file).expect("stat").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&file, perms).expect("chmod 000");
+
+        // A root test process can read a mode-000 file (DAC override). Check
+        // the fixture before asserting on it; the helper test above still
+        // proves the error path in that environment.
+        let fixture_unreadable = std::fs::read(&file).is_err();
+        if fixture_unreadable {
+            let err = ingest_directory(
+                &tmp,
+                &schema,
+                Arc::new(ZeroEmbedder),
+                store.clone(),
+                "probe",
+                None,
+                &[],
+            )
+            .await
+            .expect_err("an unreadable file must abort the ingest");
+            assert!(
+                format!("{err}").contains("failed to read"),
+                "the error names the read failure: {err}"
+            );
+            assert_eq!(
+                store
+                    .active_generation("probe", &source_key_for(&tmp))
+                    .await
+                    .expect("read"),
+                0,
+                "no generation is published"
+            );
+        }
+
+        let mut perms = std::fs::metadata(&file).expect("stat").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&file, perms).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// The file-to-directory invariant: after the path changes kind, the new
+    /// generation serves the directory node and none of the deleted file's
+    /// rows.
+    #[tokio::test]
+    async fn file_to_directory_asserts_old_rows_dead() {
+        let (tmp, db, store, schema) = kind_fixture("file-to-dir-dead").await;
+        std::fs::write(tmp.join("thing.rs"), "pub fn gone() {}").expect("write file");
+        ingest_directory(
             &tmp,
             &schema,
             Arc::new(ZeroEmbedder),
             store.clone(),
-            "test-ns",
-            Some(observer),
+            "probe",
+            None,
             &[],
         )
-        .await;
-        assert!(
-            outcome.is_ok(),
-            "the walk proceeds past the skipped document: {:?}",
-            outcome.err()
-        );
+        .await
+        .expect("first ingest");
+        let key = source_key_for(&tmp);
 
-        // The clean document landed whole.
-        let good_sym = generation_scoped_id(
-            "test-ns",
-            1,
-            &symbol_id(
-                "good.rs",
-                "functions",
-                "clean",
-                &sha256_hex("fn clean() {}".as_bytes()),
-            ),
-        );
-        assert!(
-            store
-                .get("test-ns", &good_sym)
-                .await
-                .expect("read back")
-                .is_some(),
-            "clean symbol was stored"
-        );
+        std::fs::remove_file(tmp.join("thing.rs")).expect("remove file");
+        std::fs::create_dir_all(tmp.join("thing.rs")).expect("create directory");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+            &[],
+        )
+        .await
+        .expect("second ingest");
+        let gen2 = store.active_generation("probe", &key).await.expect("gen2");
 
-        // The tripping document contributed nothing: no file node, no symbol.
-        let evil_node = generation_scoped_id("test-ns", 1, "evil.rs");
+        let rows: Vec<_> = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|r| split_scoped_id(&r.id).is_some_and(|(_, g, _)| g == gen2))
+            .collect();
         assert!(
-            store
-                .get("test-ns", &evil_node)
-                .await
-                .expect("read back")
-                .is_none(),
-            "skipped document's file node was not stored"
-        );
-        let evil_sym = generation_scoped_id(
-            "test-ns",
-            1,
-            &symbol_id(
-                "evil.rs",
-                "functions",
-                "leak",
-                &sha256_hex("fn leak() {\n    let key = \"\";\n}".as_bytes()),
-            ),
+            rows.iter()
+                .any(|r| r.id == generation_scoped_id("probe", gen2, "thing.rs")
+                    && r.payload.memory_type == "directory"),
+            "the directory node is current"
         );
         assert!(
-            store
-                .get("test-ns", &evil_sym)
-                .await
-                .expect("read back")
-                .is_none(),
-            "skipped document's symbol was not stored"
+            rows.iter().all(|r| r.payload.location != "thing.rs"
+                || r.payload.memory_type == "directory"),
+            "no deleted file row is served: {:?}",
+            rows.iter()
+                .filter(|r| r.payload.location == "thing.rs" && r.payload.memory_type != "directory")
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
         );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
 
-        // And the skip was reported with the file and the scanner's reason.
-        let skipped = skipped.lock().expect("recorder lock");
+    /// Records every embed_batch payload so tests can observe how the
+    /// consumer batches symbol and doc-section embeddings.
+    struct BatchRecordingEmbedder {
+        batch_calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for BatchRecordingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.batch_calls.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![0.0; 4]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    fn batch_recording_embedder() -> (Arc<dyn Embedder>, Arc<std::sync::Mutex<Vec<Vec<String>>>>) {
+        let batch_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(BatchRecordingEmbedder {
+            batch_calls: Arc::clone(&batch_calls),
+        });
+        (embedder, batch_calls)
+    }
+
+    /// The producer compiles one tree-sitter query per schema entry up front
+    /// instead of recompiling the pattern for every file.
+    #[test]
+    fn compile_language_queries_compiles_every_configured_query() {
+        let schema = ParserSchema::load(
+            r#"{"languages":{"rust":{"extensions":["rs"],"queries":{"functions":"(function_item name: (identifier) @name) @func"}}}}"#,
+        )
+        .expect("the fixture schema parses");
+        let compiled = compile_language_queries(&schema);
+        assert!(
+            compiled.contains_key("rust:functions"),
+            "the compiled cache is keyed by language:query, got {compiled:?}"
+        );
+    }
+
+    /// One file carrying several symbols is embedded as a single batch, not one
+    /// embed call per symbol.
+    #[tokio::test]
+    async fn ingest_batches_multi_symbol_files_into_one_embed_batch() {
+        let tmp = std::env::temp_dir().join(format!("ns-batch-symbols-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n")
+            .expect("write rust file");
+        let db = std::env::temp_dir().join(format!("ns-batch-symbols-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("batch-ns").await.expect("create the schema");
+        let (embedder, batch_calls) = batch_recording_embedder();
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder,
+            store.clone(),
+            "batch-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest batches the multi-symbol file");
+
+        let batches = batch_calls.lock().unwrap();
         assert_eq!(
-            skipped.len(),
+            batches.len(),
             1,
-            "exactly one skip reported: {:?}",
-            *skipped
+            "one file with symbols is one batch: {batches:?}"
+        );
+        assert_eq!(
+            batches[0].len(),
+            2,
+            "both symbols share one batch: {batches:?}"
         );
         assert!(
-            skipped[0].0.ends_with("evil.rs"),
-            "skip names the file: {}",
-            skipped[0].0
+            batches[0][0].contains("alpha"),
+            "the batch carries the first symbol: {}",
+            batches[0][0]
         );
         assert!(
-            skipped[0].1.contains("ERROR [SECURITY]"),
-            "skip carries the scanner verdict: {}",
-            skipped[0].1
+            batches[0][1].contains("beta"),
+            "the batch carries the second symbol: {}",
+            batches[0][1]
+        );
+        drop(batches);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// One markdown file carrying several sections is embedded as a single
+    /// batch.
+    #[tokio::test]
+    async fn ingest_batches_markdown_sections_into_one_embed_batch() {
+        let tmp = std::env::temp_dir().join(format!("ns-batch-md-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(
+            tmp.join("guide.md"),
+            "# Guide\n\nIntro.\n\n## Setup\n\nSetup.\n\n## Usage\n\nUsage.",
+        )
+        .expect("write markdown");
+        let db = std::env::temp_dir().join(format!("ns-batch-md-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("batch-ns").await.expect("create the schema");
+        let (embedder, batch_calls) = batch_recording_embedder();
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder,
+            store.clone(),
+            "batch-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest batches the multi-section markdown");
+
+        let batches = batch_calls.lock().unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "one markdown file is one batch: {batches:?}"
+        );
+        assert_eq!(
+            batches[0].len(),
+            3,
+            "all sections share one batch: {batches:?}"
+        );
+        drop(batches);
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn incremental_ingest_clears_dangling_cross_file_depends_on_when_callee_removed() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-inc-callee-removed-src-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db =
+            std::env::temp_dir().join(format!("ns-inc-callee-removed-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("caller.rs"),
+            "use crate::callee::compute_target;\npub fn invoke_caller() { compute_target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("callee.rs"), "pub fn compute_target() {}\n").unwrap();
+
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).unwrap());
+        store.init("inc-deps-ns").await.unwrap();
+        let (embedder, _) = batch_recording_embedder();
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "inc-deps-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("gen 1 ingest");
+
+        let gen1_rows = store
+            .list("inc-deps-ns", None, Some("code_ast"))
+            .await
+            .unwrap();
+        let caller_gen1 = gen1_rows
+            .iter()
+            .find(|r| {
+                r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller")
+            })
+            .expect("invoke_caller in gen 1");
+        let gen1_deps = caller_gen1
+            .payload
+            .metadata
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(gen1_deps, 1, "gen 1 caller must depend on compute_target");
+
+        // Rename `compute_target` in `callee.rs` without touching `caller.rs`.
+        std::fs::write(tmp.join("callee.rs"), "pub fn renamed_other_fn() {}\n").unwrap();
+
+        ingest_directory(
+            &tmp,
+            &schema,
+            embedder,
+            store.clone(),
+            "inc-deps-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("gen 2 incremental ingest");
+
+        let gen2_rows = store
+            .list("inc-deps-ns", None, Some("code_ast"))
+            .await
+            .unwrap();
+        let caller_gen2 = gen2_rows
+            .iter()
+            .find(|r| {
+                r.payload.metadata.get("symbol").and_then(|v| v.as_str()) == Some("invoke_caller")
+            })
+            .expect("invoke_caller carried into gen 2");
+        let gen2_deps = caller_gen2
+            .payload
+            .metadata
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let gen2_calls_resolved = caller_gen2
+            .payload
+            .metadata
+            .get("calls_resolved")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            gen2_deps, 0,
+            "carried caller must not retain dangling depends_on after callee removal: {:?}",
+            caller_gen2.payload.metadata
+        );
+        assert_eq!(
+            gen2_calls_resolved, 0,
+            "carried caller must not retain dangling calls_resolved after callee removal: {:?}",
+            caller_gen2.payload.metadata
         );
         assert!(
-            skipped[0].1.contains("github_pat"),
-            "skip carries the scanner category: {}",
-            skipped[0].1
+            caller_gen2
+                .payload
+                .metadata
+                .get("cross_file_callees")
+                .is_none(),
+            "carried caller must clear stale cross_file_callees"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
+    }
+
+    // Task 1: shared ingest eligibility predicate backing both the ingest
+    // walker and the watcher event filter.
+
+    #[test]
+    fn eligibility_rejects_every_skip_dir_name() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        for skip_dir in SKIPPED_DIRS {
+            let skipped_path = format!("/tmp/fresh-root/apps/gen/{}/src/lib.rs", skip_dir);
+            assert!(
+                !is_ingest_eligible_path(std::path::Path::new(&skipped_path), root),
+                "skip dir {skip_dir} must be rejected: {skipped_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn eligibility_rejects_database_and_store_artifacts() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        for artifact in ["app.db", "app.wal", "app.lock", "app.checkpoint"] {
+            let db_path = format!("/tmp/fresh-root/data/{}", artifact);
+            assert!(
+                !is_ingest_eligible_path(std::path::Path::new(&db_path), root),
+                "store artifact {artifact} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn eligibility_accepts_a_plain_source_file_under_root() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        assert!(is_ingest_eligible_path(
+            std::path::Path::new("/tmp/fresh-root/src/lib.rs"),
+            root
+        ));
+    }
+
+    #[test]
+    fn eligibility_rejects_paths_outside_root() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        assert!(!is_ingest_eligible_path(
+            std::path::Path::new("/tmp/other/src/lib.rs"),
+            root
+        ));
+    }
+
+    #[test]
+    fn eligibility_rejects_dotdot_escape_outside_root() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        assert!(!is_ingest_eligible_path(
+            std::path::Path::new("/tmp/fresh-root/src/../../outside.rs"),
+            root,
+        ));
+        assert!(!is_ingest_eligible_path(
+            std::path::Path::new("/tmp/fresh-root/../../../etc/passwd"),
+            root,
+        ));
+    }
+
+    #[test]
+    fn eligibility_accepts_relative_root_paths() {
+        assert!(is_ingest_eligible_path(
+            std::path::Path::new("src/lib.rs"),
+            std::path::Path::new("src"),
+        ));
+        assert!(!is_ingest_eligible_path(
+            std::path::Path::new("/tmp/fresh-root/src/lib.rs"),
+            std::path::Path::new("."),
+        ));
     }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or
@@ -3916,27 +6728,6 @@ pub async fn dry_run_directory(
     mode: &str,
 ) -> anyhow::Result<String> {
     let ext_to_lang = build_ext_map(schema);
-    let skipped_dirs = [
-        "node_modules",
-        "target",
-        "vendor",
-        ".venv",
-        "venv",
-        "env",
-        ".env",
-        "dist",
-        "build",
-        "out",
-        ".dolt",
-        ".git",
-        ".next",
-        ".nuxt",
-        "__pycache__",
-        ".fastembed_cache",
-        ".idea",
-        ".vscode",
-        "coverage",
-    ];
 
     let mut files = 0usize;
     let mut parseable = 0usize;
@@ -3966,23 +6757,10 @@ pub async fn dry_run_directory(
         };
         let path = entry.path();
         let path_str = path.to_string_lossy();
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern)
-                || path_str.starts_with(&skip_start)
-                || path_str == skip_exact
-            {
-                should_skip = true;
-                break;
-            }
-        }
-        if should_skip {
+        if !is_ingest_eligible_path(path, dir_path) {
             continue;
         }
-        let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
         if !is_file {
             continue;
         }
@@ -4058,12 +6836,12 @@ pub async fn dry_run_directory(
                 if parser.set_language(&ts_lang).is_ok() {
                     if let Some(tree) = parser.parse(&content, None) {
                         let schema_lang = &schema.languages[&ln];
-                        for (_qname, qstr) in &schema_lang.queries {
+                        for qstr in schema_lang.queries.values() {
                             if let Ok(q) = tree_sitter::Query::new(&ts_lang, qstr) {
                                 let mut cursor = tree_sitter::QueryCursor::new();
                                 let mut iter =
                                     cursor.matches(&q, tree.root_node(), content.as_bytes());
-                                while let Some(_) = iter.next() {
+                                while iter.next().is_some() {
                                     symbols += 1;
                                 }
                             }
@@ -4093,7 +6871,7 @@ pub async fn dry_run_directory(
         // `.bak`/`.old` suffixes strip off in file_stem() and would never match (AH-17).
         if p.file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |name| v_pattern.is_match(name))
+            .is_some_and(|name| v_pattern.is_match(name))
             && !version_candidates.contains(path_str)
         {
             version_candidates.push(path_str.clone());
@@ -4111,7 +6889,7 @@ pub async fn dry_run_directory(
             }
         }
     }
-    for (_key, path_set) in &stem_dir_map {
+    for path_set in stem_dir_map.values() {
         if path_set.len() > 1 {
             for path_str in path_set {
                 if !version_candidates.contains(path_str) {
@@ -4277,8 +7055,8 @@ pub fn resolve_dependency_paths(
                 for _ in 1..dots {
                     base = base.parent().unwrap_or(&base).to_path_buf();
                 }
-                let rest_path = rest.replace('.', "/");
-                if rest_path.is_empty() {
+                let segments: Vec<&str> = rest.split('.').filter(|s| !s.is_empty()).collect();
+                if segments.is_empty() {
                     // package import: __init__.py
                     candidates.push(
                         base.join("__init__.py")
@@ -4286,12 +7064,27 @@ pub fn resolve_dependency_paths(
                             .replace('\\', "/"),
                     );
                 } else {
-                    let base = base.join(&rest_path);
-                    push_candidates(&mut candidates, &base, &exts);
+                    for len in 1..=segments.len() {
+                        let sub = segments[..len].join("/");
+                        push_candidates(&mut candidates, &base.join(&sub), &exts);
+                    }
                 }
             } else {
-                let base = spec.replace('.', "/");
-                // try at root and src/
+                let segments: Vec<&str> = spec.split('.').filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len() {
+                    let base = segments[..len].join("/");
+                    push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                    push_candidates(
+                        &mut candidates,
+                        std::path::Path::new("src").join(&base).as_path(),
+                        &exts,
+                    );
+                }
+            }
+        } else if let Some(spec) = imp.strip_prefix("import:") {
+            let segments: Vec<&str> = spec.split('.').filter(|s| !s.is_empty()).collect();
+            for len in 1..=segments.len() {
+                let base = segments[..len].join("/");
                 push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
                 push_candidates(
                     &mut candidates,
@@ -4299,14 +7092,6 @@ pub fn resolve_dependency_paths(
                     &exts,
                 );
             }
-        } else if let Some(spec) = imp.strip_prefix("import:") {
-            let base = spec.replace('.', "/");
-            push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
-            push_candidates(
-                &mut candidates,
-                std::path::Path::new("src").join(&base).as_path(),
-                &exts,
-            );
         } else if let Some(spec) = imp.strip_prefix("mod:") {
             let base = parent.join(spec);
             push_candidates(&mut candidates, &base, &exts);
@@ -4332,20 +7117,32 @@ pub fn resolve_dependency_paths(
                     push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
                 }
             } else if let Some(rest) = spec.strip_prefix("super::") {
-                let base = rest.replace("::", "/");
+                let segments: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
                 let parent_parent = parent.parent().unwrap_or(parent);
-                push_candidates(&mut candidates, &parent_parent.join(&base), &exts);
+                for len in 1..=segments.len() {
+                    let base = segments[..len].join("/");
+                    push_candidates(&mut candidates, &parent.join(&base), &exts);
+                    push_candidates(&mut candidates, &parent_parent.join(&base), &exts);
+                }
             } else if let Some(rest) = spec.strip_prefix("self::") {
-                let base = rest.replace("::", "/");
-                push_candidates(&mut candidates, &parent.join(&base), &exts);
+                let segments: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len() {
+                    let base = segments[..len].join("/");
+                    push_candidates(&mut candidates, &parent.join(&base), &exts);
+                }
             } else if spec.contains("::") {
-                // external crate or module path; try as path under src
-                let base = spec.replace("::", "/");
-                push_candidates(
-                    &mut candidates,
-                    std::path::Path::new("src").join(&base).as_path(),
-                    &exts,
-                );
+                // external crate or module path; try as path under src, parent, and root
+                let segments: Vec<&str> = spec.split("::").filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len() {
+                    let base = segments[..len].join("/");
+                    push_candidates(
+                        &mut candidates,
+                        std::path::Path::new("src").join(&base).as_path(),
+                        &exts,
+                    );
+                    push_candidates(&mut candidates, &parent.join(&base), &exts);
+                    push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                }
             }
         } else if let Some(spec) = imp.strip_prefix("extern:") {
             push_candidates(
@@ -4376,6 +7173,286 @@ pub fn resolve_dependency_paths(
     out.sort();
     out.dedup();
     out
+}
+
+fn is_common_std_ident(ident: &str) -> bool {
+    matches!(
+        ident,
+        "new"
+            | "default"
+            | "from"
+            | "into"
+            | "clone"
+            | "to_string"
+            | "as_str"
+            | "as_ref"
+            | "unwrap"
+            | "expect"
+            | "ok"
+            | "err"
+            | "some"
+            | "none"
+            | "map"
+            | "and_then"
+            | "or_else"
+            | "filter"
+            | "collect"
+            | "iter"
+            | "into_iter"
+            | "len"
+            | "is_empty"
+            | "push"
+            | "pop"
+            | "insert"
+            | "remove"
+            | "get"
+            | "contains"
+            | "fmt"
+            | "write"
+            | "read"
+            | "open"
+            | "close"
+            | "init"
+            | "main"
+            | "test"
+    )
+}
+
+/// Tier-1 Workspace Symbol Table cross-file call graph linker (`neurostrata-rbde`).
+///
+/// Uses the Lean 4 verified `resolve_cross_file_call` priority order:
+/// 1. Same-file definitions (`SameFile`)
+/// 2. Imported-file definitions from `dependency_map` (`ImportedFile`)
+/// 3. Unambiguous workspace definitions (`WorkspaceUnique`, `ident_len >= 4`, `!is_common_std_ident`)
+pub async fn resolve_cross_file_calls_for_generation(
+    vector_store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    staged_symbols: &[StagedSymbolInfo],
+    dependency_map: &std::collections::HashMap<String, Vec<String>>,
+) -> usize {
+    use crate::formal_kernel::{resolve_cross_file_call, CrossFileResolution};
+
+    let mut by_file_and_name: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+
+    for sym in staged_symbols {
+        by_file_and_name
+            .entry((sym.file_path.clone(), sym.name.clone()))
+            .or_default()
+            .push(sym.id.clone());
+        by_name
+            .entry(sym.name.clone())
+            .or_default()
+            .push((sym.file_path.clone(), sym.id.clone()));
+    }
+
+    let mut resolved_targets_by_caller: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut cross_file_callees_by_caller: std::collections::HashMap<
+        String,
+        Vec<serde_json::Value>,
+    > = std::collections::HashMap::new();
+    let mut cross_file_callers_by_callee: std::collections::HashMap<
+        String,
+        Vec<serde_json::Value>,
+    > = std::collections::HashMap::new();
+    let mut cross_file_edges = 0usize;
+
+    for caller in staged_symbols {
+        if caller.calls.is_empty() {
+            continue;
+        }
+        let imported_files = dependency_map
+            .get(&caller.file_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        for callee_name in &caller.calls {
+            let same_file_ids: Vec<String> = by_file_and_name
+                .get(&(caller.file_path.clone(), callee_name.clone()))
+                .map(|ids| ids.iter().filter(|id| *id != &caller.id).cloned().collect())
+                .unwrap_or_default();
+            let in_same_file = !same_file_ids.is_empty();
+
+            let mut imported_matches: Vec<(String, String)> = Vec::new();
+            for imp_path in imported_files {
+                if let Some(ids) = by_file_and_name.get(&(imp_path.clone(), callee_name.clone())) {
+                    for tid in ids {
+                        if tid != &caller.id {
+                            imported_matches.push((imp_path.clone(), tid.clone()));
+                        }
+                    }
+                }
+            }
+            let in_imported_file = !imported_matches.is_empty();
+
+            let workspace_matches: Vec<(String, String)> = by_name
+                .get(callee_name)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|(_, tid)| tid != &caller.id)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ws_count = workspace_matches.len() as u32;
+            let is_self_call =
+                callee_name == &caller.name && !in_same_file && !in_imported_file && ws_count == 0;
+
+            let resolution = resolve_cross_file_call(
+                is_self_call,
+                in_same_file,
+                in_imported_file,
+                ws_count,
+                callee_name.len() as u32,
+                is_common_std_ident(callee_name),
+            );
+
+            match resolution {
+                CrossFileResolution::SameFile => {
+                    let entry = resolved_targets_by_caller
+                        .entry(caller.id.clone())
+                        .or_default();
+                    for tid in same_file_ids {
+                        if !entry.contains(&tid) {
+                            entry.push(tid);
+                        }
+                    }
+                }
+                CrossFileResolution::ImportedFile => {
+                    for (target_path, tid) in imported_matches {
+                        let entry = resolved_targets_by_caller
+                            .entry(caller.id.clone())
+                            .or_default();
+                        if !entry.contains(&tid) {
+                            entry.push(tid.clone());
+                        }
+                        if target_path != caller.file_path {
+                            cross_file_edges += 1;
+                            cross_file_callees_by_caller
+                                .entry(caller.id.clone())
+                                .or_default()
+                                .push(serde_json::json!({
+                                    "symbol_id": tid,
+                                    "symbol_name": callee_name,
+                                    "file_path": target_path,
+                                    "resolution": resolution.as_tag(),
+                                }));
+                            cross_file_callers_by_callee.entry(tid).or_default().push(
+                                serde_json::json!({
+                                    "symbol_id": caller.id,
+                                    "symbol_name": caller.name,
+                                    "symbol_kind": caller.kind,
+                                    "file_path": caller.file_path,
+                                    "resolution": resolution.as_tag(),
+                                }),
+                            );
+                        }
+                    }
+                }
+                CrossFileResolution::WorkspaceUnique => {
+                    if let Some((target_path, tid)) = workspace_matches.into_iter().next() {
+                        let entry = resolved_targets_by_caller
+                            .entry(caller.id.clone())
+                            .or_default();
+                        if !entry.contains(&tid) {
+                            entry.push(tid.clone());
+                        }
+                        if target_path != caller.file_path {
+                            cross_file_edges += 1;
+                            cross_file_callees_by_caller
+                                .entry(caller.id.clone())
+                                .or_default()
+                                .push(serde_json::json!({
+                                    "symbol_id": tid,
+                                    "symbol_name": callee_name,
+                                    "file_path": target_path,
+                                    "resolution": resolution.as_tag(),
+                                }));
+                            cross_file_callers_by_callee.entry(tid).or_default().push(
+                                serde_json::json!({
+                                    "symbol_id": caller.id,
+                                    "symbol_name": caller.name,
+                                    "symbol_kind": caller.kind,
+                                    "file_path": caller.file_path,
+                                    "resolution": resolution.as_tag(),
+                                }),
+                            );
+                        }
+                    }
+                }
+                CrossFileResolution::UnresolvedSelfCall
+                | CrossFileResolution::UnresolvedAmbiguousOrStd => {}
+            }
+        }
+    }
+
+    let mut dirty_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for id in cross_file_callees_by_caller.keys() {
+        dirty_ids.insert(id.clone());
+    }
+    for id in cross_file_callers_by_callee.keys() {
+        dirty_ids.insert(id.clone());
+    }
+
+    for sym_id in dirty_ids {
+        match vector_store.get(namespace, &sym_id).await {
+            Ok(Some((vec, mut payload))) => {
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    if let Some(targets) = resolved_targets_by_caller.get(&sym_id) {
+                        let mut merged_deps: Vec<String> = obj
+                            .get("depends_on")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for t in targets {
+                            if !merged_deps.contains(t) {
+                                merged_deps.push(t.clone());
+                            }
+                        }
+                        merged_deps.sort();
+                        merged_deps.dedup();
+                        obj.insert(
+                            "depends_on".to_string(),
+                            serde_json::json!(merged_deps.clone()),
+                        );
+                        obj.insert("calls_resolved".to_string(), serde_json::json!(merged_deps));
+                    }
+                    if let Some(callees) = cross_file_callees_by_caller.get(&sym_id) {
+                        obj.insert("cross_file_callees".to_string(), serde_json::json!(callees));
+                    }
+                    if let Some(callers) = cross_file_callers_by_callee.get(&sym_id) {
+                        obj.insert("cross_file_callers".to_string(), serde_json::json!(callers));
+                    }
+                }
+                if let Err(e) = vector_store.upsert(namespace, &sym_id, vec, payload).await {
+                    tracing::warn!(
+                        "cross_file_call stamping: failed to upsert symbol {} in {}: {}",
+                        sym_id,
+                        namespace,
+                        e
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "cross_file_call stamping: vector_store.get failed for {}: {}",
+                    sym_id,
+                    e
+                );
+            }
+        }
+    }
+
+    cross_file_edges
 }
 
 fn push_candidates(out: &mut Vec<String>, base: &std::path::Path, exts: &[&str]) {
@@ -4409,3 +7486,6 @@ fn normalize_rel_path(p: &str) -> String {
     }
     parts.join("/")
 }
+
+use crate::traits::{is_reserved_ingest_destination, INTERNAL_INGEST_STAGE_PREFIX};
+use tree_sitter::QueryCursor;

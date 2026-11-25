@@ -115,14 +115,11 @@ pub fn temporal_proximity_boost(query_ts: i64, metadata: &serde_json::Value) -> 
         Some(v)
     } else if let Some(v) = metadata.get("date").and_then(|v| v.as_str()) {
         parse_temporal(v).filter(|&t| t > 0)
-    } else if let Some(v) = metadata
-        .get("date")
-        .and_then(|v| v.as_i64())
-        .filter(|&n| n > 0)
-    {
-        Some(v)
     } else {
-        None
+        metadata
+            .get("date")
+            .and_then(|v| v.as_i64())
+            .filter(|&n| n > 0)
     };
     match ts {
         Some(t) => {
