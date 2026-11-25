@@ -33,7 +33,10 @@ pub struct SurfaceDocRule {
     pub required_headings: Vec<String>,
     #[serde(default)]
     pub required_tokens: Vec<String>,
-    #[serde(default)]
+    // The legacy spelling `require_co_change_on_touch` is accepted as an
+    // alias so a manifest written for the pre-rename field name still
+    // enables the rule instead of silently defaulting it off.
+    #[serde(default, alias = "require_co_change_on_touch")]
     pub require_co_change_on_surface_change: bool,
 }
 
@@ -3756,6 +3759,82 @@ pub struct AfterAll {}
             "tracked doc with machine path must be flagged: {:?}",
             report.violations
         );
+    }
+
+    #[test]
+    #[test]
+    fn probe_f1_trait_method_change_differs() {
+        let before = extract_public_surface_signatures("    fn fetch(&self, id: u64);");
+        let after = extract_public_surface_signatures("    fn fetch(&self, id: String);");
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn probe_f5_mcp_schema_property_change_differs() {
+        let before =
+            extract_public_surface_signatures("                                \"query\": { \"type\": \"string\" },");
+        let after =
+            extract_public_surface_signatures("                                \"query\": { \"type\": \"integer\" },");
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        let before_req =
+            extract_public_surface_signatures("                            \"required\": [\"content\"]");
+        let after_req = extract_public_surface_signatures(
+            "                            \"required\": [\"content\", \"namespace\"]",
+        );
+        assert_ne!(before_req, after_req);
+    }
+
+    #[test]
+    fn probe_f6_clap_arg_attribute_change_differs() {
+        let before = extract_public_surface_signatures("        #[arg(long)]");
+        let after = extract_public_surface_signatures("        #[arg(short)]");
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn probe_f7_multiline_route_method_continuation_is_limitation() {
+        let before = extract_public_surface_signatures(
+            "            get(handle_http_storage_status).post(handle_http_storage_status),",
+        );
+        let after =
+            extract_public_surface_signatures("            get(handle_http_storage_status),");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn probe_f8_typescript_interface_member_change_differs() {
+        let before = extract_public_surface_signatures("  strictMode: boolean");
+        let after = extract_public_surface_signatures("  strictMode: string");
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn legacy_manifest_field_alias_still_enables_co_change_rule() {
+        let json = r#"{
+            "schema_version": 1,
+            "tiers": {
+                "vision": {"dir": "vision", "description": "v"},
+                "features_api": {"dir": "features", "description": "f"},
+                "extend": {"dir": "extend", "description": "e"}
+            },
+            "surface_rules": [{
+                "id": "r1", "tier": "features_api", "target_doc": "features/x.md",
+                "require_co_change_on_touch": true
+            }]
+        }"#;
+        let manifest: DocManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.surface_rules[0].require_co_change_on_surface_change);
+    }
+
+    #[test]
+    fn probe_s2_pub_crate_item_is_not_surface() {
+        let decls = extract_public_surface_declarations("pub(crate) enum ScopedEnum { A }");
+        assert!(!decls.contains("ScopedEnum"), "{decls:?}");
+        let sigs = extract_public_surface_signatures("pub(crate) fn internal_op() {}");
+        assert!(sigs.is_empty(), "{sigs:?}");
+        let sigs_field =
+            extract_public_surface_signatures("    pub(crate) count: u64,");
+        assert!(sigs_field.is_empty(), "{sigs_field:?}");
     }
 
     #[test]
