@@ -193,7 +193,7 @@ fn rename_source(root: &Path, range: &str, rel_path: &str) -> Option<String> {
 }
 
 /// Parses one line as a public item declaration, returning its
-/// (declared name, item kind) when the line begins a `pub` / `pub(...)`
+/// (declared name, item kind) when the line begins a bare `pub`
 /// item (with optional async / unsafe / const / default qualifiers) of a
 /// known kind. For `use`, the declared name is the final path segment,
 /// honouring `as` renames.
@@ -204,13 +204,10 @@ fn parse_public_surface_declaration(line: &str) -> Option<(String, String)> {
     {
         let trimmed = line.trim();
         let rest = trimmed.strip_prefix("pub")?;
-        // `pub` must stand alone (bare) or open a visibility group `pub(...)`.
-        let rest = if let Some(after_paren) = rest.strip_prefix('(') {
-            let Some(close) = after_paren.find(')') else {
-                return None;
-            };
-            &after_paren[close + 1..]
-        } else if rest.starts_with(char::is_whitespace) {
+        // Only bare `pub` is external surface: a restricted visibility
+        // group (`pub(crate)`, `pub(super)`, `pub(in ...)`) marks an
+        // internal item, which must not trigger public-API checks.
+        let rest = if rest.starts_with(char::is_whitespace) {
             rest
         } else {
             return None;
@@ -416,7 +413,7 @@ fn parse_use_tree(path: &str, prefix: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// Parses one line as a `pub` / `pub(...)` `use` declaration,
+/// Parses one line as a bare-`pub` `use` declaration,
 /// returning its (declared name, full path) pairs via the use-tree
 /// parser, or `None` when the line is not a `use` declaration. A
 /// `use` line whose tree yields no pairs (e.g. a multiline group
@@ -424,10 +421,9 @@ fn parse_use_tree(path: &str, prefix: &str, out: &mut Vec<(String, String)>) {
 fn parse_use_declarations(line: &str) -> Option<Vec<(String, String)>> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix("pub")?;
-    let rest = if let Some(after_paren) = rest.strip_prefix('(') {
-        let close = after_paren.find(')')?;
-        &after_paren[close + 1..]
-    } else if rest.starts_with(char::is_whitespace) {
+    // Bare `pub` only, as in `parse_public_surface_declaration`: a
+    // restricted `pub(...)` re-export is internal, not surface.
+    let rest = if rest.starts_with(char::is_whitespace) {
         rest
     } else {
         return None;
@@ -504,14 +500,13 @@ fn leading_identifier(text: &str) -> Option<(String, usize)> {
     Some((format!("{prefix}{}", &rest[..len]), prefix.len() + len))
 }
 
-/// Strips a leading `pub` / `pub(...)` visibility prefix, returning the
+/// Strips a leading bare-`pub` visibility prefix, returning the
 /// trimmed remainder, or `None` when the line does not start with one.
 fn strip_visibility_prefix(text: &str) -> Option<&str> {
     let rest = text.strip_prefix("pub")?;
-    if let Some(after_paren) = rest.strip_prefix('(') {
-        let close = after_paren.find(')')?;
-        Some(after_paren[close + 1..].trim_start())
-    } else if rest.starts_with(char::is_whitespace) {
+    // Bare `pub` only: `pub(crate)` / `pub(super)` members are internal
+    // and do not enter the public surface.
+    if rest.starts_with(char::is_whitespace) {
         Some(rest.trim_start())
     } else {
         None
@@ -800,7 +795,7 @@ fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
         }
     }
 
-    // Pattern 2: named field — `pub` / `pub(...)` then `<name>:`.
+    // Pattern 2: named field — bare `pub` then `<name>`:..
     if let Some(after) = strip_visibility_prefix(trimmed) {
         if let Some((name, len)) = leading_identifier(after) {
             let after_name = &after[len..];
@@ -1424,7 +1419,7 @@ fn parse_http_route_registration(line: &str) -> Option<(String, String)> {
 
 /// Extracts public surface declarations from source text or diff lines:
 /// everything `extract_public_surface_identifiers` returns, plus public item
-/// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
+/// declarations (bare-`pub` items, with optional async / unsafe /
 /// const / default qualifiers, over struct/enum/trait/fn/type/const/static/
 /// mod/use/union). For `use`, the declared names come from the
 /// use-tree parser: every member of a grouped use, honouring `as`
@@ -2415,7 +2410,6 @@ struct PrivateStruct {}
         let decls = extract_public_surface_declarations(text);
         for expected in [
             "PlainStruct",
-            "ScopedEnum",
             "fetch_thing",
             "MAX_DEPTH",
             "TABLE",
@@ -2431,6 +2425,8 @@ struct PrivateStruct {}
         }
         assert!(!decls.contains("private_fn"), "{decls:?}");
         assert!(!decls.contains("PrivateStruct"), "{decls:?}");
+        // `pub(crate)` is restricted visibility, not public surface.
+        assert!(!decls.contains("ScopedEnum"), "{decls:?}");
     }
 
     #[test]
@@ -3827,7 +3823,7 @@ pub struct AfterAll {}
     }
 
     #[test]
-    fn probe_s2_pub_crate_item_is_not_surface() {
+    fn restricted_visibility_items_are_not_public_surface() {
         let decls = extract_public_surface_declarations("pub(crate) enum ScopedEnum { A }");
         assert!(!decls.contains("ScopedEnum"), "{decls:?}");
         let sigs = extract_public_surface_signatures("pub(crate) fn internal_op() {}");
