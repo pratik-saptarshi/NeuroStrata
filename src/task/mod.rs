@@ -6285,6 +6285,10 @@ mod tests {
                 .contains("4b825dc642cb6eb9a060e54bf8d69288fbee4904"),
             "the guard must diff a root commit against the git empty tree so a fresh repo's first push is evaluated, not blocked on the nonexistent HEAD~1"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("\"$BASE:Cargo.lock\""),
+            "the guard must compare advisories against the lockfile at the resolved push baseline ($BASE), not origin/develop, so an advisory inherited from the merge-base never blocks a push that did not introduce it"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();

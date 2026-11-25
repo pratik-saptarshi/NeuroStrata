@@ -31,6 +31,61 @@ if PATH="$STUB_BIN" command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+# A stub `cargo` for the audit legs (10-14): a real advisory fixture is
+# impractical offline (no RustSec DB), so the stub keys `cargo audit`
+# off markers embedded as comments in the lockfile under audit — the
+# minimal deterministic fixture this harness can support. A lockfile
+# carrying `# audit-vuln-marker` reports one high advisory
+# (RUSTSEC-9999-0001, exit 1, mirroring real cargo-audit); a lockfile
+# carrying `# audit-baseline-broken` fails a BASELINE (--file) audit
+# with no output and a non-zero exit; anything else is verified clean
+# (no output, exit 0). `cargo clippy` succeeds silently; every other
+# subcommand delegates to the real cargo.
+export GATE_TEST_REAL_CARGO="$(command -v cargo)"
+STUB_AUDIT_BIN="$TMP/bin-audit-stub"
+mkdir -p "$STUB_AUDIT_BIN"
+cat > "$STUB_AUDIT_BIN/cargo" <<'STUBEOF'
+#!/bin/bash
+if [ "${1:-}" = "audit" ]; then
+    shift
+    file="Cargo.lock"
+    is_base=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --file) file="$2"; is_base=1; shift 2 ;;
+            --file=*) file="${1#--file=}"; is_base=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    if [ "$is_base" = "1" ] && grep -q 'audit-baseline-broken' "$file" 2>/dev/null; then
+        exit 2
+    fi
+    if grep -q 'audit-vuln-marker' "$file" 2>/dev/null; then
+        printf 'Crate:     vulncrate\nVersion:   0.1.0\nTitle:     stub advisory fixture\nID:        RUSTSEC-9999-0001\nSeverity:  7.5 (high)\n'
+        exit 1
+    fi
+    exit 0
+fi
+if [ "${1:-}" = "clippy" ]; then
+    exit 0
+fi
+exec "${GATE_TEST_REAL_CARGO:-$HOME/.cargo/bin/cargo}" "$@"
+STUBEOF
+cat > "$STUB_AUDIT_BIN/cargo-audit" <<'STUBEOF'
+#!/bin/bash
+echo 'cargo-audit 0.0.0-stub'
+exit 0
+STUBEOF
+chmod +x "$STUB_AUDIT_BIN/cargo" "$STUB_AUDIT_BIN/cargo-audit"
+AUDIT_PATH="$STUB_AUDIT_BIN:$PATH"
+
+add_lock_marker() {
+    # $1 = repo, $2 = marker name, $3 = commit message
+    printf '# %s\n' "$2" >> "$1/Cargo.lock"
+    git -C "$1" add Cargo.lock
+    git -C "$1" commit -q -m "$3"
+}
+
 new_repo() {
     local repo="$1"
     mkdir -p "$repo/src"
@@ -307,6 +362,99 @@ st9b=$?
 set -e
 if [ "$st9b" -ne 0 ]; then
     printf 'FAIL: HEAD~1 baseline must keep last-commit-only scope (dirty first commit, clean last commit must pass)\n%s\n' "$out9b" >&2
+    exit 1
+fi
+
+# Leg 10 (regression, Codex P1 — advisory baseline): the branch forked
+# BEFORE an upstream advisory fix. The merge-base lockfile and the
+# branch lockfile are IDENTICAL (both carry the advisory); only
+# origin/develop's lockfile has the fix. The push makes an unrelated
+# manifest edit. Comparing against origin/develop blocks on the
+# INHERITED advisory; comparing against the resolved push baseline
+# ($BASE = merge-base) must pass.
+audit_inherited="$TMP/audit-inherited"
+new_repo "$audit_inherited"
+add_lock_marker "$audit_inherited" audit-vuln-marker 'vulnerable merge-base'
+sed -i '/audit-vuln-marker/d' "$audit_inherited/Cargo.lock"
+git -C "$audit_inherited" add Cargo.lock
+git -C "$audit_inherited" commit -q -m 'upstream advisory fix'
+git -C "$audit_inherited" update-ref refs/remotes/origin/develop HEAD
+git -C "$audit_inherited" reset -q --hard HEAD~1
+printf '# unrelated manifest edit\n' >> "$audit_inherited/Cargo.toml"
+git -C "$audit_inherited" add Cargo.toml
+git -C "$audit_inherited" commit -q -m 'unrelated manifest edit'
+set +e
+out10=$(run_gate "$audit_inherited" "$AUDIT_PATH")
+st10=$?
+set -e
+if [ "$st10" -ne 0 ] || grep -q 'new high/critical advisory' <<< "$out10"; then
+    printf 'FAIL: inherited advisory (branch lockfile == merge-base lockfile) must not block the gate\n%s\n' "$out10" >&2
+    exit 1
+fi
+
+# Leg 11 (converse): a genuinely NEW advisory introduced by the
+# branch's own lockfile change still blocks.
+audit_new="$TMP/audit-new"
+new_repo "$audit_new"
+add_lock_marker "$audit_new" audit-vuln-marker 'add vulnerable dependency'
+set +e
+out11=$(run_gate "$audit_new" "$AUDIT_PATH")
+st11=$?
+set -e
+if [ "$st11" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out11"; then
+    printf 'FAIL: a new advisory introduced by the branch lockfile change must block the gate\n%s\n' "$out11" >&2
+    exit 1
+fi
+
+# Leg 12 (converse): a failed BASELINE audit stays fail-closed in the
+# established warn posture — "audit NOT verified", never a block on an
+# unverified baseline and never a "no new advisories" pass claim.
+audit_base_broken="$TMP/audit-base-broken"
+new_repo "$audit_base_broken"
+add_lock_marker "$audit_base_broken" audit-baseline-broken 'broken baseline lockfile'
+git -C "$audit_base_broken" update-ref refs/remotes/origin/develop HEAD
+add_lock_marker "$audit_base_broken" audit-vuln-marker 'add vulnerable dependency'
+set +e
+out12=$(run_gate "$audit_base_broken" "$AUDIT_PATH")
+st12=$?
+set -e
+if [ "$st12" -ne 0 ] || ! grep -q 'audit NOT verified' <<< "$out12" \
+    || grep -q 'new high/critical advisory' <<< "$out12"; then
+    printf 'FAIL: a failed baseline audit must warn audit NOT verified without blocking or claiming no new advisories\n%s\n' "$out12" >&2
+    exit 1
+fi
+
+# Leg 13 (empty-tree baseline): a single-commit repo whose root
+# lockfile carries a high advisory. $BASE is the git empty tree —
+# there is NO baseline lockfile. The gate's added-content philosophy
+# evaluates a root commit in full (legs 6-7), so the baseline is the
+# empty advisory set and the root lockfile's advisory counts as new:
+# the gate must block with the advisory finding.
+audit_root="$TMP/audit-root"
+new_root_repo "$audit_root" clean
+printf '# audit-vuln-marker\n' >> "$audit_root/Cargo.lock"
+git -C "$audit_root" add Cargo.lock
+git -C "$audit_root" commit -q --amend --no-edit
+[ "$(git -C "$audit_root" rev-list --count HEAD)" = "1" ] || { echo 'FAIL: audit root fixture must stay a single commit' >&2; exit 1; }
+set +e
+out13=$(run_gate "$audit_root" "$AUDIT_PATH")
+st13=$?
+set -e
+if [ "$st13" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out13"; then
+    printf 'FAIL: a high advisory in a root commit lockfile (empty-tree baseline) must block the gate\n%s\n' "$out13" >&2
+    exit 1
+fi
+
+# Leg 14 (empty-tree control): a single-commit repo with a clean
+# lockfile passes the audit section on the merits.
+audit_root_clean="$TMP/audit-root-clean"
+new_root_repo "$audit_root_clean" clean
+set +e
+out14=$(run_gate "$audit_root_clean" "$AUDIT_PATH")
+st14=$?
+set -e
+if [ "$st14" -ne 0 ]; then
+    printf 'FAIL: a clean root commit must pass the gate (empty-tree baseline)\n%s\n' "$out14" >&2
     exit 1
 fi
 

@@ -380,33 +380,50 @@ for block in re.split(r"\n\s*\n", text):
                 : # parse failed: warning above already said NOT verified
             elif [ -z "$NEW_IDS" ]; then
                 echo "$GATE: no new high/critical advisories in this push"
-            elif ! git rev-parse --verify --quiet "origin/develop" >/dev/null 2>&1; then
-                echo "$GATE: warning: origin/develop unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
             else
+                # Compare against the lockfile at the RESOLVED push
+                # baseline ($BASE — the same baseline the fmt/clippy
+                # sections diff against), never origin/develop: a
+                # branch forked before an upstream advisory fix has
+                # that advisory in its merge-base lockfile too, and
+                # diffing against origin/develop would block it for an
+                # advisory it inherited rather than introduced.
                 BASE_SEV=""
                 BASE_OK=0
-                TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
-                if git show "origin/develop:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
-                    # (no `set -e` in this script, so a failing substitution
-                    # is safe to inspect via $? on the next line)
-                    BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null)"
-                    BASE_RC=$?
-                    if [ "$BASE_RC" -eq 0 ]; then
-                        # Verified-clean baseline: cargo audit prints
-                        # nothing on success. An empty set here is
-                        # evidence of absence, not missing data — any
-                        # high/critical ID in the push is therefore new.
-                        BASE_OK=1
-                    elif [ -n "$BASE_TEXT" ]; then
-                        # Only a successful parse counts as a verified
-                        # baseline; a failed one leaves BASE_OK=0 and
-                        # falls into the NOT-verified warning below.
-                        if BASE_SEV="$(parse_advisories "$BASE_TEXT")"; then
+                if [ "$BASE" = "4b825dc642cb6eb9a060e54bf8d69288fbee4904" ]; then
+                    # Empty-tree baseline (first push, root commit):
+                    # there is no baseline lockfile — that is verified
+                    # by the baseline's identity, not missing data. A
+                    # root commit is evaluated in full (the same
+                    # added-content rule fmt/clippy apply above), so
+                    # the baseline advisory set is empty and every
+                    # high/critical advisory in the push counts as new.
+                    BASE_OK=1
+                    TMPBASE=""
+                else
+                    TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
+                    if git show "$BASE:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
+                        # (no `set -e` in this script, so a failing substitution
+                        # is safe to inspect via $? on the next line)
+                        BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null)"
+                        BASE_RC=$?
+                        if [ "$BASE_RC" -eq 0 ]; then
+                            # Verified-clean baseline: cargo audit prints
+                            # nothing on success. An empty set here is
+                            # evidence of absence, not missing data — any
+                            # high/critical ID in the push is therefore new.
                             BASE_OK=1
+                        elif [ -n "$BASE_TEXT" ]; then
+                            # Only a successful parse counts as a verified
+                            # baseline; a failed one leaves BASE_OK=0 and
+                            # falls into the NOT-verified warning below.
+                            if BASE_SEV="$(parse_advisories "$BASE_TEXT")"; then
+                                BASE_OK=1
+                            fi
                         fi
                     fi
+                    rm -f "$TMPBASE"
                 fi
-                rm -f "$TMPBASE"
                 if [ "$BASE_OK" != "1" ]; then
                     echo "$GATE: warning: base lockfile audit unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
                 else
