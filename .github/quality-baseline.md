@@ -15,8 +15,10 @@ Rules that keep this file honest:
   reaches zero.
 - Allowlisted warning classes live **only** in this file and in the job
   configuration in `ci.yml` — never as scattered `#[allow]` attributes
-  added silently. **At landing, the allowlist is empty: nothing is
-  allowlisted.**
+  added silently. **At landing, the allowlist was empty: nothing was
+  allowlisted.** It has since gained exactly one entry — the accepted
+  quick-xml audit exceptions recorded under "Current audit state"
+  below (RUSTSEC-2026-0194 / RUSTSEC-2026-0195, ignored in `ci.yml`).
 
 ## Sizing evidence
 
@@ -66,6 +68,11 @@ census: rustc `unused-imports`, `unused-variables`, `unused-mut`,
 **4 informational warnings**. Counting rule: the `cargo audit` JSON
 report embedded in the job log.
 
+The table below is the **landing snapshot** (base `1c32496` — see
+Sizing evidence): the historical record the report-only job was
+calibrated against, not the current findings. The current state is
+recorded under "Current audit state" at the end of this section.
+
 | Advisory | Package | Version |
 |---|---|---|
 | RUSTSEC-2026-0204 | crossbeam-epoch | 0.9.18 |
@@ -81,6 +88,36 @@ report embedded in the job log.
 Informational warnings: 1 unmaintained (paste 1.0.15,
 RUSTSEC-2024-0436); 3 unsound (anyhow 1.0.102 RUSTSEC-2026-0190,
 cxx 1.0.138 RUSTSEC-2026-0202, tokio 1.53.1 RUSTSEC-2026-0386).
+
+### Current audit state (PR #141, measured 2026-11-23)
+
+Dependency bumps since the landing snapshot (most recently the quinn
+and url bumps in PR #141) have cleared the snapshot's backlog. A bare
+`cargo audit` on PR #141's head finds **3 vulnerabilities** and 3
+informational warnings (unmaintained: chrono, paste,
+proc-macro-error2). Two of the three are the accepted exceptions
+below; the third was published after the PR's own measurement and is
+**not** excepted.
+
+| Advisory | Package | Version | Disposition |
+|---|---|---|---|
+| RUSTSEC-2026-0194 | quick-xml | 0.37.5 | Accepted exception (Decision D1) |
+| RUSTSEC-2026-0195 | quick-xml | 0.37.5 | Accepted exception (Decision D1) |
+| RUSTSEC-2026-0594 | cookie | 0.18.2 | Remaining — not excepted |
+
+The quick-xml pair cannot be fixed yet: quick-xml enters via
+oxrdfxml 0.2.5 and sparesults 0.3.5 — both at their newest releases,
+both capping quick-xml at ^0.37 (probe 2026-11-20) — while the fixes
+require quick-xml ≥ 0.41.0. Both advisories are therefore on the
+audit allowlist: `ci.yml`'s audit job ignores exactly these two.
+**Lift condition:** remove both ignores (and this entry) once an
+ox-stack release lets quick-xml reach ≥ 0.41.0.
+
+RUSTSEC-2026-0594 (cookie, published 2026-11-23 — after PR #141's
+2026-11-22 measurement, which found only the quick-xml pair) is a
+live finding, not an exception: with the two ignores applied, the
+audit leg currently reports **1 vulnerability** until cookie is
+bumped to ≥ 0.18.3.
 
 ## deny — `cargo deny check`
 
