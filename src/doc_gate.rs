@@ -1558,6 +1558,25 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
     None
 }
 
+/// Parses one line as a clap argument attribute (`#[arg(...)]`),
+/// returning the normalized attribute contents. An option's long/short
+/// spelling, requiredness, and default are CLI surface, so the whole
+/// attribute is the signature; it is matched on the original line
+/// because a `default_value` string literal is part of that surface
+/// and the blanking pipeline would erase it. All attributes share one
+/// key: changing any one of them makes the added and removed signature
+/// sets for the key differ.
+fn parse_clap_arg_attribute(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix("#[arg(")?.strip_suffix(")]")?;
+    let inner = normalized_line(inner);
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
 /// Extracts the public surface as a map from declaration key to the set
 /// of normalized signatures seen for that key. SS7 identifiers enter as
 /// key = signature = identifier, so a changed line carrying one still
@@ -1581,6 +1600,12 @@ fn extract_public_surface_signatures(
     for line in text.lines() {
         if let Some((key, signature)) = parse_mcp_schema_line(line) {
             signatures.entry(key).or_default().insert(signature);
+        }
+        if let Some(attribute) = parse_clap_arg_attribute(line) {
+            signatures
+                .entry("clap-arg".to_string())
+                .or_default()
+                .insert(attribute);
         }
     }
     // Pipeline step 2, as in `extract_public_surface_declarations`:
@@ -3839,7 +3864,7 @@ pub struct AfterAll {}
     }
 
     #[test]
-    fn probe_f6_clap_arg_attribute_change_differs() {
+    fn clap_arg_attribute_change_differs() {
         let before = extract_public_surface_signatures("        #[arg(long)]");
         let after = extract_public_surface_signatures("        #[arg(short)]");
         assert_ne!(before, after, "before={before:?} after={after:?}");
