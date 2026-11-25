@@ -87,6 +87,12 @@ allow = [
     "Zlib",
     "zlib-acknowledgement",
 ]
+# A crate with no detectable license metadata fails the check instead of
+# passing on cargo-deny's default warning: an unknown licensing status is
+# not a pass. The workspace's own crates declare MIT (the repo LICENSE)
+# in their manifests, so this stays green on the current graph while any
+# future unlicensed dependency fails it.
+unlicensed = "deny"
 # LGPL-2.1-or-later is NOT globally allowed. Owner ruling R3 (2026-11-23):
 # the LGPL-2.1 crates are carried as named per-crate exceptions only
 # (public source repo; no binary distribution outside it). r-efi declares

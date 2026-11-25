@@ -6,6 +6,7 @@ exclude = ["src-tauri"]
 name = "neurostrata-mcp"
 version = "1.19.0"
 edition = "2021"
+license = "MIT"
 exclude = ["tools/runtime-validation/**"]
 
 [[bin]]
