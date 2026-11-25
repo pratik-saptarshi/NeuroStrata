@@ -243,11 +243,15 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           "$HOME/.elan/bin/lake" --dir proofs build
 
+      # Release profile: on Windows a debug build of the vendored C++
+      # (lbug) produces a static library that passes the 4 GiB COFF
+      # ceiling, failing the final link with LNK1248; see
+      # scripts/build.ps1. Mirrors ci.yml's platform test step.
       - name: Test
         shell: bash
         run: |
           set -o pipefail
-          cargo test --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          cargo test --release --locked -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/test-output.log"
 
       # CI telemetry (remediation programme, judge item 10): on failure,
       # publish the failing-test list as a stable-format artifact (schema:
