@@ -1773,7 +1773,26 @@ fn extract_public_surface_signatures(
     // a bare `pub use` in the same text contributes its declaration
     // signature under its own name.
     let reexported = reexported_source_names(&cleaned);
-    for (line, original_line) in cleaned.lines().zip(text.lines()) {
+    // `const` / `static` signatures are taken from the comments-only
+    // intermediate (`route_text`, computed above) instead of the fully
+    // blanked line: a constant's literal value is its surface, so
+    // blanking it would make a value-only change signature-identical.
+    // Recognition still runs on the fully blanked line, so a literal
+    // containing `;`, `//`-like text, or escaped quotes cannot break
+    // declaration parsing, and comments trailing the declaration stay
+    // blanked in both intermediates. All other kinds keep the blanked
+    // line, so literals inside fn bodies and other items do not leak
+    // into their signatures.
+    let signature_line = |kind: &str, line: &str, preserved_line: &str| {
+        if kind == "const" || kind == "static" {
+            declaration_signature(kind, preserved_line)
+        } else {
+            declaration_signature(kind, line)
+        }
+    };
+    for ((line, original_line), preserved_line) in
+        cleaned.lines().zip(text.lines()).zip(route_text.lines())
+    {
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             for (name, signature) in pairs {
                 signatures
@@ -1789,12 +1808,12 @@ fn extract_public_surface_signatures(
                     .insert(full_path);
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
-            let signature = declaration_signature(&kind, line);
+            let signature = signature_line(&kind, line, preserved_line);
             signatures.entry(name).or_default().insert(signature);
         } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
             .filter(|(name, _kind)| reexported.contains(name))
         {
-            let signature = declaration_signature(&kind, line);
+            let signature = signature_line(&kind, line, preserved_line);
             signatures.entry(name).or_default().insert(signature);
         }
         if let Some((_name, key, signature)) = parse_member_declaration(line) {
@@ -3161,6 +3180,74 @@ pub struct AfterAll {}
         let before = extract_public_surface_signatures("pub const MAX_DEPTH: usize = 3;");
         let after = extract_public_surface_signatures("pub const MAX_DEPTH: usize = 4;");
         assert_ne!(before.get("MAX_DEPTH"), after.get("MAX_DEPTH"));
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_const_string_value_change_differs() {
+        let before = extract_public_surface_signatures("pub const GREETING: &str = \"a\";");
+        let after = extract_public_surface_signatures("pub const GREETING: &str = \"b\";");
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert_ne!(before.get("GREETING"), after.get("GREETING"));
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_static_string_value_change_differs() {
+        let before =
+            extract_public_surface_signatures("pub static SCHEMA_PATH: &str = \"a.json\";");
+        let after = extract_public_surface_signatures("pub static SCHEMA_PATH: &str = \"b.json\";");
+        assert_ne!(before.get("SCHEMA_PATH"), after.get("SCHEMA_PATH"));
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_const_char_and_raw_string_changes_differ() {
+        let before = extract_public_surface_signatures("pub const SEPARATOR: char = 'a';");
+        let after = extract_public_surface_signatures("pub const SEPARATOR: char = 'b';");
+        assert_ne!(before.get("SEPARATOR"), after.get("SEPARATOR"));
+        let before = extract_public_surface_signatures("pub const TEMPLATE: &str = r#\"a\"#;");
+        let after = extract_public_surface_signatures("pub const TEMPLATE: &str = r#\"b\"#;");
+        assert_ne!(before.get("TEMPLATE"), after.get("TEMPLATE"));
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_const_literal_edge_contents_differ() {
+        // Escaped quotes, a `;` inside the literal, and `//`-like
+        // content must all survive signature construction without
+        // breaking recognition of the declaration itself.
+        for (before_line, after_line) in [
+            (
+                "pub const QUOTED: &str = \"a\\\"b\";",
+                "pub const QUOTED: &str = \"a\\\"c\";",
+            ),
+            (
+                "pub const SEMI: &str = \"a;b\";",
+                "pub const SEMI: &str = \"a;c\";",
+            ),
+            (
+                "pub const URL: &str = \"http://x/a\";",
+                "pub const URL: &str = \"http://x/b\";",
+            ),
+        ] {
+            let before = extract_public_surface_signatures(before_line);
+            let after = extract_public_surface_signatures(after_line);
+            assert_ne!(before, after, "before={before:?} after={after:?}");
+            assert_eq!(before.len(), 1, "{before:?}");
+        }
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_const_comment_change_is_identical() {
+        let before = extract_public_surface_signatures("pub const GREETING: &str = \"a\"; // one");
+        let after = extract_public_surface_signatures("pub const GREETING: &str = \"a\"; // two");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_fn_body_string_change_is_identical() {
+        // Literal preservation is scoped to const/static declarations:
+        // a string change inside a fn body is not signature surface.
+        let before = extract_public_surface_signatures("pub fn label() -> &'static str { \"a\" }");
+        let after = extract_public_surface_signatures("pub fn label() -> &'static str { \"b\" }");
+        assert_eq!(before, after);
     }
 
     #[test]
