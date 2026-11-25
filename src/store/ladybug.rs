@@ -7857,7 +7857,7 @@ type MentionSymbolIds = Arc<
 >;
 
 /// One edge list as returned by `list_edges`: each edge is
-/// (from id, to id, relation, provenance).
+/// (from id, relation, to id, provenance).
 type EdgeList = Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>;
 
 /// The rows `refresh_ontology` reads in one connection turn: (registry
