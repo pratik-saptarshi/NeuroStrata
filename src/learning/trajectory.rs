@@ -23,6 +23,8 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+type PatternAccumulator = (Vec<TrajectoryStep>, BTreeSet<String>, BTreeSet<String>);
+
 /// Simple trigger enum values that a procedure may carry verbatim.
 const SIMPLE_TRIGGERS: [&str; 3] = ["session-start", "before-edit", "after-mutation"];
 
@@ -131,8 +133,7 @@ pub async fn mine_procedures(
     }
 
     // pattern key -> (window steps, distinct task ids, distinct receipt ids)
-    let mut patterns: BTreeMap<String, (Vec<TrajectoryStep>, BTreeSet<String>, BTreeSet<String>)> =
-        BTreeMap::new();
+    let mut patterns: BTreeMap<String, PatternAccumulator> = BTreeMap::new();
 
     for task in tasks {
         if task.status != Status::Done {

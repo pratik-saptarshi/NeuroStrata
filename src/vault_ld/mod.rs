@@ -15,9 +15,6 @@ use sha2::{Digest, Sha256};
 /// W3C YAML-LD 1.0 context IRI
 pub const YAML_LD_CONTEXT: &str = "https://w3id.org/yaml/vocab";
 
-/// JSON Canvas 1.0 schema namespace
-pub const CANVAS_SCHEMA: &str = "https://jsoncanvas.org";
-
 /// Separates user-authored body content from the parser-generated edge
 /// block. Only lines after this marker are stripped on re-import.
 pub const STRUCTURAL_EDGE_MARKER: &str = "<!-- vault-ld:structural-edges -->";

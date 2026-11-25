@@ -531,20 +531,6 @@ impl Owl2RlRuleId {
         }
     }
 
-    /// Minimum premises the deterministic audit requires for this rule.
-    /// Variable-arity rules (prp-spo2, cls-int*) may carry more.
-    pub fn min_premise_count(&self) -> usize {
-        match self {
-            Self::OwlUniverse => 0,
-            Self::ScmEqc | Self::EqSym => 1,
-            Self::PrpTrp | Self::PrpSpo2 | Self::ClsHv | Self::ClsSvf => 3,
-            Self::CaxDwViolation => 3,
-            Self::ClsAvf | Self::ClsInt1 | Self::ClsInt2 | Self::ClsUni => 4,
-            Self::RdfsContainer => 1,
-            _ => 2,
-        }
-    }
-
     /// Numeric tag matching `formal_kernel::kernel_rule_tag`.
     pub fn to_kernel_tag(&self) -> u8 {
         match self {
@@ -713,9 +699,9 @@ fn nt_term(term: &oxrdf::Term) -> String {
         oxrdf::Term::BlankNode(b) => format!("_:{}", b.as_str()),
         oxrdf::Term::Literal(l) => nt_literal(l),
         oxrdf::Term::Triple(t) => format!(
-            "<<({} {} {})>>",
+            "<<({} <{}> {})>>",
             nt_subject(&t.subject),
-            format!("<{}>", escape_nt(t.predicate.as_str())),
+            escape_nt(t.predicate.as_str()),
             nt_term(&t.object)
         ),
     }
