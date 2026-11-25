@@ -34,7 +34,7 @@ pub struct SurfaceDocRule {
     #[serde(default)]
     pub required_tokens: Vec<String>,
     #[serde(default)]
-    pub require_co_change_on_touch: bool,
+    pub require_co_change_on_surface_change: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +189,89 @@ fn rename_source(root: &Path, range: &str, rel_path: &str) -> Option<String> {
         })
 }
 
-fn watched_added_lines(root: &Path, rel_path: &str) -> String {
+/// Extracts public surface declarations from source text or diff lines:
+/// everything `extract_public_surface_identifiers` returns, plus public item
+/// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
+/// const / default qualifiers, over struct/enum/trait/fn/type/const/static/
+/// mod/use/union). For `use`, the declared name is the final path segment,
+/// honouring `as` renames.
+pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTreeSet<String> {
+    let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
+        .into_iter()
+        .collect();
+    const ITEM_KINDS: [&str; 10] = [
+        "struct", "enum", "trait", "fn", "type", "const", "static", "mod", "use", "union",
+    ];
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("pub") else {
+            continue;
+        };
+        // `pub` must stand alone (bare) or open a visibility group `pub(...)`.
+        let rest = if let Some(after_paren) = rest.strip_prefix('(') {
+            let Some(close) = after_paren.find(')') else {
+                continue;
+            };
+            &after_paren[close + 1..]
+        } else if rest.starts_with(char::is_whitespace) {
+            rest
+        } else {
+            continue;
+        };
+        let mut tokens: Vec<&str> = rest.split_whitespace().collect();
+        // Optional qualifiers; `const` is a qualifier only before `fn`
+        // (otherwise it is the item kind itself, e.g. `pub const NAME`).
+        let mut start = 0;
+        while start < tokens.len() {
+            match tokens[start] {
+                "async" | "unsafe" | "default" => start += 1,
+                "const" if tokens.get(start + 1) == Some(&"fn") => start += 1,
+                _ => break,
+            }
+        }
+        tokens.drain(..start);
+        let Some((kind, _rest)) = tokens.split_first() else {
+            continue;
+        };
+        if !ITEM_KINDS.contains(kind) {
+            continue;
+        }
+        let name_token = tokens.get(1);
+        let name: String = if *kind == "use" {
+            let path = tokens[1..].join(" ");
+            let path = path.trim().trim_end_matches(';').trim();
+            if let Some((_, alias)) = path.rsplit_once(" as ") {
+                alias
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            } else {
+                path.rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_end_matches([';', '}', ','])
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            }
+        } else {
+            let Some(name_token) = name_token else {
+                continue;
+            };
+            name_token
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        };
+        if !name.is_empty() {
+            decls.insert(name);
+        }
+    }
+    decls
+}
+
+fn watched_changed_lines(root: &Path, rel_path: &str) -> (Vec<String>, Vec<String>) {
     if root.join(".git").exists() {
         let tracked = std::process::Command::new("git")
             .args(["ls-files", "--error-unmatch", "--", rel_path])
@@ -198,6 +280,7 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
             .map(|out| out.status.success())
             .unwrap_or(false);
         let mut added = Vec::new();
+        let mut removed = Vec::new();
         let mut inspected = false;
         // Shared committed baseline (connector::committed_diff_range):
         // @{u}..HEAD, else origin/main..HEAD, else no committed range —
@@ -247,6 +330,8 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         if line.starts_with('+') && !line.starts_with("+++") {
                             added.push(line[1..].to_string());
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            removed.push(line[1..].to_string());
                         }
                     }
                 }
@@ -255,10 +340,18 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
         // Successful Git inspection is authoritative, including deletion-only
         // diffs. Only new/untracked files or failed Git inspection fall back.
         if tracked && inspected {
-            return added.join("\n");
+            return (added, removed);
         }
     }
-    std::fs::read_to_string(root.join(rel_path)).unwrap_or_default()
+    let fallback = std::fs::read_to_string(root.join(rel_path)).unwrap_or_default();
+    (
+        fallback.lines().map(|line| line.to_string()).collect(),
+        Vec::new(),
+    )
+}
+
+fn watched_added_lines(root: &Path, rel_path: &str) -> String {
+    watched_changed_lines(root, rel_path).0.join("\n")
 }
 
 pub fn evaluate_doc_gate(
@@ -525,17 +618,32 @@ pub fn evaluate_doc_gate(
     }
 
     // 8. Surface-diff check: watched public-surface change without doc update.
+    //    Fires only when the watched change implicates the public surface:
+    //    a public item declaration or SS7 identifier on an added or removed
+    //    diff line of one of the rule's changed watched paths.
     for rule in &manifest.surface_rules {
-        if !rule.require_co_change_on_touch {
+        if !rule.require_co_change_on_surface_change {
             continue;
         }
-        let watched = changed_paths.iter().any(|cp| {
-            rule.watch_paths
-                .iter()
-                .any(|wp| cp == wp || cp.starts_with(wp))
-        });
+        let watched_changed: Vec<&String> = changed_paths
+            .iter()
+            .filter(|cp| {
+                rule.watch_paths
+                    .iter()
+                    .any(|wp| *cp == wp || cp.starts_with(wp))
+            })
+            .collect();
         let doc_changed = changed_paths.iter().any(|cp| cp == &rule.target_doc);
-        if watched && !doc_changed {
+        if watched_changed.is_empty() || doc_changed {
+            continue;
+        }
+        let mut declarations = std::collections::BTreeSet::new();
+        for cp in &watched_changed {
+            let (added, removed) = watched_changed_lines(root, cp);
+            declarations.extend(extract_public_surface_declarations(&added.join("\n")));
+            declarations.extend(extract_public_surface_declarations(&removed.join("\n")));
+        }
+        if !declarations.is_empty() {
             violations.push(DocViolation {
                 rule_id: rule.id.clone(),
                 kind: "surface_changed_without_doc_update".to_string(),
@@ -727,7 +835,7 @@ mod tests {
                     "target_doc": "docs/vision/target_doc.md",
                     "required_headings": ["## Introduction"],
                     "required_tokens": ["required-missing-token"],
-                    "require_co_change_on_touch": false
+                    "require_co_change_on_surface_change": false
                 }
             ]
         }"###;
@@ -773,7 +881,7 @@ mod tests {
                     "target_doc": "docs/vision/target_doc.md",
                     "required_headings": ["## Introduction"],
                     "required_tokens": ["target_doc", "feature one"],
-                    "require_co_change_on_touch": false
+                    "require_co_change_on_surface_change": false
                 }
             ]
         }"###;
@@ -794,6 +902,12 @@ mod tests {
         std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
         std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
         std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(tmp_dir.path().join("src")).unwrap();
+        std::fs::write(
+            tmp_dir.path().join("src").join("server.rs"),
+            "pub struct NewSurfaceParams {}\n",
+        )
+        .unwrap();
         std::fs::write(
             docs_dir.join("vision").join("target_doc.md"),
             "## Introduction\nThe target_doc surface.",
@@ -817,7 +931,7 @@ mod tests {
                     "target_doc": "docs/vision/target_doc.md",
                     "required_headings": ["## Introduction"],
                     "required_tokens": ["target_doc"],
-                    "require_co_change_on_touch": true
+                    "require_co_change_on_surface_change": true
                 }
             ]
         }"###;
@@ -869,7 +983,7 @@ mod tests {
                     "target_doc": "docs/features-api/cli-reference.md",
                     "required_headings": ["## Workflow, Documentation Gate & Ontology Commands"],
                     "required_tokens": ["doc-gate", "workflow"],
-                    "require_co_change_on_touch": false
+                    "require_co_change_on_surface_change": false
                 }
             ]
         }"###;
@@ -898,7 +1012,11 @@ mod tests {
             "## Introduction\nThe target_doc surface.",
         )
         .unwrap();
-        std::fs::write(root.join("src").join("server.rs"), "fn v1() {}\n").unwrap();
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub fn surface_v1() {}\n",
+        )
+        .unwrap();
         let manifest = r###"{
             "schema_version": 1,
             "allowed_root_files": ["README.md", "manifest.json"],
@@ -917,7 +1035,7 @@ mod tests {
                     "target_doc": "docs/vision/target_doc.md",
                     "required_headings": ["## Introduction"],
                     "required_tokens": ["target_doc"],
-                    "require_co_change_on_touch": true
+                    "require_co_change_on_surface_change": true
                 }
             ]
         }"###;
@@ -942,7 +1060,11 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "baseline"]);
         run(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        std::fs::write(root.join("src").join("server.rs"), "fn v2() {}\n").unwrap();
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub struct SurfaceV2 {}\npub fn surface_v2() {}\n",
+        )
+        .unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "surface change without doc update"]);
 
@@ -958,6 +1080,196 @@ mod tests {
                 v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
             }),
             "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_covers_item_kinds_and_qualifiers() {
+        let text = "\
+pub struct PlainStruct {}
+pub(crate) enum ScopedEnum { A }
+pub async fn fetch_thing() {}
+pub const MAX_DEPTH: usize = 3;
+pub static TABLE: &[&str] = &[];
+pub type Alias = u64;
+pub mod inner {}
+pub use crate::store::Widget;
+pub use crate::store::Widget as RenamedWidget;
+pub unsafe fn raw_op() {}
+pub const fn const_op() {}
+fn private_fn() {}
+struct PrivateStruct {}
+    pub trait DocumentedTrait {}
+";
+        let decls = extract_public_surface_declarations(text);
+        for expected in [
+            "PlainStruct",
+            "ScopedEnum",
+            "fetch_thing",
+            "MAX_DEPTH",
+            "TABLE",
+            "Alias",
+            "inner",
+            "Widget",
+            "RenamedWidget",
+            "raw_op",
+            "const_op",
+            "DocumentedTrait",
+        ] {
+            assert!(decls.contains(expected), "missing {expected}: {decls:?}");
+        }
+        assert!(!decls.contains("private_fn"), "{decls:?}");
+        assert!(!decls.contains("PrivateStruct"), "{decls:?}");
+    }
+
+    fn setup_git_surface_repo(root: &Path, initial_source: &str) {
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            docs_dir.join("vision").join("target_doc.md"),
+            "## Introduction\nThe target_doc surface. TargetTrait\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("server.rs"), initial_source).unwrap();
+        write_manifest(
+            &docs_dir,
+            r###"[{
+                "id": "test-rule-1",
+                "tier": "vision",
+                "watch_paths": ["src/server.rs"],
+                "target_doc": "docs/vision/target_doc.md",
+                "required_headings": ["## Introduction"],
+                "required_tokens": ["target_doc"],
+                "require_co_change_on_surface_change": true
+            }]"###,
+        );
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    fn commit_all(root: &Path, message: &str) {
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", message]);
+    }
+
+    #[test]
+    fn internal_change_to_watched_file_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\nfn helper() -> i32 { 1 }\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\nfn helper() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        commit_all(root, "internal change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "internal-only change produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn test_only_change_in_watched_file_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {}\nfn check(value: i32) -> i32 { value }\n#[cfg(test)]\nmod tests {\n    use super::check;\n    #[test]\n    fn it_works() { assert_eq!(check(1), 1); }\n}\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\nfn check(value: i32) -> i32 { value }\n#[cfg(test)]\nmod tests {\n    use super::check;\n    #[test]\n    fn it_works() { assert_eq!(check(2), 2); }\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "test-only change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "test-only change produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn attribute_only_change_in_watched_file_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\npub enum Thing { A, B }\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\n#[allow(dead_code)]\npub enum Thing { A, B }\n",
+        )
+        .unwrap();
+        commit_all(root, "attribute-only change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "attribute-only change produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn genuine_public_surface_change_without_doc_update_blocks_on_production_path() {
+        // T12-style: a new pub struct params type plus a pub trait method
+        // signature re-pointed at it, with no doc update.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {\n    fn fetch(&self, id: u64);\n}\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub struct FetchParams { pub id: u64 }\npub trait TargetTrait {\n    fn fetch(&self, params: FetchParams);\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "genuine surface change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn added_tool_identifier_in_watched_file_still_blocks_via_ss7() {
+        // Mutation / non-vacuity: the SS7 identifier check must still fire
+        // under the narrowed co-change watch.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\n// \"name\": \"neurostrata_brand_new_tool\"\n",
+        )
+        .unwrap();
+        commit_all(root, "add tool identifier");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "undocumented_public_identifier"
+                    && v.detail.contains("neurostrata_brand_new_tool")
+            }),
+            "expected SS7 undocumented_public_identifier violation, got {:?}",
             report.violations
         );
     }
@@ -990,7 +1302,7 @@ mod tests {
                 "target_doc": "docs/features-api/target.md",
                 "required_headings": [],
                 "required_tokens": [],
-                "require_co_change_on_touch": false
+                "require_co_change_on_surface_change": false
             }]"#,
         );
         init_git_repo(root);
@@ -1060,7 +1372,7 @@ mod tests {
                 "target_doc": "docs/features-api/target.md",
                 "required_headings": [],
                 "required_tokens": [],
-                "require_co_change_on_touch": false
+                "require_co_change_on_surface_change": false
             }]"#,
         );
         std::fs::write(root.join("src").join("keep.rs"), "fn keep() {}\n").unwrap();

@@ -83,7 +83,7 @@
         "Central Executive",
         "WorkflowConnector"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "mcp-and-http-api-surface",
@@ -112,7 +112,7 @@
         "neurostrata_call_hierarchy",
         "POST /vault-sync"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "cli-reference-surface",
@@ -132,7 +132,7 @@
         "scenario",
         "twin"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "kinetic-actions-subsystem",
@@ -151,7 +151,7 @@
         "SparqlAsk",
         "action_receipt"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "taxonomy-advisor-subsystem",
@@ -169,7 +169,7 @@
         "upsert_concept",
         "advise"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "workflow-connector-extension",
@@ -194,7 +194,7 @@
         "resolve_workflow_connector",
         "workflow-connector.json"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "harness-plugin-extension",
@@ -212,7 +212,7 @@
         "handleHookEvent",
         "resolveProjectRoot"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "provider-traits-extension",
@@ -230,7 +230,7 @@
         "JudgmentProvider",
         "ActionTypeDefinition"
       ],
-      "require_co_change_on_touch": true
+      "require_co_change_on_surface_change": true
     },
     {
       "id": "central-agentic-kernel-surface",
@@ -261,7 +261,7 @@
         "evaluate_connector_pre_gate",
         "evaluate_connector_post_gate"
       ],
-      "require_co_change_on_touch": false
+      "require_co_change_on_surface_change": false
     },
     {
       "id": "data-connector-surface",
@@ -292,7 +292,7 @@
         "evaluate_connector_pre_gate",
         "evaluate_connector_post_gate"
       ],
-      "require_co_change_on_touch": false
+      "require_co_change_on_surface_change": false
     }
   ]
 }
