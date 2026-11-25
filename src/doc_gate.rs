@@ -734,6 +734,47 @@ fn reference_type_passes(text: &str) -> bool {
     named_type_passes(rest)
 }
 
+/// The TypeScript primitive / keyword types a typed member may use
+/// where the Rust type test expects Rust spellings.
+const TS_PRIMITIVE_TYPES: [&str; 11] = [
+    "string", "number", "boolean", "null", "undefined", "any", "unknown", "object", "bigint",
+    "symbol", "void",
+];
+
+/// Whether `text` is a TypeScript type expression for pattern 3b:
+/// a union whose every member is a TypeScript primitive, an
+/// uppercase-start named type, an array of one of those, or a quoted
+/// literal — with a lone quoted literal rejected by the caller-side
+/// rule encoded here (a single literal is a value shape, not a type
+/// shape, unless it appears in a union).
+fn typescript_type_passes(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = text.split('|').collect();
+    if parts.len() == 1 && (text.starts_with('"') || text.starts_with('\'')) {
+        return false;
+    }
+    parts.iter().all(|part| {
+        let part = part.trim().trim_end_matches("[]").trim();
+        if part.starts_with('"') || part.starts_with('\'') {
+            return part.len() >= 2;
+        }
+        match leading_identifier(part) {
+            Some((ident, _)) => {
+                TS_PRIMITIVE_TYPES.contains(&ident.as_str())
+                    || ident
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_uppercase())
+                        .unwrap_or(false)
+            }
+            None => false,
+        }
+    })
+}
+
 /// Parses one indented line as a member of an enclosing public
 /// declaration (method, named field, parameter / typed member, or
 /// variant / bare member token), returning (name, key, signature).
@@ -819,6 +860,53 @@ fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
                     if !type_part.contains('=') && type_start_passes(type_part) {
                         let signature = strip_trailing_comma(&normalized).to_string();
                         return Some((name.clone(), format!("member:{name}"), signature));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 3b: TypeScript typed member — `<name>[?]: <TsType>` or an
+    // interface method `<name>(<params>): <TsType>;`. The Rust pattern 3
+    // type test rejects TypeScript primitives (`string`, `boolean`,
+    // `number`), so members of an exported interface whose fields use
+    // them extracted nothing. A lone quoted literal is NOT accepted as
+    // a type here: it is indistinguishable from an object-literal value
+    // (`principal: "alice",`), which the struct-literal guards exclude;
+    // a union of literals (containing `|`) is accepted.
+    {
+        let first_token = trimmed.split_whitespace().next().unwrap_or_default();
+        if !["let", "return", "if", "for", "while", "match", "use"].contains(&first_token) {
+            if let Some((name, len)) = leading_identifier(trimmed) {
+                let after_name = &trimmed[len..];
+                let after_name = after_name.strip_prefix('?').unwrap_or(after_name);
+                if let Some(type_part) = after_name.strip_prefix(':') {
+                    let type_part = strip_trailing_comma(type_part.trim())
+                        .trim_end_matches(';')
+                        .trim();
+                    if !type_part.contains('=') && typescript_type_passes(type_part) {
+                        let signature = strip_trailing_comma(&normalized).to_string();
+                        return Some((name.clone(), format!("member:{name}"), signature));
+                    }
+                }
+                if after_name.starts_with('(') && trimmed.ends_with(';') {
+                    if let Some(group_end) = balanced_group_end(after_name) {
+                        if let Some(type_part) = after_name[group_end..]
+                            .trim_start()
+                            .strip_prefix(':')
+                        {
+                            let type_part = strip_trailing_comma(type_part.trim())
+                                .trim_end_matches(';')
+                                .trim();
+                            if !type_part.contains('=')
+                                && (typescript_type_passes(type_part)
+                                    || type_start_passes(type_part))
+                            {
+                                let signature =
+                                    strip_trailing_comma(&normalized).to_string();
+                                return Some((name.clone(), format!("fn:{name}"), signature));
+                            }
+                        }
                     }
                 }
             }
@@ -3842,7 +3930,7 @@ pub struct AfterAll {}
 
     #[test]
     #[test]
-    fn probe_f1_trait_method_change_differs() {
+    fn trait_method_change_within_existing_trait_differs() {
         let before = extract_public_surface_signatures("    fn fetch(&self, id: u64);");
         let after = extract_public_surface_signatures("    fn fetch(&self, id: String);");
         assert_ne!(before, after);
@@ -3871,7 +3959,7 @@ pub struct AfterAll {}
     }
 
     #[test]
-    fn probe_f7_multiline_route_method_continuation_is_limitation() {
+    fn multiline_route_method_continuation_matches_documented_limit() {
         let before = extract_public_surface_signatures(
             "            get(handle_http_storage_status).post(handle_http_storage_status),",
         );
@@ -3881,7 +3969,7 @@ pub struct AfterAll {}
     }
 
     #[test]
-    fn probe_f8_typescript_interface_member_change_differs() {
+    fn typescript_interface_member_change_differs() {
         let before = extract_public_surface_signatures("  strictMode: boolean");
         let after = extract_public_surface_signatures("  strictMode: string");
         assert_ne!(before, after, "before={before:?} after={after:?}");
