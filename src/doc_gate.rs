@@ -1632,7 +1632,7 @@ fn watched_changed_lines(root: &Path, rel_path: &str) -> (Vec<String>, Vec<Strin
         }
         // Successful Git inspection is authoritative, including deletion-only
         // diffs. Only new/untracked files or failed Git inspection fall back.
-        if tracked && inspected {
+        if inspected && (tracked || !added.is_empty() || !removed.is_empty()) {
             return (added, removed);
         }
     }
@@ -3530,6 +3530,88 @@ pub struct AfterAll {}
         assert!(
             report.passed,
             "deletion-only diff produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn deleted_watched_file_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\n");
+        run_git(root, &["rm", "-q", "src/server.rs"]);
+        run_git(root, &["commit", "-q", "-m", "delete watched file"]);
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn deleted_watched_file_with_doc_update_passes() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\n");
+        run_git(root, &["rm", "-q", "src/server.rs"]);
+        std::fs::write(
+            root.join("docs").join("vision").join("target_doc.md"),
+            "## Introduction\nThe target_doc surface. TargetTrait removed.\n",
+        )
+        .unwrap();
+        commit_all(root, "delete watched file with doc update");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            !report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "deletion with doc update produced co-change violation: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn deleted_internal_watched_file_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "fn helper() -> i32 { 1 }\n");
+        run_git(root, &["rm", "-q", "src/server.rs"]);
+        run_git(root, &["commit", "-q", "-m", "delete internal watched file"]);
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "deleting internal-only file produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn renamed_out_of_watch_with_surface_edit_blocks() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\n");
+        run_git(root, &["mv", "src/server.rs", "src/renamed.rs"]);
+        std::fs::write(
+            root.join("src").join("renamed.rs"),
+            "pub trait RenamedTrait {}\n",
+        )
+        .unwrap();
+        commit_all(root, "rename out of watch with surface edit");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
             report.violations
         );
     }
