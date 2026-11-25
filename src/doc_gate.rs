@@ -459,6 +459,58 @@ fn parse_use_declarations(line: &str) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
+/// Parses one line as a restricted-visibility item declaration
+/// (`pub(crate)` / `pub(super)` / `pub(in ...)`), returning its
+/// (declared name, item kind), or `None` when the line is not one.
+/// The line is rewritten to its bare-`pub` form and reparsed by
+/// `parse_public_surface_declaration`, so kind / qualifier / name
+/// handling stays in one place. `use` lines return `None`: a
+/// restricted re-export is internal, never surface.
+fn parse_restricted_surface_declaration(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("pub(")?;
+    let close = rest.find(')')?;
+    let remainder = rest[close + 1..].trim_start();
+    if remainder.is_empty() {
+        return None;
+    }
+    let (name, kind) = parse_public_surface_declaration(&format!("pub {remainder}"))?;
+    if kind == "use" {
+        return None;
+    }
+    Some((name, kind))
+}
+
+/// Collects the source names re-exported by bare `pub use` lines in
+/// `text`: for each (declared name, full path) pair the use-tree
+/// parser yields, the item's own name is the final path segment,
+/// taken from before any `as` rename (a rename surfaces the alias,
+/// but the definition it points at is the restricted item). Glob
+/// re-exports yield no source name — the items behind a glob cannot
+/// be named from the use line.
+fn reexported_source_names(text: &str) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if let Some(pairs) = parse_use_declarations(line) {
+            for (_declared, full_path) in pairs {
+                let source_path = full_path.split(" as ").next().unwrap_or(&full_path);
+                let name: String = source_path
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    names
+}
+
 /// The bare Rust keywords (strict + reserved, 2021 edition, plus `gen`
 /// reserved in 2024) that can never name a variant or member in bare
 /// spelling; raw spellings (`r#false`) are distinct identifiers.
@@ -1536,6 +1588,11 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
     }
     // Pipeline step 3: blank comments and string literals.
     let cleaned = blank_comments_and_strings(text);
+    // A restricted-visibility item re-exported by a bare `pub use` in
+    // the same text is public surface transitively: the use line is
+    // extracted, so the definition behind it must be too, or its own
+    // declaration changes would register nothing.
+    let reexported = reexported_source_names(&cleaned);
     // Pipeline step 4: all declaration parsing runs on the blanked text.
     // The TypeScript export branch runs here too, on the blanked line
     // (its signatures are taken from the corresponding original line,
@@ -1550,6 +1607,10 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
                 decls.insert(name);
             }
         } else if let Some((name, _kind)) = parse_public_surface_declaration(line) {
+            decls.insert(name);
+        } else if let Some((name, _kind)) = parse_restricted_surface_declaration(line)
+            .filter(|(name, _kind)| reexported.contains(name))
+        {
             decls.insert(name);
         }
         if let Some((name, _key, _signature)) = parse_member_declaration(line) {
@@ -1707,6 +1768,11 @@ fn extract_public_surface_signatures(
         }
     }
     let cleaned = blank_comments_and_strings(text);
+    // Same re-export transitivity as in
+    // `extract_public_surface_declarations`: a restricted item behind
+    // a bare `pub use` in the same text contributes its declaration
+    // signature under its own name.
+    let reexported = reexported_source_names(&cleaned);
     for (line, original_line) in cleaned.lines().zip(text.lines()) {
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             for (name, signature) in pairs {
@@ -1723,6 +1789,11 @@ fn extract_public_surface_signatures(
                     .insert(full_path);
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
+            let signature = declaration_signature(&kind, line);
+            signatures.entry(name).or_default().insert(signature);
+        } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
+            .filter(|(name, _kind)| reexported.contains(name))
+        {
             let signature = declaration_signature(&kind, line);
             signatures.entry(name).or_default().insert(signature);
         }
@@ -4002,6 +4073,55 @@ pub struct AfterAll {}
         let sigs_field =
             extract_public_surface_signatures("    pub(crate) count: u64,");
         assert!(sigs_field.is_empty(), "{sigs_field:?}");
+    }
+
+    #[test]
+    fn reexported_restricted_fn_signature_change_differs() {
+        let before = extract_public_surface_signatures(
+            "pub(crate) fn internal_op(x: u32) {}\npub use crate::m::internal_op;",
+        );
+        let after = extract_public_surface_signatures(
+            "pub(crate) fn internal_op(x: String) {}\npub use crate::m::internal_op;",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn reexported_restricted_fn_declaration_is_surface_under_rename() {
+        // The use line surfaces only the alias; the definition itself is
+        // surface too (compare a bare-`pub` fn re-exported under a rename,
+        // whose own name enters the set from its declaration line).
+        let decls = extract_public_surface_declarations(
+            "pub(crate) fn internal_op(x: u32) {}\npub use crate::m::internal_op as external_op;",
+        );
+        assert!(decls.contains("internal_op"), "{decls:?}");
+        assert!(decls.contains("external_op"), "{decls:?}");
+        let before = extract_public_surface_signatures(
+            "pub(crate) fn internal_op(x: u32) {}\npub use crate::m::internal_op as external_op;",
+        );
+        let after = extract_public_surface_signatures(
+            "pub(crate) fn internal_op(x: String) {}\npub use crate::m::internal_op as external_op;",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn grouped_reexport_restricted_fn_signature_change_differs() {
+        let before = extract_public_surface_signatures(
+            "pub(crate) fn internal_op(x: u32) {}\npub use crate::m::{internal_op, other};",
+        );
+        let after = extract_public_surface_signatures(
+            "pub(crate) fn internal_op(x: String) {}\npub use crate::m::{internal_op, other};",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn unreexported_restricted_fn_stays_excluded() {
+        let decls = extract_public_surface_declarations("pub(crate) fn internal_op(x: u32) {}");
+        assert!(!decls.contains("internal_op"), "{decls:?}");
+        let sigs = extract_public_surface_signatures("pub(crate) fn internal_op(x: u32) {}");
+        assert!(!sigs.contains_key("internal_op"), "{sigs:?}");
     }
 
     #[test]
