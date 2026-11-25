@@ -6291,8 +6291,8 @@ mod tests {
         );
         assert!(
             SCAFFOLDED_RUST_QUALITY_GATE
-                .contains("git diff --default-prefix --no-color --no-ext-diff --no-textconv"),
-            "the guard must neutralize user git config on the attribution diff (color escapes, external diff drivers, and textconv drivers each silently empty the added-line set the same way non-default prefixes do)"
+                .contains("git diff --default-prefix --no-color --no-ext-diff --no-textconv --text"),
+            "the guard must neutralize user git config and attributes on the attribution diff (color escapes, external diff drivers, textconv drivers, and -diff binary notices each silently empty the added-line set the same way non-default prefixes do)"
         );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));

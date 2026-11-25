@@ -551,4 +551,23 @@ if [ "$st18" -eq 0 ] || ! grep -q 'FAIL' <<< "$out18"; then
     exit 1
 fi
 
+# Leg 19 (regression, Codex P1 — -diff attribute): with `*.rs -diff`
+# in attributes (here the repo-local info/attributes), Git emits a
+# "Binary files ... differ" notice instead of hunks, silently
+# emptying the attribution set exactly like the color/external/
+# textconv vectors. The gate must force textual diffs (--text), so
+# the same dirty addition must block.
+nodiff_dirty="$TMP/nodiff-dirty"
+new_repo "$nodiff_dirty"
+printf '*.rs -diff\n' > "$nodiff_dirty/.git/info/attributes"
+add_dirty_line "$nodiff_dirty"
+set +e
+out19=$(run_gate "$nodiff_dirty" "$PATH")
+st19=$?
+set -e
+if [ "$st19" -eq 0 ] || ! grep -q 'FAIL' <<< "$out19"; then
+    printf 'FAIL: dirty added lines under a -diff attribute must block the gate (text diff forcing)\n%s\n' "$out19" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
