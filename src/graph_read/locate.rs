@@ -1061,7 +1061,16 @@ pub async fn execute_locate(
     {
         for path in &selected_paths {
             if let Ok(hits) = ls
-                .memories_for_file(&namespace, None, path, None, true, &[], &[], 20)
+                .memories_for_file(crate::traits::MemoriesForFileParams {
+                    namespace: &namespace,
+                    source: None,
+                    path,
+                    symbol: None,
+                    include_ancestors: true,
+                    memory_types: &[],
+                    exclude_ids: &[],
+                    limit: 20,
+                })
                 .await
             {
                 for hit in hits {
