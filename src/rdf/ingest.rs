@@ -201,8 +201,10 @@ pub struct ClassifiedBatch {
     pub triple_count: usize,
 }
 
-/// Result of a successful ingestion: the persisted store id plus the same
-/// artifacts, for callers/tests that need to audit what was committed.
+/// Result of a successful ingestion: the persisted store id, the
+/// deterministic Turtle, and the post-dedup triple count, for
+/// callers/tests that need to audit what was committed. Unlike
+/// `ClassifiedBatch`, it does not carry the committed `MemoryPayload`.
 #[derive(Debug, Clone)]
 pub struct IngestOutcome {
     pub id: String,
