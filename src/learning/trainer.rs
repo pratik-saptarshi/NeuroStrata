@@ -2,7 +2,6 @@
 use crate::judgment::laya_onnx::{LocalTrainingRuntime, ModelVersion};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use std::process::Stdio;
@@ -256,11 +255,11 @@ impl Trainer {
             )?;
             return Ok(());
         }
-        return Err(anyhow!(
+        Err(anyhow!(
             "Laya training runtime unavailable (python: {}, laya-train: {})",
             self.runtime.python.display(),
             self.runtime.laya_train.display()
-        ));
+        ))
     }
 
     /// Transition job state through the validated machine.

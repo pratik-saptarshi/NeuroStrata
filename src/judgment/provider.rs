@@ -79,7 +79,7 @@ impl JudgmentProvider for HeuristicJudgmentProvider {
             if new_memory.memory_type == cand.payload.memory_type && jaccard >= 0.85 {
                 judgments.push(DuplicateJudgment {
                     existing_memory_id: cand.id.clone(),
-                    confidence: jaccard as f32,
+                    confidence: jaccard,
                     reason: Some("heuristic-token-jaccard".to_string()),
                 });
             }

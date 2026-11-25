@@ -1,16 +1,17 @@
 name: Release
 
 # Publishes the neurostrata-mcp binary for each supported platform, on v* tags.
+# Fork governance alignment: tag-push only (no workflow_dispatch/inputs --
+# provenance derives from the run ref), top-level permissions read-only with
+# the publish job re-granting write for itself, all actions SHA-pinned. This
+# mirrors the fork's develop-branch release.yml so the release governance CI
+# gate passes on main as well.
+# The publish step takes its release notes from
+# docs/releases/changelog/<version>.md -- upstream's notes-file flow,
+# adapted to tag-push: the version derives from github.ref_name, and the
+# publish fails if that file is missing or empty.
 # The rolling build lives in nightly.yml and targets its own tag, so the two
 # never write to the same release.
-#
-# Releases are produced ONLY by pushing a v* tag (or by re-running that
-# tag's run). Manual dispatch (workflow_dispatch) was removed: the
-# build-provenance attestation derives from the workflow run's ref, so a
-# dispatched run would build the requested tag's tree while its signed
-# provenance names the dispatch ref (Codex P2 on PR #24). On a tag push the
-# run's ref IS the tag, so the provenance names the built source by
-# construction.
 #
 # Each target builds on its own native runner. This dependency tree makes
 # cross-compilation impractical: openssl is vendored (built from source),
@@ -21,17 +22,86 @@ on:
     tags:
       - 'v*'
 
-# Least privilege by default (J17): the workflow as a whole can only read.
-# The one job that publishes -- `release` -- re-grants contents: write for
-# itself below. The build matrix only uploads workflow artifacts, which
-# needs no contents permission at all.
 permissions:
   contents: read
 
 jobs:
+  # A release is a claim that the tagged commit is the version it names and
+  # that its tests pass. Both are checked before any platform builds, so a
+  # mismatched tag or a red suite cannot publish binaries.
+  verify:
+    name: Version and test receipt
+    runs-on: ubuntu-latest
+    env:
+      LBUG_VERSION: "0.22.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          tag="${{ github.ref_name }}"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::tag '$tag' does not match Cargo.toml version '$version'"
+            exit 1
+          fi
+          echo "Tag $tag matches Cargo.toml version $version"
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Test receipt
+        shell: bash
+        run: |
+          cargo test --locked --bin neurostrata-mcp -- --test-threads=1
+          # The receipt records the commit the checkout produced for the tag,
+          # not github.sha: on workflow_dispatch that is the branch tip, which
+          # can differ from the ref the job checked out.
+          commit=$(git rev-parse HEAD)
+          {
+            echo "neurostrata release test receipt"
+            echo "tag=${{ github.ref_name }}"
+            echo "commit=$commit"
+            echo "command=cargo test --locked --bin neurostrata-mcp -- --test-threads=1"
+            echo "finished=$(date -u +%FT%TZ)"
+          } > test-receipt.txt
+
+      - name: Upload test receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-receipt
+          path: test-receipt.txt
+          if-no-files-found: error
+          retention-days: 30
+
   build:
     name: ${{ matrix.archive }}
+    needs: verify
     runs-on: ${{ matrix.os }}
+    env:
+      # LBUG_VERSION pins the engine archive the lbug build script
+      # downloads; keep it equal to the lbug crate version in Cargo.toml
+      # and move it whenever that version changes.
+      LBUG_VERSION: "0.22.3"
     strategy:
       # A failure on one platform still lets the rest build, so a single run
       # shows every platform that is broken rather than just the first.
@@ -67,11 +137,10 @@ jobs:
             archive: neurostrata-mcp-windows-amd64.zip
 
     steps:
-      # On a tag push, github.ref_name IS the tag -- the same expression the
-      # publish job uses for TAG, so the commit built and the tag published
-      # to cannot disagree. The explicit ref also documents that the
-      # checkout is the tag, never a dispatch ref (manual dispatch was
-      # removed -- see the header comment).
+      # The same expression the publish job uses for TAG, so the commit built
+      # and the tag published to cannot disagree. Without an explicit ref, a
+      # workflow_dispatch run builds whatever branch it was launched from and
+      # then attaches those binaries to the requested tag.
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -138,7 +207,7 @@ jobs:
         run: Compress-Archive -Path 'dist' -DestinationPath '${{ matrix.archive }}'
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
@@ -149,17 +218,20 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
-    # The only job that writes (J17): it creates the release and uploads the
-    # assets, and it signs the build-provenance attestation, which also
-    # needs the OIDC token and the attestations permission. No other job in
-    # this workflow gets more than the top-level contents: read.
+    # Only this job publishes; it alone re-grants contents: write.
     permissions:
       contents: write
-      attestations: write
-      id-token: write
     steps:
+      # The publish step reads the release changelog from the tree, so this
+      # job checks out the tag (upstream's publish job does the same; the
+      # ref is github.ref_name because there are no dispatch inputs).
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+
       - name: Collect artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -172,17 +244,6 @@ jobs:
           echo "--- assets built ---"
           cat SHA256SUMS
 
-      # Build provenance (J17): a signed attestation over exactly the files
-      # the Publish step is about to upload, so a downloader can verify an
-      # asset was produced by this workflow from this repository
-      # (gh attestation verify). The checksums above are kept as-is.
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/neurostrata-mcp-*
-            dist/SHA256SUMS
-
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -190,10 +251,16 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          NOTES_FILE="docs/releases/changelog/${TAG#v}.md"
+          if [ ! -s "$NOTES_FILE" ]; then
+            echo "::error::Release changelog '$NOTES_FILE' is missing or empty for tag '$TAG'"
+            exit 1
+          fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Creating release $TAG"
-            gh release create "$TAG" --title "$TAG" --generate-notes
+            echo "Creating release $TAG from $NOTES_FILE"
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           else
-            echo "Release $TAG already exists; attaching assets"
+            echo "Release $TAG already exists; syncing release body from $NOTES_FILE and attaching assets"
+            gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           fi
           gh release upload "$TAG" dist/* --clobber
