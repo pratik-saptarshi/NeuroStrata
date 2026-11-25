@@ -1726,6 +1726,27 @@ fn parse_clap_arg_attribute(line: &str) -> Option<String> {
     }
 }
 
+/// Parses one line as a serde attribute (`#[serde(...)]`), returning
+/// the normalized attribute contents. Serde container / field /
+/// variant attributes (`tag`, `rename`, `rename_all`, `flatten`, …)
+/// determine the serialized wire format, so the whole attribute is
+/// surface. It is matched on the comments-blanked-but-strings-
+/// preserved line, because its argument values are string literals
+/// the full blanking pipeline erases — and a serde-shaped text inside
+/// a comment must not count. The attribute may share its line with
+/// the declaration it annotates, so the closing `)]` is located
+/// rather than required at end of line.
+fn parse_serde_attribute(line: &str) -> Option<String> {
+    let inner_start = line.find("#[serde(")? + "#[serde(".len();
+    let inner_end = line[inner_start..].find(")]")? + inner_start;
+    let inner = normalized_line(&line[inner_start..inner_end]);
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
 /// Extracts the public surface as a map from declaration key to the set
 /// of normalized signatures seen for that key. SS7 identifiers enter as
 /// key = signature = identifier, so a changed line carrying one still
@@ -1790,9 +1811,19 @@ fn extract_public_surface_signatures(
             declaration_signature(kind, line)
         }
     };
+    // Serde attributes awaiting their declaration: a `#[serde(...)]`
+    // line contributes only when it directly precedes a declaration
+    // or member (stacked attribute lines and blank lines in between
+    // keep it pending; any other code line drops it), mirroring how
+    // clap attributes sit on the fields/items they annotate.
+    let mut pending_serde: Vec<String> = Vec::new();
     for ((line, original_line), preserved_line) in
         cleaned.lines().zip(text.lines()).zip(route_text.lines())
     {
+        if let Some(attribute) = parse_serde_attribute(preserved_line) {
+            pending_serde.push(attribute);
+        }
+        let mut attach_keys: Vec<String> = Vec::new();
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             for (name, signature) in pairs {
                 signatures
@@ -1809,15 +1840,45 @@ fn extract_public_surface_signatures(
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
             let signature = signature_line(&kind, line, preserved_line);
+            attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
             .filter(|(name, _kind)| reexported.contains(name))
         {
             let signature = signature_line(&kind, line, preserved_line);
+            attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         }
         if let Some((_name, key, signature)) = parse_member_declaration(line) {
+            attach_keys.push(key.clone());
             signatures.entry(key).or_default().insert(signature);
+        }
+        if !attach_keys.is_empty() {
+            // The pending serde contents enter the enclosing
+            // declaration's signature set (as a `serde(...)` signature)
+            // and the shared `serde` key, following the clap pattern:
+            // changing any one attribute makes the added and removed
+            // signature sets differ.
+            for key in &attach_keys {
+                for attribute in &pending_serde {
+                    signatures
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(format!("serde({attribute})"));
+                }
+            }
+            for attribute in &pending_serde {
+                signatures
+                    .entry("serde".to_string())
+                    .or_default()
+                    .insert(attribute.clone());
+            }
+            pending_serde.clear();
+        } else {
+            let preserved_trimmed = preserved_line.trim();
+            if !preserved_trimmed.is_empty() && !preserved_trimmed.starts_with("#[") {
+                pending_serde.clear();
+            }
         }
     }
     signatures
@@ -4106,6 +4167,64 @@ pub struct AfterAll {}
             "                            \"required\": [\"content\", \"namespace\"]",
         );
         assert_ne!(before_req, after_req);
+    }
+
+    #[test]
+    fn serde_container_attribute_change_differs() {
+        let before = extract_public_surface_signatures(
+            "#[serde(tag = \"kind\")]\npub enum SubmissionCriterion {\n    Name(String),\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "#[serde(tag = \"type\")]\npub enum SubmissionCriterion {\n    Name(String),\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert_ne!(
+            before.get("SubmissionCriterion"),
+            after.get("SubmissionCriterion")
+        );
+        let before = extract_public_surface_signatures(
+            "#[serde(rename_all = \"camelCase\")]\npub struct Payload {\n    pub x: u32,\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "#[serde(rename_all = \"snake_case\")]\npub struct Payload {\n    pub x: u32,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn serde_field_attribute_change_differs() {
+        let before = extract_public_surface_signatures(
+            "pub struct Payload {\n    #[serde(rename = \"a\")]\n    pub x: u32,\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub struct Payload {\n    #[serde(rename = \"b\")]\n    pub x: u32,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn serde_variant_attribute_change_differs() {
+        let before = extract_public_surface_signatures(
+            "pub enum Kind {\n    #[serde(rename = \"a\")]\n    Alpha,\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub enum Kind {\n    #[serde(rename = \"b\")]\n    Alpha,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn serde_attribute_not_preceding_a_declaration_is_ignored() {
+        // A serde-shaped attribute that does not directly precede a
+        // declaration or member (here it sits over a `let` inside a fn
+        // body) is not item surface and must not register.
+        let before = extract_public_surface_signatures(
+            "pub fn helper() {\n    #[serde(tag = \"a\")]\n    let x = 1;\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub fn helper() {\n    #[serde(tag = \"b\")]\n    let x = 1;\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
     }
 
     #[test]
