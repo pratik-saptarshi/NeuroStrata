@@ -1877,6 +1877,12 @@ fn extract_public_surface_signatures(
         if !line.starts_with([' ', '\t']) && line.trim_start().starts_with('}') {
             enclosing = None;
         }
+        // The owner in scope at the START of this line: a line that is
+        // both a declaration and a member (a `pub fn` method in an
+        // impl block) must be qualified with it, because the
+        // declaration branch below resets `enclosing` for non-container
+        // kinds before the member key is qualified.
+        let enclosing_at_line_start = enclosing.clone();
         let mut attach_keys: Vec<String> = Vec::new();
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             if let Some((name, _)) = pairs.first() {
@@ -1923,7 +1929,7 @@ fn extract_public_surface_signatures(
             enclosing = Some(owner);
         }
         if let Some((_name, key, signature)) = parse_member_declaration(line) {
-            let key = match &enclosing {
+            let key = match &enclosing_at_line_start {
                 Some(owner) => match key.split_once(':') {
                     Some((prefix, rest)) => format!("{prefix}:{owner}.{rest}"),
                     None => key,
@@ -4324,6 +4330,44 @@ pub struct AfterAll {}
         assert_ne!(before, after, "before={before:?} after={after:?}");
         assert!(before.contains_key("member:A.Alpha"), "{before:?}");
         assert!(after.contains_key("member:B.Alpha"), "{after:?}");
+    }
+
+    #[test]
+    fn inherent_impl_method_moved_between_impls_differs() {
+        // A `pub fn` in an inherent impl block is both a declaration
+        // and a member: the declaration branch must not clear the
+        // enclosing type before the member key is qualified with it.
+        let before = extract_public_surface_signatures(
+            "impl Foo {\n    pub fn bar(&self) {}\n}\nimpl Baz {\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "impl Foo {\n}\nimpl Baz {\n    pub fn bar(&self) {}\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("fn:Foo.bar"), "{before:?}");
+        assert!(after.contains_key("fn:Baz.bar"), "{after:?}");
+    }
+
+    #[test]
+    fn inherent_impl_pub_fn_without_impl_keeps_bare_key() {
+        // A `pub fn` member line with no preceding impl/container in
+        // the text (the common -U0 diff shape) keeps its bare key.
+        let sigs = extract_public_surface_signatures("    pub fn bar(&self) {}");
+        assert!(sigs.contains_key("fn:bar"), "{sigs:?}");
+    }
+
+    #[test]
+    fn trait_impl_methods_qualify_with_target_type() {
+        // Trait-impl methods carry no `pub`: they already qualified,
+        // and must keep doing so.
+        let sigs =
+            extract_public_surface_signatures("impl Greet for Foo {\n    fn bar(&self) {}\n}");
+        assert!(sigs.contains_key("fn:Foo.bar"), "{sigs:?}");
+        // A `pub fn` in an `impl Trait for Type` block qualifies with
+        // the target type, not the trait.
+        let sigs =
+            extract_public_surface_signatures("impl Greet for Foo {\n    pub fn bar(&self) {}\n}");
+        assert!(sigs.contains_key("fn:Foo.bar"), "{sigs:?}");
     }
 
     #[test]
