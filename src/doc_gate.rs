@@ -1341,6 +1341,84 @@ fn parse_typescript_exports(
     Some(vec![(name, signature)])
 }
 
+/// Parses one HTTP route registration line into its surface key and
+/// signature. Two shapes, both matched on the
+/// comments-blanked-but-strings-preserved intermediate (a route's
+/// identity is its path string literal, which full blanking erases):
+/// an inline `.route("/path", get(...))` line, whose methods are the
+/// whole-word `get` / `post` / `put` / `delete` / `patch` / `head` /
+/// `options` calls in the remainder after the path literal (a token
+/// immediately following `.`, or the first such token in the
+/// remainder, immediately followed by `(`); and a split route-path
+/// line — an indented line that is exactly a `"/…"` string literal
+/// followed by `,` — which carries an empty method set. Handler
+/// identifiers are deliberately not part of the signature: the
+/// documented HTTP surface is (path, method), so a handler swap behind
+/// an unchanged registration is an implementation change.
+fn parse_http_route_registration(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if let Some(route_idx) = trimmed.find(".route(") {
+        let after = trimmed[route_idx + ".route(".len()..].trim_start();
+        if let Some(rest) = after.strip_prefix('"') {
+            // No escape processing: a literal containing `\"` is
+            // truncated at the escape (recorded residual).
+            let close = rest.find('"')?;
+            let path = &rest[..close];
+            let remainder = &rest[close + 1..];
+            let mut methods: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let bytes = remainder.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                    let start = i;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    let token = &remainder[start..i];
+                    let is_method = matches!(
+                        token,
+                        "get" | "post" | "put" | "delete" | "patch" | "head" | "options"
+                    );
+                    let followed_by_paren = bytes.get(i) == Some(&b'(');
+                    let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
+                    if is_method && followed_by_paren && (preceded_by_dot || methods.is_empty())
+                    {
+                        methods.insert(token);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let key = format!("route:{path}");
+            let signature = if methods.is_empty() {
+                format!("route:{path}:-")
+            } else {
+                format!(
+                    "route:{path}:{}",
+                    methods.into_iter().collect::<Vec<_>>().join(",")
+                )
+            };
+            return Some((key, signature));
+        }
+    }
+    // Split route-path line: indented, sole string literal whose
+    // contents begin with `/`, followed by a comma.
+    let indented = line.starts_with(' ') || line.starts_with('\t');
+    if indented && trimmed.starts_with('"') && trimmed.ends_with(',') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if let Some(path) = inner.strip_suffix('"') {
+            if path.starts_with('/') && !path.contains('"') {
+                let key = format!("route:{path}");
+                let signature = format!("route:{path}:-");
+                return Some((key, signature));
+            }
+        }
+    }
+    None
+}
+
 /// Extracts public surface declarations from source text or diff lines:
 /// everything `extract_public_surface_identifiers` returns, plus public item
 /// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
@@ -1358,12 +1436,18 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
     let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
         .into_iter()
         .collect();
-    // Pipeline step 2 (reserved): pre-blanking extraction point. Route
-    // registrations are extracted here by a later cluster, from the
+    // Pipeline step 2: pre-blanking extraction point. Route
+    // registrations are extracted here, from the
     // comments-blanked-but-strings-preserved intermediate produced by
     // `blank_comments_only`, because a route's identity is a string
-    // literal that step 3 erases. Empty in this cluster; nothing else
-    // may use this slot without a design note.
+    // literal that step 3 erases. Nothing else may use this slot
+    // without a design note.
+    let route_text = blank_comments_only(text);
+    for line in route_text.lines() {
+        if let Some((key, _signature)) = parse_http_route_registration(line) {
+            decls.insert(key);
+        }
+    }
     // Pipeline step 3: blank comments and string literals.
     let cleaned = blank_comments_and_strings(text);
     // Pipeline step 4: all declaration parsing runs on the blanked text.
@@ -1442,6 +1526,16 @@ fn extract_public_surface_signatures(
     // on the comment/string-blanked text.
     for ident in extract_public_surface_identifiers(text) {
         signatures.entry(ident.clone()).or_default().insert(ident);
+    }
+    // Pipeline step 2, as in `extract_public_surface_declarations`:
+    // route registrations from the comments-blanked-but-strings-
+    // preserved intermediate, keyed `route:<path>` with the signature
+    // carrying the sorted method set.
+    let route_text = blank_comments_only(text);
+    for line in route_text.lines() {
+        if let Some((key, signature)) = parse_http_route_registration(line) {
+            signatures.entry(key).or_default().insert(signature);
+        }
     }
     let cleaned = blank_comments_and_strings(text);
     for (line, original_line) in cleaned.lines().zip(text.lines()) {
@@ -2647,6 +2741,162 @@ pub struct AfterAll {}
         assert!(!cleaned.contains("Hidden"), "{cleaned:?}");
         assert!(cleaned.contains("\"/health\""), "{cleaned:?}");
         assert!(!cleaned.contains("route"), "{cleaned:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_http_routes() {
+        let text = "        .route(\"/health\", get(|| async { \"ok\" }))\n        .route(\"/ingest\", post(handle_ingest))\n        .route(\"/memory/archive\", post(handle_memory_archive))\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.contains("route:/health"), "{decls:?}");
+        assert!(decls.contains("route:/ingest"), "{decls:?}");
+        assert!(decls.contains("route:/memory/archive"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(
+            sigs.get("route:/health")
+                .is_some_and(|s| s.contains("route:/health:get")),
+            "{sigs:?}"
+        );
+        assert!(
+            sigs.get("route:/ingest")
+                .is_some_and(|s| s.contains("route:/ingest:post")),
+            "{sigs:?}"
+        );
+        assert!(
+            sigs.get("route:/memory/archive")
+                .is_some_and(|s| s.contains("route:/memory/archive:post")),
+            "{sigs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_split_route_path() {
+        let text = "        .route(\n            \"/storage/status\",\n            get(handle_http_storage_status).post(handle_http_storage_status),\n        )\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.contains("route:/storage/status"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(
+            sigs.get("route:/storage/status")
+                .is_some_and(|s| s.contains("route:/storage/status:-")),
+            "{sigs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_route_method_change_differs() {
+        let before = extract_public_surface_signatures("        .route(\"/health\", get(h))\n");
+        let after = extract_public_surface_signatures("        .route(\"/health\", post(h))\n");
+        assert!(before.contains_key("route:/health"), "{before:?}");
+        assert!(after.contains_key("route:/health"), "{after:?}");
+        assert_ne!(before.get("route:/health"), after.get("route:/health"));
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_route_handler_swap_is_identical() {
+        let before_text = "        .route(\"/health\", get(handle_a))\n";
+        let after_text = "        .route(\"/health\", get(handle_b))\n";
+        let before = extract_public_surface_signatures(before_text);
+        let after = extract_public_surface_signatures(after_text);
+        assert_eq!(before.get("route:/health"), after.get("route:/health"));
+        let before_decls = extract_public_surface_declarations(before_text);
+        let after_decls = extract_public_surface_declarations(after_text);
+        assert_eq!(before_decls, after_decls);
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_commented_route() {
+        let text = "/*\n        .route(\"/ghost\", get(h))\n*/\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("route:/ghost"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(!sigs.contains_key("route:/ghost"), "{sigs:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_plain_path_strings() {
+        let text = "let p = \"/health\";\n    let q = \"/health\";\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("route:/health"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(!sigs.contains_key("route:/health"), "{sigs:?}");
+    }
+
+    fn setup_git_daemon_repo(root: &Path, initial_source: &str) {
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            docs_dir.join("vision").join("target_doc.md"),
+            "## Introduction\nThe target_doc surface. TargetTrait\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("daemon.rs"), initial_source).unwrap();
+        write_manifest(
+            &docs_dir,
+            r###"[{
+                "id": "test-rule-1",
+                "tier": "vision",
+                "watch_paths": ["src/daemon.rs"],
+                "target_doc": "docs/vision/target_doc.md",
+                "required_headings": ["## Introduction"],
+                "required_tokens": ["target_doc"],
+                "require_co_change_on_surface_change": true
+            }]"###,
+        );
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    #[test]
+    fn http_route_addition_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_daemon_repo(
+            root,
+            "        .route(\"/health\", get(handle_health))\n",
+        );
+        std::fs::write(
+            root.join("src").join("daemon.rs"),
+            "        .route(\"/health\", get(handle_health))\n        .route(\"/new-endpoint\", post(handle_new))\n",
+        )
+        .unwrap();
+        commit_all(root, "route addition");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn http_handler_only_change_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_daemon_repo(
+            root,
+            "        .route(\"/health\", get(handle_a))\n",
+        );
+        std::fs::write(
+            root.join("src").join("daemon.rs"),
+            "        .route(\"/health\", get(handle_b))\n",
+        )
+        .unwrap();
+        commit_all(root, "handler only change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "handler-only change produced violations: {:?}",
+            report.violations
+        );
     }
 
     #[test]
