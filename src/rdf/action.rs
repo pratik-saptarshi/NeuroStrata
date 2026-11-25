@@ -6360,16 +6360,16 @@ mod tests {
         store.set_action_batch_fail_after_writes(None);
 
         let hits_after_abort = store
-            .search_lexical(
-                "ns-batch-idx",
-                "zephyrquartz99",
-                10,
-                false,
-                false,
-                &[],
-                "alice",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "ns-batch-idx",
+                query: "zephyrquartz99",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap();
         assert!(
@@ -6383,16 +6383,16 @@ mod tests {
             .await
             .expect("commit");
         let hits_after_commit = store
-            .search_lexical(
-                "ns-batch-idx",
-                "zephyrquartz99",
-                10,
-                false,
-                false,
-                &[],
-                "alice",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "ns-batch-idx",
+                query: "zephyrquartz99",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap();
         assert_eq!(hits_after_commit.results.len(), 1);

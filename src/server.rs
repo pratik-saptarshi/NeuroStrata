@@ -4127,17 +4127,17 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     RELATED_TRAVERSAL_COUNTER.with(|c| c.set(c.get() + 1));
 
     match store
-        .related(
-            &namespace,
-            &traversal_seed,
-            &relations,
+        .related(crate::traits::RelatedParams {
+            namespace: &namespace,
+            seed: &traversal_seed,
+            relations: &relations,
             direction,
             max_hops,
-            &memory_types,
+            memory_types: &memory_types,
             limit,
-            cursor.as_ref(),
-            &cross_namespace,
-        )
+            cursor: cursor.as_ref(),
+            cross_namespace: &cross_namespace,
+        })
         .await
     {
         Ok(mut result) => {
@@ -7212,28 +7212,30 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
                 let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                    id_str,
-                    namespace_str,
-                    memory_type,
-                    lifecycle_state,
-                    &created_at,
-                    created_by,
-                    superseded_by,
-                    archived_at.as_deref(),
-                    tombstoned_at,
-                    &content_str,
-                    eligibility,
-                    source,
-                    &tags,
-                    concept_iri,
-                    &rels,
-                    &update_id,
-                    origin_mesh_epoch,
-                    trust,
-                    trigger,
-                    initial_fires,
-                    valid_to,
-                    rehearsal_script,
+                    crate::rdf::dataset_canonical::MeshCanonicalRecord {
+                        id: id_str,
+                        namespace: namespace_str,
+                        memory_type,
+                        lifecycle_state,
+                        created_at: &created_at,
+                        created_by,
+                        superseded_by,
+                        archived_at: archived_at.as_deref(),
+                        tombstoned_at,
+                        content: &content_str,
+                        eligibility,
+                        source,
+                        tags: &tags,
+                        concept_iri,
+                        relationships: &rels,
+                        update_id: &update_id,
+                        origin_mesh_epoch,
+                        trust,
+                        trigger,
+                        initial_fires,
+                        valid_to,
+                        rehearsal_script,
+                    },
                 );
                 // Honor profile parameter: mesh = canonical N-Quads wire format; local = full MemoryPayload JSON.
                 let result_obj: serde_json::Value = match profile {
@@ -7556,30 +7558,31 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
-            let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &id_str,
-                namespace,
-                memory_type,
-                lifecycle_state,
-                &created_at,
-                created_by,
-                superseded_by,
-                archived_at.as_deref(),
-                tombstoned_at,
-                &content_str,
-                eligibility,
-                source,
-                &tags,
-                concept_iri,
-                &rels,
-                &update_id,
-                origin_mesh_epoch,
-                trust,
-                trigger,
-                initial_fires,
-                valid_to,
-                rehearsal_script,
-            );
+            let (nquads_text, digest_str) =
+                build_mesh_canonical_nquads(crate::rdf::dataset_canonical::MeshCanonicalRecord {
+                    id: &id_str,
+                    namespace,
+                    memory_type,
+                    lifecycle_state,
+                    created_at: &created_at,
+                    created_by,
+                    superseded_by,
+                    archived_at: archived_at.as_deref(),
+                    tombstoned_at,
+                    content: &content_str,
+                    eligibility,
+                    source,
+                    tags: &tags,
+                    concept_iri,
+                    relationships: &rels,
+                    update_id: &update_id,
+                    origin_mesh_epoch,
+                    trust,
+                    trigger,
+                    initial_fires,
+                    valid_to,
+                    rehearsal_script,
+                });
             let created_by_str = payload.user_id.clone();
             let superseded_uuid = superseded_by.and_then(|s| Uuid::parse_str(s).ok());
             let archived_dt = archived_at.as_ref().and_then(|t_str| {
@@ -9932,20 +9935,20 @@ pub(crate) async fn handle_chat_ask(
         Arc::new(crate::rag_chat::OfflineProvider)
     };
 
-    match crate::rag_chat::ask(
+    match crate::rag_chat::ask(crate::rag_chat::AskParams {
         store,
         emb,
-        &namespace,
+        namespace: &namespace,
         principal,
         question,
-        top_k,
+        limit: top_k,
         system,
-        cfg.max_context_chars,
+        max_context_chars: cfg.max_context_chars,
         provider,
-        false,
-        false,
-        cfg.remote_egress_allowed,
-    )
+        include_tasks: false,
+        include_archived: false,
+        remote_egress_allowed: cfg.remote_egress_allowed,
+    })
     .await
     {
         Ok(resp) => serde_json::to_string(&resp)
@@ -11399,30 +11402,30 @@ async fn handle_search_memory(
                 .await
             } else {
                 store
-                    .search_lexical(
+                    .search_lexical(crate::traits::SearchLexicalParams {
                         namespace,
                         query,
-                        FETCH_LIMIT,
+                        limit: FETCH_LIMIT,
                         include_tasks,
                         include_archived,
-                        &slugs,
+                        domains: &slugs,
                         principal,
                         fuzzy_max_distance,
-                    )
+                    })
                     .await
             }
         } else {
             store
-                .search_lexical(
+                .search_lexical(crate::traits::SearchLexicalParams {
                     namespace,
                     query,
-                    FETCH_LIMIT,
+                    limit: FETCH_LIMIT,
                     include_tasks,
                     include_archived,
-                    &slugs,
+                    domains: &slugs,
                     principal,
                     fuzzy_max_distance,
-                )
+                })
                 .await
         };
         let outcome = match outcome_res {
@@ -11622,16 +11625,16 @@ async fn handle_search_memory(
         .await
     } else {
         store
-            .search_with_domain(
+            .search_with_domain(crate::traits::SearchWithDomainParams {
                 namespace,
-                vec,
-                FETCH_LIMIT,
+                vector: vec,
+                limit: FETCH_LIMIT,
                 include_tasks,
                 include_archived,
-                &slugs,
-                Some(query),
+                domains: &slugs,
+                query_text: Some(query),
                 exact,
-            )
+            })
             .await
     };
     if let Ok(outcome) = outcome_res {
@@ -11706,16 +11709,16 @@ async fn handle_search_memory(
         // HNSW + Tantivy + symbol + graph expansion via RRF.
         if search_mode == "vector" || !is_ladybug_store {
             let lexical_outcome = store
-                .search_lexical(
+                .search_lexical(crate::traits::SearchLexicalParams {
                     namespace,
                     query,
-                    FETCH_LIMIT,
+                    limit: FETCH_LIMIT,
                     include_tasks,
                     include_archived,
-                    &slugs,
+                    domains: &slugs,
                     principal,
                     fuzzy_max_distance,
-                )
+                })
                 .await;
             if let Err(e) = &lexical_outcome {
                 tracing::warn!("search_lexical blend failed for '{namespace}': {e}");
@@ -24765,16 +24768,16 @@ mod context_plan_tests {
                         .expect("benchmark diagnostic lookup_path_for");
                     for form in forms {
                         let hits = store
-                            .memories_for_file(
-                                NAMESPACE,
-                                None,
-                                &form,
-                                None,
-                                true,
-                                &["rule".into(), "fact".into(), "procedure".into()],
-                                &[],
-                                1,
-                            )
+                            .memories_for_file(crate::traits::MemoriesForFileParams {
+                                namespace: NAMESPACE,
+                                source: None,
+                                path: &form,
+                                symbol: None,
+                                include_ancestors: true,
+                                memory_types: &["rule".into(), "fact".into(), "procedure".into()],
+                                exclude_ids: &[],
+                                limit: 1,
+                            })
                             .await;
                         let hit_count = hits.as_ref().map(|hits| hits.len()).unwrap_or(0);
                         let error = hits.err();

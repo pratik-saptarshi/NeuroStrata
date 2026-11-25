@@ -47,21 +47,38 @@ fn row_flag_true(value: &lbug::Value) -> bool {
     matches!(value, lbug::Value::Bool(true))
 }
 
+/// Parameters for `search_inner`, in the function's original
+/// parameter order.
+struct SearchInnerParams<'a> {
+    pub store: &'a LadybugStore,
+    pub namespace: &'a str,
+    pub vector: Vec<f32>,
+    pub limit: usize,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub include_code_ast: bool,
+    pub domain_keys: HashSet<String>,
+    pub query_text: Option<String>,
+    pub exact: bool,
+    pub search_mode: crate::traits::SearchMode,
+}
+
 /// Internal search routine shared by `search`, `search_with_domain`, and `search_hybrid_with_domain`.
 /// Takes an owned `HashSet<String>` of domain keys (already normalized).
-async fn search_inner(
-    store: &LadybugStore,
-    namespace: &str,
-    vector: Vec<f32>,
-    limit: usize,
-    include_tasks: bool,
-    include_archived: bool,
-    include_code_ast: bool,
-    domain_keys: HashSet<String>,
-    query_text: Option<String>,
-    exact: bool,
-    search_mode: crate::traits::SearchMode,
-) -> Result<DomainSearchOutcome> {
+async fn search_inner(params: SearchInnerParams<'_>) -> Result<DomainSearchOutcome> {
+    let SearchInnerParams {
+        store,
+        namespace,
+        vector,
+        limit,
+        include_tasks,
+        include_archived,
+        include_code_ast,
+        domain_keys,
+        query_text,
+        exact,
+        search_mode,
+    } = params;
     // Every vector search funnels through
     // here, including the paths that never init (the fallback CLI's
     // chat ask): a data-bearing store refuses a query embedded under
@@ -199,16 +216,16 @@ async fn search_inner(
                 }
                 if hybrid_lexical_primaries.is_empty() {
                     if let Ok(fts_out) = store
-                        .search_lexical(
-                            &namespace,
-                            q,
-                            lex_fetch,
+                        .search_lexical(crate::traits::SearchLexicalParams {
+                            namespace: &namespace,
+                            query: q,
+                            limit: lex_fetch,
                             include_tasks,
                             include_archived,
-                            &domain_vec,
-                            "admin",
-                            1,
-                        )
+                            domains: &domain_vec,
+                            principal: "admin",
+                            fuzzy_max_distance: 1,
+                        })
                         .await
                     {
                         hybrid_lexical_primaries = fts_out
@@ -9030,6 +9047,17 @@ impl LadybugStore {
     }
 }
 
+/// Parameters for `LadybugStore::search_tantivy_lexical`, in the
+/// method's original parameter order.
+pub struct SearchTantivyLexicalParams<'a> {
+    pub namespace: &'a str,
+    pub query: &'a str,
+    pub limit: usize,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub domains: &'a [String],
+    pub principal: &'a str,
+}
 
 impl LadybugStore {
     /// Build the lexical view of one stored row. The engine deliberately does
@@ -9221,8 +9249,8 @@ impl LadybugStore {
         }
         let domain_keys: HashSet<String> = expanded;
         let query_owned = query_text.map(|s| s.to_string());
-        let outcome = search_inner(
-            self,
+        let outcome = search_inner(SearchInnerParams {
+            store: self,
             namespace,
             vector,
             limit,
@@ -9230,10 +9258,10 @@ impl LadybugStore {
             include_archived,
             include_code_ast,
             domain_keys,
-            query_owned,
+            query_text: query_owned,
             exact,
             search_mode,
-        )
+        })
         .await?;
         if outcome.incomplete {
             tracing::debug!(
@@ -9502,14 +9530,17 @@ impl LadybugStore {
     /// Search using the disk-backed Tantivy lexical index, hydrating payloads from LadybugDB.
     pub async fn search_tantivy_lexical(
         &self,
-        namespace: &str,
-        query: &str,
-        limit: usize,
-        include_tasks: bool,
-        include_archived: bool,
-        domains: &[String],
-        principal: &str,
+        params: SearchTantivyLexicalParams<'_>,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        let SearchTantivyLexicalParams {
+            namespace,
+            query,
+            limit,
+            include_tasks,
+            include_archived,
+            domains,
+            principal,
+        } = params;
         self.search_tantivy_lexical_with_options(
             namespace,
             query,
@@ -11968,34 +11999,37 @@ impl VectorStore for LadybugStore {
         include_tasks: bool,
         include_archived: bool,
     ) -> Result<Vec<SearchResult>> {
-        let outcome = search_inner(
-            self,
+        let outcome = search_inner(SearchInnerParams {
+            store: self,
             namespace,
             vector,
             limit,
             include_tasks,
             include_archived,
-            true,
-            HashSet::new(),
-            None,
-            true,
-            crate::traits::SearchMode::Default,
-        )
+            include_code_ast: true,
+            domain_keys: HashSet::new(),
+            query_text: None,
+            exact: true,
+            search_mode: crate::traits::SearchMode::Default,
+        })
         .await?;
         Ok(outcome.results)
     }
 
     async fn search_with_domain(
         &self,
-        namespace: &str,
-        vector: Vec<f32>,
-        limit: usize,
-        include_tasks: bool,
-        include_archived: bool,
-        domains: &[String],
-        query_text: Option<&str>,
-        exact: bool,
+        params: crate::traits::SearchWithDomainParams<'_>,
     ) -> Result<DomainSearchOutcome> {
+        let crate::traits::SearchWithDomainParams {
+            namespace,
+            vector,
+            limit,
+            include_tasks,
+            include_archived,
+            domains,
+            query_text,
+            exact,
+        } = params;
         self.search_hybrid_with_domain(
             namespace,
             vector,
@@ -12013,15 +12047,18 @@ impl VectorStore for LadybugStore {
 
     async fn search_lexical(
         &self,
-        namespace: &str,
-        query: &str,
-        limit: usize,
-        include_tasks: bool,
-        include_archived: bool,
-        domains: &[String],
-        principal: &str,
-        fuzzy_max_distance: usize,
+        params: crate::traits::SearchLexicalParams<'_>,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        let crate::traits::SearchLexicalParams {
+            namespace,
+            query,
+            limit,
+            include_tasks,
+            include_archived,
+            domains,
+            principal,
+            fuzzy_max_distance,
+        } = params;
         self.ensure_lexical_loaded(namespace).await?;
         // #149 C2.4: the in-memory partition is filtered at load, but a row
         // staged after that load (or left by a failed refresh) is re-checked
@@ -15444,17 +15481,17 @@ impl LadybugStore {
             .map(|s| s.to_string())
             .collect();
             if let Ok(related) = self
-                .related(
+                .related(crate::traits::RelatedParams {
                     namespace,
-                    &hit.id,
-                    &relations_vec,
-                    crate::graph_read::related::Direction::Both,
-                    1,
-                    &[],
-                    50,
-                    None,
-                    &crate::graph_read::traversal::CrossNamespacePolicy::default(),
-                )
+                    seed: &hit.id,
+                    relations: &relations_vec,
+                    direction: crate::graph_read::related::Direction::Both,
+                    max_hops: 1,
+                    memory_types: &[],
+                    limit: 50,
+                    cursor: None,
+                    cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                })
                 .await
             {
                 let via_ids: Vec<&str> = related
@@ -15478,17 +15515,17 @@ impl LadybugStore {
                     .map(|s| s.to_string())
                     .collect();
                     if let Ok(related2) = self
-                        .related(
+                        .related(crate::traits::RelatedParams {
                             namespace,
-                            via_id,
-                            &relations_vec,
-                            crate::graph_read::related::Direction::Both,
-                            1,
-                            &[],
-                            50,
-                            None,
-                            &crate::graph_read::traversal::CrossNamespacePolicy::default(),
-                        )
+                            seed: via_id,
+                            relations: &relations_vec,
+                            direction: crate::graph_read::related::Direction::Both,
+                            max_hops: 1,
+                            memory_types: &[],
+                            limit: 50,
+                            cursor: None,
+                            cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                        })
                         .await
                     {
                         for target_node in &related2.nodes {
@@ -15842,15 +15879,18 @@ impl LadybugStore {
 impl GraphRead for LadybugStore {
     async fn memories_for_file(
         &self,
-        namespace: &str,
-        source: Option<&str>,
-        path: &str,
-        symbol: Option<&str>,
-        include_ancestors: bool,
-        memory_types: &[String],
-        exclude_ids: &[String],
-        limit: usize,
+        params: crate::traits::MemoriesForFileParams<'_>,
     ) -> Result<Vec<MemoryHit>> {
+        let crate::traits::MemoriesForFileParams {
+            namespace,
+            source,
+            path,
+            symbol,
+            include_ancestors,
+            memory_types,
+            exclude_ids,
+            limit,
+        } = params;
         self.memories_for_file_forms(
             namespace,
             source,
@@ -15867,16 +15907,19 @@ impl GraphRead for LadybugStore {
 
     async fn related(
         &self,
-        namespace: &str,
-        seed: &str,
-        relations: &[String],
-        direction: crate::graph_read::related::Direction,
-        max_hops: usize,
-        memory_types: &[String],
-        limit: usize,
-        cursor: Option<&crate::graph_read::related::Cursor>,
-        cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
+        params: crate::traits::RelatedParams<'_>,
     ) -> Result<crate::graph_read::related::RelatedResult> {
+        let crate::traits::RelatedParams {
+            namespace,
+            seed,
+            relations,
+            direction,
+            max_hops,
+            memory_types,
+            limit,
+            cursor,
+            cross_namespace,
+        } = params;
         let namespace = namespace.to_string();
         let seed = seed.to_string();
         // Spec §6: `related` consumes the ontology's relation expansion — each
@@ -19271,7 +19314,16 @@ eurostrata\src\daemon.rs",
 
         for principal in ["alice", "owner", "admin"] {
             let hits = store
-                .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
+                .search_lexical(crate::traits::SearchLexicalParams {
+                    namespace: "probe",
+                    query: "parityneedle",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    principal,
+                    fuzzy_max_distance: 0,
+                })
                 .await
                 .unwrap()
                 .results;
@@ -19285,7 +19337,16 @@ eurostrata\src\daemon.rs",
         }
         for principal in ["bob", ""] {
             let hits = store
-                .search_lexical("probe", "parityneedle", 10, false, false, &[], principal, 0)
+                .search_lexical(crate::traits::SearchLexicalParams {
+                    namespace: "probe",
+                    query: "parityneedle",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    principal,
+                    fuzzy_max_distance: 0,
+                })
                 .await
                 .unwrap()
                 .results;
@@ -19304,7 +19365,16 @@ eurostrata\src\daemon.rs",
         store.init("probe").await.unwrap();
         // Load the empty index first, so upserts must update an already loaded index.
         assert!(store
-            .search_lexical("probe", "parityneedle", 100, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "parityneedle",
+                limit: 100,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results
@@ -19394,16 +19464,16 @@ eurostrata\src\daemon.rs",
                     .map(|(id, _, _)| id.to_string())
                     .collect();
                 let hits = store
-                    .search_lexical(
-                        "probe",
-                        "parityneedle",
-                        100,
-                        false,
-                        false,
-                        &[],
+                    .search_lexical(crate::traits::SearchLexicalParams {
+                        namespace: "probe",
+                        query: "parityneedle",
+                        limit: 100,
+                        include_tasks: false,
+                        include_archived: false,
+                        domains: &[],
                         principal,
-                        0,
-                    )
+                        fuzzy_max_distance: 0,
+                    })
                     .await
                     .unwrap()
                     .results;
@@ -19417,15 +19487,15 @@ eurostrata\src\daemon.rs",
                     .iter()
                     .all(|hit| hit.payload.content == "parityneedle confidential memory"));
                 let tantivy = store
-                    .search_tantivy_lexical(
-                        "probe",
-                        "parityneedle",
-                        100,
-                        false,
-                        false,
-                        &[],
+                    .search_tantivy_lexical(SearchTantivyLexicalParams {
+                        namespace: "probe",
+                        query: "parityneedle",
+                        limit: 100,
+                        include_tasks: false,
+                        include_archived: false,
+                        domains: &[],
                         principal,
-                    )
+                    })
                     .await
                     .unwrap()
                     .results;
@@ -19572,7 +19642,15 @@ eurostrata\src\daemon.rs",
         *store.tantivy_lexical.write().unwrap() = Some(idx);
 
         let outcome = store
-            .search_tantivy_lexical("probe", "zebratoken", 10, false, false, &[], "tester")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "zebratoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "tester",
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19613,16 +19691,16 @@ eurostrata\src\daemon.rs",
         }
         // Control: the vector/domain path already excludes both retired rows.
         let control = store
-            .search_with_domain(
-                "probe",
-                vec![1.0, 0.0, 0.0, 0.0],
-                10,
-                false,
-                false,
-                &[],
-                None,
-                false,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: false,
+            })
             .await
             .unwrap();
         let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
@@ -19647,7 +19725,15 @@ eurostrata\src\daemon.rs",
         }
         *store.tantivy_lexical.write().unwrap() = Some(idx);
         let outcome = store
-            .search_tantivy_lexical("probe", "retiretoken", 10, false, false, &[], "tester")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "retiretoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "tester",
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19694,7 +19780,15 @@ eurostrata\src\daemon.rs",
         *store.tantivy_lexical.write().unwrap() = Some(idx);
 
         let hidden = store
-            .search_tantivy_lexical("probe", "archivetoken", 10, false, false, &[], "tester")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "archivetoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "tester",
+            })
             .await
             .unwrap();
         let hidden_ids: Vec<&str> = hidden.results.iter().map(|r| r.id.as_str()).collect();
@@ -19708,7 +19802,15 @@ eurostrata\src\daemon.rs",
         );
 
         let shown = store
-            .search_tantivy_lexical("probe", "archivetoken", 10, false, true, &[], "tester")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "archivetoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: true,
+                domains: &[],
+                principal: "tester",
+            })
             .await
             .unwrap();
         let shown_ids: Vec<&str> = shown.results.iter().map(|r| r.id.as_str()).collect();
@@ -19745,7 +19847,15 @@ eurostrata\src\daemon.rs",
             ("eve", false),
         ] {
             let outcome = store
-                .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], principal)
+                .search_tantivy_lexical(SearchTantivyLexicalParams {
+                    namespace: "probe",
+                    query: "a1token",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    principal,
+                })
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19865,16 +19975,16 @@ eurostrata\src\daemon.rs",
             "structural-row",
         ] {
             let outcome = store
-                .search_with_domain(
-                    "probe",
-                    vec4.clone(),
-                    1,
-                    false,
-                    false,
-                    &[],
-                    Some(excluded),
-                    false,
-                )
+                .search_with_domain(crate::traits::SearchWithDomainParams {
+                    namespace: "probe",
+                    vector: vec4.clone(),
+                    limit: 1,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    query_text: Some(excluded),
+                    exact: false,
+                })
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19891,16 +20001,16 @@ eurostrata\src\daemon.rs",
         // Domain predicate: under an "auth" filter, a database-domain row
         // queried by id must not re-enter through the inferred merge.
         let outcome = store
-            .search_with_domain(
-                "probe",
-                vec4.clone(),
-                1,
-                false,
-                false,
-                &["auth".to_string()],
-                Some("other-domain-row"),
-                false,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec4.clone(),
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["auth".to_string()],
+                query_text: Some("other-domain-row"),
+                exact: false,
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19912,16 +20022,16 @@ eurostrata\src\daemon.rs",
         // Positive control: a clean row surfaces through the inferred merge
         // (limit 1 kept it out of the primaries).
         let outcome = store
-            .search_with_domain(
-                "probe",
-                vec4.clone(),
-                1,
-                false,
-                false,
-                &[],
-                Some("z-clean-row"),
-                false,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec4.clone(),
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: Some("z-clean-row"),
+                exact: false,
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19936,16 +20046,16 @@ eurostrata\src\daemon.rs",
             [("task-row", true, false), ("archived-row", false, true)]
         {
             let outcome = store
-                .search_with_domain(
-                    "probe",
-                    vec4.clone(),
-                    1,
+                .search_with_domain(crate::traits::SearchWithDomainParams {
+                    namespace: "probe",
+                    vector: vec4.clone(),
+                    limit: 1,
                     include_tasks,
                     include_archived,
-                    &[],
-                    Some(id),
-                    false,
-                )
+                    domains: &[],
+                    query_text: Some(id),
+                    exact: false,
+                })
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -19987,7 +20097,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let outcome = store
-            .search_lexical("probe", "searchIndex", 10, false, false, &[], "admin", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "searchIndex",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search");
         assert_eq!(outcome.results.len(), 1);
@@ -20019,7 +20138,16 @@ eurostrata\src\daemon.rs",
         // Force the lazy index to load, then mutate through the normal write paths.
         assert_eq!(
             store
-                .search_lexical("probe", "alpha", 10, false, false, &[], "admin", 2)
+                .search_lexical(crate::traits::SearchLexicalParams {
+                    namespace: "probe",
+                    query: "alpha",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    principal: "admin",
+                    fuzzy_max_distance: 2
+                })
                 .await
                 .unwrap()
                 .results
@@ -20033,14 +20161,32 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         assert!(store
-            .search_lexical("probe", "alpha", 10, false, false, &[], "admin", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "alpha",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 2
+            })
             .await
             .unwrap()
             .results
             .is_empty());
         assert_eq!(
             store
-                .search_lexical("probe", "beta", 10, false, false, &[], "admin", 2)
+                .search_lexical(crate::traits::SearchLexicalParams {
+                    namespace: "probe",
+                    query: "beta",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    principal: "admin",
+                    fuzzy_max_distance: 2
+                })
                 .await
                 .unwrap()
                 .results
@@ -20050,7 +20196,16 @@ eurostrata\src\daemon.rs",
 
         store.delete("probe", "rule-1").await.unwrap();
         assert!(store
-            .search_lexical("probe", "beta", 10, false, false, &[], "admin", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "beta",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 2
+            })
             .await
             .unwrap()
             .results
@@ -20559,16 +20714,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -20659,16 +20814,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -20728,16 +20883,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/lib.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/lib.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -20993,16 +21148,16 @@ eurostrata\src\daemon.rs",
         census_fixture(&store).await;
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                10,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 10,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(
@@ -21095,16 +21250,16 @@ eurostrata\src\daemon.rs",
         }
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(hits.len(), 5, "the page is bounded by the limit");
@@ -21127,16 +21282,16 @@ eurostrata\src\daemon.rs",
         census_fixture(&store).await;
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                10,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 10,
+            })
             .await
             .expect("graph read succeeds");
         let folded_order: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
@@ -21201,16 +21356,16 @@ eurostrata\src\daemon.rs",
         let small = retired_test_store().await;
         fallback_corpus(&small, 130).await;
         let small_hits = small
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                20,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 20,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(small_hits.len(), 20, "the page is bounded by the limit");
@@ -21218,16 +21373,16 @@ eurostrata\src\daemon.rs",
         let big = retired_test_store().await;
         fallback_corpus(&big, 260).await;
         let big_hits = big
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                20,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 20,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(big_hits.len(), 20, "the page is bounded by the limit");
@@ -21267,16 +21422,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                20,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 20,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(hits.len(), 1, "the declaration alone is a hit");
@@ -21313,16 +21468,16 @@ eurostrata\src\daemon.rs",
             .expect("seed the relates-to edge");
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                20,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 20,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(hits.len(), 3, "the three fallback hits are found");
@@ -21389,16 +21544,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                20,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 20,
+            })
             .await
             .expect("graph read succeeds");
         assert!(
@@ -21412,16 +21567,16 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                20,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 20,
+            })
             .await
             .expect("graph read succeeds");
         assert_eq!(
@@ -21484,16 +21639,16 @@ eurostrata\src\daemon.rs",
 
         // The rule now finds the file through the graph-read capability.
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/not-ingested.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/not-ingested.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         assert!(
@@ -21530,16 +21685,16 @@ eurostrata\src\daemon.rs",
         assert_eq!(payload.memory_type, "directory");
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/foo.rs",
-                None,
-                true,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/foo.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         assert!(
@@ -21587,16 +21742,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         let hit = hits
@@ -21633,16 +21788,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let hits = store
-            .memories_for_file(
-                "probe",
-                None,
-                "src/a.rs",
-                None,
-                true,
-                &["fact".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: None,
+                path: "src/a.rs",
+                symbol: None,
+                include_ancestors: true,
+                memory_types: &["fact".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .expect("graph read succeeds");
         assert!(
@@ -21691,17 +21846,17 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let result = store
-            .related(
-                "probe",
-                "seed",
-                &[],
-                crate::graph_read::related::Direction::Both,
-                2,
-                &[],
-                25,
-                None,
-                &crate::graph_read::traversal::CrossNamespacePolicy::default(),
-            )
+            .related(crate::traits::RelatedParams {
+                namespace: "probe",
+                seed: "seed",
+                relations: &[],
+                direction: crate::graph_read::related::Direction::Both,
+                max_hops: 2,
+                memory_types: &[],
+                limit: 25,
+                cursor: None,
+                cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+            })
             .await
             .expect("related traversal succeeds");
 
@@ -25531,16 +25686,16 @@ eurostrata\src\daemon.rs",
 
         // Search with domain filter for "database" only
         let outcome = store
-            .search_with_domain(
-                "probe",
-                query_vec,
-                10,
-                false,
-                false,
-                &["database".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: query_vec,
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25577,16 +25732,16 @@ eurostrata\src\daemon.rs",
 
         // Search with domain filter for "database" (no match)
         let outcome = store
-            .search_with_domain(
-                "probe",
-                query_vec,
-                10,
-                false,
-                false,
-                &["database".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: query_vec,
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25620,16 +25775,16 @@ eurostrata\src\daemon.rs",
 
         // Search with the normalized slug "database-access"
         let outcome = store
-            .search_with_domain(
-                "probe",
-                query_vec,
-                10,
-                false,
-                false,
-                &["database-access".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: query_vec,
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database-access".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25686,16 +25841,16 @@ eurostrata\src\daemon.rs",
 
         // Search with domain filter for "target" only, limit = 3
         let outcome = store
-            .search_with_domain(
-                "probe",
-                query_vec.clone(),
-                3,
-                false,
-                false,
-                &["target".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: query_vec.clone(),
+                limit: 3,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["target".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25782,29 +25937,29 @@ eurostrata\src\daemon.rs",
 
         // Case A: key set matches exactly one row → mode Domain, only that row returned
         let real_outcome = real
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &["database".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
         let mock_outcome = mock
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &["database".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25823,29 +25978,29 @@ eurostrata\src\daemon.rs",
 
         // Case B: key set matches nothing → soft fallback → mode Vector, all rows returned
         let real_outcome = real
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &["nonexistent".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["nonexistent".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
         let mock_outcome = mock
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &["nonexistent".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["nonexistent".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25864,29 +26019,29 @@ eurostrata\src\daemon.rs",
 
         // Case C: legacy free-text domain matches normalized slug at comparison time
         let real_outcome = real
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &["database-access".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database-access".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
         let mock_outcome = mock
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &["database-access".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database-access".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25904,20 +26059,29 @@ eurostrata\src\daemon.rs",
 
         // Case D: no filter (empty key set) → mode Vector, all rows returned
         let real_outcome = real
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                10,
-                false,
-                false,
-                &[],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
         let mock_outcome = mock
-            .search_with_domain(namespace, query_vec, 10, false, false, &[], None, true)
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace,
+                vector: query_vec,
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
 
@@ -25960,16 +26124,16 @@ eurostrata\src\daemon.rs",
 
         // Empty-key branch (domains = &[]): limit = 1 should return exactly 1 row
         let outcome = mock
-            .search_with_domain(
-                namespace,
-                query_vec.clone(),
-                1,
-                false,
-                false,
-                &[],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec.clone(),
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
         assert_eq!(outcome.mode, DomainMatchMode::Vector);
@@ -25982,16 +26146,16 @@ eurostrata\src\daemon.rs",
         // Filtered branch (domains = &["database"]): limit = 1 should return exactly 1 matching row
         // We seeded TWO "database" rows, so truncation must happen.
         let outcome = mock
-            .search_with_domain(
-                namespace,
-                query_vec,
-                1,
-                false,
-                false,
-                &["database".to_string()],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: namespace,
+                vector: query_vec,
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["database".to_string()],
+                query_text: None,
+                exact: true,
+            })
             .await
             .unwrap();
         assert_eq!(outcome.mode, DomainMatchMode::Domain);
@@ -26449,16 +26613,16 @@ eurostrata\src\daemon.rs",
             ),
         ] {
             let outcome = store
-                .search_with_domain(
-                    "probe",
-                    vec![0.9, 0.0, 0.0, 0.0],
-                    5,
-                    false,
-                    false,
-                    &[],
-                    Some(query),
-                    true,
-                )
+                .search_with_domain(crate::traits::SearchWithDomainParams {
+                    namespace: "probe",
+                    vector: vec![0.9, 0.0, 0.0, 0.0],
+                    limit: 5,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    query_text: Some(query),
+                    exact: true,
+                })
                 .await
                 .unwrap();
             let hit = outcome
@@ -26474,7 +26638,16 @@ eurostrata\src\daemon.rs",
             assert!(crate::traits::is_direct_match(&hit.evidence));
 
             let lex = store
-                .search_lexical("probe", query.trim(), 5, false, false, &[], "admin", 1)
+                .search_lexical(crate::traits::SearchLexicalParams {
+                    namespace: "probe",
+                    query: query.trim(),
+                    limit: 5,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    principal: "admin",
+                    fuzzy_max_distance: 1,
+                })
                 .await
                 .unwrap();
             assert!(
@@ -26486,16 +26659,16 @@ eurostrata\src\daemon.rs",
 
         // Negative probe: non-existent identifier should not get an exact-name 0.0 score
         let neg = store
-            .search_with_domain(
-                "probe",
-                vec![0.9, 0.0, 0.0, 0.0],
-                5,
-                false,
-                false,
-                &[],
-                Some("NON_EXISTENT_SYMBOL_XYZ_999"),
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec![0.9, 0.0, 0.0, 0.0],
+                limit: 5,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: Some("NON_EXISTENT_SYMBOL_XYZ_999"),
+                exact: true,
+            })
             .await
             .unwrap();
         assert!(neg.results.iter().all(|r| r.score > 0.0));
@@ -28838,16 +29011,16 @@ eurostrata\src\daemon.rs",
             .with_embed_config_dir(&fx.config_dir)
             .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
         let err = chat
-            .search_with_domain(
-                "probe",
-                vec![0.1, 0.2, 0.3, 0.4],
-                5,
-                false,
-                false,
-                &[],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec![0.1, 0.2, 0.3, 0.4],
+                limit: 5,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: true,
+            })
             .await
             .expect_err("an init-less vector search under a different model must refuse");
         assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
@@ -32759,16 +32932,16 @@ eurostrata\src\daemon.rs",
             .expect_err("a post-construction binding keys the write check");
         assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
         let err = store
-            .search_with_domain(
-                "probe",
-                vec![0.1, 0.2, 0.3, 0.4],
-                5,
-                false,
-                false,
-                &[],
-                None,
-                true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec![0.1, 0.2, 0.3, 0.4],
+                limit: 5,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: true,
+            })
             .await
             .expect_err("a post-construction binding keys the search check");
         assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
@@ -33432,13 +33605,30 @@ eurostrata\src\daemon.rs",
         // invalidate a loaded in-memory partition and an open Tantivy index.
         let warm_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/a.rs");
         let warm_inhouse = store
-            .search_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "lexgenneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
         assert_eq!(result_ids(&warm_inhouse), vec![warm_id.clone()]);
         let warm_tantivy = store
-            .search_tantivy_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "lexgenneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33455,7 +33645,16 @@ eurostrata\src\daemon.rs",
         let expected = crate::parser::ingest::generation_scoped_id("gen", second, "src/a.rs");
 
         let inhouse = store
-            .search_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "lexgenneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33466,7 +33665,15 @@ eurostrata\src\daemon.rs",
         );
 
         let tantivy = store
-            .search_tantivy_lexical("gen", "lexgenneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "lexgenneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33495,13 +33702,30 @@ eurostrata\src\daemon.rs",
         .await;
         // Load generation 1 into both caches before it is superseded.
         let warm = store
-            .search_tantivy_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "gonefileneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
         assert_eq!(warm.len(), 1, "fixture generation 1 must contain the file");
         let warm_inhouse = store
-            .search_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "gonefileneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33516,7 +33740,16 @@ eurostrata\src\daemon.rs",
         .await;
 
         let inhouse_gone = store
-            .search_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "gonefileneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33526,7 +33759,15 @@ eurostrata\src\daemon.rs",
             result_ids(&inhouse_gone)
         );
         let tantivy_gone = store
-            .search_tantivy_lexical("gen", "gonefileneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "gonefileneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33538,7 +33779,15 @@ eurostrata\src\daemon.rs",
 
         let expected = crate::parser::ingest::generation_scoped_id("gen", second, "src/kept.rs");
         let kept = store
-            .search_tantivy_lexical("gen", "keptfileneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "keptfileneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33566,22 +33815,30 @@ eurostrata\src\daemon.rs",
         .await;
         // Load both caches on the generation that still carries the row.
         let warm = store
-            .search_lexical(
-                "gen",
-                "leakedsecretneedle",
-                10,
-                false,
-                false,
-                &[],
-                "admin",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "leakedsecretneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
         assert_eq!(warm.len(), 1, "fixture generation 1 must carry the row");
         let warm_tantivy = store
-            .search_tantivy_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "leakedsecretneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33597,16 +33854,16 @@ eurostrata\src\daemon.rs",
         .await;
 
         let inhouse = store
-            .search_lexical(
-                "gen",
-                "leakedsecretneedle",
-                10,
-                false,
-                false,
-                &[],
-                "admin",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "leakedsecretneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33616,7 +33873,15 @@ eurostrata\src\daemon.rs",
             result_ids(&inhouse)
         );
         let tantivy = store
-            .search_tantivy_lexical("gen", "leakedsecretneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "leakedsecretneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33647,13 +33912,30 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let inhouse = store
-            .search_lexical("gen", "nopointerneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "nopointerneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
         assert_eq!(result_ids(&inhouse), vec![id.clone()]);
         let tantivy = store
-            .search_tantivy_lexical("gen", "nopointerneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "nopointerneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33683,16 +33965,16 @@ eurostrata\src\daemon.rs",
         .await;
         let active_id = crate::parser::ingest::generation_scoped_id("gen", first, "src/active.rs");
         let warm = store
-            .search_lexical(
-                "gen",
-                "stagedstarveneedle",
-                1,
-                false,
-                false,
-                &[],
-                "admin",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "stagedstarveneedle",
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33721,16 +34003,16 @@ eurostrata\src\daemon.rs",
         }
 
         let inhouse = store
-            .search_lexical(
-                "gen",
-                "stagedstarveneedle",
-                1,
-                false,
-                false,
-                &[],
-                "admin",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "stagedstarveneedle",
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33740,7 +34022,15 @@ eurostrata\src\daemon.rs",
             "unpublished staged rows must not consume the in-house page"
         );
         let tantivy = store
-            .search_tantivy_lexical("gen", "stagedstarveneedle", 1, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "stagedstarveneedle",
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33769,7 +34059,16 @@ eurostrata\src\daemon.rs",
         let id = crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
 
         let warm = store
-            .search_lexical("gen", "archiveneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "archiveneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33790,7 +34089,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let live = store
-            .search_lexical("gen", "archiveneedle", 10, false, false, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "archiveneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33800,7 +34108,16 @@ eurostrata\src\daemon.rs",
             result_ids(&live)
         );
         let archived = store
-            .search_lexical("gen", "archiveneedle", 10, false, true, &[], "admin", 0)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "gen",
+                query: "archiveneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: true,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33811,7 +34128,15 @@ eurostrata\src\daemon.rs",
         );
 
         let tantivy = store
-            .search_tantivy_lexical("gen", "archiveneedle", 10, false, false, &[], "admin")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "gen",
+                query: "archiveneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33852,16 +34177,16 @@ eurostrata\src\daemon.rs",
             .unwrap();
 
         let inhouse = store
-            .search_lexical(
-                "legacy",
-                "legacypointerneedle",
-                10,
-                false,
-                false,
-                &[],
-                "admin",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "legacy",
+                query: "legacypointerneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap()
             .results;
@@ -33871,15 +34196,15 @@ eurostrata\src\daemon.rs",
             "a legacy namespace pointer must keep its rows visible"
         );
         let tantivy = store
-            .search_tantivy_lexical(
-                "legacy",
-                "legacypointerneedle",
-                10,
-                false,
-                false,
-                &[],
-                "admin",
-            )
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "legacy",
+                query: "legacypointerneedle",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "admin",
+            })
             .await
             .unwrap()
             .results;
@@ -33907,29 +34232,29 @@ eurostrata\src\daemon.rs",
 
         for (principal, expected) in [("alice", 1), ("bob", 1), ("eve", 0)] {
             let inhouse = store
-                .search_lexical(
-                    "probe",
-                    "ownerparityneedle",
-                    10,
-                    false,
-                    false,
-                    &[],
+                .search_lexical(crate::traits::SearchLexicalParams {
+                    namespace: "probe",
+                    query: "ownerparityneedle",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
                     principal,
-                    0,
-                )
+                    fuzzy_max_distance: 0,
+                })
                 .await
                 .unwrap()
                 .results;
             let tantivy = store
-                .search_tantivy_lexical(
-                    "probe",
-                    "ownerparityneedle",
-                    10,
-                    false,
-                    false,
-                    &[],
+                .search_tantivy_lexical(SearchTantivyLexicalParams {
+                    namespace: "probe",
+                    query: "ownerparityneedle",
+                    limit: 10,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
                     principal,
-                )
+                })
                 .await
                 .unwrap()
                 .results;
@@ -35933,7 +36258,15 @@ eurostrata\src\daemon.rs",
         *store.tantivy_lexical.write().unwrap() = Some(idx);
 
         let outcome = store
-            .search_tantivy_lexical("probe", "zebratoken", 10, false, false, &[], "tester")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "zebratoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "tester",
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -35990,7 +36323,16 @@ eurostrata\src\daemon.rs",
 
         // A different principal must see none of the restricted rows.
         let bob = store
-            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "bob",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as bob");
         let bob_ids = ids_for(&bob);
@@ -36002,7 +36344,16 @@ eurostrata\src\daemon.rs",
         // The named principal sees the object- and string-form rows, but
         // not the all-malformed row (fail-closed, not unrestricted).
         let alice = store
-            .search_lexical("probe", "quixotic", 10, false, false, &[], "alice", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as alice");
         let alice_ids = ids_for(&alice);
@@ -36961,16 +37312,16 @@ eurostrata\src\daemon.rs",
             "structural-row",
         ] {
             let outcome = store
-                .search_with_domain(
-                    "probe",
-                    vec4.clone(),
-                    1,
-                    false,
-                    false,
-                    &[],
-                    Some(excluded),
-                    false,
-                )
+                .search_with_domain(crate::traits::SearchWithDomainParams {
+                    namespace: "probe",
+                    vector: vec4.clone(),
+                    limit: 1,
+                    include_tasks: false,
+                    include_archived: false,
+                    domains: &[],
+                    query_text: Some(excluded),
+                    exact: false,
+                })
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -36987,16 +37338,16 @@ eurostrata\src\daemon.rs",
         // Domain predicate: under an "auth" filter, a database-domain row
         // queried by id must not re-enter through the inferred merge.
         let outcome = store
-            .search_with_domain(
-                "probe",
-                vec4.clone(),
-                1,
-                false,
-                false,
-                &["auth".to_string()],
-                Some("other-domain-row"),
-                false,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec4.clone(),
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &["auth".to_string()],
+                query_text: Some("other-domain-row"),
+                exact: false,
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -37008,16 +37359,16 @@ eurostrata\src\daemon.rs",
         // Positive control: a clean row surfaces through the inferred
         // merge (limit 1 kept it out of the primaries).
         let outcome = store
-            .search_with_domain(
-                "probe",
-                vec4.clone(),
-                1,
-                false,
-                false,
-                &[],
-                Some("z-clean-row"),
-                false,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec4.clone(),
+                limit: 1,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: Some("z-clean-row"),
+                exact: false,
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -37032,16 +37383,16 @@ eurostrata\src\daemon.rs",
             [("task-row", true, false), ("archived-row", false, true)]
         {
             let outcome = store
-                .search_with_domain(
-                    "probe",
-                    vec4.clone(),
-                    1,
+                .search_with_domain(crate::traits::SearchWithDomainParams {
+                    namespace: "probe",
+                    vector: vec4.clone(),
+                    limit: 1,
                     include_tasks,
                     include_archived,
-                    &[],
-                    Some(id),
-                    false,
-                )
+                    domains: &[],
+                    query_text: Some(id),
+                    exact: false,
+                })
                 .await
                 .unwrap();
             let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -38201,7 +38552,16 @@ eurostrata\src\daemon.rs",
             .expect("rebuild the lexical index from stored rows");
         assert_eq!(rebuilt, 2);
         let bob = store
-            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "bob",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as bob after fresh load");
         let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
@@ -38210,7 +38570,16 @@ eurostrata\src\daemon.rs",
             "bob must not retrieve ACL-restricted rows after fresh load, got: {bob_ids:?}"
         );
         let alice = store
-            .search_lexical("probe", "quixotic", 10, false, false, &[], "alice", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as alice after fresh load");
         let alice_ids: Vec<String> = alice.results.iter().map(|r| r.id.clone()).collect();
@@ -38253,7 +38622,16 @@ eurostrata\src\daemon.rs",
                 .unwrap();
         }
         let bob = store
-            .search_lexical("probe", "quixotic", 3, false, false, &[], "bob", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 3,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "bob",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as bob");
         let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
@@ -38293,7 +38671,16 @@ eurostrata\src\daemon.rs",
                 .unwrap();
         }
         let bob = store
-            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "bob",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as bob");
         let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
@@ -38306,7 +38693,16 @@ eurostrata\src\daemon.rs",
             "mixed-acl row must not be visible to bob, got: {bob_ids:?}"
         );
         let carol = store
-            .search_lexical("probe", "quixotic", 10, false, false, &[], "carol", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "quixotic",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "carol",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as carol");
         let carol_ids: Vec<String> = carol.results.iter().map(|r| r.id.clone()).collect();
@@ -38382,7 +38778,16 @@ eurostrata\src\daemon.rs",
             .expect("lexical index lock")
             .upsert(doctored);
         let outcome = store
-            .search_lexical("probe", "corrupttoken", 10, false, false, &[], "bob", 2)
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "probe",
+                query: "corrupttoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "bob",
+                fuzzy_max_distance: 2,
+            })
             .await
             .expect("lexical search as bob");
         outcome.results.iter().map(|r| r.id.clone()).collect()
@@ -38413,16 +38818,16 @@ eurostrata\src\daemon.rs",
         }
         // Control: the vector/domain path already excludes both retired rows.
         let control = store
-            .search_with_domain(
-                "probe",
-                vec![1.0, 0.0, 0.0, 0.0],
-                10,
-                false,
-                false,
-                &[],
-                None,
-                false,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: "probe",
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                query_text: None,
+                exact: false,
+            })
             .await
             .unwrap();
         let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
@@ -38447,7 +38852,15 @@ eurostrata\src\daemon.rs",
         }
         *store.tantivy_lexical.write().unwrap() = Some(idx);
         let outcome = store
-            .search_tantivy_lexical("probe", "retiretoken", 10, false, false, &[], "tester")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "retiretoken",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "tester",
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
@@ -38487,7 +38900,15 @@ eurostrata\src\daemon.rs",
             .unwrap();
         *store.tantivy_lexical.write().unwrap() = Some(idx);
         let alice = store
-            .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], "alice")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "a1token",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+            })
             .await
             .unwrap();
         let alice_ids: Vec<&str> = alice.results.iter().map(|r| r.id.as_str()).collect();
@@ -38496,7 +38917,15 @@ eurostrata\src\daemon.rs",
             "metadata-derived owner alice must be admitted via tantivy search, got: {alice_ids:?}"
         );
         let bob = store
-            .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], "bob")
+            .search_tantivy_lexical(SearchTantivyLexicalParams {
+                namespace: "probe",
+                query: "a1token",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "bob",
+            })
             .await
             .unwrap();
         let bob_ids: Vec<&str> = bob.results.iter().map(|r| r.id.as_str()).collect();
