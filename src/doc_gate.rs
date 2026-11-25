@@ -1167,6 +1167,180 @@ fn raw_string_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     Some((j + 1 - start, j - r_idx - 1))
 }
 
+/// Normalizes a TypeScript export line into its public signature,
+/// mirroring `declaration_signature`'s philosophy: a `function`
+/// signature ends before the body brace; `class` / `interface` /
+/// `enum` / `namespace` keep the whole line when its braces balance
+/// on the line (inline members are surface) and otherwise keep only
+/// the header before the first `{`; a `type` alias keeps the whole
+/// line minus the trailing `;`, because the aliased definition is
+/// its surface; a `const` / `let` / `var` keeps the whole line minus
+/// the trailing `;`, because an exported value is its contract —
+/// except that an arrow-function value keeps only the text up to
+/// the first `{` after the `=>` when one exists on the line, so a
+/// same-line body edit does not fire. Re-export lines keep the
+/// whole line minus the trailing `;`, so the source path (which
+/// the signature carries) stays precise.
+fn typescript_signature(kind: &str, line: &str) -> String {
+    let normalized = normalized_line(line);
+    let strip_trailing_semicolon = |text: &str| {
+        text.trim_end()
+            .trim_end_matches(';')
+            .trim_end()
+            .to_string()
+    };
+    match kind {
+        "function" => {
+            let head = match normalized.find('{') {
+                Some(idx) => &normalized[..idx],
+                None => &normalized[..],
+            };
+            strip_trailing_semicolon(head.trim_end())
+        }
+        "class" | "interface" | "enum" | "namespace" => {
+            let opens = normalized.matches('{').count();
+            let closes = normalized.matches('}').count();
+            if opens > 0 && opens == closes && normalized.ends_with('}') {
+                normalized
+            } else if let Some(idx) = normalized.find('{') {
+                normalized[..idx].trim_end().to_string()
+            } else {
+                strip_trailing_semicolon(&normalized)
+            }
+        }
+        "type" => strip_trailing_semicolon(&normalized),
+        "const" | "let" | "var" => {
+            if let Some(arrow) = normalized.find("=>") {
+                match normalized[arrow + 2..].find('{') {
+                    Some(rel) => normalized[..arrow + 2 + rel].trim_end().to_string(),
+                    None => normalized,
+                }
+            } else {
+                strip_trailing_semicolon(&normalized)
+            }
+        }
+        _ => strip_trailing_semicolon(&normalized),
+    }
+}
+
+/// Parses one line as a TypeScript `export` declaration, returning
+/// its (declared name, signature) pairs, or `None` when the line
+/// does not begin an export. Recognition runs on the blanked line
+/// (comment/string contents are already erased there, so an
+/// `export` shape inside one extracts nothing); the signature is
+/// taken from the original line, because an exported `const`'s
+/// string value and a re-export's source path are surface that
+/// blanking erases. Modifiers (`default` / `declare` / `abstract` /
+/// `async`, in any order) precede the kind; an anonymous default
+/// export (name token `(` or `{`) inserts nothing, as do shapes
+/// outside the kind list (`export = …`, `export as namespace …`).
+fn parse_typescript_exports(
+    blanked_line: &str,
+    original_line: &str,
+) -> Option<Vec<(String, String)>> {
+    const TS_KINDS: [&str; 9] = [
+        "function", "class", "interface", "type", "const", "let", "var", "enum", "namespace",
+    ];
+    let trimmed = blanked_line.trim();
+    let rest = trimmed.strip_prefix("export")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut idx = 1;
+    while idx < tokens.len()
+        && ["default", "declare", "abstract", "async"].contains(&tokens[idx])
+    {
+        idx += 1;
+    }
+    let Some(next) = tokens.get(idx) else {
+        return Some(Vec::new());
+    };
+    if next.starts_with('{') {
+        // Re-export list: `export { A, B as C, type D } from "…";`
+        // (the `from` clause is optional). A group with no closing
+        // brace on this line is a multiline header; its member
+        // lines are caught by the member parser instead.
+        let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) else {
+            return Some(Vec::new());
+        };
+        if close <= open {
+            return Some(Vec::new());
+        }
+        let signature = typescript_signature("reexport", original_line);
+        let mut out = Vec::new();
+        for member in trimmed[open + 1..close].split(',') {
+            let member = member.trim();
+            if member.is_empty() {
+                continue;
+            }
+            let member = member.strip_prefix("type ").unwrap_or(member).trim();
+            let name = if let Some((_, alias)) = member.rsplit_once(" as ") {
+                leading_identifier(alias.trim()).map(|(name, _)| name)
+            } else {
+                leading_identifier(member).map(|(name, _)| name)
+            };
+            if let Some(name) = name {
+                if !name.is_empty() {
+                    out.push((name, signature.clone()));
+                }
+            }
+        }
+        return Some(out);
+    }
+    if next.starts_with('*') {
+        // Star re-export: `export * as ns from "…";` names `ns`;
+        // a bare `export * from "./module";` names the module
+        // path's final segment minus its extension.
+        let signature = typescript_signature("reexport", original_line);
+        if tokens.get(idx + 1) == Some(&"as") {
+            if let Some(name_token) = tokens.get(idx + 2) {
+                if let Some((name, _)) = leading_identifier(name_token) {
+                    return Some(vec![(name, signature)]);
+                }
+            }
+            return Some(Vec::new());
+        }
+        let original = original_line.trim();
+        let quote = original.find(['"', '\'']);
+        let Some(quote) = quote else {
+            return Some(Vec::new());
+        };
+        let quote_char = original[quote..].chars().next().unwrap_or('"');
+        let path = &original[quote + 1..];
+        let Some(end) = path.find(quote_char) else {
+            return Some(Vec::new());
+        };
+        let final_segment = path[..end].rsplit('/').next().unwrap_or_default();
+        let stem = match final_segment.rfind('.') {
+            Some(dot) if dot > 0 => &final_segment[..dot],
+            _ => final_segment,
+        };
+        return Some(match leading_identifier(stem) {
+            Some((name, _)) if !name.is_empty() => vec![(name, signature)],
+            _ => Vec::new(),
+        });
+    }
+    if !TS_KINDS.contains(next) {
+        return Some(Vec::new());
+    }
+    let kind = *next;
+    let Some(name_token) = tokens.get(idx + 1) else {
+        return Some(Vec::new());
+    };
+    if name_token.starts_with('(') || name_token.starts_with('{') {
+        return Some(Vec::new());
+    }
+    let Some((name, _)) = leading_identifier(name_token) else {
+        return Some(Vec::new());
+    };
+    if name.is_empty() {
+        return Some(Vec::new());
+    }
+    let signature = typescript_signature(kind, original_line);
+    Some(vec![(name, signature)])
+}
+
 /// Extracts public surface declarations from source text or diff lines:
 /// everything `extract_public_surface_identifiers` returns, plus public item
 /// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
@@ -1193,8 +1367,15 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
     // Pipeline step 3: blank comments and string literals.
     let cleaned = blank_comments_and_strings(text);
     // Pipeline step 4: all declaration parsing runs on the blanked text.
-    for line in cleaned.lines() {
-        if let Some(pairs) = parse_use_declarations(line) {
+    // The TypeScript export branch runs here too, on the blanked line
+    // (its signatures are taken from the corresponding original line,
+    // which blanking's line-structure preservation keeps aligned).
+    for (line, original_line) in cleaned.lines().zip(text.lines()) {
+        if let Some(pairs) = parse_typescript_exports(line, original_line) {
+            for (name, _signature) in pairs {
+                decls.insert(name);
+            }
+        } else if let Some(pairs) = parse_use_declarations(line) {
             for (name, _full_path) in pairs {
                 decls.insert(name);
             }
@@ -1263,8 +1444,15 @@ fn extract_public_surface_signatures(
         signatures.entry(ident.clone()).or_default().insert(ident);
     }
     let cleaned = blank_comments_and_strings(text);
-    for line in cleaned.lines() {
-        if let Some(pairs) = parse_use_declarations(line) {
+    for (line, original_line) in cleaned.lines().zip(text.lines()) {
+        if let Some(pairs) = parse_typescript_exports(line, original_line) {
+            for (name, signature) in pairs {
+                signatures
+                    .entry(format!("ts:{name}"))
+                    .or_default()
+                    .insert(signature);
+            }
+        } else if let Some(pairs) = parse_use_declarations(line) {
             for (name, full_path) in pairs {
                 signatures
                     .entry(format!("use:{name}"))
@@ -2209,6 +2397,160 @@ struct PrivateStruct {}
             .map(|name| name.to_string())
             .collect();
         assert_eq!(renamed, expected_renamed);
+    }
+
+    #[test]
+    fn extract_typescript_exports_recognizes_declaration_kinds() {
+        let text = "\
+export const DEFAULT_ENDPOINT = 'http://127.0.0.1:34343/mcp'
+export function resolveConfig(
+export interface PluginConfig {
+export type ResolvedConfig = PluginConfig
+export class NeuroStrataMCPClient {
+export async function postTurnCandidates(
+";
+        let decls = extract_public_surface_declarations(text);
+        for expected in [
+            "DEFAULT_ENDPOINT",
+            "resolveConfig",
+            "PluginConfig",
+            "ResolvedConfig",
+            "NeuroStrataMCPClient",
+            "postTurnCandidates",
+        ] {
+            assert!(decls.contains(expected), "missing {expected}: {decls:?}");
+        }
+    }
+
+    #[test]
+    fn extract_typescript_exports_recognizes_reexports() {
+        let decls = extract_public_surface_declarations(
+            "export { Alpha, Beta as Gamma, type Delta } from \"./x\";",
+        );
+        for expected in ["Alpha", "Gamma", "Delta"] {
+            assert!(decls.contains(expected), "missing {expected}: {decls:?}");
+        }
+        assert!(!decls.contains("Beta"), "{decls:?}");
+        let star_as =
+            extract_public_surface_declarations("export * as ns from \"./x\";");
+        assert!(star_as.contains("ns"), "{star_as:?}");
+        let star = extract_public_surface_declarations("export * from \"./module\";");
+        assert!(star.contains("module"), "{star:?}");
+    }
+
+    #[test]
+    fn extract_typescript_exports_ignores_non_exports() {
+        let text = "\
+const LOCAL = 1
+function helper() {}
+// export function fake() {}
+";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.is_empty(), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_typescript_export_signatures_distinguish_body_and_value() {
+        let before = extract_public_surface_signatures("export function f(): number { return 1; }");
+        let after = extract_public_surface_signatures("export function f(): number { return 2; }");
+        assert_eq!(
+            before.get("ts:f"),
+            after.get("ts:f"),
+            "body-only function edit must be signature-identical: {before:?} vs {after:?}"
+        );
+        assert!(before.contains_key("ts:f"), "{before:?}");
+        let before_const =
+            extract_public_surface_signatures("export const DEFAULT_ENDPOINT = 'a'");
+        let after_const =
+            extract_public_surface_signatures("export const DEFAULT_ENDPOINT = 'b'");
+        assert_ne!(
+            before_const.get("ts:DEFAULT_ENDPOINT"),
+            after_const.get("ts:DEFAULT_ENDPOINT"),
+            "exported const value change must differ: {before_const:?} vs {after_const:?}"
+        );
+    }
+
+    fn setup_git_typescript_repo(root: &Path, initial_source: &str) {
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("features-api")).unwrap();
+        std::fs::create_dir_all(docs_dir.join("extend")).unwrap();
+        std::fs::create_dir_all(root.join("plugins").join("core")).unwrap();
+        std::fs::write(
+            docs_dir.join("vision").join("target_doc.md"),
+            "## Introduction\nThe target_doc surface. TargetTrait\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plugins").join("core").join("index.ts"),
+            initial_source,
+        )
+        .unwrap();
+        write_manifest(
+            &docs_dir,
+            r###"[{
+                "id": "test-rule-1",
+                "tier": "vision",
+                "watch_paths": ["plugins/core/index.ts"],
+                "target_doc": "docs/vision/target_doc.md",
+                "required_headings": ["## Introduction"],
+                "required_tokens": ["target_doc"],
+                "require_co_change_on_surface_change": true
+            }]"###,
+        );
+        init_git_repo(root);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-q", "-m", "baseline"]);
+        run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    #[test]
+    fn typescript_export_change_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_typescript_repo(
+            root,
+            "export function buildHeaders(token: string) {}\n",
+        );
+        std::fs::write(
+            root.join("plugins").join("core").join("index.ts"),
+            "export function buildRequestHeaders(token: string) {}\nexport interface NewSurface {}\n",
+        )
+        .unwrap();
+        commit_all(root, "typescript export change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn typescript_internal_change_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_typescript_repo(
+            root,
+            "export function buildHeaders(token: string) {}\nfunction helper() { return 1; }\n",
+        );
+        std::fs::write(
+            root.join("plugins").join("core").join("index.ts"),
+            "export function buildHeaders(token: string) {}\nfunction helper() { return 2; }\n",
+        )
+        .unwrap();
+        commit_all(root, "typescript internal change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "internal-only TS change produced violations: {:?}",
+            report.violations
+        );
     }
 
     #[test]
