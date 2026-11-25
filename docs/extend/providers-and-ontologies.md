@@ -23,6 +23,11 @@ The `VectorStore` trait is the pluggable interface for vector persistence and si
 - `fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(String, f32)>>` — nearest-neighbor search
 - `fn delete(&mut self, id: &str) -> Result<()>` — remove a vector
 
+Two search variants take their arguments grouped in a single params struct:
+
+- `async fn search_with_domain(&self, params: SearchWithDomainParams<'_>) -> Result<DomainSearchOutcome>` — search with an optional domain key set; the default implementation ignores the key set and reports `Vector`
+- `async fn search_lexical(&self, _params: SearchLexicalParams<'_>) -> Result<LexicalSearchOutcome>` — search with the in-house multi-field lexical engine; the default implementation refuses, so a backend that cannot do lexical search does not look like a namespace with no matching memories
+
 Stores that project edges into a graph additionally implement the optional seam
 
 - `async fn reconcile_declared_edges(&self, namespace: &str, id: &str, rel_type: &str, keep: &[String]) -> Result<usize>` — retire the edges this store materialised from a previous declaration of `rel_type` whose target is not in `keep`
