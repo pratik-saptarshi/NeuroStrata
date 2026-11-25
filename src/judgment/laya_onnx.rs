@@ -698,9 +698,7 @@ impl LearningRuntimeManager {
             }
         };
         let model_artifact = runtime.model_cache.join("model.onnx");
-        if model_artifact.exists() {
-            LayaReadiness::Ready
-        } else if runtime.laya_train.exists() {
+        if model_artifact.exists() || runtime.laya_train.exists() {
             LayaReadiness::Ready
         } else {
             LayaReadiness::Degraded {
@@ -856,6 +854,9 @@ impl ContradictionQueue {
         use fs2::FileExt;
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            // Lock file only: its content is never read or written, so
+            // existing bytes must survive the open untouched.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&self.lock_path)?;
