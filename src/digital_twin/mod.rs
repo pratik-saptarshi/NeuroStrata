@@ -711,9 +711,10 @@ pub fn validate_state(
     warnings
 }
 
+type TwinBestEntry = (String, u64, usize, i64, Option<String>, Option<String>);
+
 pub fn list_twins_from_rows(rows: &[(String, crate::traits::MemoryPayload)]) -> Vec<TwinSummary> {
-    let mut best: BTreeMap<String, (String, u64, usize, i64, Option<String>, Option<String>)> =
-        BTreeMap::new();
+    let mut best: BTreeMap<String, TwinBestEntry> = BTreeMap::new();
     let now = chrono::Utc::now().timestamp();
     for (id, payload) in rows {
         let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
@@ -1026,35 +1027,6 @@ pub async fn list_twins(
                 namespace
             );
             Vec::new()
-        }
-    }
-}
-
-pub async fn get_twin_state(
-    store: &dyn crate::traits::VectorStore,
-    namespace: &str,
-    twin_id: &str,
-) -> Option<BTreeMap<String, f64>> {
-    match store.list(namespace, None, None).await {
-        Ok(results) => {
-            let rows: Vec<(String, crate::traits::MemoryPayload)> =
-                results.into_iter().map(|r| (r.id, r.payload)).collect();
-            let state = get_twin_state_from_rows(&rows, twin_id);
-            if state.is_none() {
-                tracing::debug!(
-                    "[TWIN] state lookup missed for twin '{}' in namespace '{}'",
-                    twin_id,
-                    namespace
-                );
-            }
-            state
-        }
-        Err(e) => {
-            tracing::warn!(
-                "digital_twin store.list error in namespace '{}': {e}",
-                namespace
-            );
-            None
         }
     }
 }

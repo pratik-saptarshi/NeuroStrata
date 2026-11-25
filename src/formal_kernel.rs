@@ -4472,7 +4472,7 @@ fn is_exempt_segment(segment: &str) -> bool {
                 }
                 "stash" => matches!(sub_args.first().map(|s| s.as_str()), Some("list" | "show")),
                 "branch" => {
-                    sub_args.len() >= 1 // allow empty? original requires all listed; empty args -> true? original: all() on empty true but len>=2 check
+                    !sub_args.is_empty() // allow empty? original requires all listed; empty args -> true? original: all() on empty true but len>=2 check
                         && sub_args.iter().all(|t| {
                             matches!(t.as_str(), "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
                         })

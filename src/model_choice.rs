@@ -340,6 +340,11 @@ pub(crate) fn store_state_path(db_path: &Path) -> PathBuf {
 /// recorded identity exists but cannot be verified, so every open path
 /// that consults recorded identity refuses on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+// Boxing `Recorded` would ripple across every construction and match site
+// in model_choice, store::ladybug and storage::snapshot, most of which
+// extract the `StoreState` by value; the enum is a transient read result,
+// never stored in a long-lived collection.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum StoreStateRead {
     Recorded(StoreState),
     Absent,

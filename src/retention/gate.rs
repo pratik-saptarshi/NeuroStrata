@@ -7,13 +7,6 @@ pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
     p95_plan_ms < 100.0 && p95_upsert_ms < 100.0
 }
 
-fn t8_complete() {}
-fn t9_complete() {}
-fn t10_complete() {}
-fn t11_complete() {}
-fn t12_complete() {}
-fn t13_complete() {}
-fn t14_complete() {}
 /// The 95th percentile of latency samples in milliseconds, computed the way
 /// the AC5 acceptance test computes it (ceil-index over a sorted slice).
 pub fn p95_ms(mut samples: Vec<f64>) -> f64 {

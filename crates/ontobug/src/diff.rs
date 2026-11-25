@@ -112,10 +112,12 @@ impl OntologyDiff {
 // Internal snapshot for diffing.
 // ---------------------------------------------------------------------------
 
+type PropertySnapshot = (Option<String>, Option<String>, Option<String>);
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OntologySnapshot {
     classes: BTreeMap<String, (Option<String>, Option<String>)>,
-    properties: BTreeMap<String, (Option<String>, Option<String>, Option<String>)>,
+    properties: BTreeMap<String, PropertySnapshot>,
     datatypes: BTreeMap<String, BTreeSet<String>>,
     subclass_of: BTreeSet<OntologyEdgeDiff>,
     equivalent_class: BTreeSet<OntologyEdgeDiff>,

@@ -89,26 +89,6 @@ pub fn validate_rdf_with_ontobug(
         .collect())
 }
 
-/// Validate RDF data against a ShExC schema using ontobug/rudof.
-///
-/// `shape_map` is a compact shape-map string such as `<http://ex/a>@<http://ex/Shape>`.
-pub fn validate_shex_with_ontobug(
-    data: &str,
-    shexc: &str,
-    base: &str,
-    shape_map: &str,
-) -> anyhow::Result<Vec<ShaclViolation>> {
-    let results = ontobug::validate::shex(data, shexc, base, shape_map)?;
-    Ok(results
-        .into_iter()
-        .filter(|r| !r.conformant)
-        .map(|r| ShaclViolation {
-            field: r.shape,
-            why: format!("node {}: {}", r.node, r.reason),
-        })
-        .collect())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShaclViolation {
     pub field: String,
