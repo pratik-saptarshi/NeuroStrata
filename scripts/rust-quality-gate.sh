@@ -32,6 +32,17 @@ command -v git >/dev/null 2>&1 || { echo "$GATE: no git — skipping"; exit 0; }
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$ROOT" || exit 0
 
+# Cargo output is parsed programmatically below (clippy diagnostics
+# in §2/§2b, the cargo audit report in §3). A user-set
+# CARGO_TERM_COLOR=always makes cargo wrap diagnostic severities in
+# ANSI escapes (`src/lib.rs:6:5: ESC[1mESC[33mwarningESC[0m:`), so
+# the diagnostic regex never matches and warnings on added lines are
+# silently missed — the gate passes code it never verified. Force
+# color off for every cargo invocation this script makes (the
+# clippy/audit invocations also carry --color never, so the parse
+# sites stay protected even if this export is ever lost).
+export CARGO_TERM_COLOR=never
+
 if [ "${RUST_QUALITY_SKIP:-0}" = "1" ]; then
     echo "$GATE: SKIPPED (RUST_QUALITY_SKIP=1) — quality NOT verified for this push" >&2
     exit 0
@@ -320,7 +331,7 @@ clippy_leg() {
 }
 
 if [ -f Cargo.toml ]; then
-    CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short 2>&1)"
+    CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short --color never 2>&1)"
     clippy_leg "$CLIPPY_OUT" "$?" "workspace" ""
 else
     # No root manifest: a bootstrapped repo may keep its crate under a
@@ -358,7 +369,7 @@ else
     done <<< "$CHANGED_RS"
     OWNING_MANIFESTS="$(printf '%s' "$OWNING_MANIFESTS" | sort -u)"
     if [ -z "$OWNING_MANIFESTS" ]; then
-        CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short 2>&1)"
+        CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short --color never 2>&1)"
         clippy_leg "$CLIPPY_OUT" "$?" "workspace" ""
     else
         while IFS= read -r m; do
@@ -366,7 +377,7 @@ else
             mdir="$(dirname "$m")"
             mprefix=""
             [ "$mdir" != "." ] && mprefix="$mdir/"
-            M_OUT="$(cargo clippy --locked --manifest-path "$m" --all-targets --all-features --message-format=short 2>&1)"
+            M_OUT="$(cargo clippy --locked --manifest-path "$m" --all-targets --all-features --message-format=short --color never 2>&1)"
             clippy_leg "$M_OUT" "$?" "crate at $m" "$mprefix"
         done <<< "$OWNING_MANIFESTS"
         while IFS= read -r f; do
@@ -401,7 +412,7 @@ fi
 TAURI_CHANGED="$(printf '%s\n' "$CHANGED_RS" | grep '^src-tauri/' || true)"
 TAURI_MANIFEST_CHANGED="$(printf '%s\n' "$CHANGED_MANIFEST" | grep -E '^src-tauri/Cargo\.(toml|lock)$' || true)"
 if [ -n "$TAURI_CHANGED" ] || [ -n "$TAURI_MANIFEST_CHANGED" ]; then
-    TAURI_OUT="$(cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --message-format=short 2>&1)"
+    TAURI_OUT="$(cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --message-format=short --color never 2>&1)"
     TAURI_CODE=$?
     TAURI_DIAG="$(printf '%s\n' "$TAURI_OUT" | grep -E ':[0-9]+:[0-9]+: (warning|error)' | sed -e '/^src-tauri\//b' -e 's|^|src-tauri/|' || true)"
     if [ -z "$TAURI_DIAG" ] && [ "$TAURI_CODE" -ne 0 ]; then
@@ -433,7 +444,7 @@ if [ -n "$CHANGED_MANIFEST" ]; then
     else
         # (no `set -e` in this script, so a failing substitution is safe
         # to inspect via $? on the next line)
-        AUDIT_TEXT="$(cargo audit 2>/dev/null)"
+        AUDIT_TEXT="$(cargo audit --color never 2>/dev/null)"
         AUDIT_RC=$?
         if [ -z "$AUDIT_TEXT" ] && [ "$AUDIT_RC" -eq 0 ]; then
             # Clean tree: cargo audit prints nothing on success. An empty
@@ -498,7 +509,7 @@ for block in re.split(r"\n\s*\n", text):
                     if git show "$BASE:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
                         # (no `set -e` in this script, so a failing substitution
                         # is safe to inspect via $? on the next line)
-                        BASE_TEXT="$(cargo audit --file "$TMPBASE" 2>/dev/null)"
+                        BASE_TEXT="$(cargo audit --file "$TMPBASE" --color never 2>/dev/null)"
                         BASE_RC=$?
                         if [ "$BASE_RC" -eq 0 ]; then
                             # Verified-clean baseline: cargo audit prints

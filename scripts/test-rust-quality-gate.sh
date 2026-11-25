@@ -647,4 +647,27 @@ if [ "$st21" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: native/s
     exit 1
 fi
 
+# Leg 22 (regression, Codex P1 — CARGO_TERM_COLOR=always): with
+# CARGO_TERM_COLOR=always, cargo wraps the severity in ANSI escapes
+# (`src/lib.rs:6:5: ESC[1mESC[33mwarningESC[0m:`), so the gate's
+# diagnostic regex never matches and a warning on an added line is
+# silently missed — the gate passes (fail-open). The gate must force
+# color off on its own cargo invocations, so the same warning must
+# BLOCK under this env. The fixture line is fmt-clean (clippy
+# needless_return only), isolating the clippy leg; leg 1 is the
+# default-env control for the same warning shape.
+color_env_dirty="$TMP/color-env-dirty"
+new_repo "$color_env_dirty"
+printf '\npub fn bad() -> String {\n    return "x".to_string();\n}\n' >> "$color_env_dirty/src/lib.rs"
+git -C "$color_env_dirty" add src/lib.rs
+git -C "$color_env_dirty" commit -q -m 'warn addition'
+set +e
+out22=$(cd "$color_env_dirty" && CARGO_TERM_COLOR=always bash "$GATE" 2>&1)
+st22=$?
+set -e
+if [ "$st22" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line' <<< "$out22"; then
+    printf 'FAIL: clippy warning on an added line under CARGO_TERM_COLOR=always must block the gate (color forced off at invocation)\n%s\n' "$out22" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
