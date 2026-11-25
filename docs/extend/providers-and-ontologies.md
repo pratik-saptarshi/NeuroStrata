@@ -13,7 +13,7 @@ The `Embedder` trait is the pluggable interface for embedding generation. Implem
 
 - `async fn embed_batch_degradable(&self, texts: &[String]) -> Result<BatchEmbedOutcome>` — a batch embed that may degrade item by item
 
-The `Embedder` trait carries no session-state reporting seam: whether a provider's local session is currently loaded is an implementation detail of the concrete embedder, not part of the provider contract, and status surfaces read it from the concrete type when they need it.
+The `Embedder` trait carries no session-state reporting seam: whether a provider's local session is currently loaded is an implementation detail of the concrete embedder, not part of the provider contract, and no public accessor exposes it — callers cannot query a provider's loaded-session state.
 
 `BatchEmbedOutcome` carries one entry per input, in input order: `embeddings` holds `Some(vector)` for every item that landed and `None` for every item the provider refused, and `warnings` holds the reasons. The default implementation of the seam delegates to `embed_batch` and never degrades, so an existing embedder keeps working unchanged; a provider that overrides it reports the refusal instead of costing the whole generation. A caller must not store a placeholder for a refused item: a zero vector would poison every cosine distance it is later compared against.
 
