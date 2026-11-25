@@ -14,8 +14,6 @@ use crate::rdf::action::{
 use crate::rdf::shacl::ShaclViolation;
 use crate::traits::MemoryPayload;
 
-/// The active rows and edges collected for an object view: memory rows as
-/// (id, payload) pairs and edges as (source, relation, target, provenance).
 type ActiveRowsAndEdges = (
     Vec<(String, MemoryPayload)>,
     Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>,

@@ -87,8 +87,6 @@ pub struct ProviderSet {
     pub shadow: Option<Arc<dyn JudgmentProvider>>,
 }
 
-/// The (active, shadow) provider pair selected before it is wrapped in a
-/// [`ProviderSet`].
 type ProviderPair = (
     Option<Arc<dyn JudgmentProvider>>,
     Option<Arc<dyn JudgmentProvider>>,

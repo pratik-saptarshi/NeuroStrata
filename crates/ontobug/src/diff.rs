@@ -112,7 +112,6 @@ impl OntologyDiff {
 // Internal snapshot for diffing.
 // ---------------------------------------------------------------------------
 
-/// The (label, comment, kind) recorded for one property in a snapshot.
 type PropertySnapshot = (Option<String>, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

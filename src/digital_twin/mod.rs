@@ -711,8 +711,6 @@ pub fn validate_state(
     warnings
 }
 
-/// The winning row kept per twin id in [`list_twins_from_rows`]: (row id,
-/// version, variable count, last-updated timestamp, source, schema id).
 type TwinBestEntry = (String, u64, usize, i64, Option<String>, Option<String>);
 
 pub fn list_twins_from_rows(rows: &[(String, crate::traits::MemoryPayload)]) -> Vec<TwinSummary> {

@@ -7845,8 +7845,6 @@ fn is_valid_relation_name(name: &str) -> bool {
 /// the query text, so this is what bounds how large that text can get.
 const RELINK_BATCH: usize = 500;
 
-/// Cached mention symbol ids per namespace: namespace ->
-/// (symbol ids, symbol names).
 type MentionSymbolIds = Arc<
     tokio::sync::RwLock<
         std::collections::HashMap<
@@ -7860,8 +7858,6 @@ type MentionSymbolIds = Arc<
 /// (from id, relation, to id, provenance).
 type EdgeList = Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>;
 
-/// The rows `refresh_ontology` reads in one connection turn: (registry
-/// metadata, action rows, concept rows).
 type OntologyRefreshRows = (
     Option<serde_json::Value>,
     Vec<(String, MemoryPayload)>,

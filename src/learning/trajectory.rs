@@ -23,8 +23,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-/// Accumulator for one mined pattern: (window steps, distinct task ids,
-/// distinct receipt ids).
 type PatternAccumulator = (Vec<TrajectoryStep>, BTreeSet<String>, BTreeSet<String>);
 
 /// Simple trigger enum values that a procedure may carry verbatim.

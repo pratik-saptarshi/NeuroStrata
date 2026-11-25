@@ -12,7 +12,6 @@ use crate::graph_read::locate::{LocateFailedAttempt, LocateRuleSummary, RULE_SUM
 use crate::rebac::{can_read_memory, resolve_principal};
 use crate::traits::{SearchResult, VectorStore};
 
-/// A seen file hunk, keyed by (path, old line span, new line span).
 type FileHunkKey = (String, Option<(u32, u32)>, Option<(u32, u32)>);
 
 pub const DEFAULT_MAX_BLAST_RADIUS_CALLERS: usize = 15;
