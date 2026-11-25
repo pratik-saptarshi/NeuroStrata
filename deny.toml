@@ -1,0 +1,109 @@
+# cargo-deny configuration for NeuroStrata.
+#
+# This file encodes the project's chosen license and advisory policy.
+# Posture: licenses not on the allow list below are rejected (cargo-deny's
+# default once an allow list exists); there is no blanket `default = "allow"`.
+# Every exception to a plain permissive policy is enumerated inline with its
+# rationale: the advisory ignores (the quick-xml pair, six unmaintained
+# crates, and the heapless unsound set — each enumerated inline with its
+# rationale and lift condition) and the r-efi license exception.
+# [bans] and [sources] are left at cargo-deny defaults on purpose.
+
+[advisories]
+# Unmaintained posture: the scope is left at cargo-deny's default (the
+# `unmaintained` key is omitted), so unmaintained advisories on in-scope
+# crates fail this check. The six current unmaintained advisories —
+# paste (RUSTSEC-2024-0436), proc-macro-error2 (RUSTSEC-2026-0173),
+# chrono (RUSTSEC-2026-0543), atomic-polyfill (RUSTSEC-2023-0089),
+# term_size (RUSTSEC-2020-0163), and unsafe-libyaml (RUSTSEC-2024-0449) —
+# are carried as per-ID ignores below instead of a warn posture, because
+# cargo-deny 0.18.9's `unmaintained` field is a scope enum
+# (all / workspace / transitive / none) whose in-scope hits are errors; a
+# warn level is not expressible. Per-ID ignores keep every other
+# unmaintained crate fail-closed.
+ignore = [
+    # quick-xml 0.37.5 is capped by the ox stack: oxrdfxml 0.2.5 and
+    # sparesults 0.3.5 both require quick-xml ^0.37, so the patched floor
+    # (>= 0.41.0) is unreachable today (WS0 verdict: BLOCKED-UPSTREAM).
+    # Lift condition: remove this ignore when an ox-stack release lets
+    # quick-xml reach >= 0.41.0.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml capped at ^0.37 by oxrdfxml/sparesults; lift when the ox stack lets quick-xml reach >= 0.41.0" },
+    # Same cap, same lift condition as RUSTSEC-2026-0194 above.
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml capped at ^0.37 by oxrdfxml/sparesults; lift when the ox stack lets quick-xml reach >= 0.41.0" },
+    # Unmaintained advisories: no patched version exists for an
+    # unmaintained advisory. paste and proc-macro-error2 are transitive
+    # only; chrono is a direct dependency of neurostrata-mcp.
+    # atomic-polyfill is transitive only (heapless 0.7.17 <- postcard
+    # 1.1.3 <- shex_ast 0.3.39 <- ontobug / shex_validation; target-gated,
+    # shown by `cargo tree --target all`); term_size is transitive only
+    # (shex_ast 0.3.39 <- ontobug / shex_validation); unsafe-libyaml is
+    # transitive only (serde_yaml 0.9.34 <- neurostrata-mcp). Lift
+    # condition for each: remove the ignore when the crate leaves the
+    # graph or a maintained successor is adopted.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; no patched version exists; transitive only; lift when paste leaves the graph or a maintained successor is adopted" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; no patched version exists; transitive only; lift when proc-macro-error2 leaves the graph or a maintained successor is adopted" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no patched version exists; direct dependency of neurostrata-mcp; lift when chrono leaves the graph or a maintained successor is adopted" },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained; no patched version exists; transitive only (heapless 0.7.17 <- postcard 1.1.3 <- shex_ast 0.3.39 <- ontobug/shex_validation); lift when atomic-polyfill leaves the graph or a maintained successor is adopted" },
+    { id = "RUSTSEC-2020-0163", reason = "term_size unmaintained; no patched version exists; transitive only (shex_ast 0.3.39 <- ontobug/shex_validation); lift when term_size leaves the graph or a maintained successor is adopted" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; no patched version exists; transitive only (serde_yaml 0.9.34 <- neurostrata-mcp); lift when unsafe-libyaml leaves the graph or a maintained successor is adopted" },
+    # heapless 0.7.17 is transitive-only (postcard 1.1.3 <- shex_ast <-
+    # ontobug / shex_validation). All nine unsound advisories below are
+    # patched only at heapless >= 0.9.4, unreachable while postcard
+    # requires heapless ^0.7. Lift condition: remove these ignores when
+    # the postcard/shex_ast chain admits a patched heapless or heapless
+    # leaves the graph.
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 unsound; patched only at heapless >= 0.9.4, unreachable while postcard requires heapless ^0.7; lift when the postcard/shex_ast chain admits a patched heapless or heapless leaves the graph" },
+]
+# Note: RUSTSEC-2026-0592 (url) is deliberately NOT ignored. Its fix
+# (url >= 2.5.9) is carried by the audit workstream's dependency bump.
+
+[licenses]
+# Permissive licenses actually present in the locked graph, plus MPL-2.0
+# (owner ruling R3, 2026-11-23: MPL-2.0 allowed outright; the MPL-2.0-only
+# crates colored and option-ext are unavoidable transitive dependencies).
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "zlib-acknowledgement",
+]
+# There is deliberately no `unlicensed` key: cargo-deny 0.18 removed it
+# (the v1 warn-by-default escape hatch no longer exists). On this
+# toolchain a crate with no detectable license metadata fails the check
+# by default, because no license expression can satisfy the allow list —
+# an unknown licensing status is not a pass. The workspace's own crates
+# declare MIT (the repo LICENSE) in their manifests.
+# LGPL-2.1-or-later is NOT globally allowed. Owner ruling R3 (2026-11-23):
+# the LGPL-2.1 crates are carried as named per-crate exceptions only
+# (public source repo; no binary distribution outside it). r-efi declares
+# MIT OR Apache-2.0 OR LGPL-2.1-or-later, so the permissive alternatives
+# exist; the exception exists so the declared expression resolves.
+exceptions = [
+    { allow = ["LGPL-2.1-or-later"], name = "r-efi", version = "*" },
+]
+
+# [bans] left at cargo-deny defaults: no crates are banned, skipped, or
+# highlighted. Duplicate-version warnings are expected and acceptable.
+
+# [sources] left at cargo-deny defaults: crates.io only; unknown registries
+# or git sources are rejected.
