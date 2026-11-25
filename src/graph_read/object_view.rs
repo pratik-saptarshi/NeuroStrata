@@ -14,6 +14,11 @@ use crate::rdf::action::{
 use crate::rdf::shacl::ShaclViolation;
 use crate::traits::MemoryPayload;
 
+type ActiveRowsAndEdges = (
+    Vec<(String, MemoryPayload)>,
+    Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>,
+);
+
 pub const DEFAULT_HISTORY_LIMIT: usize = 5;
 pub const MAX_HISTORY_LIMIT: usize = 25;
 pub const DEFAULT_MAX_LINKS: usize = 40;
@@ -292,10 +297,7 @@ pub async fn hydrate_object_view(
     let max_bytes = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES).max(512);
 
     // 1. Collect active rows & edges (scenario-aware when scenario_id is provided).
-    let (active_rows, active_edges): (
-        Vec<(String, MemoryPayload)>,
-        Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>,
-    ) = if let Some(scen_id) = req
+    let (active_rows, active_edges): ActiveRowsAndEdges = if let Some(scen_id) = req
         .scenario_id
         .as_deref()
         .map(str::trim)

@@ -9,6 +9,9 @@ pub use crate::telemetry::anomaly::MetricKind;
 
 pub type SeriesKey = (String, MetricKind, String);
 
+/// Callback invoked with each anomalous sample pushed to the store.
+pub type AnomalyCallback = Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>;
+
 /// Process-wide singleton time-series store used by CLI/daemon surfaces that
 /// do not own a LadybugStore (e.g. the `bench` command's `--record-metrics`).
 pub fn global_store() -> &'static TimeSeriesStore {
@@ -193,7 +196,7 @@ pub struct Series {
 pub struct TimeSeriesStore {
     pub series: RwLock<BTreeMap<SeriesKey, Series>>,
     pub config: SeriesConfig,
-    pub anomaly_cb: Option<Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>>,
+    pub anomaly_cb: Option<AnomalyCallback>,
     pub detector: crate::telemetry::AnomalyDetector,
     pub anomalies: RwLock<Vec<crate::telemetry::AnomalyEvent>>,
 }
@@ -209,10 +212,7 @@ impl TimeSeriesStore {
         }
     }
 
-    pub fn with_anomaly_callback(
-        mut self,
-        cb: Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>,
-    ) -> Self {
+    pub fn with_anomaly_callback(mut self, cb: AnomalyCallback) -> Self {
         self.anomaly_cb = Some(cb);
         self
     }

@@ -1579,14 +1579,7 @@ pub struct LadybugStore {
     /// Cached active-generation symbol ids for mention detection, per
     /// namespace. A generation counter is per namespace, so two namespaces can
     /// share a generation set; the namespace is part of the key.
-    mention_symbol_ids: Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<
-                String,
-                (std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>),
-            >,
-        >,
-    >,
+    mention_symbol_ids: MentionSymbolIds,
     /// Lazily built in-house lexical index, partitioned by namespace.
     lexical: Arc<std::sync::RwLock<crate::fts::LexicalIndex>>,
     /// Namespaces whose lexical partition is loaded. A namespace absent here is
@@ -7859,6 +7852,25 @@ fn is_valid_relation_name(name: &str) -> bool {
 /// How many edges go into one relinking statement. The pairs are written into
 /// the query text, so this is what bounds how large that text can get.
 const RELINK_BATCH: usize = 500;
+
+type MentionSymbolIds = Arc<
+    tokio::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            (std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>),
+        >,
+    >,
+>;
+
+/// One edge list as returned by `list_edges`: each edge is
+/// (from id, relation, to id, provenance).
+type EdgeList = Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>;
+
+type OntologyRefreshRows = (
+    Option<serde_json::Value>,
+    Vec<(String, MemoryPayload)>,
+    Vec<(String, MemoryPayload)>,
+);
 
 /// Citations are keyed by relationship type first: one head may declare two
 /// relationships to the same target, and each binding has its own citation.
@@ -41817,12 +41829,11 @@ impl LadybugStore {
     pub async fn list_edges(
         &self,
         namespace: &str,
-    ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+    ) -> Result<EdgeList> {
         let namespace_owned = namespace.to_string();
-        self.with_conn(move |conn: &Connection| -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        self.with_conn(move |conn: &Connection| -> Result<EdgeList> {
             let safe_ns = escape_ladybug_string(&namespace_owned);
-            let mut out: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> =
-                Vec::new();
+            let mut out: EdgeList = Vec::new();
             let tables = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
             for table in tables {
                 let query = format!(
@@ -41886,11 +41897,7 @@ impl LadybugStore {
         let namespace_owned = namespace.to_string();
         let (metadata, action_rows, concept_rows) = self
             .with_conn(
-                move |conn: &Connection| -> Result<(
-                    Option<serde_json::Value>,
-                    Vec<(String, MemoryPayload)>,
-                    Vec<(String, MemoryPayload)>,
-                )> {
+                move |conn: &Connection| -> Result<OntologyRefreshRows> {
                     let safe_ns = escape_ladybug_string(&namespace_owned);
                     let rid = crate::registry::registry_row_id(&namespace_owned);
                     let safe_id = escape_ladybug_string(&rid);

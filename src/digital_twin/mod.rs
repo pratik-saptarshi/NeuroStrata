@@ -711,9 +711,10 @@ pub fn validate_state(
     warnings
 }
 
+type TwinBestEntry = (String, u64, usize, i64, Option<String>, Option<String>);
+
 pub fn list_twins_from_rows(rows: &[(String, crate::traits::MemoryPayload)]) -> Vec<TwinSummary> {
-    let mut best: BTreeMap<String, (String, u64, usize, i64, Option<String>, Option<String>)> =
-        BTreeMap::new();
+    let mut best: BTreeMap<String, TwinBestEntry> = BTreeMap::new();
     let now = chrono::Utc::now().timestamp();
     for (id, payload) in rows {
         let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
