@@ -47,7 +47,7 @@ jobs:
         # header). One runner per way this build can differ:
         #   windows - MSVC and the CMake/Ninja assumptions, plus the 4 GiB
         #             static-library limit that decides debug vs release.
-        #             OpenSSL is vendored here too: lbug 0.20.4 hard-links it.
+        #             OpenSSL is vendored here too: lbug 0.22.3 hard-links it.
         #   macos   - Clang and libc++ rather than GCC or MSVC, and the other
         #             side of the OpenSSL target gate (Security.framework).
         #             macos-15 is arm64, a standard runner, free on a public
@@ -214,6 +214,34 @@ jobs:
         run: |
           brew list --versions openssl@3 >/dev/null 2>&1 || brew install openssl@3
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      # elan is fetched by commit, not by "master": the install script is
+      # what decides which toolchain gets downloaded onto the runner, so it
+      # is verified before it runs.
+      #   leanprover/elan v4.2.4 = commit 227caca133724d5516bee25c2aeb3e609478f2d8
+      #   elan-init.sh sha256 = a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+      # The Lean parity tests (tests/lean_parity_test.rs) hard-require
+      # `lake` on PATH: find_lake() panics when it is absent. This job runs
+      # the same full `cargo test` command as ci.yml's test job, so it
+      # needs the same toolchain install; ci.yml installs it there and
+      # this mirrors that step. The hashFiles guard keeps the step inert
+      # on trees that predate the proofs/lean-toolchain pin; this tree
+      # carries the pin, so the step runs in full. elan-init.sh handles
+      # the Windows leg's Git Bash environment explicitly (MINGW/MSYS map
+      # to pc-windows-msvc), so the step applies to both matrix legs.
+      - name: Install Lean 4 toolchain (elan)
+        if: hashFiles('proofs/lean-toolchain') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          ELAN_COMMIT=227caca133724d5516bee25c2aeb3e609478f2d8
+          ELAN_SHA256=a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53
+          ELAN_SCRIPT="$RUNNER_TEMP/elan-init.sh"
+          curl -sSfL "https://raw.githubusercontent.com/leanprover/elan/${ELAN_COMMIT}/elan-init.sh" -o "$ELAN_SCRIPT"
+          echo "${ELAN_SHA256}  ${ELAN_SCRIPT}" | sha256sum -c -
+          sh "$ELAN_SCRIPT" -y --default-toolchain "$(tr -d '[:space:]' < proofs/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/lake" --dir proofs build
 
       - name: Test
         shell: bash
