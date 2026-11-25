@@ -2062,16 +2062,16 @@ mod tests {
 
         // 2. Default lexical recall excludes action_type and action_receipt
         let lex_hits = store
-            .search_lexical(
-                "ns-recall",
-                "cryogenicmanifold77",
-                10,
-                false,
-                false,
-                &[],
-                "alice",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "ns-recall",
+                query: "cryogenicmanifold77",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap();
         let lex_ids: Vec<&str> = lex_hits.results.iter().map(|r| r.id.as_str()).collect();

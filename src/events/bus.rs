@@ -782,7 +782,6 @@ async fn dispatch(
                         let metrics = metrics.clone();
                         let store = store.clone();
                         let ns = namespace.to_string();
-                        let ts = ts;
                         let name = name.clone();
                         tokio::spawn(async move {
                             let ctx = SubscriberContext {

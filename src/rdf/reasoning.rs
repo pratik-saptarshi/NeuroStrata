@@ -713,9 +713,9 @@ fn nt_term(term: &oxrdf::Term) -> String {
         oxrdf::Term::BlankNode(b) => format!("_:{}", b.as_str()),
         oxrdf::Term::Literal(l) => nt_literal(l),
         oxrdf::Term::Triple(t) => format!(
-            "<<({} {} {})>>",
+            "<<({} <{}> {})>>",
             nt_subject(&t.subject),
-            format!("<{}>", escape_nt(t.predicate.as_str())),
+            escape_nt(t.predicate.as_str()),
             nt_term(&t.object)
         ),
     }
