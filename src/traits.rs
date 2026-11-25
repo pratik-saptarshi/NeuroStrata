@@ -383,19 +383,6 @@ pub trait Embedder: Send + Sync {
         "unknown"
     }
 
-    /// Lock-free snapshot of whether this embedder's local session is
-    /// currently loaded, for status surfaces: `Some(true)`/`Some(false)`
-    /// when that is readable without touching the session, `None` when
-    /// there is no local session state to report. Implementations must
-    /// never load, reload, or touch the session to answer, and must
-    /// never reset any idle clock -- read a snapshot field only (Spec
-    /// GT-7). Defaults to `None`; `RemoteEmbedder` no-ops by inheriting
-    /// the default, and local embedders with an unloadable session
-    /// override it.
-    fn session_loaded_snapshot(&self) -> Option<bool> {
-        None
-    }
-
     /// Stable identity of the embedding space this embedder produces.
     fn embedding_descriptor(&self) -> EmbeddingDescriptor {
         EmbeddingDescriptor {
@@ -967,19 +954,6 @@ pub trait IntakeStore: Send + Sync {
         request: crate::task::intake::ResolveCandidateRequest,
     ) -> Result<crate::task::intake::ResolveCandidateResult, String>;
 
-    /// Get a single receipt by ID.
-    async fn get_receipt(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeReceipt>, String>;
-
-    /// Get a single candidate by ID.
-    async fn get_candidate(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeCandidate>, String>;
 }
 
 #[cfg(test)]
