@@ -6289,6 +6289,11 @@ mod tests {
             SCAFFOLDED_RUST_QUALITY_GATE.contains("\"$BASE:Cargo.lock\""),
             "the guard must compare advisories against the lockfile at the resolved push baseline ($BASE), not origin/develop, so an advisory inherited from the merge-base never blocks a push that did not introduce it"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("git diff --default-prefix --no-color --no-ext-diff --no-textconv"),
+            "the guard must neutralize user git config on the attribution diff (color escapes, external diff drivers, and textconv drivers each silently empty the added-line set the same way non-default prefixes do)"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();

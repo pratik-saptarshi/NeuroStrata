@@ -106,11 +106,14 @@ fi
 # HEAD): rustfmt/clippy/audit all inspect worktree files, so attribution
 # must use worktree numbering too — otherwise uncommitted edits could
 # hide findings in the code actually being pushed (or vice versa).
-CHANGED_RS="$(git diff --name-only "$BASE" -- '*.rs')" || {
+# Every git diff below carries --no-color --no-ext-diff --no-textconv:
+# the gate parses diff output programmatically, so user git config
+# must never be able to reshape it (see the attribution diff below).
+CHANGED_RS="$(git diff --no-color --no-ext-diff --no-textconv --name-only "$BASE" -- '*.rs')" || {
     echo "$GATE: FAIL: cannot compute the changed-file set against $BASE — quality NOT verified for this push" >&2
     exit 1
 }
-CHANGED_MANIFEST="$(git diff --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' 'src-tauri/Cargo.toml' 'src-tauri/Cargo.lock')" || {
+CHANGED_MANIFEST="$(git diff --no-color --no-ext-diff --no-textconv --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' 'src-tauri/Cargo.toml' 'src-tauri/Cargo.lock')" || {
     echo "$GATE: FAIL: cannot compute the changed-manifest set against $BASE — quality NOT verified for this push" >&2
     exit 1
 }
@@ -153,9 +156,16 @@ fi
 # the parser below would never set its current file, and the
 # attribution set would silently come out empty — bypassing both
 # the fmt and clippy checks with no logged skip.
+# --no-color --no-ext-diff --no-textconv are load-bearing for the
+# same reason: color.ui/color.diff=always wraps every line in ANSI
+# escapes (the `+++ b/` header no longer matches at line start),
+# diff.external (or GIT_EXTERNAL_DIFF) hands the diff to an external
+# driver whose output is not unified diff at all, and a textconv
+# driver (diff.<driver>.textconv) rewrites file contents before
+# diffing — each silently empties the attribution set the same way.
 ADDED_FILE="$(mktemp -t rustgate-added.XXXXXX)"
 trap 'rm -f "$ADDED_FILE"' EXIT
-git diff --default-prefix -U0 "$BASE" -- '*.rs' | python3 -c '
+git diff --default-prefix --no-color --no-ext-diff --no-textconv -U0 "$BASE" -- '*.rs' | python3 -c '
 import re, sys
 cur, new_line, out = None, 0, set()
 for raw in sys.stdin:

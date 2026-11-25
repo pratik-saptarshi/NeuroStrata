@@ -478,4 +478,77 @@ if [ "$st15" -eq 0 ] || ! grep -q 'FAIL' <<< "$out15"; then
     exit 1
 fi
 
+# Leg 16 (regression, Codex P1 — diff color): with color.ui=always,
+# Git wraps every diff line in ANSI escapes (`ESC[1m+++ b/src/lib.rs`),
+# so a parser keyed on the plain `+++ b/` header never sets its
+# current file and silently builds an EMPTY added-line set — dirty
+# added lines then pass unchecked. The gate must suppress color in
+# its diff invocations (--no-color), so the same dirty addition must
+# block under this config. color.diff=always is the same vector via
+# the diff-specific knob and is pinned in the same leg.
+color_dirty="$TMP/color-dirty"
+new_repo "$color_dirty"
+git -C "$color_dirty" config color.ui always
+add_dirty_line "$color_dirty"
+set +e
+out16=$(run_gate "$color_dirty" "$PATH")
+st16=$?
+set -e
+if [ "$st16" -eq 0 ] || ! grep -q 'FAIL' <<< "$out16"; then
+    printf 'FAIL: dirty added lines under color.ui=always must block the gate (color suppression)\n%s\n' "$out16" >&2
+    exit 1
+fi
+color_diff_dirty="$TMP/color-diff-dirty"
+new_repo "$color_diff_dirty"
+git -C "$color_diff_dirty" config color.diff always
+add_dirty_line "$color_diff_dirty"
+set +e
+out16b=$(run_gate "$color_diff_dirty" "$PATH")
+st16b=$?
+set -e
+if [ "$st16b" -eq 0 ] || ! grep -q 'FAIL' <<< "$out16b"; then
+    printf 'FAIL: dirty added lines under color.diff=always must block the gate (color suppression)\n%s\n' "$out16b" >&2
+    exit 1
+fi
+
+# Leg 17 (regression, Codex P1 — external diff driver): with
+# diff.external=/bin/true, Git hands the diff to the external driver
+# and the attribution pipeline receives empty (non-unified) output —
+# the added-line set silently comes out empty and dirty added lines
+# pass unchecked. The gate must refuse external diff drivers in its
+# diff invocations (--no-ext-diff), so the same dirty addition must
+# block under this config.
+extdiff_dirty="$TMP/extdiff-dirty"
+new_repo "$extdiff_dirty"
+git -C "$extdiff_dirty" config diff.external /bin/true
+add_dirty_line "$extdiff_dirty"
+set +e
+out17=$(run_gate "$extdiff_dirty" "$PATH")
+st17=$?
+set -e
+if [ "$st17" -eq 0 ] || ! grep -q 'FAIL' <<< "$out17"; then
+    printf 'FAIL: dirty added lines under diff.external=/bin/true must block the gate (external diff suppression)\n%s\n' "$out17" >&2
+    exit 1
+fi
+
+# Leg 18 (regression, census sibling — textconv driver): a textconv
+# driver assigned via attributes (here the repo-local info/attributes,
+# the user-controlled form) with diff.<driver>.textconv=/bin/true
+# empties the attribution diff exactly like an external driver does.
+# The gate must disable textconv in its diff invocations
+# (--no-textconv), so the same dirty addition must block.
+textconv_dirty="$TMP/textconv-dirty"
+new_repo "$textconv_dirty"
+printf '*.rs diff=evil\n' > "$textconv_dirty/.git/info/attributes"
+git -C "$textconv_dirty" config diff.evil.textconv /bin/true
+add_dirty_line "$textconv_dirty"
+set +e
+out18=$(run_gate "$textconv_dirty" "$PATH")
+st18=$?
+set -e
+if [ "$st18" -eq 0 ] || ! grep -q 'FAIL' <<< "$out18"; then
+    printf 'FAIL: dirty added lines under a textconv driver (diff.evil.textconv=/bin/true) must block the gate (textconv suppression)\n%s\n' "$out18" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
