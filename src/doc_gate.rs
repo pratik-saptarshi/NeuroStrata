@@ -1879,9 +1879,9 @@ fn extract_public_surface_signatures(
         }
         // The owner in scope at the START of this line: a line that is
         // both a declaration and a member (a `pub fn` method in an
-        // impl block) must be qualified with it, because the
-        // declaration branch below resets `enclosing` for non-container
-        // kinds before the member key is qualified.
+        // impl block) must be qualified with it, not with any scope
+        // the declaration branch below installs for a container kind
+        // declared on this same line.
         let enclosing_at_line_start = enclosing.clone();
         let mut attach_keys: Vec<String> = Vec::new();
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
@@ -1907,22 +1907,24 @@ fn extract_public_surface_signatures(
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
             let signature = signature_line(&kind, line, preserved_line);
-            enclosing = if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
-                Some(name.clone())
-            } else {
-                None
-            };
+            // Only a container declaration replaces the enclosing
+            // scope: a non-container declaration (a method, say) must
+            // leave it intact, or every member after the first in a
+            // block would lose its owner qualification.
+            if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
+                enclosing = Some(name.clone());
+            }
             attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
             .filter(|(name, _kind)| reexported.contains(name))
         {
             let signature = signature_line(&kind, line, preserved_line);
-            enclosing = if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
-                Some(name.clone())
-            } else {
-                None
-            };
+            // Same rule as the public-declaration branch above: only
+            // a container declaration replaces the enclosing scope.
+            if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
+                enclosing = Some(name.clone());
+            }
             attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some(owner) = parse_impl_enclosing(line) {
@@ -4346,6 +4348,65 @@ pub struct AfterAll {}
         assert_ne!(before, after, "before={before:?} after={after:?}");
         assert!(before.contains_key("fn:Foo.bar"), "{before:?}");
         assert!(after.contains_key("fn:Baz.bar"), "{after:?}");
+    }
+
+    #[test]
+    fn consecutive_impl_methods_all_qualify() {
+        // A non-container declaration must not clear the enclosing
+        // impl: every method in the block qualifies, not just the
+        // first.
+        let sigs = extract_public_surface_signatures(
+            "impl Foo {\n    pub fn a(&self) {}\n    pub fn c(&self) {}\n}",
+        );
+        assert!(sigs.contains_key("fn:Foo.a"), "{sigs:?}");
+        assert!(sigs.contains_key("fn:Foo.c"), "{sigs:?}");
+    }
+
+    #[test]
+    fn second_method_moved_between_impls_differs() {
+        // `bar` is the second method in both blocks: position must
+        // not cancel the owner qualification.
+        let before = extract_public_surface_signatures(
+            "impl Foo {\n    pub fn a(&self) {}\n    pub fn bar(&self) {}\n}\nimpl Baz {\n    pub fn a(&self) {}\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "impl Foo {\n    pub fn a(&self) {}\n}\nimpl Baz {\n    pub fn a(&self) {}\n    pub fn bar(&self) {}\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("fn:Foo.bar"), "{before:?}");
+        assert!(after.contains_key("fn:Baz.bar"), "{after:?}");
+    }
+
+    #[test]
+    fn private_helper_after_pub_fn_in_impl_qualifies() {
+        // A bare `fn` helper following a `pub fn` in one impl block
+        // is still a member of that impl.
+        let sigs = extract_public_surface_signatures(
+            "impl Foo {\n    pub fn a(&self) {}\n    fn b(&self) {}\n}",
+        );
+        assert!(sigs.contains_key("fn:Foo.a"), "{sigs:?}");
+        assert!(sigs.contains_key("fn:Foo.b"), "{sigs:?}");
+    }
+
+    #[test]
+    fn top_level_fn_does_not_invent_owner_for_following_member() {
+        // `enclosing` starts as None and a non-container declaration
+        // must not invent an owner: a member line after a top-level
+        // `pub fn` (no container in the text) keeps its bare key.
+        let sigs = extract_public_surface_signatures("pub fn top() {}\n    pub fn bar(&self) {}");
+        assert!(sigs.contains_key("fn:bar"), "{sigs:?}");
+        assert!(!sigs.contains_key("fn:top.bar"), "{sigs:?}");
+    }
+
+    #[test]
+    fn sequential_structs_still_scope_members_correctly() {
+        // Keeping `enclosing` across non-container declarations must
+        // not blur two sequential containers.
+        let sigs = extract_public_surface_signatures(
+            "pub struct A {\n    pub x: u32,\n    pub fn make() {}\n}\npub struct B {\n    pub x: String,\n}",
+        );
+        assert!(sigs.contains_key("field:A.x"), "{sigs:?}");
+        assert!(sigs.contains_key("field:B.x"), "{sigs:?}");
     }
 
     #[test]
