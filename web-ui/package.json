@@ -10,17 +10,17 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/api": "^2.12.5",
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-shell": "^2.6.0",
     "@tauri-apps/plugin-store": "^2.5.1",
     "clsx": "^2.1.1",
-    "lucide-react": "^1.73.0",
+    "lucide-react": "^1.74.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-force-graph-2d": "^1.29.2",
     "react-force-graph-3d": "^1.29.2",
-    "tailwind-merge": "^3.7.0",
+    "tailwind-merge": "^3.7.1",
     "three": "^0.187.0",
     "three-stdlib": "^2.36.1"
   },
