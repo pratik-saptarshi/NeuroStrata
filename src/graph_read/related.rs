@@ -94,6 +94,28 @@ pub fn is_allowed_relation(relation: &str) -> bool {
     DEFAULT_RELATIONS.contains(&relation)
 }
 
+/// Escape a caller-controlled value for interpolation into a plain-text log
+/// event. CR, LF, TAB and other control characters are replaced with their
+/// `\r` / `\n` / `\t` / `\u{..}` escape forms, so a value containing line
+/// breaks cannot split the log record and forge additional log lines. The
+/// Unicode line/paragraph separators U+2028/U+2029 are escaped too: they are
+/// not `char::is_control`, but log shippers and viewers may treat them as
+/// line breaks.
+pub fn sanitize_log_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' | '\u{2029}' => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Parse a caller-supplied direction, defaulting to `Both`. An unrecognized
 /// non-empty value is warned about (warn-first, never fail the query) and read
 /// as `Both`.
@@ -105,7 +127,7 @@ pub fn parse_direction(raw: Option<&str>) -> Direction {
         Some(other) => {
             tracing::warn!(
                 "unknown graph_read direction '{}'; defaulting to Both",
-                other
+                sanitize_log_value(other)
             );
             Direction::Both
         }
@@ -592,6 +614,44 @@ mod tests {
             logs.contains("unknown graph_read direction 'sideways'"),
             "expected the warn-first log for an unknown direction, captured: {logs:?}"
         );
+    }
+
+    #[test]
+    fn parse_direction_log_line_cannot_be_forged_by_newlines() {
+        // The direction is caller-supplied (a request argument). If it were
+        // interpolated into the warn event unescaped, CR/LF inside it would
+        // split the plain-text log record and forge additional log lines.
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .finish();
+        let forged = "sideways\n2099-01-01T00:00:00Z FAKE forged log entry";
+        let direction =
+            tracing::subscriber::with_default(subscriber, || parse_direction(Some(forged)));
+        assert_eq!(direction, Direction::Both);
+        let logs = capture.text();
+        assert_eq!(
+            logs.lines().count(),
+            1,
+            "a newline-bearing direction must stay a single log record, captured: {logs:?}"
+        );
+        assert!(
+            logs.contains(r"sideways\n2099-01-01"),
+            "expected the escaped form of the value in the log, captured: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_log_value_escapes_line_breaking_controls() {
+        assert_eq!(sanitize_log_value("plain"), "plain");
+        assert_eq!(sanitize_log_value("a\rb"), "a\\rb");
+        assert_eq!(sanitize_log_value("a\nb"), "a\\nb");
+        assert_eq!(sanitize_log_value("a\tb"), "a\\tb");
+        assert_eq!(sanitize_log_value("a\u{1b}b"), "a\\u{1b}b");
+        assert_eq!(sanitize_log_value("a\u{2028}b"), "a\\u{2028}b");
+        assert!(!sanitize_log_value("x\r\ny").contains(['\r', '\n']));
     }
 
     #[test]
