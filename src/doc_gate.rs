@@ -277,6 +277,189 @@ fn parse_public_surface_declaration(line: &str) -> Option<(String, String)> {
     }
 }
 
+/// Joins a use-tree prefix and a path segment with `::`, skipping
+/// whichever side is empty.
+fn join_use_prefix(prefix: &str, segment: &str) -> String {
+    let prefix = prefix.trim();
+    let segment = segment.trim();
+    if prefix.is_empty() {
+        segment.to_string()
+    } else if segment.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}::{segment}")
+    }
+}
+
+/// Splits a use-group member list on commas at brace depth 0.
+fn split_use_group_members(members: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in members.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&members[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&members[start..]);
+    parts
+}
+
+/// Recursive use-tree parser: expands `path` under `prefix` into
+/// (declared name, full path) pairs. A `<head>::{ <members> }` group
+/// recurses per member; a leaf honours `as` aliases, maps a glob to
+/// the module segment before `*`, maps `self` to the segment before
+/// it, and otherwise takes the final segment's identifier run. Empty
+/// members and empty identifier runs insert nothing.
+fn parse_use_tree(path: &str, prefix: &str, out: &mut Vec<(String, String)>) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    if let Some(open) = path.find('{') {
+        let head = path[..open].trim().trim_end_matches("::").trim();
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, c) in path.char_indices().skip_while(|(i, _)| *i < open) {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // An unterminated group (a multiline header line) parses its
+        // remaining text as members, which yields nothing for the
+        // header alone and must not error.
+        let members = match close {
+            Some(close) => &path[open + 1..close],
+            None => &path[open + 1..],
+        };
+        let joined_prefix = join_use_prefix(prefix, head);
+        for member in split_use_group_members(members) {
+            let member = member.trim();
+            if !member.is_empty() {
+                parse_use_tree(member, &joined_prefix, out);
+            }
+        }
+        return;
+    }
+    let joined = join_use_prefix(prefix, path);
+    if let Some((_, alias)) = path.rsplit_once(" as ") {
+        let name: String = alias
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            out.push((name, joined));
+        }
+        return;
+    }
+    let final_segment = path.rsplit("::").next().unwrap_or_default().trim();
+    if final_segment == "*" {
+        let parent = joined
+            .strip_suffix("::*")
+            .or_else(|| joined.strip_suffix('*'))
+            .unwrap_or_default();
+        let name: String = parent
+            .rsplit("::")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !parent.is_empty() && !name.is_empty() {
+            out.push((name, joined));
+        }
+        return;
+    }
+    if final_segment == "self" {
+        let parent = joined
+            .strip_suffix("::self")
+            .or_else(|| joined.strip_suffix("self"))
+            .unwrap_or_default();
+        let name: String = parent
+            .rsplit("::")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !parent.is_empty() && !name.is_empty() {
+            out.push((name, parent.to_string()));
+        }
+        return;
+    }
+    let name: String = final_segment
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if !name.is_empty() {
+        out.push((name, joined));
+    }
+}
+
+/// Parses one line as a `pub` / `pub(...)` `use` declaration,
+/// returning its (declared name, full path) pairs via the use-tree
+/// parser, or `None` when the line is not a `use` declaration. A
+/// `use` line whose tree yields no pairs (e.g. a multiline group
+/// header) returns an empty vec.
+fn parse_use_declarations(line: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("pub")?;
+    let rest = if let Some(after_paren) = rest.strip_prefix('(') {
+        let close = after_paren.find(')')?;
+        &after_paren[close + 1..]
+    } else if rest.starts_with(char::is_whitespace) {
+        rest
+    } else {
+        return None;
+    };
+    let mut tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut start = 0;
+    while start < tokens.len() {
+        match tokens[start] {
+            "async" | "unsafe" | "default" => start += 1,
+            "const" if tokens.get(start + 1) == Some(&"fn") => start += 1,
+            "extern" => {
+                start += 1;
+                if tokens
+                    .get(start)
+                    .map(|token| token.starts_with('"'))
+                    .unwrap_or(false)
+                {
+                    start += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    tokens.drain(..start);
+    if tokens.first() != Some(&"use") {
+        return None;
+    }
+    let path = tokens[1..].join(" ");
+    let path = path.trim().trim_end_matches(';').trim();
+    let path = path.trim_end_matches(',').trim();
+    let mut out = Vec::new();
+    parse_use_tree(path, "", &mut out);
+    Some(out)
+}
+
 /// The bare Rust keywords (strict + reserved, 2021 edition, plus `gen`
 /// reserved in 2024) that can never name a variant or member in bare
 /// spelling; raw spellings (`r#false`) are distinct identifiers.
@@ -719,14 +902,19 @@ fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
 /// everything `extract_public_surface_identifiers` returns, plus public item
 /// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
 /// const / default qualifiers, over struct/enum/trait/fn/type/const/static/
-/// mod/use/union). For `use`, the declared name is the final path segment,
-/// honouring `as` renames.
+/// mod/use/union). For `use`, the declared names come from the
+/// use-tree parser: every member of a grouped use, honouring `as`
+/// renames, nested groups, `self`, and globs.
 pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTreeSet<String> {
     let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
         .into_iter()
         .collect();
     for line in text.lines() {
-        if let Some((name, _kind)) = parse_public_surface_declaration(line) {
+        if let Some(pairs) = parse_use_declarations(line) {
+            for (name, _full_path) in pairs {
+                decls.insert(name);
+            }
+        } else if let Some((name, _kind)) = parse_public_surface_declaration(line) {
             decls.insert(name);
         }
         if let Some((name, _key, _signature)) = parse_member_declaration(line) {
@@ -788,7 +976,14 @@ fn extract_public_surface_signatures(
         signatures.entry(ident.clone()).or_default().insert(ident);
     }
     for line in text.lines() {
-        if let Some((name, kind)) = parse_public_surface_declaration(line) {
+        if let Some(pairs) = parse_use_declarations(line) {
+            for (name, full_path) in pairs {
+                signatures
+                    .entry(format!("use:{name}"))
+                    .or_default()
+                    .insert(full_path);
+            }
+        } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
             let signature = declaration_signature(&kind, line);
             signatures.entry(name).or_default().insert(signature);
         }
@@ -1666,6 +1861,69 @@ struct PrivateStruct {}
     }
 
     #[test]
+    fn extract_public_surface_declarations_parses_grouped_use() {
+        let decls = extract_public_surface_declarations("pub use a::{Alpha, Beta};");
+        let expected: std::collections::BTreeSet<String> = ["Alpha", "Beta"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(decls, expected);
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_parses_grouped_use_with_aliases_and_nesting() {
+        let decls = extract_public_surface_declarations(
+            "pub use a::{b::{C, D}, E as RenamedE, self};",
+        );
+        let expected: std::collections::BTreeSet<String> = ["C", "D", "RenamedE", "a"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(decls, expected);
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_parses_glob_use() {
+        let decls = extract_public_surface_declarations("pub use a::b::*;");
+        let expected: std::collections::BTreeSet<String> =
+            ["b"].iter().map(|name| name.to_string()).collect();
+        assert_eq!(decls, expected);
+        let signatures = extract_public_surface_signatures("pub use a::b::*;");
+        let expected_signature: std::collections::BTreeSet<String> =
+            ["a::b::*"].iter().map(|sig| sig.to_string()).collect();
+        assert_eq!(
+            signatures.get("use:b"),
+            Some(&expected_signature),
+            "{signatures:?}"
+        );
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_use_member_move_changes_signature() {
+        let before_decls = extract_public_surface_declarations("pub use a::{Alpha};");
+        let after_decls = extract_public_surface_declarations("pub use b::{Alpha};");
+        assert_eq!(before_decls, after_decls);
+        let before = extract_public_surface_signatures("pub use a::{Alpha};");
+        let after = extract_public_surface_signatures("pub use b::{Alpha};");
+        assert_ne!(before.get("use:Alpha"), after.get("use:Alpha"));
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_single_use_unchanged() {
+        let decls = extract_public_surface_declarations("pub use crate::plugins::Alpha;");
+        let expected: std::collections::BTreeSet<String> =
+            ["Alpha"].iter().map(|name| name.to_string()).collect();
+        assert_eq!(decls, expected);
+        let renamed =
+            extract_public_surface_declarations("pub use crate::store::Widget as RenamedWidget;");
+        let expected_renamed: std::collections::BTreeSet<String> = ["RenamedWidget"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(renamed, expected_renamed);
+    }
+
+    #[test]
     fn extract_public_surface_signatures_body_only_fn_edit_is_identical() {
         let before = extract_public_surface_signatures("pub fn compute() -> i32 { 1 }");
         let after = extract_public_surface_signatures("pub fn compute() -> i32 { 2 }");
@@ -2047,6 +2305,29 @@ struct PrivateStruct {}
         )
         .unwrap();
         commit_all(root, "signature change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn grouped_use_member_addition_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub use crate::plugins::{Alpha};\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub use crate::plugins::{Alpha, Beta};\n",
+        )
+        .unwrap();
+        commit_all(root, "grouped use member addition");
 
         let report = evaluate_doc_gate(root, None);
         assert!(!report.passed);
