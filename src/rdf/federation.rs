@@ -86,7 +86,7 @@ pub struct FederationExecutionReport {
 
 fn contains_service(pattern: &GraphPattern) -> bool {
     match pattern {
-        GraphPattern::Service { inner: _, .. } => {
+        GraphPattern::Service { .. } => {
             // The inner itself may contain a nested service — handled by
             // the caller that checks inner specifically.
             true
@@ -437,27 +437,23 @@ pub async fn handle_remote_sparql_request(
             // Serialize in standard W3C application/sparql-results+json form:
             // {"head":{"vars":[...]},"results":{"bindings":[{"<var>":{"type":"uri"|"literal","value":"..."}}]}}
             let mut var_names: Vec<String> = Vec::new();
-            for item in &collected {
-                if let Ok(sol) = item {
-                    for v in sol.variables() {
-                        let name = v.as_str().to_string();
-                        if !var_names.contains(&name) {
-                            var_names.push(name);
-                        }
+            for sol in collected.iter().flatten() {
+                for v in sol.variables() {
+                    let name = v.as_str().to_string();
+                    if !var_names.contains(&name) {
+                        var_names.push(name);
                     }
                 }
             }
             let mut bindings: Vec<serde_json::Value> = Vec::new();
-            for item in &collected {
-                if let Ok(sol) = item {
-                    let mut binding = serde_json::Map::new();
-                    for v in sol.variables() {
-                        if let Some(term) = sol.get(v.as_str()) {
-                            binding.insert(v.as_str().to_string(), term_to_json(term));
-                        }
+            for sol in collected.iter().flatten() {
+                let mut binding = serde_json::Map::new();
+                for v in sol.variables() {
+                    if let Some(term) = sol.get(v.as_str()) {
+                        binding.insert(v.as_str().to_string(), term_to_json(term));
                     }
-                    bindings.push(serde_json::Value::Object(binding));
                 }
+                bindings.push(serde_json::Value::Object(binding));
             }
             body = serde_json::json!({
                 "head": { "vars": var_names },
@@ -630,10 +626,7 @@ impl HttpServiceHandler {
                         ))),
                     }
                 }
-                Ok(spareval::QuerySolutionIter::new(
-                    variables,
-                    collected.into_iter(),
-                ))
+                Ok(spareval::QuerySolutionIter::new(variables, collected))
             }
             sparesults::SliceQueryResultsParserOutput::Boolean(_) => {
                 let variables: std::sync::Arc<[oxrdf::Variable]> = std::sync::Arc::new([]);

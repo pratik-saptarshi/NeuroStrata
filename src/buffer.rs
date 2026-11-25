@@ -450,12 +450,16 @@ pub async fn handle_append_log(
 
         // Run the recall search
         let search_outcome = match store
-            .search_with_domain(
-                &namespace, vec, 3,     // limit = 3
-                false, // include_tasks = false
-                false, // include_archived = false
-                &slugs, None, true,
-            )
+            .search_with_domain(crate::traits::SearchWithDomainParams {
+                namespace: &namespace,
+                vector: vec,
+                limit: 3,                // limit = 3
+                include_tasks: false,    // include_tasks = false
+                include_archived: false, // include_archived = false
+                domains: &slugs,
+                query_text: None,
+                exact: true,
+            })
             .await
         {
             Ok(o) => o,

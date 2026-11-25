@@ -492,7 +492,7 @@ fn build_record(
     // event, so an archived record carries the archive timestamp forward as
     // its tombstone time (the publish-time update stamp).
     let tombstoned_at = if matches!(state, LifecycleState::Archived) {
-        archived_at.clone()
+        archived_at
     } else {
         None
     };
@@ -550,30 +550,31 @@ fn build_record(
         _ => serde_json::to_string(&content).unwrap_or_default(),
     };
 
-    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-        &id.to_string(),
-        &entry.namespace,
-        &entry.memory_type,
-        &format!("{:?}", state).to_lowercase(),
-        &created_at_str,
-        &node_id,
-        superseded_by_str.as_deref(),
-        archived_at_str.as_deref(),
-        tombstoned_at_str.as_deref(),
-        &content_str,
-        eligibility,
-        source,
-        &tags,
-        concept_iri,
-        &rdf_relationships,
-        &update_id_str,
-        epoch,
-        &trust_val,
-        trigger.as_deref(),
-        initial_fires,
-        valid_to.as_deref(),
-        rehearsal_script.as_deref(),
-    );
+    let (nquads_text, digest_str) =
+        build_mesh_canonical_nquads(crate::rdf::dataset_canonical::MeshCanonicalRecord {
+            id: &id.to_string(),
+            namespace: &entry.namespace,
+            memory_type: &entry.memory_type,
+            lifecycle_state: &format!("{:?}", state).to_lowercase(),
+            created_at: &created_at_str,
+            created_by: node_id,
+            superseded_by: superseded_by_str.as_deref(),
+            archived_at: archived_at_str.as_deref(),
+            tombstoned_at: tombstoned_at_str.as_deref(),
+            content: &content_str,
+            eligibility,
+            source,
+            tags: &tags,
+            concept_iri,
+            relationships: &rdf_relationships,
+            update_id: &update_id_str,
+            origin_mesh_epoch: epoch,
+            trust: &trust_val,
+            trigger: trigger.as_deref(),
+            initial_fires,
+            valid_to: valid_to.as_deref(),
+            rehearsal_script: rehearsal_script.as_deref(),
+        });
 
     let patch_op = if matches!(state, LifecycleState::Archived | LifecycleState::Tombstoned) {
         crate::streaming::PatchOp::Delete
@@ -656,7 +657,7 @@ fn sign_record_with_keypair(
     record.signature = None;
     let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
     let payload = crate::did::canonical_signing_bytes(&val)?;
-    let sig = crate::did::sign(&payload, &pkey)?;
+    let sig = crate::did::sign(&payload, pkey)?;
     record.signature = Some(crate::did::encode_base64(&sig));
     Ok(())
 }
@@ -712,10 +713,9 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
         record
             .lifecycle
             .archived_at
-            .clone()
-            .or_else(|| record.lifecycle.tombstoned_at.clone())
+            .or(record.lifecycle.tombstoned_at)
     } else {
-        record.lifecycle.tombstoned_at.clone()
+        record.lifecycle.tombstoned_at
     };
     let tombstoned_at_str = tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
     let content_str = match &record.content {
@@ -768,30 +768,31 @@ fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBloc
         (None, None, None, None)
     };
 
-    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-        &id_str,
-        namespace,
-        memory_type,
-        &state_str,
-        &created_at_str,
-        created_by,
-        superseded_by_str.as_deref(),
-        archived_at_str.as_deref(),
-        tombstoned_at_str.as_deref(),
-        &content_str,
-        eligibility,
-        source,
-        &tags,
-        concept_iri,
-        &rdf_relationships,
-        &update_id_str,
-        epoch,
-        &trust_val,
-        trigger.as_deref(),
-        initial_fires,
-        valid_to.as_deref(),
-        rehearsal_script.as_deref(),
-    );
+    let (nquads_text, digest_str) =
+        build_mesh_canonical_nquads(crate::rdf::dataset_canonical::MeshCanonicalRecord {
+            id: &id_str,
+            namespace,
+            memory_type,
+            lifecycle_state: &state_str,
+            created_at: &created_at_str,
+            created_by,
+            superseded_by: superseded_by_str.as_deref(),
+            archived_at: archived_at_str.as_deref(),
+            tombstoned_at: tombstoned_at_str.as_deref(),
+            content: &content_str,
+            eligibility,
+            source,
+            tags: &tags,
+            concept_iri,
+            relationships: &rdf_relationships,
+            update_id: &update_id_str,
+            origin_mesh_epoch: epoch,
+            trust: &trust_val,
+            trigger: trigger.as_deref(),
+            initial_fires,
+            valid_to: valid_to.as_deref(),
+            rehearsal_script: rehearsal_script.as_deref(),
+        });
     Some(RdfBlock {
         // The rebuilt block retains the existing block's schema/format
         // identifiers — a rebuilt block is the same projection, refreshed.
@@ -1438,6 +1439,70 @@ mod tests {
         assert!(dir.join(format!("{shareable_id}.json")).exists());
         assert!(!dir.join(format!("{private_id}.json")).exists());
         assert!(!dir.join(format!("{absent_id}.json")).exists());
+    }
+
+    /// Wiring-level egress test (task 1ypd / panel C3 R6.4): drive the REAL
+    /// `drain_once` path — not `is_shareable_memory_type` directly — with a
+    /// receipt-shaped row, a non-shareable row, and a legitimate shareable row.
+    /// Only the last may cross into the mesh checkout.
+    #[tokio::test]
+    async fn mesh_drain_egress_does_not_export_receipt_or_nonshareable_rows() {
+        let (mesh, outbox) = fixture("egress-wiring", None).await;
+
+        // (a) receipt-shaped row: `action_receipt` is non-shareable even with
+        // eligibility:shareable — the type gate must stop it at drain time.
+        let receipt_id = Uuid::now_v7();
+        let mut receipt_entry = created(
+            &receipt_id.to_string(),
+            json!({
+                "eligibility": "shareable",
+                "event_id": "evt-must-not-escape",
+                "query_digest": "digest-must-not-escape"
+            }),
+        );
+        receipt_entry.memory_type = "action_receipt".to_string();
+        receipt_entry.content = "evt-must-not-escape secret query".to_string();
+        outbox.append(&receipt_entry).unwrap();
+
+        // (a2) a second, distinctly-typed non-shareable row.
+        let task_id = Uuid::now_v7();
+        let mut task_entry = created(&task_id.to_string(), shareable_metadata());
+        task_entry.memory_type = "task".to_string();
+        outbox.append(&task_entry).unwrap();
+
+        // (b) the legitimate shareable row.
+        let shareable_id = Uuid::now_v7();
+        outbox
+            .append(&created(&shareable_id.to_string(), shareable_metadata()))
+            .unwrap();
+
+        let report = drain_once(&outbox, &mesh, "node-author").await.unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "only the legitimate shareable row crosses"
+        );
+        assert_eq!(
+            report.skipped, 2,
+            "receipt + non-shareable rows are skipped"
+        );
+        assert!(report.committed);
+
+        let dir = mesh.root().join("ns").join("memories");
+        let mut exported: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        exported.sort();
+        assert_eq!(exported, vec![format!("{shareable_id}.json")]);
+        assert!(!dir.join(format!("{receipt_id}.json")).exists());
+        assert!(!dir.join(format!("{task_id}.json")).exists());
+
+        // The crossing record is the real one and carries no receipt content.
+        let text = std::fs::read_to_string(dir.join(format!("{shareable_id}.json"))).unwrap();
+        assert!(!text.contains("evt-must-not-escape"));
+        assert!(!text.contains("query_digest"));
     }
 
     #[tokio::test]

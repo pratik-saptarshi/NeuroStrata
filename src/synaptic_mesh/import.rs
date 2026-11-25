@@ -451,18 +451,18 @@ pub async fn apply_changed(
         if let Some(stream) = load_record_patch(&root.join(&rel)) {
             record.patch = Some(stream);
         }
-        match apply_one(
+        match apply_one(ApplyOneParams {
             root,
-            &mesh_id,
+            mesh_id: &mesh_id,
             record,
-            store.clone(),
-            emb.clone(),
+            store: store.clone(),
+            emb: emb.clone(),
             concurrent,
             import_trust,
             head_signature,
-            &signature_disposition,
-            false,
-        )
+            signature_disposition: &signature_disposition,
+            from_bundle: false,
+        })
         .await
         {
             Disposition::Applied => {
@@ -526,18 +526,18 @@ pub async fn apply_changed(
             Some(r) => r,
             None => continue,
         };
-        match apply_one(
+        match apply_one(ApplyOneParams {
             root,
-            &mesh_id,
+            mesh_id: &mesh_id,
             record,
-            store.clone(),
-            emb.clone(),
+            store: store.clone(),
+            emb: emb.clone(),
             concurrent,
             import_trust,
             head_signature,
-            &signature_disposition,
-            true,
-        )
+            signature_disposition: &signature_disposition,
+            from_bundle: true,
+        })
         .await
         {
             Disposition::Applied => {
@@ -863,9 +863,7 @@ fn validate_parsed_record(
     // beside, not instead of, the served-namespace parity check below: a
     // peer's namespace must be a legal name before it matters whether this
     // node serves it.
-    if let Err(e) = crate::domain::validate_namespace(&record.namespace) {
-        return Err(e);
-    }
+    crate::domain::validate_namespace(&record.namespace)?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
@@ -1538,21 +1536,37 @@ fn load_record_patch(record_path: &Path) -> Option<crate::streaming::Stream> {
 /// this record's signature; it keys the provenance stamp in
 /// `apply_effective`, so a signature that verified only over the RDF
 /// projection is never stamped as full-record verified.
-async fn apply_one(
-    root: &Path,
-    mesh_id: &str,
-    record: MeshRecord,
-    store: std::sync::Arc<dyn VectorStore>,
-    emb: std::sync::Arc<dyn Embedder>,
-    concurrent: bool,
-    import_trust: Trust,
-    head_signature: &str,
-    signature_disposition: &SignatureDisposition,
+/// Parameters for `apply_one`, in the function's original parameter
+/// order.
+struct ApplyOneParams<'a> {
+    pub root: &'a Path,
+    pub mesh_id: &'a str,
+    pub record: MeshRecord,
+    pub store: std::sync::Arc<dyn VectorStore>,
+    pub emb: std::sync::Arc<dyn Embedder>,
+    pub concurrent: bool,
+    pub import_trust: Trust,
+    pub head_signature: &'a str,
+    pub signature_disposition: &'a SignatureDisposition,
     // Route flag for the tracked-stale-bundle guard (issue #44): `true`
     // only for records that arrived through the bundle-only loop, never
     // for `.json` candidates.
-    from_bundle: bool,
-) -> Disposition {
+    pub from_bundle: bool,
+}
+
+async fn apply_one(params: ApplyOneParams<'_>) -> Disposition {
+    let ApplyOneParams {
+        root,
+        mesh_id,
+        record,
+        store,
+        emb,
+        concurrent,
+        import_trust,
+        head_signature,
+        signature_disposition,
+        from_bundle,
+    } = params;
     let id = record.id.to_string();
     let namespace = record.namespace.clone();
     if let Err(e) = store.init(&namespace).await {
@@ -1665,20 +1679,20 @@ async fn apply_one(
                 return Disposition::Conflicted(id);
             }
             MergeDecision::SupersedeWinsPreserveEdit => {
-                return preserve_superseded_edit(
+                return preserve_superseded_edit(PreserveSupersededEditParams {
                     root,
                     mesh_id,
-                    &id,
-                    &namespace,
+                    id: &id,
+                    namespace: &namespace,
                     local_state,
-                    &payload,
-                    &record,
+                    local_payload: &payload,
+                    cand: &record,
                     store,
                     emb,
                     import_trust,
                     head_signature,
                     signature_disposition,
-                )
+                })
                 .await;
             }
             MergeDecision::ApplyCombination(reason) => {
@@ -1690,19 +1704,19 @@ async fn apply_one(
                 } else {
                     payload.content.clone()
                 };
-                return match apply_effective(
+                return match apply_effective(ApplyEffectiveParams {
                     root,
                     mesh_id,
-                    &id,
-                    &namespace,
-                    &record,
+                    id: &id,
+                    namespace: &namespace,
+                    record: &record,
                     store,
                     emb,
-                    ApplyShape::ArchivedCombination { edited },
-                    Some(import_trust),
+                    shape: ApplyShape::ArchivedCombination { edited },
+                    trust_stamp: Some(import_trust),
                     head_signature,
                     signature_disposition,
-                )
+                })
                 .await
                 {
                     Disposition::Applied => Disposition::AppliedCombination(reason.to_string()),
@@ -1713,19 +1727,19 @@ async fn apply_one(
         }
     }
 
-    apply_effective(
+    apply_effective(ApplyEffectiveParams {
         root,
         mesh_id,
-        &id,
-        &namespace,
-        &record,
+        id: &id,
+        namespace: &namespace,
+        record: &record,
         store,
         emb,
-        ApplyShape::AsCandidate,
-        Some(import_trust),
+        shape: ApplyShape::AsCandidate,
+        trust_stamp: Some(import_trust),
         head_signature,
         signature_disposition,
-    )
+    })
     .await
 }
 
@@ -1739,19 +1753,36 @@ async fn apply_one(
 /// the record's own trust key as the record builder set it — the
 /// preserved-edit path, whose builder is itself funnel code that has
 /// already decided the stamp. Non-procedure records are never stamped.
-async fn apply_effective(
-    root: &Path,
-    mesh_id: &str,
-    id: &str,
-    namespace: &str,
-    record: &MeshRecord,
-    store: std::sync::Arc<dyn VectorStore>,
-    emb: std::sync::Arc<dyn Embedder>,
-    shape: ApplyShape,
-    trust_stamp: Option<Trust>,
-    head_signature: &str,
-    signature_disposition: &SignatureDisposition,
-) -> Disposition {
+/// Parameters for `apply_effective`, in the function's original
+/// parameter order.
+struct ApplyEffectiveParams<'a> {
+    pub root: &'a Path,
+    pub mesh_id: &'a str,
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub record: &'a MeshRecord,
+    pub store: std::sync::Arc<dyn VectorStore>,
+    pub emb: std::sync::Arc<dyn Embedder>,
+    pub shape: ApplyShape,
+    pub trust_stamp: Option<Trust>,
+    pub head_signature: &'a str,
+    pub signature_disposition: &'a SignatureDisposition,
+}
+
+async fn apply_effective(params: ApplyEffectiveParams<'_>) -> Disposition {
+    let ApplyEffectiveParams {
+        root,
+        mesh_id,
+        id,
+        namespace,
+        record,
+        store,
+        emb,
+        shape,
+        trust_stamp,
+        head_signature,
+        signature_disposition,
+    } = params;
     // 54-B: only an as-candidate apply stores the record the candidate's
     // signature was verified over. An archived combination stores a
     // (content, state) pair that was never the subject of that
@@ -2044,20 +2075,38 @@ async fn apply_effective(
 /// metadata and relationships. Fixed 2026-10-11 (slice-6b): the preserved
 /// record now carries the row's structured content, merged metadata and
 /// reconstructed relationships — see [`preserved_edit_record`].
-async fn preserve_superseded_edit(
-    root: &Path,
-    mesh_id: &str,
-    id: &str,
-    namespace: &str,
-    local_state: LifecycleState,
-    local_payload: &MemoryPayload,
-    cand: &MeshRecord,
-    store: std::sync::Arc<dyn VectorStore>,
-    emb: std::sync::Arc<dyn Embedder>,
-    import_trust: Trust,
-    head_signature: &str,
-    signature_disposition: &SignatureDisposition,
-) -> Disposition {
+/// Parameters for `preserve_superseded_edit`, in the function's
+/// original parameter order.
+struct PreserveSupersededEditParams<'a> {
+    pub root: &'a Path,
+    pub mesh_id: &'a str,
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub local_state: LifecycleState,
+    pub local_payload: &'a MemoryPayload,
+    pub cand: &'a MeshRecord,
+    pub store: std::sync::Arc<dyn VectorStore>,
+    pub emb: std::sync::Arc<dyn Embedder>,
+    pub import_trust: Trust,
+    pub head_signature: &'a str,
+    pub signature_disposition: &'a SignatureDisposition,
+}
+
+async fn preserve_superseded_edit(params: PreserveSupersededEditParams<'_>) -> Disposition {
+    let PreserveSupersededEditParams {
+        root,
+        mesh_id,
+        id,
+        namespace,
+        local_state,
+        local_payload,
+        cand,
+        store,
+        emb,
+        import_trust,
+        head_signature,
+        signature_disposition,
+    } = params;
     // Which side holds the edit, and must the incoming supersession apply?
     // `source_metadata` is the metadata the new record inherits from the
     // losing edit's side (candidate metadata for direction A, the existing
@@ -2090,19 +2139,19 @@ async fn preserve_superseded_edit(
         };
 
     if apply_supersession {
-        match apply_effective(
+        match apply_effective(ApplyEffectiveParams {
             root,
             mesh_id,
             id,
             namespace,
-            cand,
-            store.clone(),
-            emb.clone(),
-            ApplyShape::AsCandidate,
-            Some(import_trust),
+            record: cand,
+            store: store.clone(),
+            emb: emb.clone(),
+            shape: ApplyShape::AsCandidate,
+            trust_stamp: Some(import_trust),
             head_signature,
             signature_disposition,
-        )
+        })
         .await
         {
             Disposition::Applied => {}
@@ -2110,17 +2159,17 @@ async fn preserve_superseded_edit(
         }
     }
 
-    let new_record = preserved_edit_record(
+    let new_record = preserved_edit_record(PreservedEditRecordParams {
         namespace,
-        id,
+        original_id: id,
         content,
         memory_type,
         created_by,
         source_rels,
         source_metadata,
         import_trust,
-        cand.origin_mesh_epoch,
-    );
+        origin_mesh_epoch: cand.origin_mesh_epoch,
+    });
     let new_id = new_record.id.to_string();
     // No trust_stamp: `preserved_edit_record` is funnel code and has
     // already set the preserved record's stamp from `import_trust`
@@ -2128,19 +2177,19 @@ async fn preserve_superseded_edit(
     // stamping again here would only repeat the funnel's own decision.
     // The preserved record is built unsigned, so its signature
     // disposition is `Unsigned` and it earns no verification stamp.
-    apply_effective(
+    apply_effective(ApplyEffectiveParams {
         root,
         mesh_id,
-        &new_id,
+        id: &new_id,
         namespace,
-        &new_record,
+        record: &new_record,
         store,
         emb,
-        ApplyShape::AsCandidate,
-        None,
+        shape: ApplyShape::AsCandidate,
+        trust_stamp: None,
         head_signature,
-        &SignatureDisposition::Unsigned,
-    )
+        signature_disposition: &SignatureDisposition::Unsigned,
+    })
     .await
 }
 
@@ -2215,17 +2264,32 @@ fn local_relationships(payload: &MemoryPayload) -> Vec<Relationship> {
 /// the edit carried survives. `import_trust` is the trust the stored row
 /// carries (defaulting to untrusted, honoring the manifest's
 /// `imported_procedures_trust` when it is configured differently).
-fn preserved_edit_record(
-    namespace: &str,
-    original_id: &str,
-    content: Value,
-    memory_type: String,
-    created_by: String,
-    source_rels: Vec<Relationship>,
-    source_metadata: Value,
-    import_trust: Trust,
-    origin_mesh_epoch: u32,
-) -> MeshRecord {
+/// Parameters for `preserved_edit_record`, in the function's original
+/// parameter order.
+struct PreservedEditRecordParams<'a> {
+    pub namespace: &'a str,
+    pub original_id: &'a str,
+    pub content: Value,
+    pub memory_type: String,
+    pub created_by: String,
+    pub source_rels: Vec<Relationship>,
+    pub source_metadata: Value,
+    pub import_trust: Trust,
+    pub origin_mesh_epoch: u32,
+}
+
+fn preserved_edit_record(params: PreservedEditRecordParams<'_>) -> MeshRecord {
+    let PreservedEditRecordParams {
+        namespace,
+        original_id,
+        content,
+        memory_type,
+        created_by,
+        source_rels,
+        source_metadata,
+        import_trust,
+        origin_mesh_epoch,
+    } = params;
     let mut rels = source_rels;
     if let Ok(original_id) = Uuid::parse_str(original_id) {
         rels.push(Relationship {
@@ -2286,28 +2350,30 @@ fn preserved_edit_record(
     let id = Uuid::new_v4();
     let update_id = Uuid::new_v4();
     let (nquads_text, digest_str) = crate::rdf::dataset_canonical::build_mesh_canonical_nquads(
-        &id.to_string(),
-        namespace,
-        &memory_type,
-        state_str,
-        &created_at.to_rfc3339(),
-        &created_by,
-        None,
-        None,
-        None,
-        &content_str,
-        eligibility,
-        source,
-        &tags,
-        concept_iri,
-        &rdf_relationships,
-        &update_id.to_string(),
-        origin_mesh_epoch,
-        &import_trust.to_string(),
-        None,
-        None,
-        None,
-        None,
+        crate::rdf::dataset_canonical::MeshCanonicalRecord {
+            id: &id.to_string(),
+            namespace,
+            memory_type: &memory_type,
+            lifecycle_state: state_str,
+            created_at: &created_at.to_rfc3339(),
+            created_by: &created_by,
+            superseded_by: None,
+            archived_at: None,
+            tombstoned_at: None,
+            content: &content_str,
+            eligibility,
+            source,
+            tags: &tags,
+            concept_iri,
+            relationships: &rdf_relationships,
+            update_id: &update_id.to_string(),
+            origin_mesh_epoch,
+            trust: &import_trust.to_string(),
+            trigger: None,
+            initial_fires: None,
+            valid_to: None,
+            rehearsal_script: None,
+        },
     );
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
@@ -2540,32 +2606,32 @@ async fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)
         if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-                    if path.to_string_lossy().ends_with(".bundle.zst") {
-                        // Local-only (git-ignored or untracked) bundles
-                        // never replay; tracked bundles are the transport.
-                        let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
-                        if !tracked_bundles.contains(rel) {
+                if path.extension().and_then(|e| e.to_str()) == Some("zst")
+                    && path.to_string_lossy().ends_with(".bundle.zst")
+                {
+                    // Local-only (git-ignored or untracked) bundles
+                    // never replay; tracked bundles are the transport.
+                    let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
+                    if !tracked_bundles.contains(rel) {
+                        tracing::debug!(
+                            "mesh bundle {} is local-only (not tracked) — skipped",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    match read_compressed_bundle(&path) {
+                        Ok(records) => {
                             tracing::debug!(
-                                "mesh bundle {} is local-only (not tracked) — skipped",
-                                path.display()
+                                "mesh bundle {} decoded: {} record(s)",
+                                path.display(),
+                                records.len()
                             );
-                            continue;
+                            for record in records {
+                                bundled_records.push((path.clone(), record));
+                            }
                         }
-                        match read_compressed_bundle(&path) {
-                            Ok(records) => {
-                                tracing::debug!(
-                                    "mesh bundle {} decoded: {} record(s)",
-                                    path.display(),
-                                    records.len()
-                                );
-                                for record in records {
-                                    bundled_records.push((path.clone(), record));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
-                            }
+                        Err(e) => {
+                            tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
                         }
                     }
                 }
@@ -6546,20 +6612,20 @@ mod tests {
 
         let store = fresh_store("dirb-proc").await;
         store.init(&namespace).await.unwrap();
-        let disposition = preserve_superseded_edit(
-            &root,
-            &mesh_id,
-            &id.to_string(),
-            &namespace,
-            LifecycleState::Active,
-            &local_payload,
-            &cand,
-            store.clone(),
-            emb(),
-            Trust::Untrusted,
-            "unsigned",
-            &SignatureDisposition::Unsigned,
-        )
+        let disposition = preserve_superseded_edit(PreserveSupersededEditParams {
+            root: &root,
+            mesh_id: &mesh_id,
+            id: &id.to_string(),
+            namespace: &namespace,
+            local_state: LifecycleState::Active,
+            local_payload: &local_payload,
+            cand: &cand,
+            store: store.clone(),
+            emb: emb(),
+            import_trust: Trust::Untrusted,
+            head_signature: "unsigned",
+            signature_disposition: &SignatureDisposition::Unsigned,
+        })
         .await;
         assert!(
             matches!(disposition, Disposition::Applied),
@@ -6597,17 +6663,17 @@ mod tests {
 
         // The typed relationships carry the row's own references link forward
         // AND append the spec's references -> original_id link.
-        let rebuilt = preserved_edit_record(
-            &namespace,
-            &id.to_string(),
-            local_content_value(&local_payload),
-            local_payload.memory_type.clone(),
-            local_origin(&local_payload),
-            local_relationships(&local_payload),
-            local_payload.metadata.clone(),
-            Trust::Untrusted,
-            cand.origin_mesh_epoch,
-        );
+        let rebuilt = preserved_edit_record(PreservedEditRecordParams {
+            namespace: &namespace,
+            original_id: &id.to_string(),
+            content: local_content_value(&local_payload),
+            memory_type: local_payload.memory_type.clone(),
+            created_by: local_origin(&local_payload),
+            source_rels: local_relationships(&local_payload),
+            source_metadata: local_payload.metadata.clone(),
+            import_trust: Trust::Untrusted,
+            origin_mesh_epoch: cand.origin_mesh_epoch,
+        });
         assert!(
             rebuilt.relationships.contains(&Relationship {
                 kind: "references".to_string(),
@@ -6683,20 +6749,20 @@ mod tests {
 
         let store = fresh_store("dirb-meta").await;
         store.init(&namespace).await.unwrap();
-        let disposition = preserve_superseded_edit(
-            &root,
-            &mesh_id,
-            &id.to_string(),
-            &namespace,
-            LifecycleState::Active,
-            &local_payload,
-            &cand,
-            store.clone(),
-            emb(),
-            Trust::Untrusted,
-            "unsigned",
-            &SignatureDisposition::Unsigned,
-        )
+        let disposition = preserve_superseded_edit(PreserveSupersededEditParams {
+            root: &root,
+            mesh_id: &mesh_id,
+            id: &id.to_string(),
+            namespace: &namespace,
+            local_state: LifecycleState::Active,
+            local_payload: &local_payload,
+            cand: &cand,
+            store: store.clone(),
+            emb: emb(),
+            import_trust: Trust::Untrusted,
+            head_signature: "unsigned",
+            signature_disposition: &SignatureDisposition::Unsigned,
+        })
         .await;
         assert!(
             matches!(disposition, Disposition::Applied),
@@ -6791,20 +6857,20 @@ mod tests {
 
         let store = fresh_store("dirb-trusted").await;
         store.init(&namespace).await.unwrap();
-        let disposition = preserve_superseded_edit(
-            &root,
-            &mesh_id,
-            &id.to_string(),
-            &namespace,
-            LifecycleState::Active,
-            &local_payload,
-            &cand,
-            store.clone(),
-            emb(),
-            Trust::Trusted,
-            "unsigned",
-            &SignatureDisposition::Unsigned,
-        )
+        let disposition = preserve_superseded_edit(PreserveSupersededEditParams {
+            root: &root,
+            mesh_id: &mesh_id,
+            id: &id.to_string(),
+            namespace: &namespace,
+            local_state: LifecycleState::Active,
+            local_payload: &local_payload,
+            cand: &cand,
+            store: store.clone(),
+            emb: emb(),
+            import_trust: Trust::Trusted,
+            head_signature: "unsigned",
+            signature_disposition: &SignatureDisposition::Unsigned,
+        })
         .await;
         assert!(
             matches!(disposition, Disposition::Applied),

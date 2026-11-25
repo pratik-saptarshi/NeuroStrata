@@ -1004,7 +1004,9 @@ pub fn memory_to_quads(
     quads.push(Quad {
         subject: subject.clone(),
         predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
-        object: Term::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:Memory"))),
+        object: Term::NamedNode(NamedNode::new_unchecked(
+            "urn:neurostrata:Memory".to_string(),
+        )),
         graph_name: graph.clone(),
     });
 
@@ -2060,16 +2062,16 @@ mod tests {
 
         // 2. Default lexical recall excludes action_type and action_receipt
         let lex_hits = store
-            .search_lexical(
-                "ns-recall",
-                "cryogenicmanifold77",
-                10,
-                false,
-                false,
-                &[],
-                "alice",
-                0,
-            )
+            .search_lexical(crate::traits::SearchLexicalParams {
+                namespace: "ns-recall",
+                query: "cryogenicmanifold77",
+                limit: 10,
+                include_tasks: false,
+                include_archived: false,
+                domains: &[],
+                principal: "alice",
+                fuzzy_max_distance: 0,
+            })
             .await
             .unwrap();
         let lex_ids: Vec<&str> = lex_hits.results.iter().map(|r| r.id.as_str()).collect();

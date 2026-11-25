@@ -1,11 +1,7 @@
 //! Learning control actions: pause, resume, rollback, reset, and purge.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
-use crate::config::DedupProviderMode;
-use crate::judgment::laya_onnx::RuntimeState;
 use crate::learning::status::LearnStatus;
-use crate::learning::trainer::TrainingJobState;
 use std::path::Path;
 
 use crate::learning::trainer::ActiveManifest;

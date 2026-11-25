@@ -764,7 +764,7 @@ fn find_jwt_segments(s: &str) -> Option<(&str, &str, &str)> {
 fn is_valid_jwt_header(segment: &str) -> bool {
     // base64url decode: replace URL chars, add padding.
     let mut s = segment.replace('-', "+").replace('_', "/");
-    while s.len() % 4 != 0 {
+    while !s.len().is_multiple_of(4) {
         s.push('=');
     }
     let decoded = match base64_decode(&s) {

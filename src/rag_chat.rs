@@ -76,33 +76,51 @@ impl std::fmt::Display for ChatError {
 
 impl std::error::Error for ChatError {}
 
+/// Parameters for `retrieve_context_with_egress`, in the function's
+/// original parameter order.
+pub struct RetrieveContextWithEgressParams<'a> {
+    pub store: Arc<dyn crate::traits::VectorStore>,
+    pub emb: Arc<dyn crate::traits::Embedder>,
+    pub namespace: &'a str,
+    pub principal: &'a str,
+    pub query: &'a str,
+    pub limit: usize,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub require_shareable: bool,
+    pub snippet_max_chars: usize,
+}
+
 pub async fn retrieve_context_with_egress(
-    store: Arc<dyn crate::traits::VectorStore>,
-    emb: Arc<dyn crate::traits::Embedder>,
-    namespace: &str,
-    principal: &str,
-    query: &str,
-    limit: usize,
-    include_tasks: bool,
-    include_archived: bool,
-    require_shareable: bool,
-    snippet_max_chars: usize,
+    params: RetrieveContextWithEgressParams<'_>,
 ) -> Result<RagContext, ChatError> {
+    let RetrieveContextWithEgressParams {
+        store,
+        emb,
+        namespace,
+        principal,
+        query,
+        limit,
+        include_tasks,
+        include_archived,
+        require_shareable,
+        snippet_max_chars,
+    } = params;
     let vector = emb
         .embed(query)
         .await
         .map_err(|e| ChatError::Retrieval(format!("embed: {}", e)))?;
     let outcome = store
-        .search_with_domain(
+        .search_with_domain(crate::traits::SearchWithDomainParams {
             namespace,
             vector,
             limit,
             include_tasks,
             include_archived,
-            &[],
-            Some(query),
-            false,
-        )
+            domains: &[],
+            query_text: Some(query),
+            exact: false,
+        })
         .await
         .map_err(|e| ChatError::Retrieval(format!("search: {}", e)))?;
     if outcome.incomplete {
@@ -124,15 +142,14 @@ pub async fn retrieve_context_with_egress(
         if !crate::rebac::allowed(principal, &owner, "viewer", &visible) {
             continue;
         }
-        if require_shareable {
-            if r.payload
+        if require_shareable
+            && r.payload
                 .metadata
                 .get("eligibility")
                 .and_then(|v| v.as_str())
                 != Some("shareable")
-            {
-                continue;
-            }
+        {
+            continue;
         }
         results.push(r);
     }
@@ -228,18 +245,22 @@ pub fn build_prompt_with_citations(
     (prompt, citations)
 }
 
-pub async fn retrieve_context(
-    store: Arc<dyn crate::traits::VectorStore>,
-    emb: Arc<dyn crate::traits::Embedder>,
-    namespace: &str,
-    principal: &str,
-    query: &str,
-    limit: usize,
-    include_tasks: bool,
-    include_archived: bool,
-    snippet_max_chars: usize,
-) -> Result<RagContext, ChatError> {
-    retrieve_context_with_egress(
+/// Parameters for `retrieve_context`, in the function's original
+/// parameter order.
+pub struct RetrieveContextParams<'a> {
+    pub store: Arc<dyn crate::traits::VectorStore>,
+    pub emb: Arc<dyn crate::traits::Embedder>,
+    pub namespace: &'a str,
+    pub principal: &'a str,
+    pub query: &'a str,
+    pub limit: usize,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub snippet_max_chars: usize,
+}
+
+pub async fn retrieve_context(params: RetrieveContextParams<'_>) -> Result<RagContext, ChatError> {
+    let RetrieveContextParams {
         store,
         emb,
         namespace,
@@ -248,9 +269,20 @@ pub async fn retrieve_context(
         limit,
         include_tasks,
         include_archived,
-        false,
         snippet_max_chars,
-    )
+    } = params;
+    retrieve_context_with_egress(RetrieveContextWithEgressParams {
+        store,
+        emb,
+        namespace,
+        principal,
+        query,
+        limit,
+        include_tasks,
+        include_archived,
+        require_shareable: false,
+        snippet_max_chars,
+    })
     .await
 }
 
@@ -442,7 +474,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let content = json
             .get("choices")
             .and_then(|c| c.as_array())
-            .and_then(|arr| arr.get(0))
+            .and_then(|arr| arr.first())
             .and_then(|c| c.get("message"))
             .and_then(|m| m.get("content"))
             .and_then(|v| v.as_str())
@@ -451,20 +483,37 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
-pub async fn ask(
-    store: Arc<dyn crate::traits::VectorStore>,
-    emb: Arc<dyn crate::traits::Embedder>,
-    namespace: &str,
-    principal: &str,
-    question: &str,
-    limit: usize,
-    system: Option<&str>,
-    max_context_chars: usize,
-    provider: Arc<dyn LlmProvider>,
-    include_tasks: bool,
-    include_archived: bool,
-    remote_egress_allowed: bool,
-) -> Result<ChatResponse, ChatError> {
+/// Parameters for `ask`, in the function's original parameter order.
+pub struct AskParams<'a> {
+    pub store: Arc<dyn crate::traits::VectorStore>,
+    pub emb: Arc<dyn crate::traits::Embedder>,
+    pub namespace: &'a str,
+    pub principal: &'a str,
+    pub question: &'a str,
+    pub limit: usize,
+    pub system: Option<&'a str>,
+    pub max_context_chars: usize,
+    pub provider: Arc<dyn LlmProvider>,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub remote_egress_allowed: bool,
+}
+
+pub async fn ask(params: AskParams<'_>) -> Result<ChatResponse, ChatError> {
+    let AskParams {
+        store,
+        emb,
+        namespace,
+        principal,
+        question,
+        limit,
+        system,
+        max_context_chars,
+        provider,
+        include_tasks,
+        include_archived,
+        remote_egress_allowed,
+    } = params;
     // Kill-switch magic question: the disabled sentinel short-circuits before
     // any retrieval or provider call, so a wedge cannot be debugged by chat.
     if question.trim().eq_ignore_ascii_case("__disabled__") {
@@ -476,33 +525,33 @@ pub async fn ask(
         ));
     }
     let ctx = if !remote_egress_allowed {
-        retrieve_context(
-            store.clone(),
-            emb.clone(),
+        retrieve_context(RetrieveContextParams {
+            store: store.clone(),
+            emb: emb.clone(),
             namespace,
             principal,
-            question,
+            query: question,
             limit,
             include_tasks,
             include_archived,
             // Snippets are the context budget's working unit: keep per-hit
             // truncation proportional to the prompt ceiling.
-            (max_context_chars / 4).clamp(120, 1000),
-        )
+            snippet_max_chars: (max_context_chars / 4).clamp(120, 1000),
+        })
         .await?
     } else {
-        retrieve_context_with_egress(
+        retrieve_context_with_egress(RetrieveContextWithEgressParams {
             store,
             emb,
             namespace,
             principal,
-            question,
+            query: question,
             limit,
             include_tasks,
             include_archived,
-            provider.is_remote(),
-            (max_context_chars / 4).clamp(120, 1000),
-        )
+            require_shareable: provider.is_remote(),
+            snippet_max_chars: (max_context_chars / 4).clamp(120, 1000),
+        })
         .await?
     };
     let (prompt, citations) =
@@ -711,20 +760,20 @@ mod tests {
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(MockStore::new());
         let emb: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
         let provider: Arc<dyn LlmProvider> = Arc::new(OfflineProvider);
-        let err = ask(
+        let err = ask(AskParams {
             store,
             emb,
-            "ns",
-            "local-user",
-            "__disabled__",
-            5,
-            None,
-            4000,
+            namespace: "ns",
+            principal: "local-user",
+            question: "__disabled__",
+            limit: 5,
+            system: None,
+            max_context_chars: 4000,
             provider,
-            false,
-            false,
-            false,
-        )
+            include_tasks: false,
+            include_archived: false,
+            remote_egress_allowed: false,
+        })
         .await
         .unwrap_err();
         assert!(matches!(err, ChatError::Disabled));

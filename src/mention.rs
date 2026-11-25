@@ -69,23 +69,26 @@ pub fn build_candidates(index: &KnownIds) -> HashMap<String, String> {
         pairs.push((logical.clone(), id.to_string()));
         // File path portion before '#'.
         let file_path = logical.split('#').next().unwrap_or("").to_string();
-        if !file_path.is_empty() && file_path != logical {
-            if !is_short_alias(&file_path) || alias_allowed(&file_path) {
-                pairs.push((file_path.clone(), id.to_string()));
-            }
+        if !file_path.is_empty()
+            && file_path != logical
+            && (!is_short_alias(&file_path) || alias_allowed(&file_path))
+        {
+            pairs.push((file_path.clone(), id.to_string()));
         }
         // Symbol name after kind: (e.g. functions:bar -> bar)
         let rest = logical.split('#').nth(1).unwrap_or("");
         let name = if rest.contains(':') {
-            rest.split(':').last().unwrap_or(rest)
+            rest.split(':').next_back().unwrap_or(rest)
         } else {
             rest
         };
         let name = name.to_string();
-        if !name.is_empty() && name != logical && name != file_path {
-            if !is_short_alias(&name) || alias_allowed(&name) {
-                pairs.push((name.clone(), id.to_string()));
-            }
+        if !name.is_empty()
+            && name != logical
+            && name != file_path
+            && (!is_short_alias(&name) || alias_allowed(&name))
+        {
+            pairs.push((name.clone(), id.to_string()));
         }
         // Short aliases (final path components), guard + uniqueness handled later.
         if !file_path.is_empty() {

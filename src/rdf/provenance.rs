@@ -244,7 +244,7 @@ pub fn validate_assertion_iri(iri: &str) -> bool {
     // Anchor by position so a namespace or ID named "memory" or "edge"
     // elsewhere in the IRI cannot confuse the validator.
     let parts: Vec<&str> = iri.split(':').collect();
-    if parts.get(0) != Some(&"urn")
+    if parts.first() != Some(&"urn")
         || parts.get(1) != Some(&"neurostrata")
         || parts.get(2) != Some(&"assertion")
     {

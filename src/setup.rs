@@ -19,7 +19,6 @@ pub struct SetupReport {
 /// Entry point. Dispatches on platform.
 pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
     let bin_path = std::env::current_exe().context("cannot determine current_exe")?;
-    let script_path = repo_path.join("scripts").join("backup.sh");
     // systemd ExecStart and launchd ProgramArguments require absolute paths;
     // a relative repo_path (e.g. `./`) would otherwise leak into the units.
     let canonical_repo = std::fs::canonicalize(repo_path).unwrap_or_else(|e| {

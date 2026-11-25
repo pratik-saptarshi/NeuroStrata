@@ -23,6 +23,23 @@ The `VectorStore` trait is the pluggable interface for vector persistence and si
 - `fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(String, f32)>>` — nearest-neighbor search
 - `fn delete(&mut self, id: &str) -> Result<()>` — remove a vector
 
+Two search variants take their arguments grouped in a single params struct:
+
+- `async fn search_with_domain(&self, params: SearchWithDomainParams<'_>) -> Result<DomainSearchOutcome>` — search with an optional domain key set; the default implementation ignores the key set and reports `Vector`
+- `async fn search_lexical(&self, _params: SearchLexicalParams<'_>) -> Result<LexicalSearchOutcome>` — search with the in-house multi-field lexical engine; the default implementation refuses, so a backend that cannot do lexical search does not look like a namespace with no matching memories
+
+Stores that project edges into a graph additionally implement the optional seam
+
+- `async fn reconcile_declared_edges(&self, namespace: &str, id: &str, rel_type: &str, keep: &[String]) -> Result<usize>` — retire the edges this store materialised from a previous declaration of `rel_type` whose target is not in `keep`
+
+The default implementation is a no-op, so a vector-only backend is unaffected. `LadybugStore` implements it as a delete over edges stamped `extractor = 'upsert'`; mention-detector and hand-authored edges are never candidates, and an empty `keep` retires every declared edge. The vault importer calls it before each head's upsert so a removed WikiLink cannot survive as a stale `RELATES_TO` relationship; ordinary upserts that do not declare a link set are never reconciled implicitly.
+
+A second optional seam rebinds edges without rewriting the head:
+
+- `async fn rebind_declared_edges(&self, namespace: &str, id: &str, rel_type: &str, declared: &[String], keep: &[String]) -> Result<usize>` — materialise any missing outgoing `rel_type` edges to `keep`, then reconcile the rest; `declared` is the importing note's declaration list, positionally aligned with `keep`
+
+The default is again a no-op. `LadybugStore` creates edges under the same `extractor = 'upsert'` provenance as an upsert would, stamps each replacement edge's `metadata.edge_sources` entry through the same builder `upsert` uses (declaration index, declared and resolved targets, evidence id), and then runs `reconcile_declared_edges`. Content, identity metadata and history stay untouched; only the citation lists change. The vault importer uses it only for an unchanged declarer whose preferred exact target arrived in that import, so a byte-identical note can follow a newly named target without minting a content version and without losing the live edge's reference.
+
 Both traits are generic over storage backend. The default implementation uses a local in-memory store; custom implementations can target GPU-accelerated indexes or distributed stores.
 
 ## Custom `JudgmentProvider` Adapters
