@@ -786,7 +786,16 @@ async fn evaluate_custom_insight(
                     .downcast_ref::<crate::store::LadybugStore>()
                 {
                     if let Ok(hits) = ls
-                        .search_lexical(namespace, &def.query, 500, false, false, &[], "admin", 0)
+                        .search_lexical(crate::traits::SearchLexicalParams {
+                            namespace,
+                            query: &def.query,
+                            limit: 500,
+                            include_tasks: false,
+                            include_archived: false,
+                            domains: &[],
+                            principal: "admin",
+                            fuzzy_max_distance: 0,
+                        })
                         .await
                     {
                         for hit in hits.results {

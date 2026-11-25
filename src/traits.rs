@@ -448,6 +448,32 @@ pub struct RawDistanceQuery {
     pub scope: DedupCandidateScope,
 }
 
+/// Parameters for `VectorStore::search_with_domain`, in the method's
+/// original parameter order.
+pub struct SearchWithDomainParams<'a> {
+    pub namespace: &'a str,
+    pub vector: Vec<f32>,
+    pub limit: usize,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub domains: &'a [String],
+    pub query_text: Option<&'a str>,
+    pub exact: bool,
+}
+
+/// Parameters for `VectorStore::search_lexical`, in the method's
+/// original parameter order.
+pub struct SearchLexicalParams<'a> {
+    pub namespace: &'a str,
+    pub query: &'a str,
+    pub limit: usize,
+    pub include_tasks: bool,
+    pub include_archived: bool,
+    pub domains: &'a [String],
+    pub principal: &'a str,
+    pub fuzzy_max_distance: usize,
+}
+
 /// The core interface for vector storage and retrieval.
 /// By making this a trait, we can swap between Embedded Qdrant,
 /// Remote Qdrant, LadybugDB, or SQLite-VSS.
@@ -766,15 +792,16 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// the key set and reports `Vector`, so a store that cannot filter stays honest.
     async fn search_with_domain(
         &self,
-        namespace: &str,
-        vector: Vec<f32>,
-        limit: usize,
-        include_tasks: bool,
-        include_archived: bool,
-        _domains: &[String],
-        _query_text: Option<&str>,
-        _exact: bool,
+        params: SearchWithDomainParams<'_>,
     ) -> Result<DomainSearchOutcome> {
+        let SearchWithDomainParams {
+            namespace,
+            vector,
+            limit,
+            include_tasks,
+            include_archived,
+            ..
+        } = params;
         let results = self
             .search(namespace, vector, limit, include_tasks, include_archived)
             .await?;
@@ -792,14 +819,7 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// with no matching memories.
     async fn search_lexical(
         &self,
-        _namespace: &str,
-        _query: &str,
-        _limit: usize,
-        _include_tasks: bool,
-        _include_archived: bool,
-        _domains: &[String],
-        _principal: &str,
-        _fuzzy_max_distance: usize,
+        _params: SearchLexicalParams<'_>,
     ) -> Result<LexicalSearchOutcome> {
         anyhow::bail!("lexical-inhouse search is not supported by this store")
     }
@@ -848,6 +868,33 @@ pub trait VectorStore: Send + Sync + AsAny {
     }
 }
 
+/// Parameters for `GraphRead::memories_for_file`, in the method's
+/// original parameter order.
+pub struct MemoriesForFileParams<'a> {
+    pub namespace: &'a str,
+    pub source: Option<&'a str>,
+    pub path: &'a str,
+    pub symbol: Option<&'a str>,
+    pub include_ancestors: bool,
+    pub memory_types: &'a [String],
+    pub exclude_ids: &'a [String],
+    pub limit: usize,
+}
+
+/// Parameters for `GraphRead::related`, in the method's original
+/// parameter order.
+pub struct RelatedParams<'a> {
+    pub namespace: &'a str,
+    pub seed: &'a str,
+    pub relations: &'a [String],
+    pub direction: RelatedDirection,
+    pub max_hops: usize,
+    pub memory_types: &'a [String],
+    pub limit: usize,
+    pub cursor: Option<&'a RelatedCursor>,
+    pub cross_namespace: &'a crate::graph_read::traversal::CrossNamespacePolicy,
+}
+
 /// Graph-read capability, exposed beside `VectorStore` rather than folded into
 /// it (spec §4.6): file nodes carry a zero vector, so any backend that only
 /// knows vector search cannot answer these and must say so. A backend that
@@ -864,17 +911,7 @@ pub trait GraphRead: Send + Sync {
     /// `MAX_LIMIT` by the implementation. `exclude_ids` names memory ids to
     /// drop, and is applied *before* `limit` so an excluded hit never crowds
     /// out a live one.
-    async fn memories_for_file(
-        &self,
-        namespace: &str,
-        source: Option<&str>,
-        path: &str,
-        symbol: Option<&str>,
-        include_ancestors: bool,
-        memory_types: &[String],
-        exclude_ids: &[String],
-        limit: usize,
-    ) -> Result<Vec<MemoryHit>>;
+    async fn memories_for_file(&self, params: MemoriesForFileParams<'_>) -> Result<Vec<MemoryHit>>;
 
     /// Bounded 1–2 hop traversal from a seed node (spec §4.2). `relations`
     /// empty means all four; `direction` controls orientation; `max_hops` is
@@ -886,18 +923,7 @@ pub trait GraphRead: Send + Sync {
     /// the boundary policy: same-namespace hops are always allowed, and a
     /// cross-namespace hop requires an explicit opt-in (plus an optional
     /// target allowlist).
-    async fn related(
-        &self,
-        namespace: &str,
-        seed: &str,
-        relations: &[String],
-        direction: RelatedDirection,
-        max_hops: usize,
-        memory_types: &[String],
-        limit: usize,
-        cursor: Option<&RelatedCursor>,
-        cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
-    ) -> Result<RelatedResult>;
+    async fn related(&self, params: RelatedParams<'_>) -> Result<RelatedResult>;
 }
 
 /// Trait for durable task intake ledger operations (PQTH).
