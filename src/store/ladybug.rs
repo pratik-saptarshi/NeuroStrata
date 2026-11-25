@@ -1741,7 +1741,7 @@ impl Drop for TestCleanupDir {
 enum CachedStoreState {
     /// A sidecar exists on disk (written by us or a previous process):
     /// its content is authoritative.
-    Recorded(crate::model_choice::StoreState),
+    Recorded(Box<crate::model_choice::StoreState>),
     /// No sidecar, and this process must not create a pristine one: the
     /// store predates the sidecar (or its sidecar is unreadable), so it
     /// is treated as data-bearing with an unknown descriptor.
@@ -4577,7 +4577,7 @@ impl FirstWriteFlip {
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
-                CachedStoreState::Recorded(recorded)
+                CachedStoreState::Recorded(Box::new(recorded))
             }
             crate::model_choice::StoreStateRead::Unparseable(reason) => {
                 CachedStoreState::Unparseable(reason)
@@ -4637,7 +4637,7 @@ impl FirstWriteFlip {
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
                         );
                     }
-                    self.set_cached_store_state(CachedStoreState::Recorded(state));
+                    self.set_cached_store_state(CachedStoreState::Recorded(Box::new(state)));
                 }
             }
             _ => {}
@@ -4687,7 +4687,7 @@ impl LockedUnknownStamp {
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
-                CachedStoreState::Recorded(recorded)
+                CachedStoreState::Recorded(Box::new(recorded))
             }
             crate::model_choice::StoreStateRead::Unparseable(reason) => {
                 CachedStoreState::Unparseable(reason)
@@ -4798,7 +4798,7 @@ impl LockedUnknownStamp {
         }
         let state = crate::model_choice::StoreState::new(false, serving.clone());
         match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
-            Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
+            Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(Box::new(state))),
             Err(e) => {
                 tracing::warn!("store-state sidecar write failed: {e}")
             }
@@ -4861,7 +4861,7 @@ impl LockedUnknownMigration {
         match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
             Ok(()) => {
                 let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
-                *cache = Some(CachedStoreState::Recorded(state));
+                *cache = Some(CachedStoreState::Recorded(Box::new(state)));
                 Ok(true)
             }
             Err(e) => {
@@ -5204,7 +5204,7 @@ impl LadybugStore {
         }
         let state = match crate::model_choice::read_store_state(&self.local_path) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
-                CachedStoreState::Recorded(recorded)
+                CachedStoreState::Recorded(Box::new(recorded))
             }
             crate::model_choice::StoreStateRead::Unparseable(reason) => {
                 CachedStoreState::Unparseable(reason)
@@ -5504,7 +5504,7 @@ impl LadybugStore {
                             &state,
                         ) {
                             Ok(()) => {
-                                self.set_cached_store_state(CachedStoreState::Recorded(state))
+                                self.set_cached_store_state(CachedStoreState::Recorded(Box::new(state)))
                             }
                             Err(e) => {
                                 tracing::warn!("store-state sidecar update failed: {e}")
@@ -5522,7 +5522,7 @@ impl LadybugStore {
                             &state,
                         ) {
                             Ok(()) => {
-                                self.set_cached_store_state(CachedStoreState::Recorded(state))
+                                self.set_cached_store_state(CachedStoreState::Recorded(Box::new(state)))
                             }
                             Err(e) => {
                                 tracing::warn!("store-state sidecar write failed: {e}")
@@ -43416,6 +43416,9 @@ pub(crate) fn acquire_database_writer_lock(db_path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        // Writer lock file only: it is flocked, never written, so
+        // existing bytes must survive the open untouched.
+        .truncate(false)
         .open(&path)
         .map_err(|error| {
             anyhow::anyhow!(

@@ -367,7 +367,7 @@ pub enum AppliedEvidence {
     /// The walk **proved** a `COMMIT_RECORD`, or the WAL ended in a valid
     /// observed `CHECKPOINT` record: there was committed work the engine could
     /// apply, and the bytes were authenticated.
-    CommittedWork,
+    Proven,
     /// The walk **saw** a `COMMIT_RECORD` in a sound walk but could not
     /// authenticate it: a checksums-off WAL, whose frames carry no trailer to
     /// verify.
@@ -378,10 +378,10 @@ pub enum AppliedEvidence {
     /// This is the checksum-config-mismatch case (`#191`): the records are
     /// intact and only the checksum *setting* was wrong, so the lenient
     /// replay drains the WAL and the store reopens.
-    UnverifiedCommittedWork,
+    SeenUnverified,
     /// Nothing proves committed or applied work: no commit frame was seen in a
     /// sound walk and no valid checkpoint was observed.
-    NoCommittedWork,
+    None,
 }
 
 /// The engine's applied-record count, **emulated** from the recovery facts
@@ -415,7 +415,7 @@ pub const fn emulate_applied_records(
     record_failure: bool,
     evidence: AppliedEvidence,
 ) -> AppliedRecords {
-    if record_failure || matches!(evidence, AppliedEvidence::NoCommittedWork) {
+    if record_failure || matches!(evidence, AppliedEvidence::None) {
         AppliedRecords::None
     } else {
         AppliedRecords::AtLeastOne
@@ -431,7 +431,7 @@ pub fn emulated_applied_records(record_failure: bool, scan: Option<WalScan>) -> 
     emulate_applied_records(
         record_failure,
         scan.map(|scan| scan.committed_work_evidence())
-            .unwrap_or(AppliedEvidence::NoCommittedWork),
+            .unwrap_or(AppliedEvidence::None),
     )
 }
 
@@ -577,11 +577,11 @@ impl WalScan {
     /// offer, whatever frames it walked.
     pub const fn committed_work_evidence(self) -> AppliedEvidence {
         if self.proved_commit() || self.ended_in_checkpoint() {
-            AppliedEvidence::CommittedWork
+            AppliedEvidence::Proven
         } else if self.commits > 0 && self.sound_walk() {
-            AppliedEvidence::UnverifiedCommittedWork
+            AppliedEvidence::SeenUnverified
         } else {
-            AppliedEvidence::NoCommittedWork
+            AppliedEvidence::None
         }
     }
 
@@ -2242,22 +2242,22 @@ mod tests {
     #[test]
     fn the_emulated_applied_record_count_never_reads_a_record_failure_as_a_replay() {
         assert_eq!(
-            emulate_applied_records(true, AppliedEvidence::CommittedWork),
+            emulate_applied_records(true, AppliedEvidence::Proven),
             AppliedRecords::None,
             "a record-level failure replays nothing: the lenient replay stops at the same record"
         );
         assert_eq!(
-            emulate_applied_records(false, AppliedEvidence::CommittedWork),
+            emulate_applied_records(false, AppliedEvidence::Proven),
             AppliedRecords::AtLeastOne,
             "a header-level failure or a torn tail leaves the records intact"
         );
         assert_eq!(
-            emulate_applied_records(false, AppliedEvidence::NoCommittedWork),
+            emulate_applied_records(false, AppliedEvidence::None),
             AppliedRecords::None,
             "a WAL with no committed work applies nothing, whatever the failure was"
         );
         assert_eq!(
-            emulate_applied_records(true, AppliedEvidence::NoCommittedWork),
+            emulate_applied_records(true, AppliedEvidence::None),
             AppliedRecords::None,
             "a broken record never raises the replay claim"
         );
@@ -2285,7 +2285,7 @@ mod tests {
         );
         assert_eq!(
             lone_begin.committed_work_evidence(),
-            AppliedEvidence::NoCommittedWork,
+            AppliedEvidence::None,
             "a lone BEGIN frame is no evidence of committed work"
         );
         assert_eq!(
@@ -2302,7 +2302,7 @@ mod tests {
         // A proven commit is committed work.
         assert_eq!(
             scan_with_commit().committed_work_evidence(),
-            AppliedEvidence::CommittedWork,
+            AppliedEvidence::Proven,
             "a proven commit is committed work"
         );
         assert_eq!(
@@ -2315,7 +2315,7 @@ mod tests {
         // applies that checkpoint and only then retires the file.
         assert_eq!(
             scan_with_checkpoint().committed_work_evidence(),
-            AppliedEvidence::CommittedWork,
+            AppliedEvidence::Proven,
             "an observed CHECKPOINT record is committed work"
         );
 
@@ -2352,7 +2352,7 @@ mod tests {
         );
         assert_eq!(
             scan.committed_work_evidence(),
-            AppliedEvidence::UnverifiedCommittedWork
+            AppliedEvidence::SeenUnverified
         );
         assert_eq!(
             emulated_applied_records(false, Some(scan)),
@@ -2368,7 +2368,7 @@ mod tests {
         // A checksums-off WAL with no commit applies nothing.
         assert_eq!(
             scan_checksums_off_no_commit().committed_work_evidence(),
-            AppliedEvidence::NoCommittedWork
+            AppliedEvidence::None
         );
 
         // A walk that found a corrupt frame proves nothing, whatever frames it
@@ -2377,7 +2377,7 @@ mod tests {
         assert_eq!(corrupt_tail.commits, 1);
         assert_eq!(
             corrupt_tail.committed_work_evidence(),
-            AppliedEvidence::NoCommittedWork
+            AppliedEvidence::None
         );
     }
 

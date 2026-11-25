@@ -157,6 +157,10 @@ pub struct SyncHello {
 /// Tri-Strata + World State payload variants carried inside a [`MeshFrame`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Wire payload of the signed mesh frame: serde-serialized and matched
+// across the mesh modules; boxing the record would change the public
+// construction shape for a one-per-frame value.
+#[allow(clippy::large_enum_variant)]
 pub enum MeshPayloadKind {
     CognitiveDelta {
         record: MeshRecord,
