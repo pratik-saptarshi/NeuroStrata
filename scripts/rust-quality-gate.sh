@@ -147,9 +147,15 @@ fi
 # per-string environment limit and python would fail to start. The
 # pipeline's exit status is checked explicitly below: a failed
 # attribution run must fail closed, never pass on an empty set.
+# --default-prefix is load-bearing: user config such as
+# diff.noprefix=true (or custom src/dst prefixes) would otherwise
+# make Git emit `+++ src/lib.rs` instead of `+++ b/src/lib.rs`,
+# the parser below would never set its current file, and the
+# attribution set would silently come out empty — bypassing both
+# the fmt and clippy checks with no logged skip.
 ADDED_FILE="$(mktemp -t rustgate-added.XXXXXX)"
 trap 'rm -f "$ADDED_FILE"' EXIT
-git diff -U0 "$BASE" -- '*.rs' | python3 -c '
+git diff --default-prefix -U0 "$BASE" -- '*.rs' | python3 -c '
 import re, sys
 cur, new_line, out = None, 0, set()
 for raw in sys.stdin:

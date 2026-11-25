@@ -458,4 +458,24 @@ if [ "$st14" -ne 0 ]; then
     exit 1
 fi
 
+# Leg 15 (regression, Codex P1 — diff prefixes): with
+# diff.noprefix=true, Git emits `+++ src/lib.rs` instead of
+# `+++ b/src/lib.rs`, so a parser keyed on the default b/ prefix
+# never sets its current file and silently builds an EMPTY added-line
+# set — dirty added lines then pass unchecked. The gate must
+# normalize prefixes in its diff invocation (--default-prefix), so
+# the same dirty addition must block under this config.
+noprefix_dirty="$TMP/noprefix-dirty"
+new_repo "$noprefix_dirty"
+git -C "$noprefix_dirty" config diff.noprefix true
+add_dirty_line "$noprefix_dirty"
+set +e
+out15=$(run_gate "$noprefix_dirty" "$PATH")
+st15=$?
+set -e
+if [ "$st15" -eq 0 ] || ! grep -q 'FAIL' <<< "$out15"; then
+    printf 'FAIL: dirty added lines under diff.noprefix=true must block the gate (prefix normalization)\n%s\n' "$out15" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
