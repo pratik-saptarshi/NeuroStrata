@@ -1031,35 +1031,6 @@ pub async fn list_twins(
     }
 }
 
-pub async fn get_twin_state(
-    store: &dyn crate::traits::VectorStore,
-    namespace: &str,
-    twin_id: &str,
-) -> Option<BTreeMap<String, f64>> {
-    match store.list(namespace, None, None).await {
-        Ok(results) => {
-            let rows: Vec<(String, crate::traits::MemoryPayload)> =
-                results.into_iter().map(|r| (r.id, r.payload)).collect();
-            let state = get_twin_state_from_rows(&rows, twin_id);
-            if state.is_none() {
-                tracing::debug!(
-                    "[TWIN] state lookup missed for twin '{}' in namespace '{}'",
-                    twin_id,
-                    namespace
-                );
-            }
-            state
-        }
-        Err(e) => {
-            tracing::warn!(
-                "digital_twin store.list error in namespace '{}': {e}",
-                namespace
-            );
-            None
-        }
-    }
-}
-
 pub async fn twin_history(
     store: &dyn crate::traits::VectorStore,
     namespace: &str,
