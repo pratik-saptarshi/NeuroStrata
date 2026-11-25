@@ -3,9 +3,8 @@
 //! `AgentKernel` never exposes the raw `LadybugStore`; every read and write
 //! goes through one of these three async traits, and each implementation
 //! evaluates ReBAC before touching storage. `MemoryPort` owns the private
-//! `data_pointer` registry, `ExecutivePort` wraps the task ledger and the
-//! workflow state machine, and `OntologyPort` answers ontology queries and
-//! verifies kinetic action receipts.
+//! `data_pointer` registry, `ExecutivePort` gates workflow state machine
+//! transitions, and `OntologyPort` verifies kinetic action receipts.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,7 +19,7 @@ use crate::connectors::{
 use crate::formal_kernel::KernelActionReceiptState;
 use crate::rdf::action::ActionReceiptPayload;
 use crate::rebac::can_read_memory;
-use crate::traits::{MemoryPayload, OntologyStore, TaskStore, TaskSummaryRow, VectorStore};
+use crate::traits::{MemoryPayload, OntologyStore, VectorStore};
 use crate::workflow::machine::WorkflowStage;
 
 /// Kernel workflow verdict – allows or denies a transition based on gate.
@@ -32,17 +31,9 @@ pub enum KernelWorkflowTransitionVerdict {
     DenyTransition,
 }
 
-/// §3.2.1 – In‑memory recall, data pointer registry, and private store view.
+/// §3.2.1 – Data pointer registry and private store view.
 #[async_trait]
 pub trait MemoryPort: Send + Sync {
-    /// Retrieve one memory payload under ReBAC.
-    async fn get_visible_memory(
-        &self,
-        namespace: &str,
-        id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>>;
-
     /// Register a new `data_pointer` in the private registry.
     async fn register_data_pointer(
         &self,
@@ -142,27 +133,9 @@ pub trait MemoryPort: Send + Sync {
     }
 }
 
-/// §3.2.2 – Executive interface over tasks and workflow stage transitions.
+/// §3.2.2 – Executive interface over workflow stage transitions.
 #[async_trait]
 pub trait ExecutivePort: Send + Sync {
-    /// List tasks visible to the principal.
-    async fn list_tasks(
-        &self,
-        namespace: &str,
-        principal: Option<&str>,
-    ) -> Result<Vec<TaskSummaryRow>>;
-
-    /// Load a single task row under ReBAC.
-    async fn get_task(
-        &self,
-        namespace: &str,
-        task_id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>>;
-
-    /// Count live extractions for a task (Lock‑2 enforcement).
-    async fn verify_task_extraction_count(&self, namespace: &str, task_id: &str) -> Result<usize>;
-
     /// Evaluate a workflow transition as a high‑level gate. The `gate_passed`
     /// boolean represents whether the specific guard for the transition is
     /// satisfied (e.g., `has_valid_scope`, `mutations_since_note_after`).
@@ -174,25 +147,9 @@ pub trait ExecutivePort: Send + Sync {
     ) -> KernelWorkflowTransitionVerdict;
 }
 
-/// §3.2.3 – Ontology interface over action receipts and static entities.
+/// §3.2.3 – Ontology interface over action receipts.
 #[async_trait]
 pub trait OntologyPort: Send + Sync {
-    /// List ontology entities under ReBAC filtering.
-    async fn list_ontology_entities(
-        &self,
-        namespace: &str,
-        memory_types: &[&str],
-        principal: Option<&str>,
-    ) -> Result<Vec<(String, MemoryPayload)>>;
-
-    /// Load a single ontology entity under ReBAC.
-    async fn get_ontology_entity(
-        &self,
-        namespace: &str,
-        id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>>;
-
     /// Inspect an action receipt’s kinetic state (bound, reverted, etc.).
     async fn verify_active_action_receipt(
         &self,
@@ -201,15 +158,6 @@ pub trait OntologyPort: Send + Sync {
         pointer_id: &str,
         pool_id: &str,
     ) -> Result<KernelActionReceiptState>;
-
-    /// Zero-mutation ontology change-impact plan (spec §3.2). Read-only: never
-    /// commits to the store, scenarios, tasks, edges or the ontology cache.
-    async fn plan_ontology_diff(
-        &self,
-        namespace: &str,
-        request: &crate::rdf::ontology::OntologyPlanRequest,
-        principal: Option<&str>,
-    ) -> Result<crate::rdf::ontology::OntologyPlanReport>;
 }
 
 /// Persistent `MemoryPort` backed by `LadybugStore`.
@@ -231,24 +179,6 @@ impl LadybugMemoryPort {
     async fn trusted_get_memory(&self, namespace: &str, id: &str) -> Result<Option<MemoryPayload>> {
         let lb = self.ladybug_store();
         lb.get_memory_by_id(namespace, id).await
-    }
-
-    /// ReBAC‑checked path – returns `None` when principal lacks visibility.
-    async fn rebac_get_memory(
-        &self,
-        namespace: &str,
-        id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>> {
-        let lb = self.ladybug_store();
-        let Some(payload) = lb.get_memory_by_id(namespace, id).await? else {
-            return Ok(None);
-        };
-        let visible = match principal {
-            None => false, // unauthenticated callers may read nothing
-            Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
-        };
-        Ok(visible.then(|| payload))
     }
 
     fn ladybug_store(&self) -> &crate::store::ladybug::LadybugStore {
@@ -293,19 +223,6 @@ fn is_retired_data_metadata(metadata: &Value, now: i64) -> bool {
 
 #[async_trait]
 impl MemoryPort for LadybugMemoryPort {
-    async fn get_visible_memory(
-        &self,
-        namespace: &str,
-        id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>> {
-        // None means trusted kernel internal read – bypass ReBAC.
-        match principal {
-            None => self.trusted_get_memory(namespace, id).await,
-            Some(p) => self.rebac_get_memory(namespace, id, Some(p)).await,
-        }
-    }
-
     async fn register_data_pointer(
         &self,
         namespace: &str,
@@ -781,9 +698,7 @@ impl MemoryPort for LadybugMemoryPort {
 }
 
 /// Persistent `ExecutivePort` backed by `LadybugStore`.
-pub struct LadybugExecutivePort {
-    store: Arc<dyn VectorStore>,
-}
+pub struct LadybugExecutivePort {}
 
 impl LadybugExecutivePort {
     /// Create a new `LadybugExecutivePort` backed by the given store.
@@ -792,7 +707,7 @@ impl LadybugExecutivePort {
         crate::traits::VectorStore::as_any(store.as_ref())
             .downcast_ref::<crate::store::ladybug::LadybugStore>()
             .expect("executive port requires the LadybugDB store backend");
-        LadybugExecutivePort { store }
+        LadybugExecutivePort {}
     }
 
     fn transition_event(
@@ -835,66 +750,10 @@ impl LadybugExecutivePort {
         }
     }
 
-    fn ladybug_store(&self) -> &crate::store::ladybug::LadybugStore {
-        crate::traits::VectorStore::as_any(self.store.as_ref())
-            .downcast_ref::<crate::store::ladybug::LadybugStore>()
-            .expect("executive port requires the LadybugDB store backend")
-    }
 }
 
 #[async_trait]
 impl ExecutivePort for LadybugExecutivePort {
-    async fn list_tasks(
-        &self,
-        namespace: &str,
-        principal: Option<&str>,
-    ) -> Result<Vec<TaskSummaryRow>> {
-        let lb = self.ladybug_store();
-        let rows = lb.list_task_rows(namespace).await?;
-        let mut filtered = Vec::new();
-        for row in rows {
-            let visible = match principal {
-                None => false,
-                Some(p) => can_read_memory(p, row.payload.user_id.as_str(), &row.payload.metadata),
-            };
-            if visible {
-                filtered.push(row);
-            }
-        }
-        Ok(filtered)
-    }
-
-    async fn get_task(
-        &self,
-        namespace: &str,
-        task_id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>> {
-        if let Some(payload) = self
-            .ladybug_store()
-            .load_task_row(namespace, task_id)
-            .await?
-        {
-            let visible = match principal {
-                None => false,
-                Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
-            };
-            if visible {
-                Ok(Some(payload))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn verify_task_extraction_count(&self, namespace: &str, task_id: &str) -> Result<usize> {
-        self.ladybug_store()
-            .count_extracted_memories_for_task(namespace, task_id)
-            .await
-    }
-
     async fn evaluate_workflow_transition(
         &self,
         from: WorkflowStage,
@@ -935,41 +794,6 @@ impl LadybugOntologyPort {
 
 #[async_trait]
 impl OntologyPort for LadybugOntologyPort {
-    async fn list_ontology_entities(
-        &self,
-        namespace: &str,
-        memory_types: &[&str],
-        principal: Option<&str>,
-    ) -> Result<Vec<(String, MemoryPayload)>> {
-        let lb = self.ladybug_store();
-        let mut rows = lb.list_memories_by_types(namespace, memory_types).await?;
-        // ReBAC filtering – if principal is None, treat as unauthenticated (no reads).
-        if let Some(p) = principal {
-            rows.retain(|(_, payload)| {
-                can_read_memory(p, payload.user_id.as_str(), &payload.metadata)
-            });
-        } else {
-            rows.clear();
-        }
-        Ok(rows)
-    }
-
-    async fn get_ontology_entity(
-        &self,
-        namespace: &str,
-        id: &str,
-        principal: Option<&str>,
-    ) -> Result<Option<MemoryPayload>> {
-        let Some(payload) = self.ladybug_store().get_memory_by_id(namespace, id).await? else {
-            return Ok(None);
-        };
-        let visible = match principal {
-            None => false,
-            Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
-        };
-        Ok(visible.then_some(payload))
-    }
-
     async fn verify_active_action_receipt(
         &self,
         namespace: &str,
@@ -1035,19 +859,5 @@ impl OntologyPort for LadybugOntologyPort {
         }
     }
 
-    async fn plan_ontology_diff(
-        &self,
-        namespace: &str,
-        request: &crate::rdf::ontology::OntologyPlanRequest,
-        principal: Option<&str>,
-    ) -> Result<crate::rdf::ontology::OntologyPlanReport> {
-        crate::rdf::scenario::plan_ontology_diff(
-            self.ladybug_store(),
-            namespace,
-            request,
-            principal,
-        )
-        .await
-        .map_err(anyhow::Error::msg)
-    }
+
 }

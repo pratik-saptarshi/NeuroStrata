@@ -124,8 +124,6 @@ pub enum VocabularySelectionError {
     UnknownDomain(String),
     BudgetExhausted { visited: usize, max_nodes: usize },
     EmptyVocabulary(String),
-    MalformedIri(String),
-    UnknownDatatype(String),
 }
 
 impl OntologyIndex {

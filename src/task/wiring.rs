@@ -204,27 +204,6 @@ pub fn known_wire_ids() -> Vec<&'static str> {
         .collect()
 }
 
-/// Whether `name` is an automatic wire id at all (as opposed to a reminder).
-pub fn is_automatic_wire(name: &str) -> bool {
-    AUTOMATIC_WIRES.iter().any(|w| w.id == name)
-}
-
-/// Whether `name` is a reminder wire id whose trigger is a member of the
-/// closed `fires_on` enum. An ENFORCED rule citing one of these names a
-/// reminder where a machine belongs.
-pub fn is_reminder_wire(name: &str) -> bool {
-    REMINDER_WIRES
-        .iter()
-        .any(|r| r.id == name && is_valid_fires_on(r.fires_on))
-}
-
-/// Whether the automatic wire `name` hard-fails. An ENFORCED rule needs a
-/// machine that blocks: citing an advisory wire (`blocks == false`) as the
-/// sole guard is an enforcement claim no machine carries.
-pub fn is_blocking_automatic_wire(name: &str) -> bool {
-    AUTOMATIC_WIRES.iter().any(|w| w.id == name && w.blocks)
-}
-
 /// The closed set of `fires_on` triggers a `Reminder` may name — the
 /// machine-readable form of the closed enum documented on the struct.
 pub const VALID_FIRES_ON: &[&str] = &[

@@ -48,7 +48,7 @@ A `WorkflowConnector` is a pluggable implementation that knows how to:
 The shipped implementations are:
 
 - **`GitWorkflowConnector`** — the default, preserving the pre-existing hardwired behavior
-- **`ManifestWorkflowConnector`** — a non-git connector that reads `.NeuroStrata/workflow-connector.json`
+- **`ManifestWorkflowConnector`** — a non-git connector that reads `.NeuroStrata/workflow-connector.json`. It retains only the parsed manifest: the manifest's source path is consumed at load time and is not stored on the connector.
 
 ## Configuring Non-Git Workspaces (`.NeuroStrata/workflow-connector.json`)
 
