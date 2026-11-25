@@ -4000,7 +4000,6 @@ pub struct AfterAll {}
     }
 
     #[test]
-    #[test]
     fn trait_method_change_within_existing_trait_differs() {
         let before = extract_public_surface_signatures("    fn fetch(&self, id: u64);");
         let after = extract_public_surface_signatures("    fn fetch(&self, id: String);");
