@@ -189,34 +189,28 @@ fn rename_source(root: &Path, range: &str, rel_path: &str) -> Option<String> {
         })
 }
 
-/// Extracts public surface declarations from source text or diff lines:
-/// everything `extract_public_surface_identifiers` returns, plus public item
-/// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
-/// const / default qualifiers, over struct/enum/trait/fn/type/const/static/
-/// mod/use/union). For `use`, the declared name is the final path segment,
+/// Parses one line as a public item declaration, returning its
+/// (declared name, item kind) when the line begins a `pub` / `pub(...)`
+/// item (with optional async / unsafe / const / default qualifiers) of a
+/// known kind. For `use`, the declared name is the final path segment,
 /// honouring `as` renames.
-pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTreeSet<String> {
-    let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
-        .into_iter()
-        .collect();
+fn parse_public_surface_declaration(line: &str) -> Option<(String, String)> {
     const ITEM_KINDS: [&str; 10] = [
         "struct", "enum", "trait", "fn", "type", "const", "static", "mod", "use", "union",
     ];
-    for line in text.lines() {
+    {
         let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix("pub") else {
-            continue;
-        };
+        let rest = trimmed.strip_prefix("pub")?;
         // `pub` must stand alone (bare) or open a visibility group `pub(...)`.
         let rest = if let Some(after_paren) = rest.strip_prefix('(') {
             let Some(close) = after_paren.find(')') else {
-                continue;
+                return None;
             };
             &after_paren[close + 1..]
         } else if rest.starts_with(char::is_whitespace) {
             rest
         } else {
-            continue;
+            return None;
         };
         let mut tokens: Vec<&str> = rest.split_whitespace().collect();
         // Optional qualifiers; `const` is a qualifier only before `fn`
@@ -231,10 +225,10 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
         }
         tokens.drain(..start);
         let Some((kind, _rest)) = tokens.split_first() else {
-            continue;
+            return None;
         };
         if !ITEM_KINDS.contains(kind) {
-            continue;
+            return None;
         }
         let name_token = tokens.get(1);
         let name: String = if *kind == "use" {
@@ -257,18 +251,96 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
             }
         } else {
             let Some(name_token) = name_token else {
-                continue;
+                return None;
             };
             name_token
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect()
         };
-        if !name.is_empty() {
+        if name.is_empty() {
+            return None;
+        }
+        Some((name, (*kind).to_string()))
+    }
+}
+
+/// Extracts public surface declarations from source text or diff lines:
+/// everything `extract_public_surface_identifiers` returns, plus public item
+/// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
+/// const / default qualifiers, over struct/enum/trait/fn/type/const/static/
+/// mod/use/union). For `use`, the declared name is the final path segment,
+/// honouring `as` renames.
+pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTreeSet<String> {
+    let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
+        .into_iter()
+        .collect();
+    for line in text.lines() {
+        if let Some((name, _kind)) = parse_public_surface_declaration(line) {
             decls.insert(name);
         }
     }
     decls
+}
+
+/// Normalizes a declaration line into its public signature: whitespace
+/// runs collapse to one space; a `fn` signature ends before the body
+/// brace, so body-only edits are signature-identical; `const` / `static` /
+/// `type` / `use` keep the whole line minus the trailing `;` because the
+/// value / aliased type / path is the surface of those kinds; a balanced
+/// one-line item keeps the whole line, while a multiline item keeps only
+/// the header before the first `{`.
+fn declaration_signature(kind: &str, line: &str) -> String {
+    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let strip_trailing_semicolon = |text: &str| {
+        text.trim_end()
+            .trim_end_matches(';')
+            .trim_end()
+            .to_string()
+    };
+    match kind {
+        "const" | "static" | "type" | "use" => strip_trailing_semicolon(&normalized),
+        "fn" => {
+            let head = match normalized.find('{') {
+                Some(idx) => &normalized[..idx],
+                None => &normalized[..],
+            };
+            strip_trailing_semicolon(head)
+        }
+        "struct" | "enum" | "trait" | "union" | "mod" => {
+            let opens = normalized.matches('{').count();
+            let closes = normalized.matches('}').count();
+            if opens > 0 && opens == closes && normalized.ends_with('}') {
+                normalized
+            } else if let Some(idx) = normalized.find('{') {
+                normalized[..idx].trim_end().to_string()
+            } else {
+                strip_trailing_semicolon(&normalized)
+            }
+        }
+        _ => normalized,
+    }
+}
+
+/// Extracts the public surface as a map from declaration key to the set
+/// of normalized signatures seen for that key. SS7 identifiers enter as
+/// key = signature = identifier, so a changed line carrying one still
+/// registers exactly as it does in the name set.
+fn extract_public_surface_signatures(
+    text: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut signatures: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for ident in extract_public_surface_identifiers(text) {
+        signatures.entry(ident.clone()).or_default().insert(ident);
+    }
+    for line in text.lines() {
+        if let Some((name, kind)) = parse_public_surface_declaration(line) {
+            let signature = declaration_signature(&kind, line);
+            signatures.entry(name).or_default().insert(signature);
+        }
+    }
+    signatures
 }
 
 fn watched_changed_lines(root: &Path, rel_path: &str) -> (Vec<String>, Vec<String>) {
@@ -619,8 +691,11 @@ pub fn evaluate_doc_gate(
 
     // 8. Surface-diff check: watched public-surface change without doc update.
     //    Fires only when the watched change implicates the public surface:
-    //    a public item declaration or SS7 identifier on an added or removed
-    //    diff line of one of the rule's changed watched paths.
+    //    the rule's merged added/removed signature maps differ — a public
+    //    declaration or SS7 identifier was added, removed, or changed
+    //    signature on a diff line of one of the rule's changed watched
+    //    paths. A body-only edit to a declaration line yields identical
+    //    signatures on both sides and does not fire.
     for rule in &manifest.surface_rules {
         if !rule.require_co_change_on_surface_change {
             continue;
@@ -637,13 +712,24 @@ pub fn evaluate_doc_gate(
         if watched_changed.is_empty() || doc_changed {
             continue;
         }
-        let mut declarations = std::collections::BTreeSet::new();
+        let mut added_signatures: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        let mut removed_signatures: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
         for cp in &watched_changed {
             let (added, removed) = watched_changed_lines(root, cp);
-            declarations.extend(extract_public_surface_declarations(&added.join("\n")));
-            declarations.extend(extract_public_surface_declarations(&removed.join("\n")));
+            for (key, sigs) in extract_public_surface_signatures(&added.join("\n")) {
+                added_signatures.entry(key).or_default().extend(sigs);
+            }
+            for (key, sigs) in extract_public_surface_signatures(&removed.join("\n")) {
+                removed_signatures.entry(key).or_default().extend(sigs);
+            }
         }
-        if !declarations.is_empty() {
+        if added_signatures != removed_signatures {
             violations.push(DocViolation {
                 rule_id: rule.id.clone(),
                 kind: "surface_changed_without_doc_update".to_string(),
@@ -1123,6 +1209,43 @@ struct PrivateStruct {}
         assert!(!decls.contains("PrivateStruct"), "{decls:?}");
     }
 
+    #[test]
+    fn extract_public_surface_signatures_body_only_fn_edit_is_identical() {
+        let before = extract_public_surface_signatures("pub fn compute() -> i32 { 1 }");
+        let after = extract_public_surface_signatures("pub fn compute() -> i32 { 2 }");
+        assert!(before.contains_key("compute"), "{before:?}");
+        assert!(after.contains_key("compute"), "{after:?}");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_signature_change_differs() {
+        let before = extract_public_surface_signatures("pub fn compute(x: u64) -> i32 { 1 }");
+        let after = extract_public_surface_signatures("pub fn compute(x: String) -> i32 { 1 }");
+        assert_ne!(before.get("compute"), after.get("compute"));
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_const_value_change_differs() {
+        let before = extract_public_surface_signatures("pub const MAX_DEPTH: usize = 3;");
+        let after = extract_public_surface_signatures("pub const MAX_DEPTH: usize = 4;");
+        assert_ne!(before.get("MAX_DEPTH"), after.get("MAX_DEPTH"));
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_whitespace_reformat_is_identical() {
+        let before = extract_public_surface_signatures("pub fn compute() -> i32 { 1 }");
+        let after = extract_public_surface_signatures("pub  fn   compute()   ->   i32   { 1 }");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn extract_public_surface_signatures_one_line_enum_variant_change_differs() {
+        let before = extract_public_surface_signatures("pub enum Thing { A, B }");
+        let after = extract_public_surface_signatures("pub enum Thing { A, C }");
+        assert_ne!(before.get("Thing"), after.get("Thing"));
+    }
+
     fn setup_git_surface_repo(root: &Path, initial_source: &str) {
         let docs_dir = root.join("docs");
         std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
@@ -1237,6 +1360,56 @@ struct PrivateStruct {}
         )
         .unwrap();
         commit_all(root, "genuine surface change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn body_only_change_to_one_line_pub_fn_passes_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {}\npub fn compute() -> i32 { 1 }\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn compute() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        commit_all(root, "body-only change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "body-only change produced violations: {:?}",
+            report.violations
+        );
+        assert_eq!(report.violations.len(), 0);
+    }
+
+    #[test]
+    fn signature_change_to_one_line_pub_fn_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {}\npub fn compute() -> i32 { 1 }\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn compute(x: u64) -> i32 { 1 }\n",
+        )
+        .unwrap();
+        commit_all(root, "signature change");
 
         let report = evaluate_doc_gate(root, None);
         assert!(!report.passed);
