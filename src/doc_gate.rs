@@ -220,6 +220,18 @@ fn parse_public_surface_declaration(line: &str) -> Option<(String, String)> {
             match tokens[start] {
                 "async" | "unsafe" | "default" => start += 1,
                 "const" if tokens.get(start + 1) == Some(&"fn") => start += 1,
+                "extern" => {
+                    start += 1;
+                    // An ABI string (`"C"`, `"system"`) is a single
+                    // whitespace-delimited token; consume it too.
+                    if tokens
+                        .get(start)
+                        .map(|token| token.starts_with('"'))
+                        .unwrap_or(false)
+                    {
+                        start += 1;
+                    }
+                }
                 _ => break,
             }
         }
@@ -265,6 +277,444 @@ fn parse_public_surface_declaration(line: &str) -> Option<(String, String)> {
     }
 }
 
+/// The bare Rust keywords (strict + reserved, 2021 edition, plus `gen`
+/// reserved in 2024) that can never name a variant or member in bare
+/// spelling; raw spellings (`r#false`) are distinct identifiers.
+const RUST_KEYWORDS: [&str; 52] = [
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+    "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+    "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
+    "try", "type", "unsafe", "use", "where", "while", "abstract", "become", "box", "do",
+    "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "gen",
+];
+
+const PRIMITIVE_TYPES: [&str; 18] = [
+    "bool", "char", "str", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32",
+    "u64", "u128", "usize", "f32", "f64", "Self",
+];
+
+/// Parses an ASCII identifier at the start of `text`, honouring a raw
+/// `r#` prefix, returning the identifier as written (prefix included)
+/// and its byte length.
+fn leading_identifier(text: &str) -> Option<(String, usize)> {
+    let (prefix, rest) = if let Some(raw) = text.strip_prefix("r#") {
+        ("r#", raw)
+    } else {
+        ("", text)
+    };
+    let mut chars = rest.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    let mut len = first.len_utf8();
+    for c in chars {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((format!("{prefix}{}", &rest[..len]), prefix.len() + len))
+}
+
+/// Strips a leading `pub` / `pub(...)` visibility prefix, returning the
+/// trimmed remainder, or `None` when the line does not start with one.
+fn strip_visibility_prefix(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("pub")?;
+    if let Some(after_paren) = rest.strip_prefix('(') {
+        let close = after_paren.find(')')?;
+        Some(after_paren[close + 1..].trim_start())
+    } else if rest.starts_with(char::is_whitespace) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+fn normalized_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_trailing_comma(text: &str) -> &str {
+    text.trim_end().strip_suffix(',').unwrap_or(text.trim_end()).trim_end()
+}
+
+/// The type-start test for a parameter / typed member type: an
+/// uppercase, `[`, or `(` start, a primitive / `Self` name, or a
+/// reference type passing rule R.
+fn type_start_passes(text: &str) -> bool {
+    let text = text.trim();
+    let Some(first) = text.chars().next() else {
+        return false;
+    };
+    match first {
+        'A'..='Z' | '[' | '(' => true,
+        '&' => reference_type_passes(text),
+        _ => match leading_identifier(text) {
+            Some((ident, _)) => {
+                let plain = ident.strip_prefix("r#").unwrap_or(&ident);
+                PRIMITIVE_TYPES.contains(&plain)
+            }
+            None => false,
+        },
+    }
+}
+
+/// Rule R's named-type test (R1): the type is `str`, a primitive, or
+/// `Self`, or an identifier / path whose final segment begins with an
+/// uppercase ASCII letter and is not immediately followed by `(` (the
+/// `Fn` family excepted: its `(` is trait-argument sugar).
+fn named_type_passes(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let path_end = text
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(text.len());
+    let path = &text[..path_end];
+    let path_core = path.split('<').next().unwrap_or_default();
+    if path_core.is_empty() {
+        return false;
+    }
+    let final_segment = path_core.rsplit("::").next().unwrap_or_default();
+    let Some((ident, ident_len)) = leading_identifier(final_segment) else {
+        return false;
+    };
+    if ident_len != final_segment.len() {
+        return false;
+    }
+    let plain = ident.strip_prefix("r#").unwrap_or(&ident);
+    if PRIMITIVE_TYPES.contains(&plain) {
+        return true;
+    }
+    if !plain.chars().next().unwrap().is_ascii_uppercase() {
+        return false;
+    }
+    // Immediately after the path core: `(` is a call, not a type —
+    // except for the `Fn` family's trait-argument sugar.
+    match text[path_core.len()..].chars().next() {
+        Some('(') => matches!(plain, "Fn" | "FnMut" | "FnOnce"),
+        _ => true,
+    }
+}
+
+/// Finds the end (exclusive byte index) of the balanced group opening
+/// at the first character of `text`, counting `[ ] ( ) { } < >` and
+/// ignoring the `>` of a `->`.
+fn balanced_group_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'(' | b'{' | b'<' => depth += 1,
+            b']' | b')' | b'}' | b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `text` contains `target` at bracket depth 0.
+fn contains_at_depth_zero(text: &str, target: u8) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'(' | b'{' | b'<' => depth += 1,
+            b']' | b')' | b'}' | b'>' => depth -= 1,
+            c if c == target && depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Splits `text` at the first `target` occurring at bracket depth 0.
+fn split_at_depth_zero(text: &str, target: u8) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'(' | b'{' | b'<' => depth += 1,
+            b']' | b')' | b'}' | b'>' => depth -= 1,
+            c if c == target && depth == 0 => {
+                return Some((&text[..i], &text[i + 1..]));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Rule R3's bracket-type test: the bracket group is the whole of
+/// `text`, its content is non-empty, and it is a slice type (content
+/// passes the type-start test, no top-level comma) or an array type
+/// (`Type ; length`).
+fn bracket_type_passes(text: &str) -> bool {
+    let text = text.trim();
+    if !text.starts_with('[') {
+        return false;
+    }
+    if balanced_group_end(text) != Some(text.len()) {
+        return false;
+    }
+    let content = text[1..text.len() - 1].trim();
+    if content.is_empty() {
+        return false;
+    }
+    if let Some((element, length)) = split_at_depth_zero(content, b';') {
+        let length = length.trim();
+        type_start_passes(element.trim())
+            && !length.is_empty()
+            && length
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit() || c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+    } else {
+        !contains_at_depth_zero(content, b',') && type_start_passes(content)
+    }
+}
+
+/// Rule R: a reference type. Consumes the leading `&` (recursively),
+/// an optional lifetime, and an optional `mut`, then requires the
+/// remainder to be a named type (R1), a `dyn` / `impl` type (R2), or
+/// a bracket type (R3). Reference *values* (`&[]`, `&some_var`,
+/// `&(expr)`, calls) fail.
+fn reference_type_passes(text: &str) -> bool {
+    let mut rest = text.trim();
+    if !rest.starts_with('&') {
+        return false;
+    }
+    loop {
+        if let Some(after) = rest.strip_prefix('&') {
+            rest = after;
+            continue;
+        }
+        if rest.starts_with('\'') {
+            // A lifetime token must be followed by whitespace.
+            let Some((_, len)) = leading_identifier(&rest[1..]) else {
+                return false;
+            };
+            let after = &rest[1 + len..];
+            if !after.starts_with(char::is_whitespace) {
+                return false;
+            }
+            rest = after.trim_start();
+            continue;
+        }
+        if rest.starts_with("mut")
+            && rest[3..].starts_with(char::is_whitespace)
+        {
+            rest = rest[3..].trim_start();
+            continue;
+        }
+        break;
+    }
+    let rest = rest.trim();
+    if rest.starts_with('[') {
+        return bracket_type_passes(rest);
+    }
+    for keyword in ["dyn", "impl"] {
+        if let Some(after) = rest.strip_prefix(keyword) {
+            if after.starts_with(char::is_whitespace) {
+                return named_type_passes(after.trim_start());
+            }
+        }
+    }
+    named_type_passes(rest)
+}
+
+/// Parses one indented line as a member of an enclosing public
+/// declaration (method, named field, parameter / typed member, or
+/// variant / bare member token), returning (name, key, signature).
+/// Indentation is the enclosing-declaration signal: top-level items
+/// sit at column 0, interior lines are indented.
+fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
+    if line == line.trim_start() {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = normalized_line(trimmed);
+
+    // Pattern 1: method — optional visibility, optional qualifiers,
+    // then `fn`, a name, and `(`.
+    {
+        let rest = match strip_visibility_prefix(trimmed) {
+            Some(after) => after,
+            None => trimmed,
+        };
+        let mut tokens: Vec<&str> = rest.split_whitespace().collect();
+        let mut start = 0;
+        while start < tokens.len() {
+            match tokens[start] {
+                "async" | "unsafe" | "default" => start += 1,
+                "const" if tokens.get(start + 1) == Some(&"fn") => start += 1,
+                "extern" => {
+                    start += 1;
+                    if tokens
+                        .get(start)
+                        .map(|token| token.starts_with('"'))
+                        .unwrap_or(false)
+                    {
+                        start += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        tokens.drain(..start);
+        if tokens.first() == Some(&"fn") {
+            if let Some(name_token) = tokens.get(1) {
+                if let Some((name, len)) = leading_identifier(name_token) {
+                    let after_name = &name_token[len..];
+                    if after_name.starts_with('(')
+                        || (after_name.is_empty()
+                            && tokens
+                                .get(2)
+                                .map(|token| token.starts_with('('))
+                                .unwrap_or(false))
+                    {
+                        let signature = declaration_signature("fn", trimmed);
+                        return Some((name.clone(), format!("fn:{name}"), signature));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 2: named field — `pub` / `pub(...)` then `<name>:`.
+    if let Some(after) = strip_visibility_prefix(trimmed) {
+        if let Some((name, len)) = leading_identifier(after) {
+            let after_name = &after[len..];
+            if after_name.starts_with(':') && !after_name.starts_with("::") {
+                let signature = strip_trailing_comma(&normalized).to_string();
+                return Some((name.clone(), format!("field:{name}"), signature));
+            }
+        }
+    }
+
+    // Pattern 3: parameter / typed member — `<name>: <Type>`.
+    {
+        let first_token = trimmed.split_whitespace().next().unwrap_or_default();
+        if !["let", "return", "if", "for", "while", "match", "use"]
+            .contains(&first_token)
+        {
+            if let Some((name, len)) = leading_identifier(trimmed) {
+                let after_name = &trimmed[len..];
+                if after_name.starts_with(':') && !after_name.starts_with("::") {
+                    let type_part = strip_trailing_comma(after_name[1..].trim());
+                    if !type_part.contains('=') && type_start_passes(type_part) {
+                        let signature = strip_trailing_comma(&normalized).to_string();
+                        return Some((name.clone(), format!("member:{name}"), signature));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 4: variant / bare member token — a path or identifier,
+    // optionally one balanced group, optionally a trailing comma.
+    {
+        let core = strip_trailing_comma(trimmed);
+        if !core.contains(';') && !core.contains('=') {
+            let group_start = core.find(['(', '{']);
+            let (token, has_group) = match group_start {
+                Some(idx) => (&core[..idx], true),
+                None => (core, false),
+            };
+            let token = token.trim_end();
+            let group_ok = if has_group {
+                let group = &core[group_start.unwrap()..];
+                let (open, close) = if group.starts_with('(') {
+                    ('(', ')')
+                } else {
+                    ('{', '}')
+                };
+                let mut depth = 0i32;
+                let mut ends_at_close = false;
+                for (i, c) in group.char_indices() {
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            ends_at_close = i + c.len_utf8() == group.len();
+                            break;
+                        }
+                    }
+                }
+                depth == 0 && ends_at_close
+            } else {
+                !token.contains(char::is_whitespace)
+            };
+            if group_ok && !token.is_empty() {
+                let mut segments_ok = true;
+                let mut final_segment = "";
+                for segment in token.split("::") {
+                    match leading_identifier(segment) {
+                        Some((_, len)) if len == segment.len() => {
+                            final_segment = segment;
+                        }
+                        _ => {
+                            segments_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if segments_ok && !final_segment.is_empty() {
+                    let raw = final_segment.starts_with("r#");
+                    let plain = final_segment.strip_prefix("r#").unwrap_or(final_segment);
+                    let keyword_ok = raw || !RUST_KEYWORDS.contains(&plain);
+                    let uppercase_ok = plain
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_uppercase())
+                        .unwrap_or(false);
+                    if keyword_ok && uppercase_ok {
+                        let content = strip_trailing_comma(&normalized).to_string();
+                        let key = format!("member:{content}");
+                        return Some((final_segment.to_string(), key, content));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Extracts public surface declarations from source text or diff lines:
 /// everything `extract_public_surface_identifiers` returns, plus public item
 /// declarations (`pub` / `pub(...)` items, with optional async / unsafe /
@@ -277,6 +727,9 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
         .collect();
     for line in text.lines() {
         if let Some((name, _kind)) = parse_public_surface_declaration(line) {
+            decls.insert(name);
+        }
+        if let Some((name, _key, _signature)) = parse_member_declaration(line) {
             decls.insert(name);
         }
     }
@@ -338,6 +791,9 @@ fn extract_public_surface_signatures(
         if let Some((name, kind)) = parse_public_surface_declaration(line) {
             let signature = declaration_signature(&kind, line);
             signatures.entry(name).or_default().insert(signature);
+        }
+        if let Some((_name, key, signature)) = parse_member_declaration(line) {
+            signatures.entry(key).or_default().insert(signature);
         }
     }
     signatures
@@ -1246,6 +1702,187 @@ struct PrivateStruct {}
         assert_ne!(before.get("Thing"), after.get("Thing"));
     }
 
+    #[test]
+    fn extract_public_surface_declarations_recognizes_trait_method_signature_lines() {
+        let before = extract_public_surface_declarations("    fn fetch(&self, id: u64);");
+        let after = extract_public_surface_declarations("    fn fetch(&self, id: String);");
+        assert!(before.contains("fetch"), "{before:?}");
+        assert!(after.contains("fetch"), "{after:?}");
+        let before_sigs = extract_public_surface_signatures("    fn fetch(&self, id: u64);");
+        let after_sigs = extract_public_surface_signatures("    fn fetch(&self, id: String);");
+        assert_ne!(before_sigs.get("fn:fetch"), after_sigs.get("fn:fetch"));
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_pub_field_type_lines() {
+        let decls = extract_public_surface_declarations("    pub id: u64,");
+        assert!(decls.contains("id"), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_enum_variant_lines() {
+        let decls = extract_public_surface_declarations("    Variant(u64),\n    PlainVariant,");
+        assert!(decls.contains("Variant"), "{decls:?}");
+        assert!(decls.contains("PlainVariant"), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_multiline_signature_continuation() {
+        let decls = extract_public_surface_declarations("        text: String,");
+        assert!(decls.contains("text"), "{decls:?}");
+        let boundary = extract_public_surface_declarations("pub fn embed(");
+        assert!(boundary.contains("embed"), "{boundary:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_extern_c_fn() {
+        let decls = extract_public_surface_declarations(
+            "pub extern \"C\" fn exported_op() {}\npub unsafe extern \"C\" fn raw_exported_op() {}",
+        );
+        assert!(decls.contains("exported_op"), "{decls:?}");
+        assert!(decls.contains("raw_exported_op"), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_column_zero_private_fn() {
+        let decls = extract_public_surface_declarations("fn helper() -> i32 { 1 }");
+        assert!(decls.is_empty(), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_struct_literal_member_lines() {
+        let decls = extract_public_surface_declarations("        id: 1,");
+        assert!(decls.is_empty(), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_live_struct_literal_reference_lines() {
+        // The verbatim added lines from the live src/rdf/action.rs diff:
+        // a struct literal in test code. None of them is a member line;
+        // `domains: &[],` is a reference value, never a type.
+        let decls = extract_public_surface_declarations(
+            "                namespace: \"ns-batch-idx\",\n                query: \"zephyrquartz99\",\n                limit: 10,\n                include_tasks: false,\n                include_archived: false,\n                domains: &[],\n                principal: \"alice\",\n                fuzzy_max_distance: 0,",
+        );
+        assert!(decls.is_empty(), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_reference_value_member_lines() {
+        for line in [
+            "        domains: &[],",
+            "        values: &[1, 2],",
+            "        field: &some_var,",
+            "        field: &mut some_var,",
+            "        field: &(some_var),",
+        ] {
+            let decls = extract_public_surface_declarations(line);
+            assert!(decls.is_empty(), "{line} yielded {decls:?}");
+        }
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_reference_type_continuation_lines() {
+        for (line, name) in [
+            ("        text: &str,", "text"),
+            ("        target: &String,", "target"),
+            ("        label: &'static str,", "label"),
+            ("        handler: &'a mut String,", "handler"),
+            ("        callback: &dyn Fn(u8),", "callback"),
+            ("        nested: &&str,", "nested"),
+        ] {
+            let decls = extract_public_surface_declarations(line);
+            assert!(decls.contains(name), "{line} yielded {decls:?}");
+        }
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_slice_type_continuation_lines() {
+        for (line, name) in [
+            ("        bytes: &[u8],", "bytes"),
+            ("        names: &[String],", "names"),
+            ("        words: &[&str],", "words"),
+            ("        buffer: &mut [u8],", "buffer"),
+            ("        fixed: &[u8; 32],", "fixed"),
+        ] {
+            let decls = extract_public_surface_declarations(line);
+            assert!(decls.contains(name), "{line} yielded {decls:?}");
+        }
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_keyword_bare_tokens() {
+        // Every spelling in the pattern-4 keyword set (strict + reserved
+        // 2021, plus `gen`): a bare keyword can never name a variant or
+        // member, so none of these lines extracts.
+        for keyword in [
+            "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+            "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+            "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+            "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract",
+            "become", "box", "do", "final", "macro", "override", "priv", "typeof", "unsized",
+            "virtual", "yield", "gen",
+        ] {
+            let line = format!("        {keyword},");
+            let decls = extract_public_surface_declarations(&line);
+            assert!(decls.is_empty(), "{line} yielded {decls:?}");
+        }
+        // Named pins, including the no-comma form.
+        for line in [
+            "        false,",
+            "        true,",
+            "        true",
+            "        Self,",
+            "        self,",
+            "        crate,",
+            "        break,",
+            "        continue,",
+            "        mut,",
+            "        ref,",
+        ] {
+            let decls = extract_public_surface_declarations(line);
+            assert!(decls.is_empty(), "{line} yielded {decls:?}");
+        }
+        // Control: the raw spelling is a distinct, legal identifier.
+        let decls = extract_public_surface_declarations("        r#Self,");
+        assert!(decls.contains("r#Self"), "{decls:?}");
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_ignores_lowercase_bare_tokens() {
+        // The Q2 class: bare lowercase tokens are body fragments
+        // (positional arguments, shorthand fields, chain receivers,
+        // grouped-use members), not variants.
+        for line in [
+            "        statuses,",
+            "        my_var,",
+            "        domains,",
+            "        namespace",
+            "        is_task(r),",
+            "        foo::bar(x),",
+            "        foo::bar,",
+            "        some_function,",
+            "        self,",
+        ] {
+            let decls = extract_public_surface_declarations(line);
+            assert!(decls.is_empty(), "{line} yielded {decls:?}");
+        }
+    }
+
+    #[test]
+    fn extract_public_surface_declarations_recognizes_uppercase_variant_lines_after_revision2() {
+        for (line, name) in [
+            ("        PlainVariant,", "PlainVariant"),
+            ("        Variant(u64),", "Variant"),
+            ("        Pid(u32),", "Pid"),
+            ("        Running { since: String },", "Running"),
+            ("        MarkerOrder::First,", "First"),
+            ("        Alpha,", "Alpha"),
+        ] {
+            let decls = extract_public_surface_declarations(line);
+            assert!(decls.contains(name), "{line} yielded {decls:?}");
+        }
+    }
+
     fn setup_git_surface_repo(root: &Path, initial_source: &str) {
         let docs_dir = root.join("docs");
         std::fs::create_dir_all(docs_dir.join("vision")).unwrap();
@@ -1418,6 +2055,148 @@ struct PrivateStruct {}
                 v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
             }),
             "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn trait_method_signature_change_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {\n    fn fetch(&self, id: u64);\n}\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {\n    fn fetch(&self, id: String);\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "trait method signature change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn struct_field_type_change_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub struct Params {\n    pub id: u64,\n}\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub struct Params {\n    pub id: String,\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "struct field type change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn enum_variant_change_blocks_without_doc_update() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub enum Thing {\n    A,\n    B,\n}\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub enum Thing {\n    A,\n    C,\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "enum variant change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn struct_literal_reference_field_addition_passes_without_doc_update() {
+        // Gate-level mirror of the live shape: adding a reference-value
+        // field line to a struct literal inside a private function body
+        // is not a public-surface change.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {}\nfn build() {\n    let params = Params {\n        principal: \"alice\",\n    };\n}\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\nfn build() {\n    let params = Params {\n        principal: \"alice\",\n        domains: &[],\n    };\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "struct literal field addition");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "struct-literal field addition produced violations: {:?}",
+            report.violations
+        );
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.kind == "surface_changed_without_doc_update"),
+            "unexpected co-change violation: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn bare_positional_argument_lines_pass_without_doc_update() {
+        // Gate-level mirror of the full live shape, both stops in one
+        // test: converting a multiline positional call to struct-literal
+        // form and joining a multiline assert onto one line changes no
+        // public surface — the removed side's bare `false,` / `statuses,`
+        // lines and the added side's `domains: &[],` line extract nothing.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {}\nfn run() {\n    search_lexical(\n        \"ns\",\n        \"q\",\n        10,\n        false,\n        false,\n        &[],\n        \"alice\",\n        0,\n    );\n    assert_eq!(\n        statuses,\n        vec![1, 2]\n    );\n}\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\nfn run() {\n    search_lexical(crate::traits::SearchLexicalParams {\n        namespace: \"ns-batch-idx\",\n        query: \"zephyrquartz99\",\n        limit: 10,\n        include_tasks: false,\n        include_archived: false,\n        domains: &[],\n        principal: \"alice\",\n        fuzzy_max_distance: 0,\n    });\n    assert_eq!(statuses, vec![1, 2]);\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "positional call to struct literal");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "bare positional argument lines produced violations: {:?}",
+            report.violations
+        );
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|v| v.kind == "surface_changed_without_doc_update"),
+            "unexpected co-change violation: {:?}",
             report.violations
         );
     }
