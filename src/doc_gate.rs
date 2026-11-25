@@ -2301,6 +2301,45 @@ fn watched_added_lines(root: &Path, rel_path: &str) -> String {
     watched_changed_lines(root, rel_path).0.join("\n")
 }
 
+/// The (baseline, current) full texts of a watched path for the
+/// surface-diff check: the file's content at the committed baseline
+/// (the start of the shared committed range — `@{u}` or
+/// `origin/main` — or `HEAD` when no committed range resolves) and
+/// its current working-tree content. Comparing the surfaces of
+/// these two texts yields the NET surface change across committed
+/// and uncommitted edits combined. Unioning the successive diffs'
+/// lines instead puts a declaration added by a commit on both
+/// sides whenever a later uncommitted edit re-touches its line, so
+/// a newly added API whose only uncommitted change is a same-line
+/// body edit cancelled out and escaped the gate. A path absent at
+/// the baseline reads as empty there; a path deleted from the
+/// working tree reads as empty here.
+fn watched_surface_texts(root: &Path, rel_path: &str) -> (String, String) {
+    let current = std::fs::read_to_string(root.join(rel_path)).unwrap_or_default();
+    if !root.join(".git").exists() {
+        return (String::new(), current);
+    }
+    let range = crate::workflow::connector::committed_diff_range(root);
+    let baseline_ref = range
+        .as_deref()
+        .and_then(|range| range.split("..").next())
+        .unwrap_or("HEAD");
+    let baseline_path = range
+        .as_deref()
+        .and_then(|range| rename_source(root, range, rel_path))
+        .or_else(|| rename_source(root, "HEAD", rel_path))
+        .unwrap_or_else(|| rel_path.to_string());
+    let baseline = std::process::Command::new("git")
+        .args(["show", &format!("{baseline_ref}:{baseline_path}")])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    (baseline, current)
+}
+
 pub fn evaluate_doc_gate(
     root: &Path,
     changed_paths_override: Option<Vec<String>>,
@@ -2566,11 +2605,16 @@ pub fn evaluate_doc_gate(
 
     // 8. Surface-diff check: watched public-surface change without doc update.
     //    Fires only when the watched change implicates the public surface:
-    //    the rule's merged added/removed signature maps differ — a public
+    //    the rule's merged before/after signature maps differ — a public
     //    declaration or SS7 identifier was added, removed, or changed
-    //    signature on a diff line of one of the rule's changed watched
-    //    paths. A body-only edit to a declaration line yields identical
-    //    signatures on both sides and does not fire.
+    //    signature in one of the rule's changed watched paths. The maps
+    //    are extracted from the baseline tree's file text and the
+    //    current working file text (see `watched_surface_texts`), so
+    //    the comparison is the NET surface change across committed and
+    //    uncommitted edits: a body-only edit yields identical
+    //    signatures on both sides and does not fire, while an API
+    //    added by a commit stays visible on the after side even when
+    //    an uncommitted edit re-touches its declaration line.
     for rule in &manifest.surface_rules {
         if !rule.require_co_change_on_surface_change {
             continue;
@@ -2596,11 +2640,11 @@ pub fn evaluate_doc_gate(
             std::collections::BTreeSet<String>,
         > = std::collections::BTreeMap::new();
         for cp in &watched_changed {
-            let (added, removed) = watched_changed_lines(root, cp);
-            for (key, sigs) in extract_public_surface_signatures(&added.join("\n")) {
+            let (before_text, after_text) = watched_surface_texts(root, cp);
+            for (key, sigs) in extract_public_surface_signatures(&after_text) {
                 added_signatures.entry(key).or_default().extend(sigs);
             }
-            for (key, sigs) in extract_public_surface_signatures(&removed.join("\n")) {
+            for (key, sigs) in extract_public_surface_signatures(&before_text) {
                 removed_signatures.entry(key).or_default().extend(sigs);
             }
         }
@@ -4065,6 +4109,95 @@ pub struct AfterAll {}
         assert!(
             report.passed,
             "body-only tail-expression change produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn committed_new_api_with_uncommitted_body_edit_blocks_without_doc_update() {
+        // W2 probe (Codex PR #162): a commit adds a public fn, then
+        // an UNCOMMITTED edit changes only its same-line body. The
+        // union of both diffs puts the new fn on both sides with an
+        // identical (body-stripped) signature, so the new API
+        // escaped enforcement.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn new_api() { let x = 1; }\n",
+        )
+        .unwrap();
+        commit_all(root, "add new_api");
+        // Uncommitted body-only edit to the just-added fn.
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn new_api() { let x = 2; }\n",
+        )
+        .unwrap();
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed, "new API escaped the gate: {report:?}");
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn committed_and_uncommitted_body_edits_to_existing_fn_pass() {
+        // W2 control: the net surface of a pre-existing fn is
+        // unchanged by a committed body edit plus an uncommitted
+        // body edit, so the gate must still pass.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {}\npub fn compute() -> i32 { 1 }\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn compute() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        commit_all(root, "body edit");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn compute() -> i32 { 3 }\n",
+        )
+        .unwrap();
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "net-unchanged surface produced violations: {:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn uncommitted_only_new_api_blocks_without_doc_update() {
+        // W2 control: a purely uncommitted new API (no committed
+        // range involvement) must keep blocking.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(root, "pub trait TargetTrait {}\n");
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {}\npub fn new_api() { let x = 1; }\n",
+        )
+        .unwrap();
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(!report.passed);
+        assert!(
+            report.violations.iter().any(|v| {
+                v.kind == "surface_changed_without_doc_update" && v.rule_id == "test-rule-1"
+            }),
+            "expected co-change violation, got {:?}",
             report.violations
         );
     }
