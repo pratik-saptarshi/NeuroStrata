@@ -3,9 +3,8 @@
 //! `AgentKernel` never exposes the raw `LadybugStore`; every read and write
 //! goes through one of these three async traits, and each implementation
 //! evaluates ReBAC before touching storage. `MemoryPort` owns the private
-//! `data_pointer` registry, `ExecutivePort` wraps the task ledger and the
-//! workflow state machine, and `OntologyPort` answers ontology queries and
-//! verifies kinetic action receipts.
+//! `data_pointer` registry, `ExecutivePort` gates workflow state machine
+//! transitions, and `OntologyPort` verifies kinetic action receipts.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,7 +31,7 @@ pub enum KernelWorkflowTransitionVerdict {
     DenyTransition,
 }
 
-/// §3.2.1 – In‑memory recall, data pointer registry, and private store view.
+/// §3.2.1 – Data pointer registry and private store view.
 #[async_trait]
 pub trait MemoryPort: Send + Sync {
     /// Register a new `data_pointer` in the private registry.
@@ -134,7 +133,7 @@ pub trait MemoryPort: Send + Sync {
     }
 }
 
-/// §3.2.2 – Executive interface over tasks and workflow stage transitions.
+/// §3.2.2 – Executive interface over workflow stage transitions.
 #[async_trait]
 pub trait ExecutivePort: Send + Sync {
     /// Evaluate a workflow transition as a high‑level gate. The `gate_passed`
@@ -148,7 +147,7 @@ pub trait ExecutivePort: Send + Sync {
     ) -> KernelWorkflowTransitionVerdict;
 }
 
-/// §3.2.3 – Ontology interface over action receipts and static entities.
+/// §3.2.3 – Ontology interface over action receipts.
 #[async_trait]
 pub trait OntologyPort: Send + Sync {
     /// Inspect an action receipt’s kinetic state (bound, reverted, etc.).
