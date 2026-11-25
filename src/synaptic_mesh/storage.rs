@@ -150,17 +150,21 @@ impl MeshStorage {
 
         let fields: Vec<&str> = text.trim_end().split('\t').collect();
         if fields.len() != 3 {
+            // Never embed the file's contents in the error: this path can be
+            // a symlink to a sensitive file, and callers (e.g. the daemon's
+            // drain loop) log this error on every tick. Field/byte counts
+            // keep the error diagnosable without leaking content bytes.
             bail!(
-                "mesh pointer at {} is malformed: expected `<mesh_id>\\t<mesh_dir>\\t<remote or ->`, got {:?}",
+                "mesh pointer at {} is malformed: expected `<mesh_id>\\t<mesh_dir>\\t<remote or ->` (got {} field(s), {} byte(s))",
                 path.display(),
-                text
+                fields.len(),
+                text.len()
             );
         }
         let mesh_id = Uuid::parse_str(fields[0]).with_context(|| {
             format!(
-                "mesh pointer at {} names an invalid mesh id {:?}",
-                path.display(),
-                fields[0]
+                "mesh pointer at {} names an invalid mesh id",
+                path.display()
             )
         })?;
         let mesh_dir = PathBuf::from(fields[1]);
@@ -601,6 +605,48 @@ mod tests {
         assert!(MeshStorage::read_pointer(&project).unwrap().is_none());
         // leave() is idempotent.
         MeshStorage::remove_pointer(&project).unwrap();
+    }
+
+    #[test]
+    fn read_pointer_malformed_contents_do_not_leak_into_error() {
+        let project = scratch("pointer-leak");
+        let marker = "SECRET_MARKER_DO_NOT_LEAK_9f3c7a";
+        let dir = project.join(POINTER_DIR_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Malformed (not the TSV pointer format) JSON carrying a secret-like
+        // marker — e.g. a pointer path symlinked to a sensitive file.
+        std::fs::write(
+            dir.join(POINTER_FILE_NAME),
+            format!(r#"{{"api_key": "{marker}", "broken": "#),
+        )
+        .unwrap();
+        let err = MeshStorage::read_pointer(&project)
+            .expect_err("malformed pointer must error")
+            .to_string();
+        assert!(
+            !err.contains(marker),
+            "error must not contain pointer file contents, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_pointer_invalid_mesh_id_does_not_leak_into_error() {
+        let project = scratch("pointer-leak-id");
+        let marker = "SECRET_MARKER_DO_NOT_LEAK_9f3c7a";
+        let dir = project.join(POINTER_DIR_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(POINTER_FILE_NAME),
+            format!("{marker}\t/some/mesh/dir\t-\n"),
+        )
+        .unwrap();
+        let err = MeshStorage::read_pointer(&project)
+            .expect_err("pointer with invalid mesh id must error")
+            .to_string();
+        assert!(
+            !err.contains(marker),
+            "error must not contain pointer file contents, got: {err}"
+        );
     }
 
     #[tokio::test]
