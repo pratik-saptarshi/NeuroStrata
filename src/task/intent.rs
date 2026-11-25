@@ -61,7 +61,7 @@ fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
         if !haystack.is_char_boundary(start) {
             continue;
         }
-        if (0..nb.len()).all(|j| hb[start + j].to_ascii_lowercase() == nb[j].to_ascii_lowercase()) {
+        if (0..nb.len()).all(|j| hb[start + j].eq_ignore_ascii_case(&nb[j])) {
             return Some(start);
         }
     }

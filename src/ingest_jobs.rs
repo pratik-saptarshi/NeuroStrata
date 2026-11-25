@@ -39,6 +39,9 @@ pub struct IngestProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub files_ingested: usize,
+    pub files_skipped: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skip_reasons: Vec<String>,
     pub symbols_ingested: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_file: Option<String>,
@@ -62,6 +65,8 @@ impl IngestProgress {
             state: IngestState::Running,
             error: None,
             files_ingested: 0,
+            files_skipped: 0,
+            skip_reasons: Vec::new(),
             symbols_ingested: 0,
             last_file: None,
             skipped_files: Vec::new(),
@@ -93,15 +98,19 @@ impl IngestObserver for ProgressReporter {
         });
     }
 
+    fn file_skipped(&self, path: &str, reason: &str) {
+        self.tx.send_modify(|progress| {
+            progress.files_skipped += 1;
+            if progress.skip_reasons.len() < 10 {
+                progress.skip_reasons.push(format!("{path}: {reason}"));
+            }
+            progress.skipped_files.push(format!("{}: {}", path, reason));
+        });
+    }
+
     fn relinked(&self, edges: usize) {
         self.tx
             .send_modify(|progress| progress.relinked_edges = Some(edges));
-    }
-
-    fn file_skipped(&self, path: &str, reason: &str) {
-        self.tx.send_modify(|progress| {
-            progress.skipped_files.push(format!("{}: {}", path, reason));
-        });
     }
     fn version_gate_tripped(&self, _prev: &str, _current: &str) {
         // The warning is emitted once in ingest_directory itself so it covers
@@ -269,7 +278,7 @@ impl IngestJobs {
         // Poison disposition (this fn returns bool, so the error cannot
         // propagate): a suspect registry cannot confirm idle, so the
         // answer is false, with the failure logged.
-        let receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
+        let _receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
             Ok(jobs) => jobs.values().cloned().collect(),
             Err(e) => {
                 tracing::error!(error = %e, "ingest jobs lock poisoned; cannot confirm idle");
@@ -382,6 +391,18 @@ mod tests {
             "{}",
             progress.skipped_files[0]
         );
+    }
+
+    #[test]
+    fn progress_counts_skipped_files_without_echoing_a_secret() {
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        let reporter = ProgressReporter { tx };
+        reporter.file_skipped("src/clean.rs", "ERROR [SECURITY]: password");
+        reporter.file_skipped("docs/guide.md", "ERROR [SECURITY]: github_pat");
+        let progress = rx.borrow();
+        assert_eq!(progress.files_skipped, 2);
+        assert_eq!(progress.skip_reasons.len(), 2);
+        assert!(progress.skip_reasons[0].contains("src/clean.rs"));
     }
 
     #[tokio::test]

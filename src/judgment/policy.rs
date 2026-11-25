@@ -52,10 +52,7 @@ pub fn model_may_block(
     if !matches!(calibration_tier, CalibrationTier::Gold) {
         return false;
     }
-    match active_version {
-        Some(av) if av == model_version => true,
-        _ => false,
-    }
+    matches!(active_version, Some(av) if av == model_version)
 }
 
 #[cfg(test)]
