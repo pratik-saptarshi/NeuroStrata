@@ -6286,8 +6286,12 @@ mod tests {
             "the guard must diff a root commit against the git empty tree so a fresh repo's first push is evaluated, not blocked on the nonexistent HEAD~1"
         );
         assert!(
-            SCAFFOLDED_RUST_QUALITY_GATE.contains("\"$BASE:Cargo.lock\""),
-            "the guard must compare advisories against the lockfile at the resolved push baseline ($BASE), not origin/develop, so an advisory inherited from the merge-base never blocks a push that did not introduce it"
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("\"$BASE:$lock\""),
+            "the guard must compare advisories against the same lockfile path at the resolved push baseline ($BASE), not origin/develop, so an advisory inherited from the merge-base never blocks a push that did not introduce it"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("':(glob)**/Cargo.toml'"),
+            "the guard must detect Cargo.toml/Cargo.lock changes tree-wide (glob pathspecs matching the root and any nested directory), so a manifest/lockfile-only push in a nested crate (e.g. native/) engages the gate instead of exiting as 'no Rust sources or manifests changed'"
         );
         assert!(
             SCAFFOLDED_RUST_QUALITY_GATE

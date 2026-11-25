@@ -670,4 +670,82 @@ if [ "$st22" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line' <<< "$ou
     exit 1
 fi
 
+# Leg 23 (regression, Codex P1 — nested manifest detection): a
+# manifest/lockfile-ONLY push in a nested crate (native/Cargo.toml +
+# native/Cargo.lock changed, NO .rs change) whose lockfile carries a
+# high advisory. Pre-fix, change detection named only the root,
+# crates/* and src-tauri manifests, so this push exited 0 with "no
+# Rust sources or manifests changed" and the advisory was never
+# audited. Post-fix the tree-wide glob detection engages the gate
+# and the per-lockfile audit blocks on the new advisory.
+nested_manifest_audit="$TMP/nested-manifest-audit"
+new_nested_repo "$nested_manifest_audit"
+printf '# manifest-only edit\n' >> "$nested_manifest_audit/native/Cargo.toml"
+printf '# audit-vuln-marker\n' >> "$nested_manifest_audit/native/Cargo.lock"
+git -C "$nested_manifest_audit" add native/Cargo.toml native/Cargo.lock
+git -C "$nested_manifest_audit" commit -q -m 'nested manifest/lockfile only, advisory lockfile'
+set +e
+out23=$(run_gate "$nested_manifest_audit" "$AUDIT_PATH")
+st23=$?
+set -e
+if [ "$st23" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out23"; then
+    printf 'FAIL: a nested manifest/lockfile-only push with an advisory lockfile must block the gate\n%s\n' "$out23" >&2
+    exit 1
+fi
+
+# Leg 24 (regression, same P1 — nested lockfile-only): only
+# native/Cargo.lock changes. The lockfile alone is gate-relevant at
+# any depth: the audit leg audits it per-path and blocks.
+nested_lock_only="$TMP/nested-lock-only"
+new_nested_repo "$nested_lock_only"
+printf '# audit-vuln-marker\n' >> "$nested_lock_only/native/Cargo.lock"
+git -C "$nested_lock_only" add native/Cargo.lock
+git -C "$nested_lock_only" commit -q -m 'nested lockfile only, advisory lockfile'
+set +e
+out24=$(run_gate "$nested_lock_only" "$AUDIT_PATH")
+st24=$?
+set -e
+if [ "$st24" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out24"; then
+    printf 'FAIL: a nested lockfile-only push with an advisory lockfile must block the gate\n%s\n' "$out24" >&2
+    exit 1
+fi
+
+# Leg 25 (regression, same P1 — nested manifest-only, broken dep):
+# a manifest-ONLY push in the nested crate adding an unresolvable
+# path dependency. No .rs changed, so no clippy leg keyed on sources
+# can see it; the owning-manifest clippy derived from the changed
+# manifest itself must fail closed ("crate at native/Cargo.toml does
+# not build"). Runs under the real cargo (the audit stub's clippy
+# always succeeds, which would hide the build failure).
+nested_manifest_broken="$TMP/nested-manifest-broken"
+new_nested_repo "$nested_manifest_broken"
+printf '\n[dependencies]\nbaddep = { path = "../does-not-exist" }\n' >> "$nested_manifest_broken/native/Cargo.toml"
+git -C "$nested_manifest_broken" add native/Cargo.toml
+git -C "$nested_manifest_broken" commit -q -m 'nested manifest only, unresolvable dependency'
+set +e
+out25=$(run_gate "$nested_manifest_broken" "$PATH")
+st25=$?
+set -e
+if [ "$st25" -eq 0 ] || ! grep -q 'crate at native/Cargo.toml does not build' <<< "$out25"; then
+    printf 'FAIL: a nested manifest-only push with an unresolvable dependency must block the gate via the owning manifest\n%s\n' "$out25" >&2
+    exit 1
+fi
+
+# Leg 26 (fast-exit pin): a docs-only push in a Rust repo still
+# takes the genuinely-unrelated fast exit — tree-wide manifest
+# detection must not widen into checking unrelated pushes.
+docs_only="$TMP/docs-only"
+new_repo "$docs_only"
+printf '# docs\n' > "$docs_only/README.md"
+git -C "$docs_only" add README.md
+git -C "$docs_only" commit -q -m 'docs only'
+set +e
+out26=$(run_gate "$docs_only" "$PATH")
+st26=$?
+set -e
+if [ "$st26" -ne 0 ] || ! grep -q 'no Rust sources or manifests changed' <<< "$out26"; then
+    printf 'FAIL: a docs-only push must take the no-op fast exit\n%s\n' "$out26" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'

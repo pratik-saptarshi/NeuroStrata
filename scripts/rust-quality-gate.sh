@@ -125,7 +125,16 @@ CHANGED_RS="$(git diff --no-color --no-ext-diff --no-textconv --text --name-only
     echo "$GATE: FAIL: cannot compute the changed-file set against $BASE — quality NOT verified for this push" >&2
     exit 1
 }
-CHANGED_MANIFEST="$(git diff --no-color --no-ext-diff --no-textconv --text --name-only "$BASE" -- 'Cargo.toml' 'Cargo.lock' 'crates/*/Cargo.toml' 'src-tauri/Cargo.toml' 'src-tauri/Cargo.lock')" || {
+# Manifest detection is tree-wide, not a hardcoded crate-directory
+# list: a bootstrapped repo may keep its crate under ANY directory
+# (native/, tools/foo/, ...), and a manifest/lockfile-only push there
+# changes the dependency set exactly like a root one. The glob-magic
+# pathspecs match Cargo.toml/Cargo.lock at the root and at any depth
+# (plain '**/Cargo.toml' would miss the root files). Every relevance
+# decision below (clippy §2/§2c, the src-tauri leg §2b, the audit
+# trigger §3) consumes this same set, so no layout is gate-relevant
+# for one leg and invisible to another.
+CHANGED_MANIFEST="$(git diff --no-color --no-ext-diff --no-textconv --text --name-only "$BASE" -- ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock')" || {
     echo "$GATE: FAIL: cannot compute the changed-manifest set against $BASE — quality NOT verified for this push" >&2
     exit 1
 }
@@ -367,6 +376,27 @@ else
 "
         fi
     done <<< "$CHANGED_RS"
+    # A manifest/lockfile-ONLY push changes no .rs file, so the loop
+    # above finds no owning manifest and the fallback below would
+    # fail closed on the missing root manifest without ever checking
+    # the crate that actually changed. Derive the owning manifests
+    # from the changed manifests themselves: a changed Cargo.toml is
+    # its own owning manifest, and a changed Cargo.lock is owned by
+    # the sibling Cargo.toml beside it (when one exists).
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in
+            */Cargo.toml|Cargo.toml)
+                [ -f "$p" ] && OWNING_MANIFESTS="${OWNING_MANIFESTS}${p}
+"
+                ;;
+            */Cargo.lock|Cargo.lock)
+                sib="${p%Cargo.lock}Cargo.toml"
+                [ -f "$sib" ] && OWNING_MANIFESTS="${OWNING_MANIFESTS}${sib}
+"
+                ;;
+        esac
+    done <<< "$CHANGED_MANIFEST"
     OWNING_MANIFESTS="$(printf '%s' "$OWNING_MANIFESTS" | sort -u)"
     if [ -z "$OWNING_MANIFESTS" ]; then
         CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short --color never 2>&1)"
@@ -387,6 +417,45 @@ else
     fi
 fi
 
+# ── 2c. clippy (changed nested manifests, root workspace present) ──────
+# With a root Cargo.toml, §2's workspace run covers workspace members,
+# but a manifest/lockfile-only push in a nested crate changes no .rs
+# file, so nothing above ever builds that crate on its own — and a
+# nested crate outside the workspace (a bootstrapped layout next to a
+# root crate) is not covered by the workspace run at all. Run clippy
+# once per distinct owning manifest derived from the changed
+# manifests (a changed Cargo.toml owns itself; a changed Cargo.lock
+# is owned by its sibling Cargo.toml), so a broken or unresolvable
+# dependency introduced by a manifest-only push fails closed here.
+# Diagnostics are attributed exactly like §2's nested runs (manifest
+# dir prefixed back to repo-root form); a manifest-only push adds no
+# .rs lines, so in practice this leg fires on build failure, which is
+# the point. Root and src-tauri manifests are excluded: §2 and §2b
+# own those.
+if [ -f Cargo.toml ]; then
+    CHANGED_OWNING=""
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in
+            */Cargo.toml) cand="$p" ;;
+            */Cargo.lock) cand="${p%Cargo.lock}Cargo.toml" ;;
+            *) continue ;;
+        esac
+        case "$cand" in
+            src-tauri/Cargo.toml) continue ;;
+        esac
+        [ -f "$cand" ] && CHANGED_OWNING="${CHANGED_OWNING}${cand}
+"
+    done <<< "$CHANGED_MANIFEST"
+    CHANGED_OWNING="$(printf '%s' "$CHANGED_OWNING" | sort -u)"
+    while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        mdir="$(dirname "$m")"
+        M_OUT="$(cargo clippy --locked --manifest-path "$m" --all-targets --all-features --message-format=short --color never 2>&1)"
+        clippy_leg "$M_OUT" "$?" "crate at $m" "$mdir/"
+    done <<< "$CHANGED_OWNING"
+fi
+
 # ── 2b. clippy (src-tauri): the excluded standalone crate ────────────────
 # The root workspace EXCLUDES src-tauri (standalone package, own
 # lockfile), so the --workspace run above never checks it: a push
@@ -395,11 +464,11 @@ fi
 # clippy for that crate on its own and attribute its diagnostics
 # exactly like the workspace ones. The manifests count as a touch:
 # a dependency-only change (src-tauri/Cargo.toml or Cargo.lock) can
-# break the crate or change what it compiles, and the change
-# detection above must name those files explicitly — the plain
-# 'Cargo.toml'/'Cargo.lock' pathspecs match only the root files, so
-# a Tauri-only manifest push otherwise exits above as "no Rust
-# sources or manifests changed" and is never checked at all.
+# break the crate or change what it compiles — the tree-wide glob
+# detection above names those files in CHANGED_MANIFEST, and this
+# leg keys off that set, so a Tauri-only manifest push is checked
+# here instead of exiting above as "no Rust sources or manifests
+# changed".
 # Cargo emits its paths relative to src-tauri/
 # (src/...), so prefix them back to repo-root form before matching
 # ADDED_FILE. Same fail-closed rule as the workspace run: no
@@ -438,24 +507,16 @@ fi
 # 7.5 (high)`). The JSON advisory objects carry `cvss` but NO `severity`
 # key, so filtering JSON on severity silently matches nothing and the
 # gate would never fire. Both sides parsed from text; IDs compared.
-if [ -n "$CHANGED_MANIFEST" ]; then
-    if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
-        echo "$GATE: warning: cargo-audit not installed — audit NOT run (run \`cargo install cargo-audit\`; CI audit remains backstop)" >&2
-    else
-        # (no `set -e` in this script, so a failing substitution is safe
-        # to inspect via $? on the next line)
-        AUDIT_TEXT="$(cargo audit --color never 2>/dev/null)"
-        AUDIT_RC=$?
-        if [ -z "$AUDIT_TEXT" ] && [ "$AUDIT_RC" -eq 0 ]; then
-            # Clean tree: cargo audit prints nothing on success. An empty
-            # report with exit 0 is a verified-clean result, not missing
-            # data — do not confuse it with the offline case below.
-            NEW_IDS=""
-        elif [ -z "$AUDIT_TEXT" ]; then
-            echo "$GATE: warning: cargo audit produced no output (offline DB?) — audit NOT verified" >&2
-        else
-            parse_advisories() {
-                printf '%s' "$1" | python3 -c '
+# The comparison runs PER LOCKFILE this push touches: for every
+# changed Cargo.lock, and for the sibling lockfile of every changed
+# Cargo.toml (a manifest-only edit is audited through the lockfile it
+# resolves against). Each lockfile's baseline is the SAME path at the
+# resolved push baseline ($BASE), never origin/develop: a branch
+# forked before an upstream advisory fix has that advisory in its
+# merge-base lockfile too, and diffing against origin/develop would
+# block it for an advisory it inherited rather than introduced.
+parse_advisories() {
+    printf '%s' "$1" | python3 -c '
 import re, sys
 text = sys.stdin.read()
 for block in re.split(r"\n\s*\n", text):
@@ -467,80 +528,127 @@ for block in re.split(r"\n\s*\n", text):
         m_sev = re.search(r"^Severity:\s*(\w+)", block, re.M)
     print(m_id.group(1), (m_sev.group(1).lower() if m_sev else "unknown"))
 ' 2>/dev/null
-            }
-            # A failed parse must never read as "no advisories": warn
-            # loudly that the audit is NOT verified (this section's
-            # established unverifiable-audit posture) instead of
-            # proceeding on an emptied advisory set.
-            PARSED_ADVISORIES="$(parse_advisories "$AUDIT_TEXT")"
-            PARSE_RC=$?
-            NEW_IDS=""
-            if [ "$PARSE_RC" -ne 0 ]; then
-                echo "$GATE: warning: could not parse the cargo audit report (python3 exited $PARSE_RC) — audit NOT verified (CI audit remains backstop)" >&2
-            else
-                NEW_IDS="$(printf '%s\n' "$PARSED_ADVISORIES" | awk '$2=="high"||$2=="critical"{print $1}')"
-            fi
-            if [ "$PARSE_RC" -ne 0 ]; then
-                : # parse failed: warning above already said NOT verified
-            elif [ -z "$NEW_IDS" ]; then
-                echo "$GATE: no new high/critical advisories in this push"
-            else
-                # Compare against the lockfile at the RESOLVED push
-                # baseline ($BASE — the same baseline the fmt/clippy
-                # sections diff against), never origin/develop: a
-                # branch forked before an upstream advisory fix has
-                # that advisory in its merge-base lockfile too, and
-                # diffing against origin/develop would block it for an
-                # advisory it inherited rather than introduced.
-                BASE_SEV=""
-                BASE_OK=0
-                if [ "$BASE" = "4b825dc642cb6eb9a060e54bf8d69288fbee4904" ]; then
-                    # Empty-tree baseline (first push, root commit):
-                    # there is no baseline lockfile — that is verified
-                    # by the baseline's identity, not missing data. A
-                    # root commit is evaluated in full (the same
-                    # added-content rule fmt/clippy apply above), so
-                    # the baseline advisory set is empty and every
-                    # high/critical advisory in the push counts as new.
-                    BASE_OK=1
-                    TMPBASE=""
-                else
-                    TMPBASE="$(mktemp -t rustgate-base-lock.XXXXXX)"
-                    if git show "$BASE:Cargo.lock" > "$TMPBASE" 2>/dev/null; then
-                        # (no `set -e` in this script, so a failing substitution
-                        # is safe to inspect via $? on the next line)
-                        BASE_TEXT="$(cargo audit --file "$TMPBASE" --color never 2>/dev/null)"
-                        BASE_RC=$?
-                        if [ "$BASE_RC" -eq 0 ]; then
-                            # Verified-clean baseline: cargo audit prints
-                            # nothing on success. An empty set here is
-                            # evidence of absence, not missing data — any
-                            # high/critical ID in the push is therefore new.
-                            BASE_OK=1
-                        elif [ -n "$BASE_TEXT" ]; then
-                            # Only a successful parse counts as a verified
-                            # baseline; a failed one leaves BASE_OK=0 and
-                            # falls into the NOT-verified warning below.
-                            if BASE_SEV="$(parse_advisories "$BASE_TEXT")"; then
-                                BASE_OK=1
-                            fi
-                        fi
-                    fi
-                    rm -f "$TMPBASE"
-                fi
-                if [ "$BASE_OK" != "1" ]; then
-                    echo "$GATE: warning: base lockfile audit unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
-                else
-                    while IFS= read -r aid; do
-                        [ -n "$aid" ] || continue
-                        if ! printf '%s\n' "$BASE_SEV" | grep -qE "^${aid}[[:space:]]"; then
-                            echo "$GATE: FAIL: new high/critical advisory introduced by this push: $aid" >&2
-                            FAIL=1
-                        fi
-                    done <<< "$NEW_IDS"
+}
+
+# audit_leg <lockfile-path>: audit one lockfile's current state and
+# diff its high/critical advisory IDs against the same path at $BASE.
+audit_leg() {
+    local lock="$1"
+    local audit_text audit_rc parsed parse_rc new_ids
+    local base_sev base_ok tmpbase base_text base_rc aid
+    if [ "$lock" = "Cargo.lock" ]; then
+        # (no `set -e` in this script, so a failing substitution is safe
+        # to inspect via $? on the next line)
+        audit_text="$(cargo audit --color never 2>/dev/null)"
+        audit_rc=$?
+    else
+        audit_text="$(cargo audit --file "$lock" --color never 2>/dev/null)"
+        audit_rc=$?
+    fi
+    if [ -z "$audit_text" ] && [ "$audit_rc" -eq 0 ]; then
+        # Clean tree: cargo audit prints nothing on success. An empty
+        # report with exit 0 is a verified-clean result, not missing
+        # data — do not confuse it with the offline case below.
+        return 0
+    fi
+    if [ -z "$audit_text" ]; then
+        echo "$GATE: warning: cargo audit produced no output (offline DB?) — audit NOT verified" >&2
+        return 0
+    fi
+    # A failed parse must never read as "no advisories": warn
+    # loudly that the audit is NOT verified (this section's
+    # established unverifiable-audit posture) instead of
+    # proceeding on an emptied advisory set.
+    parsed="$(parse_advisories "$audit_text")"
+    parse_rc=$?
+    new_ids=""
+    if [ "$parse_rc" -ne 0 ]; then
+        echo "$GATE: warning: could not parse the cargo audit report (python3 exited $parse_rc) — audit NOT verified (CI audit remains backstop)" >&2
+        return 0
+    fi
+    new_ids="$(printf '%s\n' "$parsed" | awk '$2=="high"||$2=="critical"{print $1}')"
+    if [ -z "$new_ids" ]; then
+        echo "$GATE: no new high/critical advisories in this push"
+        return 0
+    fi
+    base_sev=""
+    base_ok=0
+    if [ "$BASE" = "4b825dc642cb6eb9a060e54bf8d69288fbee4904" ]; then
+        # Empty-tree baseline (first push, root commit):
+        # there is no baseline lockfile — that is verified
+        # by the baseline's identity, not missing data. A
+        # root commit is evaluated in full (the same
+        # added-content rule fmt/clippy apply above), so
+        # the baseline advisory set is empty and every
+        # high/critical advisory in the push counts as new.
+        base_ok=1
+    else
+        tmpbase="$(mktemp -t rustgate-base-lock.XXXXXX)"
+        if git show "$BASE:$lock" > "$tmpbase" 2>/dev/null; then
+            base_text="$(cargo audit --file "$tmpbase" --color never 2>/dev/null)"
+            base_rc=$?
+            if [ "$base_rc" -eq 0 ]; then
+                # Verified-clean baseline: cargo audit prints
+                # nothing on success. An empty set here is
+                # evidence of absence, not missing data — any
+                # high/critical ID in the push is therefore new.
+                base_ok=1
+            elif [ -n "$base_text" ]; then
+                # Only a successful parse counts as a verified
+                # baseline; a failed one leaves base_ok=0 and
+                # falls into the NOT-verified warning below.
+                if base_sev="$(parse_advisories "$base_text")"; then
+                    base_ok=1
                 fi
             fi
         fi
+        rm -f "$tmpbase"
+    fi
+    if [ "$base_ok" != "1" ]; then
+        echo "$GATE: warning: base lockfile audit unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
+        return 0
+    fi
+    while IFS= read -r aid; do
+        [ -n "$aid" ] || continue
+        if ! printf '%s\n' "$base_sev" | grep -qE "^${aid}[[:space:]]"; then
+            echo "$GATE: FAIL: new high/critical advisory introduced by this push: $aid" >&2
+            FAIL=1
+        fi
+    done <<< "$new_ids"
+}
+
+if [ -n "$CHANGED_MANIFEST" ]; then
+    if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
+        echo "$GATE: warning: cargo-audit not installed — audit NOT run (run \`cargo install cargo-audit\`; CI audit remains backstop)" >&2
+    else
+        AUDIT_LOCKS=""
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            case "$p" in
+                */Cargo.lock|Cargo.lock)
+                    AUDIT_LOCKS="${AUDIT_LOCKS}${p}
+"
+                    ;;
+                */Cargo.toml|Cargo.toml)
+                    sib="${p%Cargo.toml}Cargo.lock"
+                    [ -f "$sib" ] && AUDIT_LOCKS="${AUDIT_LOCKS}${sib}
+"
+                    ;;
+            esac
+        done <<< "$CHANGED_MANIFEST"
+        AUDIT_LOCKS="$(printf '%s' "$AUDIT_LOCKS" | sort -u)"
+        if [ -z "$AUDIT_LOCKS" ]; then
+            # A manifest changed but no lockfile exists anywhere it
+            # resolves against (e.g. the lockfile itself was deleted
+            # by this push): audit the root path anyway — cargo audit
+            # then reports NOT verified rather than the push passing
+            # with the audit leg silently skipped.
+            AUDIT_LOCKS="Cargo.lock"
+        fi
+        while IFS= read -r audit_lock; do
+            [ -n "$audit_lock" ] || continue
+            audit_leg "$audit_lock"
+        done <<< "$AUDIT_LOCKS"
     fi
 else
     echo "$GATE: no manifest changes — audit skipped (deps unchanged)"
