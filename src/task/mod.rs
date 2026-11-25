@@ -1043,17 +1043,17 @@ pub async fn build_task_graph_context(
                 break;
             }
             match lb
-                .related(
+                .related(crate::traits::RelatedParams {
                     namespace,
                     seed,
-                    &relations,
-                    crate::graph_read::related::Direction::Both,
-                    1,
-                    &[],
-                    MAX_RELATED_EDGES,
-                    None,
-                    &policy,
-                )
+                    relations: &relations,
+                    direction: crate::graph_read::related::Direction::Both,
+                    max_hops: 1,
+                    memory_types: &[],
+                    limit: MAX_RELATED_EDGES,
+                    cursor: None,
+                    cross_namespace: &policy,
+                })
                 .await
             {
                 Ok(res) => {
@@ -1219,17 +1219,17 @@ async fn synthesize_conceptual_bridges(
         let seed_location = item.get("location").and_then(|v| v.as_str()).unwrap_or("");
         let seed_tokens = feature_tokens(seed_metadata, seed_location);
         if let Ok(result) = ladybug
-            .related(
+            .related(crate::traits::RelatedParams {
                 namespace,
-                &seed_id,
-                &relations,
-                crate::graph_read::related::Direction::Both,
-                2,
-                &[],
-                50,
-                None,
-                &policy,
-            )
+                seed: &seed_id,
+                relations: &relations,
+                direction: crate::graph_read::related::Direction::Both,
+                max_hops: 2,
+                memory_types: &[],
+                limit: 50,
+                cursor: None,
+                cross_namespace: &policy,
+            })
             .await
         {
             // hop1_ids: the via nodes reached from the seed (frontier depth 0).

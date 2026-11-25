@@ -208,15 +208,14 @@ impl VectorStore for MockStore {
 
     async fn search_with_domain(
         &self,
-        namespace: &str,
-        _vector: Vec<f32>,
-        limit: usize,
-        _include_tasks: bool,
-        _include_archived: bool,
-        domains: &[String],
-        _query_text: Option<&str>,
-        _exact: bool,
+        params: crate::traits::SearchWithDomainParams<'_>,
     ) -> Result<DomainSearchOutcome> {
+        let crate::traits::SearchWithDomainParams {
+            namespace,
+            limit,
+            domains,
+            ..
+        } = params;
         if *self.search_fails.lock().expect("mock store lock") {
             return Err(anyhow::anyhow!(
                 "MockStore search_with_domain configured to fail"
