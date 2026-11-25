@@ -827,6 +827,124 @@ fn typescript_type_passes(text: &str) -> bool {
     })
 }
 
+/// Splits `text` at commas occurring at bracket depth 0.
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'(' | b'{' | b'<' => depth += 1,
+            b']' | b')' | b'}' | b'>' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// The byte index of a single `:` at bracket depth 0 in `text` — one
+/// that is not half of a `::` path separator — or `None`.
+fn single_colon_index(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'(' | b'{' | b'<' => depth += 1,
+            b']' | b')' | b'}' | b'>' => depth -= 1,
+            b':' if depth == 0
+                && bytes.get(i + 1) != Some(&b':')
+                && (i == 0 || bytes[i - 1] != b':') =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `text` is a type expression usable as an enum variant
+/// payload: a named type (R1), a reference type (rule R), a bracket
+/// type (R3), a tuple type whose elements all pass, or a `dyn` /
+/// `impl` type over a named type. Value expressions fail: a variable
+/// (`out`), a call (`Error::new()`), and a literal are not types.
+fn variant_type_passes(text: &str) -> bool {
+    let text = text.trim();
+    if text.starts_with('[') {
+        return bracket_type_passes(text);
+    }
+    if text.starts_with('(') {
+        if balanced_group_end(text) != Some(text.len()) {
+            return false;
+        }
+        let inner = text[1..text.len() - 1].trim();
+        return inner.is_empty()
+            || split_top_level_commas(inner)
+                .iter()
+                .all(|part| variant_payload_part_passes(part));
+    }
+    if text.starts_with('&') {
+        return reference_type_passes(text);
+    }
+    for keyword in ["dyn", "impl"] {
+        if let Some(after) = text.strip_prefix(keyword) {
+            if after.starts_with(char::is_whitespace) {
+                return named_type_passes(after.trim_start());
+            }
+        }
+    }
+    named_type_passes(text)
+}
+
+/// Whether one comma-separated part of an enum variant payload is
+/// surface-shaped: a type, or a struct-style `field: Type` entry
+/// whose type passes.
+fn variant_payload_part_passes(part: &str) -> bool {
+    let part = part.trim();
+    if part.is_empty() {
+        return false;
+    }
+    if let Some(idx) = single_colon_index(part) {
+        let name = part[..idx].trim();
+        let name_ok = match leading_identifier(name) {
+            Some((_, len)) => len == name.len(),
+            None => false,
+        };
+        return name_ok && variant_type_passes(part[idx + 1..].trim());
+    }
+    variant_type_passes(part)
+}
+
+/// Whether a variant's balanced payload group (delimiters included)
+/// is type-shaped. An empty payload passes; a payload of value
+/// expressions (`Ok(out)`, `Some(value)`) fails, because a tuple
+/// variant declares types, never values.
+fn variant_payload_passes(group: &str) -> bool {
+    let content = group[1..group.len() - 1].trim();
+    content.is_empty()
+        || split_top_level_commas(content)
+            .iter()
+            .all(|part| variant_payload_part_passes(part))
+}
+
 /// Parses one indented line as a member of an enclosing public
 /// declaration (method, named field, parameter / typed member, or
 /// variant / bare member token), returning (name, key, signature).
@@ -996,7 +1114,10 @@ fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
                         }
                     }
                 }
-                depth == 0 && ends_at_close
+                // A payload group must be type-shaped: a body
+                // expression such as `Ok(out)` carries a value, and
+                // a value can never be a variant payload.
+                depth == 0 && ends_at_close && variant_payload_passes(group)
             } else {
                 !token.contains(char::is_whitespace)
             };
@@ -1867,15 +1988,33 @@ fn extract_public_surface_signatures(
     // `evaluate_doc_gate`); the name set is not consumed by the gate,
     // so qualifying it would change no enforcement outcome.
     let mut enclosing: Option<String> = None;
+    // The KIND of the enclosing container, tracked alongside its name:
+    // the bare-member (variant) pattern may only fire when the
+    // enclosing container is actually an enum. A bare token inside a
+    // struct / trait / union / mod / impl block is a body or literal
+    // fragment, never a variant.
+    let mut enclosing_kind: Option<String> = None;
+    // The indentation of a `fn` header whose body opened on its line
+    // and has not closed yet. Lines deeper than the header are fn
+    // body lines: their bare tokens are body expressions (`Ok(out)`
+    // is the tail expression of a method, not an enum member), so the
+    // variant pattern must not fire for them either. A line at or
+    // shallower than the header ends the body.
+    let mut fn_body_indent: Option<usize> = None;
     for ((line, original_line), preserved_line) in
         cleaned.lines().zip(text.lines()).zip(route_text.lines())
     {
         if let Some(attribute) = parse_serde_attribute(preserved_line) {
             pending_serde.push(attribute);
         }
+        let indent = line.len() - line.trim_start().len();
+        if fn_body_indent.map(|i| indent <= i).unwrap_or(false) {
+            fn_body_indent = None;
+        }
         // A closing brace at column 0 ends the enclosing container.
         if !line.starts_with([' ', '\t']) && line.trim_start().starts_with('}') {
             enclosing = None;
+            enclosing_kind = None;
         }
         // The owner in scope at the START of this line: a line that is
         // both a declaration and a member (a `pub fn` method in an
@@ -1883,13 +2022,22 @@ fn extract_public_surface_signatures(
         // the declaration branch below installs for a container kind
         // declared on this same line.
         let enclosing_at_line_start = enclosing.clone();
+        let enclosing_kind_at_line_start = enclosing_kind.clone();
+        let in_fn_body_at_line_start = fn_body_indent.is_some();
+        let mut line_is_fn = false;
         let mut attach_keys: Vec<String> = Vec::new();
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             if let Some((name, _)) = pairs.first() {
-                let container = line
+                let container_kind = line
                     .split_whitespace()
-                    .any(|token| ["class", "interface", "enum", "namespace"].contains(&token));
-                enclosing = if container { Some(name.clone()) } else { None };
+                    .find(|token| ["class", "interface", "enum", "namespace"].contains(token))
+                    .map(|token| token.to_string());
+                enclosing = if container_kind.is_some() {
+                    Some(name.clone())
+                } else {
+                    None
+                };
+                enclosing_kind = container_kind;
             }
             for (name, signature) in pairs {
                 signatures
@@ -1899,6 +2047,7 @@ fn extract_public_surface_signatures(
             }
         } else if let Some(pairs) = parse_use_declarations(line) {
             enclosing = None;
+            enclosing_kind = None;
             for (name, full_path) in pairs {
                 signatures
                     .entry(format!("use:{name}"))
@@ -1907,12 +2056,16 @@ fn extract_public_surface_signatures(
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
             let signature = signature_line(&kind, line, preserved_line);
+            if kind == "fn" {
+                line_is_fn = true;
+            }
             // Only a container declaration replaces the enclosing
             // scope: a non-container declaration (a method, say) must
             // leave it intact, or every member after the first in a
             // block would lose its owner qualification.
             if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
                 enclosing = Some(name.clone());
+                enclosing_kind = Some(kind.clone());
             }
             attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
@@ -1920,26 +2073,60 @@ fn extract_public_surface_signatures(
             .filter(|(name, _kind)| reexported.contains(name))
         {
             let signature = signature_line(&kind, line, preserved_line);
+            if kind == "fn" {
+                line_is_fn = true;
+            }
             // Same rule as the public-declaration branch above: only
             // a container declaration replaces the enclosing scope.
             if ["struct", "enum", "trait", "union", "mod"].contains(&kind.as_str()) {
                 enclosing = Some(name.clone());
+                enclosing_kind = Some(kind.clone());
             }
             attach_keys.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some(owner) = parse_impl_enclosing(line) {
             enclosing = Some(owner);
+            enclosing_kind = Some("impl".to_string());
         }
         if let Some((_name, key, signature)) = parse_member_declaration(line) {
-            let key = match &enclosing_at_line_start {
-                Some(owner) => match key.split_once(':') {
-                    Some((prefix, rest)) => format!("{prefix}:{owner}.{rest}"),
+            if key.starts_with("fn:") {
+                line_is_fn = true;
+            }
+            // The variant / bare-member pattern is the one whose key
+            // repeats its whole signature (`member:<content>`): it
+            // may fire only in an enum context — an enclosing enum,
+            // or no enclosing context at all (the common -U0 diff
+            // shape, where the enum header is unchanged context and
+            // the variant line is all there is). Inside a fn body or
+            // a known non-enum container the same shape is a body
+            // expression, and recording it made a pure body refactor
+            // (`Ok(out)` -> `Ok(embeddings)`) read as a surface
+            // change.
+            let is_variant_token = key.strip_prefix("member:") == Some(signature.as_str());
+            let variant_allowed = !is_variant_token
+                || (!in_fn_body_at_line_start
+                    && match enclosing_kind_at_line_start.as_deref() {
+                        None => true,
+                        Some(kind) => kind == "enum",
+                    });
+            if variant_allowed {
+                let key = match &enclosing_at_line_start {
+                    Some(owner) => match key.split_once(':') {
+                        Some((prefix, rest)) => format!("{prefix}:{owner}.{rest}"),
+                        None => key,
+                    },
                     None => key,
-                },
-                None => key,
-            };
-            attach_keys.push(key.clone());
-            signatures.entry(key).or_default().insert(signature);
+                };
+                attach_keys.push(key.clone());
+                signatures.entry(key).or_default().insert(signature);
+            }
+        }
+        // A fn header whose body brace opens unclosed on its line
+        // puts the following, deeper lines inside the fn body.
+        if line_is_fn
+            && line.matches('{').count() > line.matches('}').count()
+        {
+            fn_body_indent = Some(indent);
         }
         if !attach_keys.is_empty() {
             // The pending serde contents enter the enclosing
@@ -3438,6 +3625,58 @@ pub struct AfterAll {}
     }
 
     #[test]
+    fn body_expression_in_trait_method_is_not_an_enum_member() {
+        // W1 probe (Codex PR #162): the tail expression of a trait
+        // default method (`Ok(out)` in Embedder::embed_batch) is a
+        // body expression, not an enum variant: a body-only refactor
+        // renaming the returned variable must be signature-identical.
+        let before = extract_public_surface_signatures(
+            "pub trait Embedder {\n    async fn embed_batch(&self) -> Result<Vec<Vec<f32>>> {\n        Ok(out)\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub trait Embedder {\n    async fn embed_batch(&self) -> Result<Vec<Vec<f32>>> {\n        Ok(embeddings)\n    }\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            !before.keys().any(|k| k.contains("Ok")),
+            "body expression extracted as a member: {before:?}"
+        );
+    }
+
+    #[test]
+    fn body_expression_in_impl_method_is_not_an_enum_member() {
+        let before = extract_public_surface_signatures(
+            "impl Foo {\n    fn build(&self) -> Result<Foo> {\n        Ok(foo)\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "impl Foo {\n    fn build(&self) -> Result<Foo> {\n        Ok(bar)\n    }\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn body_expression_in_top_level_fn_is_not_an_enum_member() {
+        let before =
+            extract_public_surface_signatures("pub fn build() -> Result<Foo> {\n    Ok(out)\n}");
+        let after = extract_public_surface_signatures(
+            "pub fn build() -> Result<Foo> {\n    Ok(embeddings)\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn enum_variant_with_type_payload_still_differs() {
+        // Control: real enum variants keep registering, including a
+        // variant whose name collides with a body-expression callee.
+        let before = extract_public_surface_signatures("pub enum E {\n    Ok(u64),\n    Plain,\n}");
+        let after =
+            extract_public_surface_signatures("pub enum E {\n    Ok(String),\n    Plain,\n}");
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        let after2 = extract_public_surface_signatures("pub enum E {\n    Ok(u64),\n    Other,\n}");
+        assert_ne!(before, after2, "before={before:?} after={after2:?}");
+    }
+
+    #[test]
     fn extract_public_surface_declarations_recognizes_multiline_signature_continuation() {
         let decls = extract_public_surface_declarations("        text: String,");
         assert!(decls.contains("text"), "{decls:?}");
@@ -3742,6 +3981,33 @@ pub struct AfterAll {}
             report.violations
         );
         assert_eq!(report.violations.len(), 0);
+    }
+
+    #[test]
+    fn body_only_tail_expression_change_passes_without_doc_update() {
+        // W1 gate-level probe: a committed body-only refactor of a
+        // trait default method's tail expression (`Ok(out)` ->
+        // `Ok(embeddings)`) is not a surface change. The -U0 diff
+        // carries only the two tail lines, with no enclosing context.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        setup_git_surface_repo(
+            root,
+            "pub trait TargetTrait {\n    fn finish(&self) -> Result<i32> {\n        Ok(out)\n    }\n}\n",
+        );
+        std::fs::write(
+            root.join("src").join("server.rs"),
+            "pub trait TargetTrait {\n    fn finish(&self) -> Result<i32> {\n        Ok(embeddings)\n    }\n}\n",
+        )
+        .unwrap();
+        commit_all(root, "body-only tail expression change");
+
+        let report = evaluate_doc_gate(root, None);
+        assert!(
+            report.passed,
+            "body-only tail-expression change produced violations: {:?}",
+            report.violations
+        );
     }
 
     #[test]
