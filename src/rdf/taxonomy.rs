@@ -1111,8 +1111,8 @@ fn compute_axis_alignment_bps(scores: &BTreeMap<String, u32>, thesis: Option<&Th
                     count += 1;
                 }
             }
-            if count > 0 {
-                return ((sum / count) as u32).min(10000);
+            if let Some(quotient) = sum.checked_div(count) {
+                return ((quotient) as u32).min(10000);
             }
         }
     }

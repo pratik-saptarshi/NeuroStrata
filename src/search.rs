@@ -252,10 +252,7 @@ pub fn passes_filters(
             return false;
         }
     }
-    if filters.exclude_stale && is_stale_for_filter(metadata) {
-        return false;
-    }
-    true
+    !(filters.exclude_stale && is_stale_for_filter(metadata))
 }
 
 /// Exact warning emitted when the removed `include_related` alias is used.

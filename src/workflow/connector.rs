@@ -315,7 +315,6 @@ fn default_triggers() -> Vec<String> {
 #[derive(Debug, Clone)]
 pub struct ManifestWorkflowConnector {
     pub manifest: WorkflowConnectorManifest,
-    pub manifest_path: PathBuf,
 }
 
 impl ManifestWorkflowConnector {
@@ -332,10 +331,7 @@ impl ManifestWorkflowConnector {
                 "workflow-connector manifest must not declare connector_id \"git\""
             ));
         }
-        Ok(Self {
-            manifest,
-            manifest_path,
-        })
+        Ok(Self { manifest })
     }
 
     pub fn from_file(root: &Path) -> Result<Self> {

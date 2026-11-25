@@ -17,6 +17,9 @@ pub const DEFAULT_ALLOWED_MIMES: [&str; 11] = [
 
 pub const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+/// Resolves an attachment URI to its bytes, when available.
+pub type BytesResolver<'a> = dyn Fn(&str) -> Option<Vec<u8>> + 'a;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub id: String,
@@ -572,7 +575,7 @@ pub fn validate_attachment(
 pub fn validate_attachments(
     atts: &[Attachment],
     config: &MultimodalConfig,
-    bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>,
+    bytes_resolver: Option<&BytesResolver<'_>>,
 ) -> Vec<MultimodalWarning> {
     let mut warnings = Vec::new();
 
@@ -658,7 +661,7 @@ fn verify_inline_attachments(metadata: &serde_json::Value) -> Vec<MultimodalWarn
 pub fn validate_metadata_attachments(
     metadata: &serde_json::Value,
     config: &MultimodalConfig,
-    bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>,
+    bytes_resolver: Option<&BytesResolver<'_>>,
 ) -> Vec<MultimodalWarning> {
     match metadata.get("attachments") {
         None | Some(serde_json::Value::Null) => Vec::new(),

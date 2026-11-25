@@ -15,12 +15,6 @@ pub struct EvaluationReport {
     pub suites: Vec<SuiteReport>,
 }
 
-impl EvaluationReport {
-    pub fn gold_metrics(&self) -> Option<f64> {
-        None
-    }
-}
-
 impl Default for EvaluationReport {
     fn default() -> Self {
         Self {

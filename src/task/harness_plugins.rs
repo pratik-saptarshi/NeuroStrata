@@ -1174,10 +1174,7 @@ fn sync_skills_and_agent_rules(
         let needs_write = std::fs::read_to_string(path)
             .map(|existing| existing != content)
             .unwrap_or(true);
-        if needs_write && std::fs::write(path, content).is_err() {
-            return false;
-        }
-        true
+        !(needs_write && std::fs::write(path, content).is_err())
     };
 
     // 1. Always scaffold project-local .agents/skills/neurostrata/SKILL.md and .agents/agents/NeuroStrata-Task.md
