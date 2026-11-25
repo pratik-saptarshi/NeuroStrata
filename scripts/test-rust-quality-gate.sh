@@ -748,4 +748,80 @@ if [ "$st26" -ne 0 ] || ! grep -q 'no Rust sources or manifests changed' <<< "$o
     exit 1
 fi
 
+# Leg 27 (regression, Codex P1 — verified non-Rust baseline): the
+# baseline commit is a non-Rust repo (README only — NO Cargo.lock
+# anywhere). The push adds the whole crate: Cargo.toml, src/lib.rs
+# and a Cargo.lock carrying a high advisory. Pre-fix, the baseline
+# lockfile lookup failed, BASE_OK stayed 0, and the advisory only
+# warned "audit NOT verified" while the gate passed (fail-open).
+# Post-fix, the baseline commit exists and positively has no
+# lockfile at this path (git cat-file), so it is a verified-empty
+# baseline and the advisory counts as new: the gate must block.
+new_nonrust_repo() {
+    local repo="$1"
+    mkdir -p "$repo"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email test@example.com
+    git -C "$repo" config user.name test
+    printf '# just docs\n' > "$repo/README.md"
+    git -C "$repo" add README.md
+    git -C "$repo" commit -q -m 'non-Rust baseline'
+    git -C "$repo" update-ref refs/remotes/origin/develop HEAD
+    if [ -e "$repo/Cargo.lock" ] || [ -e "$repo/Cargo.toml" ]; then
+        echo 'FAIL: non-Rust fixture must have no Cargo files at baseline' >&2; exit 1
+    fi
+}
+nonrust_first_crate="$TMP/nonrust-first-crate"
+new_nonrust_repo "$nonrust_first_crate"
+mkdir -p "$nonrust_first_crate/src"
+cat > "$nonrust_first_crate/Cargo.toml" <<'EOF'
+[package]
+name = "gate-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+printf 'pub fn clean() -> i32 {\n    1\n}\n' > "$nonrust_first_crate/src/lib.rs"
+(cd "$nonrust_first_crate" && cargo generate-lockfile >/dev/null 2>&1)
+printf '# audit-vuln-marker\n' >> "$nonrust_first_crate/Cargo.lock"
+git -C "$nonrust_first_crate" add Cargo.toml Cargo.lock src/lib.rs
+git -C "$nonrust_first_crate" commit -q -m 'add Rust crate with vulnerable lockfile'
+set +e
+out27=$(run_gate "$nonrust_first_crate" "$AUDIT_PATH")
+st27=$?
+set -e
+if [ "$st27" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out27"; then
+    printf 'FAIL: an advisory in a lockfile added to a verified non-Rust baseline must block the gate\n%s\n' "$out27" >&2
+    exit 1
+fi
+
+# Leg 28 (negative, same P1 — existing-but-unparseable baseline):
+# the baseline DOES have a lockfile at the audited path (nested
+# native/Cargo.lock), but it is unparseable (the stub's baseline
+# audit fails on it). Verified-absent must NOT swallow this shape:
+# the gate keeps the warn-only "audit NOT verified" posture — no
+# block, and no silent "no new advisories" pass claim either. This
+# pins the verified-absent vs unverified distinction per-path.
+nested_base_broken="$TMP/nested-base-broken"
+new_nested_repo "$nested_base_broken"
+printf '# audit-baseline-broken\n' >> "$nested_base_broken/native/Cargo.lock"
+git -C "$nested_base_broken" add native/Cargo.lock
+git -C "$nested_base_broken" commit -q -m 'unparseable baseline lockfile'
+git -C "$nested_base_broken" update-ref refs/remotes/origin/develop HEAD
+sed -i '/audit-baseline-broken/d' "$nested_base_broken/native/Cargo.lock"
+printf '# audit-vuln-marker\n' >> "$nested_base_broken/native/Cargo.lock"
+git -C "$nested_base_broken" add native/Cargo.lock
+git -C "$nested_base_broken" commit -q -m 'add vulnerable dependency'
+set +e
+out28=$(run_gate "$nested_base_broken" "$AUDIT_PATH")
+st28=$?
+set -e
+if [ "$st28" -ne 0 ] || ! grep -q 'audit NOT verified' <<< "$out28" \
+    || grep -q 'new high/critical advisory' <<< "$out28"; then
+    printf 'FAIL: an existing-but-unparseable baseline lockfile must warn audit NOT verified without blocking or claiming no new advisories\n%s\n' "$out28" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'

@@ -6290,6 +6290,10 @@ mod tests {
             "the guard must compare advisories against the same lockfile path at the resolved push baseline ($BASE), not origin/develop, so an advisory inherited from the merge-base never blocks a push that did not introduce it"
         );
         assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("Verified-absent baseline"),
+            "the guard must treat a baseline commit that positively has no lockfile at the audited path (verified via git cat-file against the existing baseline commit, not a failed git show) as a verified-empty advisory baseline, so advisories in a newly added lockfile block instead of warning and passing"
+        );
+        assert!(
             SCAFFOLDED_RUST_QUALITY_GATE.contains("':(glob)**/Cargo.toml'"),
             "the guard must detect Cargo.toml/Cargo.lock changes tree-wide (glob pathspecs matching the root and any nested directory), so a manifest/lockfile-only push in a nested crate (e.g. native/) engages the gate instead of exiting as 'no Rust sources or manifests changed'"
         );

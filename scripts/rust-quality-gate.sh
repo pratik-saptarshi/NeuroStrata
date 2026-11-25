@@ -582,7 +582,11 @@ audit_leg() {
         # the baseline advisory set is empty and every
         # high/critical advisory in the push counts as new.
         base_ok=1
-    else
+    elif git cat-file -e "$BASE:$lock" 2>/dev/null; then
+        # The baseline HAS a lockfile at this path: audit it. (A failed
+        # `git show` below, or a failed audit/parse of what it shows,
+        # leaves base_ok=0 — an existing-but-unverifiable baseline
+        # keeps the warn-only NOT-verified posture, never a pass.)
         tmpbase="$(mktemp -t rustgate-base-lock.XXXXXX)"
         if git show "$BASE:$lock" > "$tmpbase" 2>/dev/null; then
             base_text="$(cargo audit --file "$tmpbase" --color never 2>/dev/null)"
@@ -603,6 +607,21 @@ audit_leg() {
             fi
         fi
         rm -f "$tmpbase"
+    elif git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+        # Verified-absent baseline: the resolved baseline commit
+        # EXISTS and positively has NO lockfile at this path (the
+        # cat-file probe above failed on an existing commit — not a
+        # failed show or a parse failure, which look identical to
+        # missing data if only `git show` is consulted). This is the
+        # empty-tree precedent generalized: a repo whose baseline is
+        # non-Rust (or whose crate at this path is new) has a
+        # verified-empty advisory baseline, so every high/critical
+        # advisory in the newly added lockfile counts as new and
+        # blocks — instead of warning "audit NOT verified" and
+        # passing (fail-open) on the very push that introduces the
+        # dependency set.
+        base_ok=1
+        base_sev=""
     fi
     if [ "$base_ok" != "1" ]; then
         echo "$GATE: warning: base lockfile audit unavailable — cannot diff advisory baseline; audit NOT verified (CI audit remains backstop)" >&2
