@@ -194,7 +194,11 @@ cur, new_line, out = None, 0, set()
 for raw in sys.stdin:
     line = raw.rstrip("\n")
     if line.startswith("+++ b/"):
-        cur, new_line = line[6:], 0
+        # Git appends a TAB separator after a pathname containing
+        # spaces ("+++ b/src/has space.rs\t"); strip it or the
+        # attribution entries for such files never match the paths
+        # clippy diagnostics carry.
+        cur, new_line = line[6:].rstrip("\t"), 0
         continue
     m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
     if m:
@@ -354,9 +358,15 @@ clippy_leg() {
                 *) diag="$prefix$diag" ;;
             esac
         fi
-        # short format: path:line:col: warning|error: message
-        dpath="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs' || true)"
-        dline="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs:[0-9]+' | grep -oE '[0-9]+$' || true)"
+        # short format: path:line:col: warning|error: message. The
+        # path may contain characters outside ASCII word chars —
+        # most importantly spaces (a valid module loaded via
+        # #[path = "has space.rs"]) — so parse the :line:col:
+        # severity suffix greedily from the right instead of
+        # restricting the filename character set; an ASCII-only
+        # pattern silently discards every such diagnostic.
+        dpath="$(printf '%s' "$diag" | sed -E 's/^(.*\.rs):[0-9]+:[0-9]+: (warning|error).*/\1/' || true)"
+        dline="$(printf '%s' "$diag" | sed -E 's/^.*\.rs:([0-9]+):[0-9]+: (warning|error).*/\1/' || true)"
         if [ -n "$dpath" ] && [ -n "$dline" ] \
             && grep -qxF "$dpath:$dline" "$ADDED_FILE" 2>/dev/null; then
             echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2
@@ -564,8 +574,10 @@ if [ -n "$TAURI_CHANGED" ] || [ -n "$TAURI_MANIFEST_CHANGED" ]; then
     elif [ -n "$TAURI_DIAG" ]; then
         while IFS= read -r diag; do
             [ -n "$diag" ] || continue
-            dpath="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs' || true)"
-            dline="$(printf '%s' "$diag" | grep -oE '^[a-zA-Z0-9_./+-]+\.rs:[0-9]+' | grep -oE '[0-9]+$' || true)"
+            # Same greedy suffix parse as clippy_leg: paths with
+            # spaces (#[path = "has space.rs"]) must not be dropped.
+            dpath="$(printf '%s' "$diag" | sed -E 's/^(.*\.rs):[0-9]+:[0-9]+: (warning|error).*/\1/' || true)"
+            dline="$(printf '%s' "$diag" | sed -E 's/^.*\.rs:([0-9]+):[0-9]+: (warning|error).*/\1/' || true)"
             if [ -n "$dpath" ] && [ -n "$dline" ] \
                 && grep -qxF "$dpath:$dline" "$ADDED_FILE" 2>/dev/null; then
                 echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2

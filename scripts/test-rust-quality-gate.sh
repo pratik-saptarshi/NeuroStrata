@@ -927,4 +927,28 @@ if [ "$st32" -eq 0 ] || ! grep -q 'needs formatting on added lines' <<< "$out32"
     exit 1
 fi
 
+# Leg 33 (regression, Codex P2 — diagnostic paths with spaces): a
+# module loaded via #[path = "has space.rs"] gets diagnostics like
+# `src/has space.rs:6:5: warning: ...`. Pre-fix the ASCII-only path
+# extraction discarded them and the gate passed a needless_return on
+# an added line; post-fix the complete path is parsed and it blocks.
+spaced_dirty="$TMP/spaced-dirty"
+new_repo "$spaced_dirty"
+printf '#[path = "has space.rs"]\npub mod spaced;\n\npub fn clean() -> i32 {\n    1\n}\n' > "$spaced_dirty/src/lib.rs"
+printf 'pub fn sclean() -> i32 {\n    1\n}\n' > "$spaced_dirty/src/has space.rs"
+git -C "$spaced_dirty" add src/lib.rs 'src/has space.rs'
+git -C "$spaced_dirty" commit -q -m 'spaced-path module baseline'
+git -C "$spaced_dirty" update-ref refs/remotes/origin/develop HEAD
+printf '\npub fn bad() -> String {\n    return "x".to_string();\n}\n' >> "$spaced_dirty/src/has space.rs"
+git -C "$spaced_dirty" add 'src/has space.rs'
+git -C "$spaced_dirty" commit -q -m 'dirty spaced-path addition'
+set +e
+out33=$(run_gate "$spaced_dirty" "$PATH")
+st33=$?
+set -e
+if [ "$st33" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: src/has space.rs' <<< "$out33"; then
+    printf 'FAIL: clippy warning on an added line in a space-named module file must block the gate\n%s\n' "$out33" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
