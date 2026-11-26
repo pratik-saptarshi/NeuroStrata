@@ -120,8 +120,19 @@ fi
 # Every git diff below carries --no-color --no-ext-diff --no-textconv
 # --text: the gate parses diff output programmatically, so user git
 # config and attributes must never be able to reshape it (see the
-# attribution diff below).
-CHANGED_RS="$(git diff --no-color --no-ext-diff --no-textconv --text --name-only "$BASE" -- '*.rs')" || {
+# attribution diff below). Every diff whose PATH output is parsed
+# (the two --name-only sets here and the attribution diff below)
+# also carries -c core.quotePath=false: by default Git C-quotes
+# pathnames containing non-ASCII bytes ("src/caf\303\251.rs" for
+# src/café.rs) in both --name-only output and +++ diff headers, so
+# the changed-file set, the attribution parser, and every leg keyed
+# on those paths would silently skip such files — a violation in a
+# non-ASCII-named file would pass unchecked while the identical
+# violation in an ASCII-named file blocks. With quoting disabled,
+# Git emits the raw pathname bytes and every consumer below (the
+# fmt loop, the owning-manifest walks, the manifest legs, the
+# audit lockfile derivation) sees the real path.
+CHANGED_RS="$(git -c core.quotePath=false diff --no-color --no-ext-diff --no-textconv --text --name-only "$BASE" -- '*.rs')" || {
     echo "$GATE: FAIL: cannot compute the changed-file set against $BASE — quality NOT verified for this push" >&2
     exit 1
 }
@@ -134,7 +145,7 @@ CHANGED_RS="$(git diff --no-color --no-ext-diff --no-textconv --text --name-only
 # decision below (clippy §2/§2c, the src-tauri leg §2b, the audit
 # trigger §3) consumes this same set, so no layout is gate-relevant
 # for one leg and invisible to another.
-CHANGED_MANIFEST="$(git diff --no-color --no-ext-diff --no-textconv --text --name-only "$BASE" -- ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock')" || {
+CHANGED_MANIFEST="$(git -c core.quotePath=false diff --no-color --no-ext-diff --no-textconv --text --name-only "$BASE" -- ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock')" || {
     echo "$GATE: FAIL: cannot compute the changed-manifest set against $BASE — quality NOT verified for this push" >&2
     exit 1
 }
@@ -188,8 +199,10 @@ fi
 # the attribution set the same way.
 ADDED_FILE="$(mktemp -t rustgate-added.XXXXXX)"
 trap 'rm -f "$ADDED_FILE"' EXIT
-git diff --default-prefix --no-color --no-ext-diff --no-textconv --text -U0 "$BASE" -- '*.rs' | python3 -c '
+git -c core.quotePath=false diff --default-prefix --no-color --no-ext-diff --no-textconv --text -U0 "$BASE" -- '*.rs' | python3 -c '
 import re, sys
+sys.stdin.reconfigure(errors="surrogateescape")
+sys.stdout.reconfigure(errors="surrogateescape")
 cur, new_line, out = None, 0, set()
 for raw in sys.stdin:
     line = raw.rstrip("\n")
@@ -272,7 +285,7 @@ import os, re, sys
 f = os.environ.get("FILE", "")
 added = set()
 try:
-    with open(os.environ.get("ADDED_FILE", "")) as fh:
+    with open(os.environ.get("ADDED_FILE", ""), errors="surrogateescape") as fh:
         for ln in fh:
             ln = ln.strip()
             if ln.startswith(f + ":"):

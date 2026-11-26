@@ -6299,8 +6299,13 @@ mod tests {
         );
         assert!(
             SCAFFOLDED_RUST_QUALITY_GATE
-                .contains("git diff --default-prefix --no-color --no-ext-diff --no-textconv --text"),
+                .contains("git -c core.quotePath=false diff --default-prefix --no-color --no-ext-diff --no-textconv --text"),
             "the guard must neutralize user git config and attributes on the attribution diff (color escapes, external diff drivers, textconv drivers, and -diff binary notices each silently empty the added-line set the same way non-default prefixes do)"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("git -c core.quotePath=false diff --no-color --no-ext-diff --no-textconv --text --name-only"),
+            "the guard must disable Git path quoting (core.quotePath=false) on every diff whose path output it parses, so non-ASCII pathnames (e.g. src/café.rs) are emitted raw instead of C-quoted (\"src/caf\\303\\251.rs\") and reach the changed-file set, the attribution parser, and the fmt leg instead of being silently skipped"
         );
         assert!(
             SCAFFOLDED_RUST_QUALITY_GATE

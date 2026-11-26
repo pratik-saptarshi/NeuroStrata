@@ -951,4 +951,43 @@ if [ "$st33" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: src/has 
     exit 1
 fi
 
+# Leg 34 (regression, Codex P2 — quoted Git paths): a clippy
+# violation on an added line in a NON-ASCII-named file
+# (src/café.rs). Git C-quotes such pathnames by default in
+# --name-only output ("src/caf\303\251.rs") and in diff headers,
+# so pre-fix the changed-file set, the attribution parser and the
+# fmt leg all skipped the file and the gate passed (fail-open),
+# while the identical violation in src/cafe.rs blocked (leg 1
+# shape). Post-fix the gate decodes the path and blocks.
+nonascii_dirty="$TMP/nonascii-dirty"
+mkdir -p "$nonascii_dirty/src"
+git -C "$nonascii_dirty" init -q
+git -C "$nonascii_dirty" config user.email test@example.com
+git -C "$nonascii_dirty" config user.name test
+cat > "$nonascii_dirty/Cargo.toml" <<'EOF'
+[package]
+name = "gate-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/café.rs"
+EOF
+printf 'pub fn clean() -> i32 {\n    1\n}\n' > "$nonascii_dirty/src/café.rs"
+(cd "$nonascii_dirty" && cargo generate-lockfile >/dev/null 2>&1)
+git -C "$nonascii_dirty" add Cargo.toml Cargo.lock 'src/café.rs'
+git -C "$nonascii_dirty" commit -q -m baseline
+git -C "$nonascii_dirty" update-ref refs/remotes/origin/develop HEAD
+printf '\npub fn bad() -> String {\n    return "x".to_string();\n}\n' >> "$nonascii_dirty/src/café.rs"
+git -C "$nonascii_dirty" add 'src/café.rs'
+git -C "$nonascii_dirty" commit -q -m 'dirty non-ascii addition'
+set +e
+out34=$(run_gate "$nonascii_dirty" "$PATH")
+st34=$?
+set -e
+if [ "$st34" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: src/café.rs' <<< "$out34"; then
+    printf 'FAIL: clippy warning on an added line in a non-ASCII-named file must block the gate (quoted Git paths decoded)\n%s\n' "$out34" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
