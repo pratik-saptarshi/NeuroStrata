@@ -2411,6 +2411,21 @@ fn extract_public_surface_signatures(
     // variant pattern must not fire for them either. A line at or
     // shallower than the header ends the body.
     let mut fn_body_indent: Option<usize> = None;
+    // The indentation of a bare `Name {` expression-position header
+    // inside a fn body that opened an unclosed block: a struct
+    // literal. Its typed member lines are field initializers, not
+    // declarations — their "type" is the initializer expression
+    // (`warnings: Vec::new(),`), so recording them made a pure
+    // initializer edit read as a surface change. Adjudication
+    // (W6-1): inside a fn body, an enclosing container counts as a
+    // DECLARATION only with positive evidence — its header carries
+    // the `struct` keyword / declaration syntax (a local struct
+    // declaration inside a fn body keeps the current recording
+    // behavior); a bare `Name {` header has no such evidence and is
+    // a literal, so a literal scope opens instead and typed member
+    // lines inside it are excluded. A line at or shallower than the
+    // header ends the literal scope, as with the fn body.
+    let mut literal_scope_indent: Option<usize> = None;
     let mut test_scope = TestScopeTracker::new();
     for ((line, original_line), preserved_line) in
         cleaned.lines().zip(text.lines()).zip(route_text.lines())
@@ -2447,6 +2462,12 @@ fn extract_public_surface_signatures(
         if !line.trim().is_empty() && fn_body_indent.map(|i| indent <= i).unwrap_or(false) {
             fn_body_indent = None;
         }
+        // Same end rule for a struct-literal scope inside a fn body.
+        if !line.trim().is_empty()
+            && literal_scope_indent.map(|i| indent <= i).unwrap_or(false)
+        {
+            literal_scope_indent = None;
+        }
         // A closing brace at column 0 ends the enclosing container.
         if !line.starts_with([' ', '\t']) && line.trim_start().starts_with('}') {
             enclosing = None;
@@ -2462,6 +2483,7 @@ fn extract_public_surface_signatures(
         let enclosing_kind_at_line_start = enclosing_kind.clone();
         let variant_at_line_start = variant_scope.as_ref().map(|(name, _)| name.clone());
         let in_fn_body_at_line_start = fn_body_indent.is_some();
+        let in_literal_scope_at_line_start = literal_scope_indent.is_some();
         let mut line_is_fn = false;
         let mut attach_keys: Vec<String> = Vec::new();
         let mut attach_names: Vec<String> = Vec::new();
@@ -2572,7 +2594,19 @@ fn extract_public_surface_signatures(
                         None => true,
                         Some(kind) => kind == "enum",
                     });
-            if variant_allowed {
+            // Typed member lines (the `field:` / typed `member:`
+            // patterns) get the analogous body-scope rule: inside a
+            // struct-literal scope in a fn body they are field
+            // initializers, not declarations, and are excluded.
+            // Outside a literal scope — a real container's fields, a
+            // local declaration's fields inside a fn body, the
+            // contextless -U0 shape — they record as before.
+            let is_typed_member = !is_variant_token
+                && (key.starts_with("field:") || key.starts_with("member:"));
+            let typed_member_allowed = !(is_typed_member
+                && in_fn_body_at_line_start
+                && in_literal_scope_at_line_start);
+            if variant_allowed && typed_member_allowed {
                 // The owner path composes like the clap-arg owner
                 // path below: when a struct-variant scope is active
                 // at line start, the variant segment sits between the
@@ -2620,6 +2654,30 @@ fn extract_public_surface_signatures(
             && line.matches('{').count() > line.matches('}').count()
         {
             fn_body_indent = Some(indent);
+        }
+        // End-of-line literal-scope bookkeeping (see the
+        // adjudication at `literal_scope_indent`). A declaration
+        // header — positive evidence: a container header of any
+        // visibility (a local `struct` declaration included) or a
+        // public/restricted declaration — or a nested fn header
+        // supersedes an open literal scope: the block it opens is a
+        // declaration/body context, not a literal, even when it sits
+        // inside a block that opened one. Any other fn-body line
+        // that opens an unclosed block (a bare `Name {` literal
+        // header, a control-flow block, a closure) opens the scope;
+        // nested openers keep the outermost scope, since every line
+        // inside is excluded either way.
+        if line_is_fn
+            || parse_any_container_header(line).is_some()
+            || parse_public_surface_declaration(line).is_some()
+            || parse_restricted_surface_declaration(line).is_some()
+        {
+            literal_scope_indent = None;
+        } else if fn_body_indent.is_some()
+            && literal_scope_indent.is_none()
+            && line.matches('{').count() > line.matches('}').count()
+        {
+            literal_scope_indent = Some(indent);
         }
         if !attach_keys.is_empty() {
             // The pending serde contents enter the enclosing
@@ -6163,6 +6221,107 @@ pub struct AfterAll {}
             before.contains_key("member:Shape.Square.side"),
             "{before:?}"
         );
+    }
+
+    #[test]
+    fn struct_literal_initializer_change_in_fn_body_is_identical_real_shape() {
+        // W6-1 probe (Codex PR #162): replacing
+        // `warnings: Vec::new(),` with
+        // `warnings: Vec::with_capacity(0),` in the
+        // `BatchEmbedOutcome` literal inside the `Embedder`
+        // trait's default method in the real src/traits.rs changed
+        // the map at exactly `member:Embedder.warnings` — the
+        // typed-member lines of a struct literal inside a fn body
+        // recorded their initializer text as the signature. The
+        // fn-body guard gated only variant tokens.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/traits.rs")).unwrap();
+        assert!(real.contains("warnings: Vec::new(),"));
+        let mutated = real.replacen(
+            "warnings: Vec::new(),",
+            "warnings: Vec::with_capacity(0),",
+            1,
+        );
+        assert_ne!(real, mutated);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_eq!(before, after, "literal initializer edit must not register");
+        assert!(
+            !after.contains_key("member:Embedder.warnings"),
+            "{:?}",
+            after
+                .keys()
+                .filter(|k| k.contains("warnings"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn struct_literal_fields_inside_fn_bodies_are_not_surface() {
+        // Synthetic shapes of the same class: a literal in tail
+        // position inside a trait default method, a bare-header
+        // literal, and a literal in argument position. None of
+        // their typed member lines are declarations.
+        let method_literal = |init: &str| {
+            format!(
+                "pub trait Embedder {{\n    fn build(&self) -> Outcome {{\n        Ok(Outcome {{\n            warnings: {init},\n        }})\n    }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&method_literal("Vec::new()"));
+        let after =
+            extract_public_surface_signatures(&method_literal("Vec::with_capacity(0)"));
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        assert!(!after.contains_key("member:Embedder.warnings"), "{after:?}");
+
+        let bare_header = |init: &str| {
+            format!(
+                "pub fn build() -> Outcome {{\n    Outcome {{\n        warnings: {init},\n    }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&bare_header("Vec::new()"));
+        let after =
+            extract_public_surface_signatures(&bare_header("Vec::with_capacity(0)"));
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+
+        let argument = |init: &str| {
+            format!(
+                "pub fn build() {{\n    register(Outcome {{\n        warnings: {init},\n    }});\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&argument("Vec::new()"));
+        let after = extract_public_surface_signatures(&argument("Vec::with_capacity(0)"));
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn local_struct_declaration_inside_fn_body_still_records() {
+        // Adjudication pin (W6-1): inside a fn body an enclosing
+        // container counts as a declaration only with positive
+        // evidence — its header carries the `struct` keyword /
+        // declaration syntax. A local struct declaration therefore
+        // keeps the current recording behavior; only a bare
+        // `Name {` expression-position header is a literal.
+        let decl = |ty: &str| {
+            format!(
+                "pub fn build() -> u32 {{\n    struct Local {{\n        field: {ty},\n    }}\n    0\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&decl("u32"));
+        let after = extract_public_surface_signatures(&decl("u64"));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("member:Local.field"), "{before:?}");
+        // Same after a literal earlier in the same body: the
+        // literal's scope ends at its closing line and does not
+        // suppress the later declaration.
+        let decl_after_literal = |ty: &str| {
+            format!(
+                "pub fn build() -> u32 {{\n    let x = Outcome {{\n        warnings: Vec::new(),\n    }};\n    struct Local {{\n        field: {ty},\n    }}\n    0\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&decl_after_literal("u32"));
+        let after = extract_public_surface_signatures(&decl_after_literal("u64"));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("member:Local.field"), "{before:?}");
     }
 
     #[test]
