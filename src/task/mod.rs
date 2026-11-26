@@ -3977,6 +3977,44 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
+# ── Pushed refs (best-effort) ────────────────────────────────────────────
+# git invokes pre-push as: pre-push <remote-name> <remote-url> with one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per updated
+# ref on stdin. Capture them for guards that need the exact push range
+# (e.g. the Rust gate validates pushed refs, not just the checkout).
+# /dev/null or empty stdin yields empty immediately; a TTY is never read
+# (it would hang waiting for input).
+HOOK_PUSH_REFS=""
+if [ ! -t 0 ]; then
+    HOOK_PUSH_REFS="$(cat 2>/dev/null || true)"
+fi
+export HOOK_PUSH_REFS
+
+# ── Project guards (run before the task gate, independently of it) ───────
+# These run BEFORE Guard 2 below on purpose: NEUROSTRATA_SKIP_GATE=1
+# exits 0 at the top of Guard 2, so project guards placed after it would
+# be skipped along with the task gate; running them first makes them
+# skip-proof.
+# A guard that belongs here does NOT need a CI workflow to be real.
+PROJECT_GATES=(
+    # Rust quality gate: fmt/clippy deltas + audit delta on pushes that
+    # touch Rust sources or manifests. Never blocks on legacy backlog
+    # (the quality-baseline file owns that); see
+    # docs/SECDEVOPS-CHECKLIST.md. Bypass: RUST_QUALITY_SKIP=1.
+    ./scripts/rust-quality-gate.sh
+    # Task-coverage gate: blocks pushes when changed docs contain work-item
+    # language without a NeuroStrata task ID citation.
+    ./scripts/task-coverage-gate.sh
+    # ./scripts/rules-gate.sh
+)
+
+if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
+    for g in "${PROJECT_GATES[@]}"; do
+        [ -f "$g" ] || { echo "project guard $g missing — skipping" >&2; continue; }
+        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
+    done
+fi
+
 command -v neurostrata-mcp >/dev/null 2>&1 || { echo "error: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 1; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
@@ -4008,25 +4046,8 @@ for GATE_NAMESPACE in "${GATE_NAMESPACES[@]}"; do
     fi
 done
 
-# ── project guards (add yours here) ────────────────────────────────────────
-# Add the path of each local guard; it runs before every push on every host.
-# A guard that belongs here does NOT need a CI workflow to be real.
-PROJECT_GATES=(
-    # Task-coverage gate: blocks pushes when changed docs contain work-item
-    # language without a NeuroStrata task ID citation.
-    ./scripts/task-coverage-gate.sh
-    # ./scripts/rules-gate.sh
-)
-
-if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
-    for g in "${PROJECT_GATES[@]}"; do
-        [ -f "$g" ] || { echo "task-coverage-gate: guard $g missing — skipping" >&2; continue; }
-        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
-    done
-fi
-
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 484be5817cac70a65f860f0f79654f0c243f97e9113bd09e3cdf43e7dd3ac05a
+# neurostrata-hook-sha256: 171b4ce9eab330bbcc44cf25be0d941346ad9e53638092ce5bb0c606f22c2bf8
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -4427,6 +4448,12 @@ echo "Verify: neurostrata_task_setup should report verified.hook_installed: true
 pub(crate) const SCAFFOLDED_TASK_COVERAGE_GATE: &str =
     include_str!("../../scripts/task-coverage-gate.sh");
 
+/// Single source for the Rust quality guard: the scaffolded file and the
+/// repository script are the same bytes, so the hook's live PROJECT_GATES
+/// entry can never point at a guard the installer forgot to create.
+pub(crate) const SCAFFOLDED_RUST_QUALITY_GATE: &str =
+    include_str!("../../scripts/rust-quality-gate.sh");
+
 /// The directory git actually runs hooks from, resolved the way git resolves
 /// it: `core.hooksPath` at the highest-priority config level that sets it,
 /// else `$GIT_DIR/hooks`.
@@ -4540,6 +4567,7 @@ fn hook_hygiene_files(root: &std::path::Path) -> String {
         ("hooks/pre-commit", SCAFFOLDED_PRE_COMMIT_HOOK),
         ("install-hooks.sh", SCAFFOLDED_INSTALL_HOOKS),
         ("task-coverage-gate.sh", SCAFFOLDED_TASK_COVERAGE_GATE),
+        ("rust-quality-gate.sh", SCAFFOLDED_RUST_QUALITY_GATE),
     ] {
         let path = scripts_dir.join(rel);
         if !path.exists() && std::fs::write(&path, content).is_ok() {
@@ -4831,7 +4859,7 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         if hook_installed {
             "Git detected -- still the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project -- and the NeuroStrata pre-push hook is already installed at the path git runs -- so the task gate runs on every push; nothing to install, and the scaffolded files are omitted from this instruction rather than written over a working hook. What is left is the project-pipeline gates above: `verified.hook_project_guards` lists the ones the installed hook already runs, and the rest are not yet enforced on a bare `git push`. Extend the installed `pre-push` hook's `PROJECT_GATES` with them -- a guard in the hook runs on every host and needs no CI. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook."
         } else {
-            "Git detected -- the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project: run `neurostrata-mcp hooks install` to put the task gate on pre-push (the gate does not move until that hook is installed and runs `task gate --strict`). The `files` field of this instruction carries a runnable `scripts/hooks/pre-push`, `scripts/hooks/pre-commit`, `scripts/install-hooks.sh` and `scripts/task-coverage-gate.sh` (the guard the hook's PROJECT_GATES already names); write them, install the hook, then extend that hook with the project-pipeline gates above -- they belong in the hook, not in a workflow. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook. Verify with the `verified` block in this payload."
+            "Git detected -- the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project: run `neurostrata-mcp hooks install` to put the task gate on pre-push (the gate does not move until that hook is installed and runs `task gate --strict`). The `files` field of this instruction carries a runnable `scripts/hooks/pre-push`, `scripts/hooks/pre-commit`, `scripts/install-hooks.sh`, `scripts/task-coverage-gate.sh` and `scripts/rust-quality-gate.sh` (the guards the hook's PROJECT_GATES already names); write them, install the hook, then extend that hook with the project-pipeline gates above -- they belong in the hook, not in a workflow. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook. Verify with the `verified` block in this payload."
         }
     } else {
         "No git detected. Identify the ONE step every unit of work must pass to leave this project -- a CMS publish action, a render-farm submission, a publish script, a review-approval step. Wire `neurostrata-mcp task gate NAMESPACE --strict` (exit 1 = blocked) and the project-pipeline gates above into that step so nothing ships past an unresolved gate. Record the chosen step: neurostrata_add_memory with memory_type: rule, content naming the gate point -- the next session must not have to re-derive it."
@@ -4872,6 +4900,10 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
                   "content": SCAFFOLDED_TASK_COVERAGE_GATE,
                   "executable": true,
                   "note": "project gate: blocks docs with untracked work items" },
+                { "path": "scripts/rust-quality-gate.sh",
+                  "content": SCAFFOLDED_RUST_QUALITY_GATE,
+                  "executable": true,
+                  "note": "project gate: Rust fmt/clippy/audit deltas on the push" },
             ])
         } else {
             json!([])
@@ -5808,6 +5840,37 @@ mod tests {
         );
     }
 
+    /// Codex P1s on PR #93 (SECDevOps gate round): (a) hook hygiene
+    /// rewrites a stale installed hook with this scaffold, so the
+    /// scaffold itself must carry the Rust gate entry — otherwise a
+    /// normal session init silently drops enforcement; (b) Guard 2
+    /// exits 0 early when the binary is missing or skipped, so project
+    /// guards must run BEFORE the task gate, not after its early
+    /// returns; (c) root-only `cargo clippy` skips workspace members.
+    #[test]
+    fn scaffolded_pre_push_hook_carries_rust_gate_before_the_gate() {
+        let hook = SCAFFOLDED_PRE_PUSH_HOOK;
+        let rust_gate = hook
+            .find("./scripts/rust-quality-gate.sh")
+            .expect("the scaffold must carry the Rust gate entry");
+        let project_guards = hook
+            .find("PROJECT_GATES=(")
+            .expect("the scaffold must carry the project-guards block");
+        let gate_binary_check = hook
+            .find("command -v neurostrata-mcp")
+            .expect("the scaffold must carry the task gate");
+        assert!(
+            rust_gate > project_guards && project_guards < gate_binary_check,
+            "the Rust gate entry must live in PROJECT_GATES ahead of the task gate's early exits"
+        );
+        let gate_script = std::fs::read_to_string("scripts/rust-quality-gate.sh")
+            .expect("the Rust gate script must exist at scripts/rust-quality-gate.sh");
+        assert!(
+            gate_script.contains("cargo clippy --locked --workspace"),
+            "clippy must cover workspace members (crates/neurostrata-wasm), not just the root package"
+        );
+    }
+
     /// The behavioral half of the same finding: the scaffolded hook, run
     /// the way git runs it (`pre-push <remote-name> <remote-url>`), must
     /// reject the upstream remote in its canonical forms — even with the
@@ -5916,6 +5979,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Codex round 4: the gate validates pushed refs, not just the
+    /// checkout. The hook must therefore deliver stdin ref lines to
+    /// guards via HOOK_PUSH_REFS (a foreign branch or tag push must
+    /// reach the gate for its "not locally verified" warning), while a
+    /// push of the checked-out branch flows through quietly.
+    #[test]
+    fn scaffolded_pre_push_hook_exports_pushed_refs_to_guards() {
+        use std::os::unix::fs::PermissionsExt;
+        if which_bash().is_none() || which_git().is_none() {
+            return; // nothing to smoke-test with
+        }
+        let root = std::env::temp_dir().join(format!("ns-hookrefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "user.email", "t@t.t"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("f.txt"), "x\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-qm", "t"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let set_exec = |p: &std::path::Path| {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).unwrap();
+        };
+        let hook = root.join("scripts").join("hooks").join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        set_exec(&hook);
+        let stub = root.join("bin").join("neurostrata-mcp");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        set_exec(&stub);
+        // stub the project gate the scaffold wires by default; the rust
+        // gate stub echoes what the hook delivered so the test can assert
+        // on the plumbing without running the real gate
+        let p = root.join("scripts").join("task-coverage-gate.sh");
+        std::fs::write(&p, "#!/bin/bash\nexit 0\n").unwrap();
+        set_exec(&p);
+        let p = root.join("scripts").join("rust-quality-gate.sh");
+        std::fs::write(&p, "#!/bin/bash\necho \"REFS=$HOOK_PUSH_REFS\"\nexit 0\n").unwrap();
+        set_exec(&p);
+        let path = format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let run_with_stdin = |input: &str| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("bash")
+                .arg("scripts/hooks/pre-push")
+                .arg("origin")
+                .arg("https://github.com/pratik-saptarshi/NeuroStrata.git")
+                .current_dir(&root)
+                .env("PATH", &path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        // pushing the checked-out branch: quiet, passing
+        let cur = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let own = run_with_stdin(&format!(
+            "refs/heads/{branch} {head_sha} refs/heads/{branch} {sha}\n"
+        ));
+        assert!(own.status.success(), "own-branch push must pass");
+        assert!(
+            String::from_utf8_lossy(&own.stdout).contains(&format!("refs/heads/{branch}")),
+            "own-branch ref line must reach guards via HOOK_PUSH_REFS"
+        );
+
+        // pushing another branch and a tag: the refs must reach the
+        // gate (which warns that they are not locally verified)
+        let foreign = run_with_stdin(&format!(
+            "refs/heads/other {head_sha} refs/heads/other {sha}\nrefs/tags/v9 {head_sha} refs/tags/v9 {sha}\n"
+        ));
+        assert!(foreign.status.success(), "foreign refs warn, not block");
+        let out = String::from_utf8_lossy(&foreign.stdout).to_string();
+        assert!(
+            out.contains("refs/heads/other") && out.contains("refs/tags/v9"),
+            "pushed ref lines must reach guards via HOOK_PUSH_REFS: {}",
+            out
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Install-hook audit: every live PROJECT_GATES entry in the scaffolded
     /// pre-push hook must have a matching bootstrap file, so a fresh project
     /// never silently skips a guard the hook claims to run.
@@ -5939,6 +6134,7 @@ mod tests {
             "scripts/hooks/pre-commit",
             "scripts/install-hooks.sh",
             "scripts/task-coverage-gate.sh",
+            "scripts/rust-quality-gate.sh",
         ] {
             assert!(
                 paths.contains(&expected),
@@ -5953,15 +6149,18 @@ mod tests {
         );
 
         // Comments and blank lines are not gates; only live array entries are.
+        // The block ends at the line that closes the array (a `)` at line
+        // start, the same rule hook_project_guards parses by): a `)` inside
+        // a gate comment — e.g. "(the quality-baseline file owns that)" in
+        // the Rust gate's comment — must not truncate the parse.
         let open = "PROJECT_GATES=(";
         let start = SCAFFOLDED_PRE_PUSH_HOOK
             .find(open)
             .expect("PROJECT_GATES block in the scaffolded hook")
             + open.len();
-        let block = &SCAFFOLDED_PRE_PUSH_HOOK[start..];
-        let end = block.find(')').expect("closing paren of PROJECT_GATES");
-        let live_gates: Vec<&str> = block[..end]
+        let live_gates: Vec<&str> = SCAFFOLDED_PRE_PUSH_HOOK[start..]
             .lines()
+            .take_while(|line| !line.trim_start().starts_with(')'))
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .collect();
@@ -5998,6 +6197,7 @@ mod tests {
                 "scripts/task-coverage-gate.sh",
                 SCAFFOLDED_TASK_COVERAGE_GATE,
             ),
+            ("scripts/rust-quality-gate.sh", SCAFFOLDED_RUST_QUALITY_GATE),
         ] {
             let path = root.join(rel);
             assert!(path.is_file(), "missing scaffolded artifact {rel}");
@@ -6042,6 +6242,101 @@ mod tests {
         );
         let path = std::env::temp_dir().join(format!("ns-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_TASK_COVERAGE_GATE).unwrap();
+        let syntax = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "scaffolded guard must be valid bash: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The scaffolded Rust quality guard must be the canonical script, not
+    /// an empty stub.
+    #[test]
+    fn scaffolded_rust_quality_gate_is_valid_bash() {
+        if which_bash().is_none() {
+            return;
+        }
+        assert_eq!(
+            SCAFFOLDED_RUST_QUALITY_GATE,
+            include_str!("../../scripts/rust-quality-gate.sh"),
+            "the guard must be single-sourced from the canonical script"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("cargo clippy --locked --workspace"),
+            "the guard must carry the workspace clippy marker"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("python3 is required to attribute findings"),
+            "the guard must fail closed when python3 is missing or unusable"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("cargo clippy --locked --workspace --all-targets --all-features"),
+            "the guard must enable all features so feature-gated code gets clippy coverage"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("4b825dc642cb6eb9a060e54bf8d69288fbee4904"),
+            "the guard must diff a root commit against the git empty tree so a fresh repo's first push is evaluated, not blocked on the nonexistent HEAD~1"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("\"$BASE:$lock\""),
+            "the guard must compare advisories against the same lockfile path at the resolved push baseline ($BASE), not origin/develop, so an advisory inherited from the merge-base never blocks a push that did not introduce it"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("Verified-absent baseline"),
+            "the guard must treat a baseline commit that positively has no lockfile at the audited path (verified via git cat-file against the existing baseline commit, not a failed git show) as a verified-empty advisory baseline, so advisories in a newly added lockfile block instead of warning and passing"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("resolve renamed lockfiles to their original baseline paths"),
+            "the guard must resolve a relocated lockfile to its original baseline path (rename detection over the push range, then an exact content match against the baseline's lockfiles) before treating its new path as verified-absent, so a crate relocation is not blocked on advisories inherited from the lockfile's old location"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("':(glob)**/Cargo.toml'"),
+            "the guard must detect Cargo.toml/Cargo.lock changes tree-wide (glob pathspecs matching the root and any nested directory), so a manifest/lockfile-only push in a nested crate (e.g. native/) engages the gate instead of exiting as 'no Rust sources or manifests changed'"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("git -c core.quotePath=false diff --default-prefix --no-color --no-ext-diff --no-textconv --text"),
+            "the guard must neutralize user git config and attributes on the attribution diff (color escapes, external diff drivers, textconv drivers, and -diff binary notices each silently empty the added-line set the same way non-default prefixes do)"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("git -c core.quotePath=false diff --no-color --no-ext-diff --no-textconv --text --name-only"),
+            "the guard must disable Git path quoting (core.quotePath=false) on every diff whose path output it parses, so non-ASCII pathnames (e.g. src/café.rs) are emitted raw instead of C-quoted (\"src/caf\\303\\251.rs\") and reach the changed-file set, the attribution parser, and the fmt leg instead of being silently skipped"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("resolve the owning manifest for each changed .rs file"),
+            "the guard must resolve the owning manifest for each changed .rs file when no root Cargo.toml exists, so a bootstrapped repo whose crate lives under a subdirectory (e.g. native/) is linted instead of blocked on the missing root manifest"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("FILE_EDITION"),
+            "the guard must resolve the rustfmt edition per source file from its owning package (nearest Cargo.toml ancestor), so a bootstrapped nested-only crate on edition 2024 is not formatted as the root default 2021 — rustfmt errors on edition-2024 syntax, the fmt leg warns-and-skips, and misformatted added lines pass"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("all affected Rust crates were deleted in this push"),
+            "the guard must distinguish an empty owning-manifest set caused by this push deleting the affected crates themselves (nothing left to lint — skip the workspace clippy fallback) from no manifest found for a live source file (existing fail-closed fallback), so a deletion-only push removing the last nested crate is not blocked on the missing root Cargo.toml"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("export CARGO_TERM_COLOR=never"),
+            "the guard must force cargo color off so a user-set CARGO_TERM_COLOR=always cannot inject ANSI escapes into the clippy diagnostics and audit report the guard parses (an escaped severity silently empties the diagnostic set and the gate passes unverified code)"
+        );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("normalize_diag_path"),
+            "the guard must normalize diagnostic paths lexically (resolving ./.. components, no symlink resolution) before matching them against the Git-attributed added-line set, in both the main clippy parser and the duplicated src-tauri parser — a module loaded via #[path = \"sub/../logic.rs\"] is reported by clippy as src/sub/../logic.rs while Git attributes its lines to src/logic.rs, so the unnormalized diagnostic never matches and an added violation passes unchecked"
+        );
+        let path =
+            std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
+        std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();
         let syntax = std::process::Command::new("bash")
             .arg("-n")
             .arg(&path)
@@ -7184,6 +7479,7 @@ mod tests {
                 "scripts/hooks/pre-commit",
                 "scripts/install-hooks.sh",
                 "scripts/task-coverage-gate.sh",
+                "scripts/rust-quality-gate.sh",
             ]
         );
         let hook = files[0]["content"].as_str().unwrap();
@@ -7235,8 +7531,8 @@ mod tests {
 
     /// The mirror: with the scaffolded hook installed the gate verifies. But a
     /// hook file existing is NOT a project-pipeline guard running — the
-    /// scaffold ships PROJECT_GATES empty — so the panel must not claim the
-    /// pipeline guards are enforced (fix round 1, Important #1).
+    /// per-guard half of coverage comes from parsing PROJECT_GATES, not
+    /// from any hardcoded list (fix round 1, Important #1).
     #[test]
     fn installed_scaffolded_hook_verifies_the_gate_without_faking_pipeline_coverage() {
         let root = std::env::temp_dir().join(format!("ns-hooked-{}", std::process::id()));
@@ -7256,10 +7552,13 @@ mod tests {
             json!(["task-gate"])
         );
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
-        // the task-coverage gate is wired by design; it is a real guard, not faked
+        // both shipped guards are wired by design; they are real guards, not faked
         assert_eq!(
             verified["hook_project_guards"],
-            json!(["./scripts/task-coverage-gate.sh"])
+            json!([
+                "./scripts/rust-quality-gate.sh",
+                "./scripts/task-coverage-gate.sh"
+            ])
         );
         // and no per-guard claim of client-side coverage survives
         assert!(
@@ -7291,6 +7590,7 @@ mod tests {
         assert_eq!(
             verified["hook_project_guards"],
             json!([
+                "./scripts/rust-quality-gate.sh",
                 "./scripts/task-coverage-gate.sh",
                 "./scripts/rules-gate.sh",
                 "./scripts/typecheck.sh"
