@@ -1860,7 +1860,12 @@ fn declaration_signature(kind: &str, line: &str) -> String {
 /// `"description":` entry — so a constraint-only edit registers,
 /// while an `"enum":` quoted inside a description string (which
 /// follows the description key in the observed shapes) and a
-/// description-only edit do not.
+/// description-only edit do not. A single-line property's signature
+/// also records the nested type structure inside its own object —
+/// an `items` type and the types of nested `properties`, at any
+/// depth, each appended as `|<path>=<type>` in source order (see
+/// `nested_schema_type_signatures`) — so a nested-type change
+/// registers even though the property's own type is unchanged.
 /// Property lines without a same-line type and non-schema JSON lines
 /// (`"name":`, `"description":`, `"properties": {`) extract nothing.
 
@@ -1915,6 +1920,222 @@ fn schema_default_signature(after: &str) -> Option<String> {
     }
 }
 
+/// A parsed fragment of an inline JSON schema object: the subset of
+/// JSON shapes an MCP `inputSchema` property line can carry.
+enum SchemaFrag {
+    Obj(Vec<(String, SchemaFrag)>),
+    Arr(Vec<SchemaFrag>),
+    Str(String),
+    Lit,
+}
+
+/// A minimal string-aware parser for one inline schema object.
+/// Strings are consumed whole (escapes included), so braces or
+/// `"type":`-shaped text inside a description string are never
+/// mistaken for structure. Any malformed or unbalanced fragment
+/// yields `None`; the caller then keeps the legacy first-type
+/// behaviour for that line.
+struct SchemaFragParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SchemaFragParser<'a> {
+    fn new(text: &'a str) -> Self {
+        SchemaFragParser {
+            bytes: text.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.bytes.get(self.pos).map(|b| b.is_ascii_whitespace()) == Some(true) {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_string(&mut self) -> Option<String> {
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return None;
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        loop {
+            let byte = *self.bytes.get(self.pos)?;
+            self.pos += 1;
+            match byte {
+                b'"' => return Some(out),
+                b'\\' => {
+                    let escaped = *self.bytes.get(self.pos)?;
+                    self.pos += 1;
+                    out.push(escaped as char);
+                }
+                _ => {
+                    // Push the whole UTF-8 char containing this byte.
+                    let start = self.pos - 1;
+                    let mut end = self.pos;
+                    while end < self.bytes.len() && (self.bytes[end] & 0xC0) == 0x80 {
+                        end += 1;
+                    }
+                    out.push_str(std::str::from_utf8(&self.bytes[start..end]).ok()?);
+                    self.pos = end;
+                }
+            }
+        }
+    }
+
+    fn parse_value(&mut self) -> Option<SchemaFrag> {
+        match self.peek()? {
+            b'{' => {
+                self.pos += 1;
+                let mut entries = Vec::new();
+                loop {
+                    match self.peek()? {
+                        b'}' => {
+                            self.pos += 1;
+                            return Some(SchemaFrag::Obj(entries));
+                        }
+                        b'"' => {
+                            let key = self.parse_string()?;
+                            if self.peek()? != b':' {
+                                return None;
+                            }
+                            self.pos += 1;
+                            let value = self.parse_value()?;
+                            entries.push((key, value));
+                            match self.peek()? {
+                                b',' => self.pos += 1,
+                                b'}' => {
+                                    self.pos += 1;
+                                    return Some(SchemaFrag::Obj(entries));
+                                }
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                self.pos += 1;
+                let mut items = Vec::new();
+                loop {
+                    match self.peek()? {
+                        b']' => {
+                            self.pos += 1;
+                            return Some(SchemaFrag::Arr(items));
+                        }
+                        _ => {
+                            items.push(self.parse_value()?);
+                            match self.peek()? {
+                                b',' => self.pos += 1,
+                                b']' => {
+                                    self.pos += 1;
+                                    return Some(SchemaFrag::Arr(items));
+                                }
+                                _ => return None,
+                            }
+                        }
+                    }
+                }
+            }
+            b'"' => self.parse_string().map(SchemaFrag::Str),
+            _ => {
+                // A bare literal (number, boolean, null): consume up
+                // to its delimiter without interpreting it.
+                let start = self.pos;
+                while let Some(byte) = self.bytes.get(self.pos) {
+                    if matches!(byte, b',' | b'}' | b']') {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+                if self.pos == start {
+                    None
+                } else {
+                    Some(SchemaFrag::Lit)
+                }
+            }
+        }
+    }
+}
+
+/// The normalized type material of a parsed `type` value: a scalar
+/// string as-is, or an array of strings in the bracketed form
+/// `schema_type_signature` produces for the array-valued shape.
+fn schema_frag_type_signature(frag: &SchemaFrag) -> Option<String> {
+    match frag {
+        SchemaFrag::Str(value) => Some(value.clone()),
+        SchemaFrag::Arr(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                match item {
+                    SchemaFrag::Str(value) => parts.push(format!("\"{value}\"")),
+                    _ => return None,
+                }
+            }
+            Some(format!("[{}]", parts.join(", ")))
+        }
+        _ => None,
+    }
+}
+
+/// Collects every `type` entry in a parsed schema fragment as
+/// (path, type signature) pairs in source order. The path names the
+/// object keys enclosing the entry (outermost first); the fragment's
+/// own `type` entry carries the empty path.
+fn collect_schema_types(
+    frag: &SchemaFrag,
+    path: &mut Vec<String>,
+    out: &mut Vec<(String, String)>,
+) {
+    match frag {
+        SchemaFrag::Obj(entries) => {
+            for (key, value) in entries {
+                if key == "type" {
+                    if let Some(signature) = schema_frag_type_signature(value) {
+                        out.push((path.join("."), signature));
+                    }
+                } else {
+                    path.push(key.clone());
+                    collect_schema_types(value, path, out);
+                    path.pop();
+                }
+            }
+        }
+        SchemaFrag::Arr(items) => {
+            for item in items {
+                collect_schema_types(item, path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The nested `type` entries of one inline property object (the text
+/// following the property's colon, starting at `{`): every entry
+/// below the property's own top-level type — an `items` type, the
+/// types of nested `properties`, and deeper nestings of the two —
+/// as (path, type signature) pairs in source order. An unbalanced
+/// (multi-line) or unparseable object yields no entries: its nested
+/// lines are scanned on their own lines instead, qualified by the
+/// caller's property-path stack.
+fn nested_schema_type_signatures(after: &str) -> Vec<(String, String)> {
+    let mut parser = SchemaFragParser::new(after);
+    let Some(frag) = parser.parse_value() else {
+        return Vec::new();
+    };
+    let mut all = Vec::new();
+    collect_schema_types(&frag, &mut Vec::new(), &mut all);
+    all.retain(|(path, _)| !path.is_empty());
+    all
+}
+
 fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix('"')?;
@@ -1944,6 +2165,15 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
         let type_idx = after.find("\"type\":")?;
         let type_value = schema_type_signature(&after[type_idx + "\"type\":".len()..])?;
         let mut signature = format!("{key}:{type_value}");
+        // Nested type structure on the same line (an `items` type,
+        // the types of nested `properties`, and deeper nestings) is
+        // part of the property's input contract too: recording only
+        // the first `"type":` made a nested-type change invisible.
+        // Each nested entry appends `|<path>=<type>` in source
+        // order, so a non-nested property's signature is unchanged.
+        for (path, nested_type) in nested_schema_type_signatures(after) {
+            signature.push_str(&format!("|{path}={nested_type}"));
+        }
         // Same-line constraint material, searched only in the part
         // of the line before `"description":` so constraint-shaped
         // text inside a description string is not captured.
@@ -6180,6 +6410,185 @@ pub struct AfterAll {}
             "\"mode\": { \"type\": [\"string\", \"array\"], \"enum\": [\"a\", \"b\"], \"description\": \"see \\\"enum\\\": [\\\"z\\\"] here\" },",
         );
         assert_eq!(before, reworded, "before={before:?} after={reworded:?}");
+    }
+
+    #[test]
+    fn mcp_schema_nested_items_type_change_differs_real_shape() {
+        // W8-1 probe (Codex PR #162): mutating the `related_to`
+        // property's nested `items` type in the real src/server.rs
+        // from string to object produced identical maps — only the
+        // first `"type":` on the line was captured, so the nested
+        // input contract was invisible to the gate.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/server.rs")).unwrap();
+        let needle =
+            "\"related_to\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }";
+        assert!(real.contains(needle), "real shape missing");
+        let mutated = real.replacen(
+            needle,
+            "\"related_to\": { \"type\": \"array\", \"items\": { \"type\": \"object\" }",
+            1,
+        );
+        assert_ne!(real, mutated);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_ne!(before, after, "nested items type change must register");
+        assert!(
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .any(|k| k.contains("related_to")),
+            "differing key must name the related_to property: {:?}",
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mcp_schema_nested_items_type_change_differs() {
+        // Synthetic single-line shape, independent of the real file.
+        let before = extract_public_surface_signatures(
+            "\"related_to\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"description\": \"Ids.\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"related_to\": { \"type\": \"array\", \"items\": { \"type\": \"object\" }, \"description\": \"Ids.\" },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before["mcp-schema:related_to"]
+                .iter()
+                .any(|s| s.contains("items=string")),
+            "{before:?}"
+        );
+        assert!(
+            after["mcp-schema:related_to"]
+                .iter()
+                .any(|s| s.contains("items=object")),
+            "{after:?}"
+        );
+        // A description-only edit on a nested property stays
+        // invisible, exactly as for non-nested properties.
+        let reworded = extract_public_surface_signatures(
+            "\"related_to\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"description\": \"Other wording.\" },",
+        );
+        assert_eq!(before, reworded, "before={before:?} after={reworded:?}");
+    }
+
+    #[test]
+    fn mcp_schema_nested_properties_type_change_differs() {
+        // Nested `properties` under `items` (the real
+        // follow_up_tasks shape): each nested property's own type
+        // is part of the input contract.
+        let schema = |priority_type: &str, labels_items_type: &str| {
+            format!(
+                "\"follow_up_tasks\": {{ \"type\": \"array\", \"items\": {{ \"type\": \"object\", \"properties\": {{ \"title\": {{ \"type\": \"string\" }}, \"priority\": {{ \"type\": \"{priority_type}\" }}, \"labels\": {{ \"type\": \"array\", \"items\": {{ \"type\": \"{labels_items_type}\" }} }} }}, \"required\": [\"title\"] }}, \"description\": \"Tasks.\" }},"
+            )
+        };
+        let before = extract_public_surface_signatures(&schema("integer", "string"));
+        let after_priority =
+            extract_public_surface_signatures(&schema("string", "string"));
+        assert_ne!(
+            before, after_priority,
+            "before={before:?} after={after_priority:?}"
+        );
+        let after_labels = extract_public_surface_signatures(&schema("integer", "object"));
+        assert_ne!(
+            before, after_labels,
+            "before={before:?} after={after_labels:?}"
+        );
+        assert!(
+            before["mcp-schema:follow_up_tasks"]
+                .iter()
+                .any(|s| s.contains("items.properties.priority=integer")),
+            "{before:?}"
+        );
+        assert!(
+            before["mcp-schema:follow_up_tasks"]
+                .iter()
+                .any(|s| s.contains("items.properties.labels.items=string")),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_direct_nested_properties_type_change_differs() {
+        // Nested `properties` directly under an object-typed
+        // property (the real cursor shape, on one line).
+        let before = extract_public_surface_signatures(
+            "\"cursor\": { \"type\": \"object\", \"properties\": { \"fingerprint\": { \"type\": \"string\" }, \"offset\": { \"type\": \"integer\" } } },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"cursor\": { \"type\": \"object\", \"properties\": { \"fingerprint\": { \"type\": \"string\" }, \"offset\": { \"type\": \"string\" } } },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before["mcp-schema:cursor"]
+                .iter()
+                .any(|s| s.contains("properties.offset=integer")),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_nested_items_type_with_array_valued_outer_type_differs() {
+        // The W6 array-valued outer type keeps its normalization
+        // while the nested items type is recorded alongside it.
+        let before = extract_public_surface_signatures(
+            "\"domain\": { \"type\": [\"string\", \"array\"], \"items\": { \"type\": \"string\" }, \"description\": \"Slug(s).\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"domain\": { \"type\": [\"string\", \"array\"], \"items\": { \"type\": \"object\" }, \"description\": \"Slug(s).\" },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before["mcp-schema:domain"]
+                .iter()
+                .any(|s| s.starts_with("domain:[\"string\", \"array\"]")
+                    && s.contains("items=string")),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_non_nested_and_constraint_pins_unchanged_by_nested_recording() {
+        // Pins that must hold before and after the W8-1 fix: a
+        // non-nested property keeps its exact legacy signature, the
+        // W6 array-valued type keeps its exact normalized form, and
+        // the W5 constraint leaves keep their owner-qualified keys.
+        let scalar = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"description\": \"Track.\" },",
+        );
+        assert!(
+            scalar["mcp-schema:mode"].iter().any(|s| s == "mode:string"),
+            "{scalar:?}"
+        );
+        let array_typed = extract_public_surface_signatures(
+            "\"domain\": { \"type\": [\"string\", \"array\"], \"description\": \"Slug(s).\" },",
+        );
+        assert!(
+            array_typed["mcp-schema:domain"]
+                .iter()
+                .any(|s| s == "domain:[\"string\", \"array\"]"),
+            "{array_typed:?}"
+        );
+        let schema = |leaf_line: &str| {
+            format!(
+                "\"name\": \"tool_a\",\n\"inputSchema\": {{\n  \"properties\": {{\n    \"mode\": {{\n      \"type\": \"string\",\n      {leaf_line}\n    }}\n  }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&schema("\"enum\": [\"hybrid\"]"));
+        assert!(
+            before.contains_key("mcp-schema:tool_a:mode.enum"),
+            "{before:?}"
+        );
+        let before =
+            extract_public_surface_signatures(&schema("\"default\": \"hybrid\""));
+        assert!(
+            before.contains_key("mcp-schema:tool_a:mode.default"),
+            "{before:?}"
+        );
     }
 
     #[test]
