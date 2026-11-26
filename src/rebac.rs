@@ -18,13 +18,13 @@ pub fn allowed_with_roles(
     relation: &str,
     acl: &[(String, String)],
 ) -> bool {
-    if user.is_empty() {
-        return false; // no anonymous access
+    if user.trim().is_empty() {
+        return false; // no anonymous or whitespace-only access
     }
     if user == "admin" {
         return true; // admin bypass
     }
-    if !resource_owner.is_empty() && check(resource_owner, user, "") {
+    if !resource_owner.trim().is_empty() && check(resource_owner, user, "") {
         return true; // owner always allowed, via §5.2 exact-equality check
     }
     if acl.is_empty() {
@@ -43,14 +43,17 @@ pub fn allowed_with_roles(
 
 /// §5.2 — check (exact equality only, no substring spoofing).
 pub fn check(predicate: &str, user: &str, resource: &str) -> bool {
-    if user.is_empty() {
+    if user.trim().is_empty() {
         return false;
     }
     predicate == user || predicate == resource || user == "admin"
 }
 
 /// §5.3 — principal resolution; admin honors client claim, others ignored.
-pub fn resolve_principal(authenticated_principal: &str, client_requested_principal: Option<&str>) -> String {
+pub fn resolve_principal(
+    authenticated_principal: &str,
+    client_requested_principal: Option<&str>,
+) -> String {
     if authenticated_principal == "admin" {
         client_requested_principal
             .filter(|s| !s.trim().is_empty())
@@ -72,10 +75,10 @@ pub fn extract_visible_to(metadata: &Value) -> Vec<String> {
                 .filter_map(|v| {
                     if let Some(s) = v.as_str() {
                         Some(s.to_string())
-                    } else if let Some(p) = v.get("principal").and_then(|p| p.as_str()) {
-                        Some(p.to_string())
                     } else {
-                        None
+                        v.get("principal")
+                            .and_then(|p| p.as_str())
+                            .map(|p| p.to_string())
                     }
                 })
                 .collect();
@@ -146,7 +149,9 @@ pub fn validate_visible_to(vt: &Value) -> Vec<String> {
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
             if !p_ok {
-                errs.push(format!("visible_to[{idx}].principal must be a non-empty string"));
+                errs.push(format!(
+                    "visible_to[{idx}].principal must be a non-empty string"
+                ));
             }
             if let Some(role) = obj.get("role").and_then(|v| v.as_str()) {
                 if !matches!(role, "viewer" | "editor" | "owner") {
@@ -174,17 +179,29 @@ pub fn extract_resource_owner(user_id: &str, metadata: &Value) -> String {
             return s.to_string();
         }
     }
-    if let Some(s) = metadata.get("mesh").and_then(|v| v.get("created_by")).and_then(|v| v.as_str()) {
+    if let Some(s) = metadata
+        .get("mesh")
+        .and_then(|v| v.get("created_by"))
+        .and_then(|v| v.as_str())
+    {
         if !s.is_empty() {
             return s.to_string();
         }
     }
-    if let Some(s) = metadata.get("lifecycle").and_then(|v| v.get("created_by")).and_then(|v| v.as_str()) {
+    if let Some(s) = metadata
+        .get("lifecycle")
+        .and_then(|v| v.get("created_by"))
+        .and_then(|v| v.as_str())
+    {
         if !s.is_empty() {
             return s.to_string();
         }
     }
-    if let Some(s) = metadata.get("mesh").and_then(|v| v.get("verified_signer_did")).and_then(|v| v.as_str()) {
+    if let Some(s) = metadata
+        .get("mesh")
+        .and_then(|v| v.get("verified_signer_did"))
+        .and_then(|v| v.as_str())
+    {
         if !s.is_empty() {
             return s.to_string();
         }
@@ -213,6 +230,54 @@ pub fn can_write_memory(principal: &str, user_id: &str, metadata: &Value) -> boo
         principal,
         &extract_resource_owner(user_id, metadata),
         "editor",
+        &extract_acl_with_roles(metadata),
+    )
+}
+
+/// §5.4 / §5.6 — namespace write permission via ReBAC.
+///
+/// The namespace-level write gate:
+/// - empty or whitespace-only namespace or principal is always denied
+///   (fail-closed; blank credentials are not meaningful authorization inputs),
+/// - `admin` always passes,
+/// - a principal whose name exactly matches the namespace name is allowed
+///   (namespace owner namesake convention),
+/// - any other principal is denied (fail-closed).
+pub fn can_write_namespace(
+    _store: &crate::store::LadybugStore,
+    namespace: &str,
+    principal: Option<&str>,
+) -> bool {
+    let principal = principal.unwrap_or("");
+    // Fail closed on blank credentials: an empty or whitespace-only namespace
+    // or principal names nothing, so nothing can be authorized (R14 parity
+    // with the store-level namespace guard).
+    if namespace.trim().is_empty() || principal.trim().is_empty() {
+        return false;
+    }
+    // admin bypass
+    if principal == "admin" {
+        return true;
+    }
+    // namespace owner namesake convention
+    principal == namespace
+}
+
+/// Kinetic Action role check: verifies `principal` satisfies `required_role`
+/// (`"editor"` or `"owner"`) on a target row.
+pub fn can_execute_action_on_row(
+    principal: &str,
+    user_id: &str,
+    required_role: &str,
+    metadata: &Value,
+) -> bool {
+    if !matches!(required_role, "editor" | "owner") {
+        return false;
+    }
+    allowed_with_roles(
+        principal,
+        &extract_resource_owner(user_id, metadata),
+        required_role,
         &extract_acl_with_roles(metadata),
     )
 }
@@ -265,6 +330,8 @@ mod tests {
     fn allowed_empty_user_denied() {
         assert!(!allowed("", "alice", "viewer", &[]));
         assert!(!allowed("", "", "viewer", &[]));
+        assert!(!allowed("   ", "alice", "viewer", &[]));
+        assert!(!allowed("   ", "   ", "viewer", &[]));
     }
 
     #[test]
@@ -275,7 +342,12 @@ mod tests {
 
     #[test]
     fn allowed_restricted_acl_stranger_denied() {
-        assert!(!allowed("bob", "alice", "viewer", &["alice".into(), "charlie".into()]));
+        assert!(!allowed(
+            "bob",
+            "alice",
+            "viewer",
+            &["alice".into(), "charlie".into()]
+        ));
     }
 
     // §5.2 check — exact match, no substring spoofing.
@@ -299,6 +371,8 @@ mod tests {
     #[test]
     fn check_empty_user_denied() {
         assert!(!check("alice", "", "resource"));
+        assert!(!check("alice", "   ", "resource"));
+        assert!(!check("   ", "   ", "resource"));
     }
 
     // §5.3 resolve_principal — non-admin cannot spoof; admin can.
@@ -340,7 +414,10 @@ mod tests {
     #[test]
     fn extract_visible_to_empty_and_array() {
         assert!(extract_visible_to(&serde_json::json!({})).is_empty());
-        assert_eq!(extract_visible_to(&serde_json::json!({"visible_to":["a","b"]})), vec!["a","b"]);
+        assert_eq!(
+            extract_visible_to(&serde_json::json!({"visible_to":["a","b"]})),
+            vec!["a", "b"]
+        );
     }
 
     // §5.6 role-aware ACLs — {principal, role} objects honor their role.
@@ -364,8 +441,14 @@ mod tests {
             "user_id": "alice",
             "visible_to": [{ "principal": "bob", "role": "editor" }]
         });
-        assert!(can_write_memory("bob", "alice", &meta), "editor entry grants editor");
-        assert!(can_read_memory("bob", "alice", &meta), "editor entry grants viewer");
+        assert!(
+            can_write_memory("bob", "alice", &meta),
+            "editor entry grants editor"
+        );
+        assert!(
+            can_read_memory("bob", "alice", &meta),
+            "editor entry grants viewer"
+        );
         assert!(
             !allowed_with_roles("bob", "alice", "owner", &extract_acl_with_roles(&meta)),
             "editor entry must NOT grant owner"
@@ -377,9 +460,24 @@ mod tests {
         let meta = serde_json::json!({
             "visible_to": [{ "principal": "*", "role": "editor" }]
         });
-        assert!(allowed_with_roles("stranger", "alice", "editor", &extract_acl_with_roles(&meta)));
-        assert!(allowed_with_roles("stranger", "alice", "viewer", &extract_acl_with_roles(&meta)));
-        assert!(!allowed_with_roles("stranger", "alice", "owner", &extract_acl_with_roles(&meta)));
+        assert!(allowed_with_roles(
+            "stranger",
+            "alice",
+            "editor",
+            &extract_acl_with_roles(&meta)
+        ));
+        assert!(allowed_with_roles(
+            "stranger",
+            "alice",
+            "viewer",
+            &extract_acl_with_roles(&meta)
+        ));
+        assert!(!allowed_with_roles(
+            "stranger",
+            "alice",
+            "owner",
+            &extract_acl_with_roles(&meta)
+        ));
     }
 
     #[test]
@@ -387,8 +485,14 @@ mod tests {
         assert!(!is_restricted(&serde_json::json!({"visible_to":[]})));
         assert!(is_restricted(&serde_json::json!({"visible_to":["alice"]})));
         assert!(!is_restricted(&serde_json::json!({"visible_to":["*"]})));
-        assert!(can_publish_to_mesh(&serde_json::json!({"visible_to":["alice"]}), &["alice".into()]));
-        assert!(can_publish_to_mesh(&serde_json::json!({"visible_to":["*"]}), &[]));
+        assert!(can_publish_to_mesh(
+            &serde_json::json!({"visible_to":["alice"]}),
+            &["alice".into()]
+        ));
+        assert!(can_publish_to_mesh(
+            &serde_json::json!({"visible_to":["*"]}),
+            &[]
+        ));
     }
 
     // §5.6 fail-closed — a non-empty visible_to array whose every element is
@@ -402,11 +506,156 @@ mod tests {
             extract_acl_with_roles(&meta),
             vec![("__invalid_acl__".to_string(), "viewer".to_string())]
         );
-        assert!(!allowed("bob", "alice", "viewer", &extract_visible_to(&meta)));
+        assert!(!allowed(
+            "bob",
+            "alice",
+            "viewer",
+            &extract_visible_to(&meta)
+        ));
         assert!(!can_read_memory("bob", "alice", &meta));
         // Malformed elements paired with a valid one still parse the valid one.
         let mixed = serde_json::json!({"user_id":"alice","visible_to":[42,"bob"]});
         assert!(can_read_memory("bob", "alice", &mixed));
         assert!(!can_read_memory("carol", "alice", &mixed));
+    }
+
+    // §5.4 / §5.6 namespace write gate must fail closed on blank credentials:
+    // an empty or whitespace-only namespace or principal names nothing, so no
+    // authorization can be meaningful. Adversarial cases: blank==blank used to
+    // authorize via the namesake rule, and the admin bypass honored a blank
+    // namespace.
+    fn namespace_gate_store() -> (tempfile::TempDir, crate::store::LadybugStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db");
+        let store = crate::store::LadybugStore::new(path, 4).expect("store init");
+        (dir, store)
+    }
+
+    #[test]
+    fn can_write_namespace_rejects_blank_namespace() {
+        let (_dir, store) = namespace_gate_store();
+        assert!(
+            !can_write_namespace(&store, "", None),
+            "empty namespace, no principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("")),
+            "empty namespace, empty principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("admin")),
+            "empty namespace, admin"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("alice")),
+            "empty namespace, owner namesake"
+        );
+        assert!(
+            !can_write_namespace(&store, "   ", None),
+            "spaces namespace"
+        );
+        assert!(
+            !can_write_namespace(&store, "  ", Some("  ")),
+            "spaces namespace, spaces principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "\t\n", Some("\t\n")),
+            "control-whitespace match"
+        );
+        assert!(
+            !can_write_namespace(&store, "  ", Some("admin")),
+            "spaces namespace, admin"
+        );
+    }
+
+    #[test]
+    fn can_write_namespace_rejects_blank_principal() {
+        let (_dir, store) = namespace_gate_store();
+        assert!(
+            !can_write_namespace(&store, "ns", Some("")),
+            "empty principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some("   ")),
+            "spaces principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some("\t")),
+            "tab principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "  ", Some("")),
+            "blank namespace, empty principal"
+        );
+        assert!(
+            !can_write_namespace(&store, "", Some("   ")),
+            "empty namespace, spaces principal"
+        );
+    }
+
+    #[test]
+    fn can_write_namespace_preserves_non_blank_behavior() {
+        let (_dir, store) = namespace_gate_store();
+        assert!(
+            can_write_namespace(&store, "ns", Some("admin")),
+            "admin bypass preserved"
+        );
+        assert!(
+            can_write_namespace(&store, "ns", Some("ns")),
+            "namesake convention preserved"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some("bob")),
+            "stranger denied"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", None),
+            "absent principal denied"
+        );
+        assert!(
+            can_write_namespace(&store, " ns ", Some(" ns ")),
+            "non-blank whitespace namesake kept"
+        );
+        assert!(
+            !can_write_namespace(&store, "ns", Some(" ns ")),
+            "exact match only, no trim-spoof"
+        );
+    }
+
+    #[test]
+    fn action_role_check_enforces_editor_or_owner_and_blocks_viewer() {
+        let meta = serde_json::json!({
+            "visible_to": [
+                {"principal": "bob-viewer", "role": "viewer"},
+                {"principal": "carol-editor", "role": "editor"},
+                {"principal": "dave-owner", "role": "owner"}
+            ]
+        });
+        assert!(!can_execute_action_on_row(
+            "bob-viewer",
+            "alice",
+            "editor",
+            &meta
+        ));
+        assert!(can_execute_action_on_row(
+            "carol-editor",
+            "alice",
+            "editor",
+            &meta
+        ));
+        assert!(!can_execute_action_on_row(
+            "carol-editor",
+            "alice",
+            "owner",
+            &meta
+        ));
+        assert!(can_execute_action_on_row(
+            "dave-owner",
+            "alice",
+            "owner",
+            &meta
+        ));
+        assert!(can_execute_action_on_row("alice", "alice", "owner", &meta));
+        assert!(can_execute_action_on_row("admin", "alice", "owner", &meta));
     }
 }

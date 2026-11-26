@@ -50,7 +50,10 @@ pub fn resolve_node_id_at(home: &Path) -> String {
     let fresh = Uuid::new_v4().to_string();
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!("mesh-node-id dir {} could not be created: {e}", dir.display());
+            tracing::warn!(
+                "mesh-node-id dir {} could not be created: {e}",
+                dir.display()
+            );
         }
     }
     if let Err(e) = std::fs::write(&path, format!("{}\n", fresh)) {
@@ -58,7 +61,6 @@ pub fn resolve_node_id_at(home: &Path) -> String {
     }
     fresh
 }
-
 
 /// The call-site wrapper: resolves the local home once, then delegates.
 pub fn resolve_node_id() -> String {
@@ -77,7 +79,6 @@ async fn head_exists(root: &Path) -> bool {
         .map(|out| out.status.success())
         .unwrap_or(false)
 }
-
 
 /// Does the configured remote have refs yet? Three answers, not two:
 /// `Some(false)` = reachable but EMPTY (bare repo nobody pushed to — a
@@ -283,21 +284,21 @@ impl MeshService {
                             // runtime (e.g. #[tokio::test]) has no multi-thread worker
                             // pool for block_in_place, so the probe runs on a scoped
                             // OS thread instead.
-                            let bearer =
-                                std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN")
-                                    .unwrap_or_default();
+                            let bearer = std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN")
+                                .unwrap_or_default();
                             let probe = if handle.runtime_flavor()
                                 == tokio::runtime::RuntimeFlavor::MultiThread
                             {
                                 tokio::task::block_in_place(|| {
-                                    handle.block_on(self.federated_remote_list(&remote, &ns, &bearer))
+                                    handle
+                                        .block_on(self.federated_remote_list(&remote, &ns, &bearer))
                                 })
                             } else {
                                 std::thread::scope(|s| {
                                     s.spawn(|| {
-                                        handle.clone().block_on(self.federated_remote_list(
-                                            &remote, &ns, &bearer,
-                                        ))
+                                        handle.clone().block_on(
+                                            self.federated_remote_list(&remote, &ns, &bearer),
+                                        )
                                     })
                                     .join()
                                     .map_err(|_| "federated probe thread panicked".to_string())
@@ -331,7 +332,12 @@ impl MeshService {
 
     /// Remote peer probe: used by `status_report` to inspect a configured
     /// HTTP federated peer in production, and by the test surface directly.
-    pub async fn federated_remote_list(&self, base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
+    pub async fn federated_remote_list(
+        &self,
+        base_url: &str,
+        namespace: &str,
+        token: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
         crate::synaptic_mesh::federation::remote_list(base_url, namespace, token).await
     }
 }
@@ -388,7 +394,8 @@ pub async fn dirty_paths(mesh_root: &Path) -> Vec<String> {
 /// Detached HEAD: `git rev-parse --abbrev-ref HEAD` answers `HEAD` (unborn
 /// branches answer the branch name or fail — neither is detached).
 pub async fn detached_head(mesh_root: &Path) -> bool {
-    git(mesh_root, &["rev-parse", "--abbrev-ref", "HEAD"]).await
+    git(mesh_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "HEAD")
         .unwrap_or(false)
@@ -416,7 +423,6 @@ async fn health_line(mesh_root: &Path) -> String {
     "healthy".to_string()
 }
 
-
 /// `(head, age)` from the import cursor file, when it is intact and belongs
 /// to this mesh (import.rs owns the validation rules; the report only reads).
 fn accepted_head_state(mesh_root: &Path, mesh_id: &str) -> Option<(String, String)> {
@@ -436,7 +442,8 @@ fn accepted_head_state(mesh_root: &Path, mesh_id: &str) -> Option<(String, Strin
 /// means "what we last fetched/pushed equals HEAD", and a never-fetched
 /// mesh says so.
 async fn published_head_line(mesh_root: &Path, remote: Option<&str>) -> String {
-    let local = git(mesh_root, &["log", "-1", "--format=%H %ct", "HEAD"]).await
+    let local = git(mesh_root, &["log", "-1", "--format=%H %ct", "HEAD"])
+        .await
         .filter(|o| o.status.success())
         .and_then(|o| {
             let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -815,7 +822,6 @@ impl StorageApi for MeshService {
     }
 }
 
-
 /// Dispatch one MCP `tools/call` for the synaptic-mesh surface, production
 /// base root (the conventional `~/.NeuroStrata/synaptic-mesh`).
 pub async fn handle_mesh_tool_call(name: &str, arguments: &Value) -> String {
@@ -849,7 +855,11 @@ pub fn resolve_mesh_project_root(arguments: &Value) -> Result<PathBuf, String> {
 
 /// Test-seam variant: same dispatch, explicit base root. Tests pass a scratch
 /// dir so a mesh never lands under the developer's real home.
-pub async fn handle_mesh_tool_call_with_base(name: &str, arguments: &Value, base_root: &Path) -> String {
+pub async fn handle_mesh_tool_call_with_base(
+    name: &str,
+    arguments: &Value,
+    base_root: &Path,
+) -> String {
     let project_root = match resolve_mesh_project_root(arguments) {
         Ok(root) => root,
         Err(e) => return e,
@@ -930,7 +940,8 @@ mod tests {
                 "platform-team",
                 &["proj-ns".to_string()],
                 None,
-            ).await
+            )
+            .await
             .expect("init");
         assert!(Uuid::parse_str(&id).is_ok(), "id is uuid, got {id}");
         assert!(project
@@ -948,14 +959,17 @@ mod tests {
         let project = scratch("idem-proj");
         let mut svc = MeshService::new(project.clone());
         let first = svc
-            .init_mesh(&base, "node-idem", "first-team", &[], None).await
+            .init_mesh(&base, "node-idem", "first-team", &[], None)
+            .await
             .expect("first init");
         let (p_id, p_dir, _) = svc
             .read_pointer(&project)
             .expect("pointer readable")
             .expect("pointer written after first init");
 
-        let second = svc.init_mesh(&base, "node-idem", "second-team", &[], None).await;
+        let second = svc
+            .init_mesh(&base, "node-idem", "second-team", &[], None)
+            .await;
         let err = second.expect_err("second init MUST refuse — one mesh per project");
         assert!(
             err.contains("one mesh per project"),
@@ -984,7 +998,8 @@ mod tests {
         let base = scratch("nsdef-base");
         let project = scratch("nsdef-proj");
         let mut svc = MeshService::new(project.clone());
-        svc.init_mesh(&base, "node-nsdef", "nsdef-team", &[], None).await
+        svc.init_mesh(&base, "node-nsdef", "nsdef-team", &[], None)
+            .await
             .expect("init");
         let expected_ns = project
             .file_name()
@@ -1006,7 +1021,8 @@ mod tests {
         let project = scratch("proj2");
         let mut first = MeshService::new(project.clone());
         let id = first
-            .init_mesh(&base, "node-b", "shared", &["ns".into()], None).await
+            .init_mesh(&base, "node-b", "shared", &["ns".into()], None)
+            .await
             .unwrap();
         drop(first);
         // New-process simulation: a fresh service with no cached handle.
@@ -1017,7 +1033,6 @@ mod tests {
         let err = second.push().await.expect_err("no remote configured");
         assert!(err.contains("no remote"), "err: {err}");
     }
-
 
     #[tokio::test]
     async fn no_mesh_paths_collapse_to_the_canonical_reply() {
@@ -1041,7 +1056,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn join_adopts_and_writes_the_pointer_in_one_call() {
         let base = scratch("jbase");
@@ -1050,7 +1064,8 @@ mod tests {
         let mut a = MeshService::new(project_a);
         let id = a
             .init_mesh(&base, "node-j", "adopted", &["ns".into()], None)
-            .await.unwrap();
+            .await
+            .unwrap();
         let mesh_dir = base.join(&id);
         let mut b = MeshService::new(project_b.clone());
         b.open_mesh(&mesh_dir).expect("join");
@@ -1074,7 +1089,8 @@ mod tests {
         .unwrap();
         let svc = MeshService::new(project);
         let err = svc
-            .status().await
+            .status()
+            .await
             .expect_err("garbage pointer must not read as joined");
         assert!(
             err.contains("malformed"),
@@ -1110,7 +1126,8 @@ mod tests {
             "neurostrata_synaptic_mesh_status",
             &json!({"project_root": project}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(status.contains("tool-mesh"), "status reply: {status}");
         assert!(
             status.contains("permanent record"),
@@ -1120,7 +1137,8 @@ mod tests {
             "neurostrata_synaptic_mesh_leave",
             &json!({"project_root": project}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(leave.contains("left"), "leave reply: {leave}");
         assert!(!project
             .join(".NeuroStrata")
@@ -1156,7 +1174,8 @@ mod tests {
             "neurostrata_synaptic_mesh_status",
             &json!({"project_root": spelled}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(
             status.contains("canon-mesh"),
             "the canonical project answers, whatever the spelling: {status}"
@@ -1190,7 +1209,8 @@ mod tests {
             "neurostrata_synaptic_mesh_push",
             &json!({"project_root": project}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(
             push.contains("nothing to publish yet"),
             "fresh mesh push must answer the empty state, got: {push}"
@@ -1199,14 +1219,13 @@ mod tests {
             "neurostrata_synaptic_mesh_pull",
             &json!({"project_root": project}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(
             pull.contains("nothing on the remote yet"),
             "empty-remote pull must answer the empty state, got: {pull}"
         );
     }
-
-
 
     // --- slice 7: full status surface --------------------------------------
 
@@ -1234,15 +1253,19 @@ mod tests {
     /// and the checkout. `status_report` re-resolves through the pointer on
     /// every call (no cache), so post-init file writes show up in the SAME
     /// service's report.
-    async fn init_joined(base: &Path, project: &Path, namespaces: &[&str]) -> (MeshService, PathBuf) {
+    async fn init_joined(
+        base: &Path,
+        project: &Path,
+        namespaces: &[&str],
+    ) -> (MeshService, PathBuf) {
         let ns: Vec<String> = namespaces.iter().map(|s| s.to_string()).collect();
         let mut svc = MeshService::new(project.to_path_buf());
         let id = svc
-            .init_mesh(base, "node-7", "status-team", &ns, None).await
+            .init_mesh(base, "node-7", "status-team", &ns, None)
+            .await
             .expect("init");
         (svc, base.join(&id))
     }
-
 
     #[tokio::test]
     async fn status_on_a_fresh_mesh_reports_the_full_surface() {
@@ -1282,7 +1305,6 @@ mod tests {
             "status is read-only sanity: mesh dir untouched"
         );
     }
-
 
     /// End-to-end pin for the wired seam: a conflict registered in the
     /// overlay must surface through `status()` — the count AND the per-entry
@@ -1341,7 +1363,6 @@ mod tests {
         );
     }
 
-
     /// e2e pin for the PULL TRIGGER side of the conflict loop (slice 7):
     /// the seam test above pins the import side; this one drives the pull
     /// trigger path with the same registered conflict and pins that the
@@ -1372,7 +1393,8 @@ mod tests {
                 "node_id": "pt-node"
             }),
             &base,
-        ).await;
+        )
+        .await;
         assert!(init.contains("mesh created"), "init reply: {init}");
         let svc = MeshService::new(project.clone());
         let (mesh_id, dir, _) = svc
@@ -1430,7 +1452,8 @@ mod tests {
             "neurostrata_synaptic_mesh_pull",
             &json!({"project_root": project}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(
             pull.contains("nothing on the remote yet"),
             "empty-remote pull reply: {pull}"
@@ -1448,7 +1471,8 @@ mod tests {
             "neurostrata_synaptic_mesh_status",
             &json!({"project_root": project}),
             &base,
-        ).await;
+        )
+        .await;
         assert!(
             status.contains("conflicts: 1 unresolved"),
             "conflict survives the pull trigger: {status}"
@@ -1490,7 +1514,6 @@ mod tests {
         assert!(report.contains("oldest 2m"), "121s renders as 2m: {report}");
     }
 
-
     #[tokio::test]
     async fn a_wal_fragment_without_newline_is_not_pending() {
         let base = scratch("st-frag");
@@ -1525,7 +1548,6 @@ mod tests {
             "fragment dropped, one durable entry: {report}"
         );
     }
-
 
     #[tokio::test]
     async fn status_pauses_on_a_dirty_checkout_and_names_the_paths() {
@@ -1581,7 +1603,6 @@ mod tests {
         assert!(report.contains("health: paused: detached HEAD"), "{report}");
     }
 
-
     // --- slice 7: sync-enqueue (hook target) --------------------------------
 
     #[tokio::test]
@@ -1598,7 +1619,8 @@ mod tests {
             "enqueue-team",
             &["alpha".to_string()],
             Some(bare.to_str().unwrap()),
-        ).await
+        )
+        .await
         .expect("init with remote");
         commit_manifest(&mut svc, "node-7").await;
 
@@ -1624,7 +1646,8 @@ mod tests {
             "dead-team",
             &["alpha".to_string()],
             Some(dead_remote.to_str().unwrap()),
-        ).await
+        )
+        .await
         .expect("init with a remote to nowhere");
         commit_manifest(&mut svc, "node-7").await;
 
@@ -1735,7 +1758,6 @@ mod tests {
         let report = recover_report(&project).await;
         assert!(report.starts_with("no mesh joined"), "{report}");
     }
-
 
     #[test]
     fn ages_are_human() {

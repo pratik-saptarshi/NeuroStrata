@@ -6,8 +6,8 @@
 
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::util::lock_or_err;
 
@@ -51,7 +51,9 @@ pub fn acquire_test_lock() -> TestLockGuard {
     }
     let guard = TEST_LOCK.lock().expect("test lock poisoned");
     HOLDING.set(true);
-    TestLockGuard { _guard: Some(guard) }
+    TestLockGuard {
+        _guard: Some(guard),
+    }
 }
 
 #[cfg(test)]
@@ -73,8 +75,7 @@ static SINGLE_DOMAIN_BYPASSES: AtomicU64 = AtomicU64::new(0);
 static RECALL_RESPONSES: AtomicU64 = AtomicU64::new(0);
 static RECALL_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 
-static RECENTLY_RECALLED: Mutex<Option<HashMap<String, VecDeque<String>>>> =
-    Mutex::new(None);
+static RECENTLY_RECALLED: Mutex<Option<HashMap<String, VecDeque<String>>>> = Mutex::new(None);
 
 pub fn domain_filter_snapshot() -> serde_json::Value {
     #[cfg(test)]
@@ -170,7 +171,6 @@ pub fn record_promotion(namespace: &str, id: &str) -> bool {
     }
     found
 }
-
 
 #[cfg(test)]
 pub fn reset_counters_for_tests() {

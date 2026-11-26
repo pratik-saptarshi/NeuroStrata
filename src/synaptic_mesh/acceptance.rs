@@ -195,7 +195,8 @@ mod tests {
             &[NS.to_string()],
             Some(remote.to_str().unwrap()),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         a.commit_all("bootstrap", "node-a").await.unwrap();
         a.push().await.unwrap();
         let branch = git_out(a.root(), &["branch", "--show-current"]);
@@ -221,7 +222,9 @@ mod tests {
     /// push — the worker's publish cycle.
     async fn publish(mesh: &MeshStorage, outbox: &Outbox, node: &str, pending: OutboxEntry) {
         outbox.append(&pending).unwrap();
-        let report = super::super::worker::drain_once(outbox, mesh, node).await.unwrap();
+        let report = super::super::worker::drain_once(outbox, mesh, node)
+            .await
+            .unwrap();
         assert_eq!(report.applied, 1, "drain must publish: {report:?}");
         assert!(
             report.committed,
@@ -782,7 +785,9 @@ mod tests {
         );
 
         // 5. B's drain quarantines T (epoch 1 < epoch 2): skipped, named, pending.
-        let drain = super::super::worker::drain_once(&b_out, &b, "node-b").await.unwrap();
+        let drain = super::super::worker::drain_once(&b_out, &b, "node-b")
+            .await
+            .unwrap();
         assert_eq!(
             drain.applied, 0,
             "the stale entry must not publish: {drain:?}"

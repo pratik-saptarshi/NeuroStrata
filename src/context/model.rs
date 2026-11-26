@@ -34,13 +34,13 @@ pub const CONTEXT_PLAN_SCHEMA_VERSION: &str = "context-plan/v1";
 macro_rules! state_enum {
     (
         $(#[$meta:meta])*
-        $name:ident { $( $variant:ident => $token:literal ),+ $(,)? }
+        $name:ident { $( $(#[$vmeta:meta])* $variant:ident => $token:literal ),+ $(,)? }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
-            $( $variant, )+
+            $( $(#[$vmeta])* $variant, )+
         }
 
         impl $name {
@@ -111,6 +111,7 @@ state_enum! {
         Unchanged => "unchanged",
         Changed => "changed",
         Missing => "missing",
+        #[default]
         Unknown => "unknown",
         NotApplicable => "not_applicable",
     }
@@ -121,6 +122,7 @@ state_enum! {
     ///
     /// A matching file hash refreshes the anchor; it never verifies meaning.
     SemanticValidation {
+        #[default]
         Unreviewed => "unreviewed",
         Verified => "verified",
         Contradicted => "contradicted",
@@ -132,6 +134,7 @@ state_enum! {
     Coverage {
         Complete => "complete",
         Partial => "partial",
+        #[default]
         Unavailable => "unavailable",
     }
 }
@@ -142,6 +145,7 @@ state_enum! {
     /// Independent of source currency: a decision does not go stale because
     /// the code it touched moved.
     DecisionLifecycle {
+        #[default]
         Proposed => "proposed",
         Accepted => "accepted",
         Superseded => "superseded",
@@ -162,39 +166,10 @@ state_enum! {
     Degradation {
         Supported => "supported",
         Unsupported => "unsupported",
+        #[default]
         Unavailable => "unavailable",
         Partial => "partial",
         Degraded => "degraded",
-    }
-}
-
-impl Default for SourceCurrency {
-    fn default() -> Self {
-        SourceCurrency::Unknown
-    }
-}
-
-impl Default for SemanticValidation {
-    fn default() -> Self {
-        SemanticValidation::Unreviewed
-    }
-}
-
-impl Default for Coverage {
-    fn default() -> Self {
-        Coverage::Unavailable
-    }
-}
-
-impl Default for DecisionLifecycle {
-    fn default() -> Self {
-        DecisionLifecycle::Proposed
-    }
-}
-
-impl Default for Degradation {
-    fn default() -> Self {
-        Degradation::Unavailable
     }
 }
 
@@ -340,28 +315,39 @@ impl ContextPlan {
     }
 }
 
-
 impl AsRef<ContextRequest> for ContextRequest {
-    fn as_ref(&self) -> &Self { self }
+    fn as_ref(&self) -> &Self {
+        self
+    }
 }
 impl AsRef<ContextPlan> for ContextPlan {
-    fn as_ref(&self) -> &Self { self }
+    fn as_ref(&self) -> &Self {
+        self
+    }
 }
-
 
 
 impl EgressPolicy {
     pub fn allow() -> Self {
-        Self { allowed: true, reason: None }
+        Self {
+            allowed: true,
+            reason: None,
+        }
     }
     pub fn deny(reason: impl Into<String>) -> Self {
-        Self { allowed: false, reason: Some(reason.into()) }
+        Self {
+            allowed: false,
+            reason: Some(reason.into()),
+        }
     }
     pub fn enforce(&self) -> Result<(), String> {
         if self.allowed {
             Ok(())
         } else {
-            Err(self.reason.clone().unwrap_or_else(|| "egress denied".into()))
+            Err(self
+                .reason
+                .clone()
+                .unwrap_or_else(|| "egress denied".into()))
         }
     }
 }

@@ -1,72 +1,79 @@
 // Increase recursion limit for large JSON literals in tools/list
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod attempt;
+mod bench;
 mod buffer;
-mod config;
+mod community;
 // The context DTOs are shipped ahead of the service that builds plans
 // (plan Task 2 of the agent-adoption plan). Nothing constructs them yet,
 // so the dead-code lint has no honest answer to give.
+mod compression;
+mod config;
+mod connectors;
 #[allow(dead_code)]
 mod context;
 mod crash;
 mod daemon;
-mod domain;
-mod embed;
-mod compression;
-
-
-
-
+mod diagnostic;
 mod did;
 mod digital_twin;
-
-
+mod doc_gate;
+mod domain;
+mod embed;
+mod events;
+mod formal_kernel;
 mod fts;
 mod gliner;
-mod graphql;
-mod kge;
-mod community;
-mod events;
 mod graph_read;
+mod graphql;
 mod guard;
 mod handlers;
 mod ingest_jobs;
+mod ingest_watch;
 mod judgment;
+mod kernel;
+mod kge;
+mod learning;
 mod lexical;
-mod model_downloader;
 mod mention;
+mod model_choice;
+mod model_downloader;
 mod multimodal;
 mod ontology_grounding;
-mod learning;
 mod parser;
+mod paths;
+mod procmem;
 mod rag_chat;
+mod rdf;
 mod rebac;
 mod recall_metrics;
 mod receipts;
-mod rdf;
 mod registry;
+mod retention;
 mod search;
 mod secrets;
+mod semantic_eval;
 mod server;
 mod setup;
 mod source_context;
+mod storage;
 mod store;
+mod streaming;
 mod synaptic_mesh;
 mod task;
+
+
 #[cfg(test)]
 mod test_support;
-mod storage;
-
-mod streaming;
-
-
 mod telemetry;
-mod retention;
-mod diagnostic;
 mod time_series;
 mod tools;
 mod traits;
+mod vault_ld;
+mod workflow;
+
+
 mod util;
 
 use crate::traits::SearchResult;
@@ -75,7 +82,6 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::Config;
 use embed::build_embedder;
-use std::collections::HashSet;
 use std::sync::Arc;
 use store::LadybugStore;
 
@@ -90,7 +96,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start NeuroStrata in daemon-only mode
-    Daemon,
+    Daemon {
+        /// Record the memory growth log and sampler (`~/.config/neurostrata/memory-growth.log`).
+        /// Off by default; `NEUROSTRATA_PROFILE=1` does the same for a daemon an IDE starts.
+        #[arg(long)]
+        profile: bool,
+    },
 
     /// List all active namespaces
     Namespaces,
@@ -119,6 +130,16 @@ enum Commands {
         /// Dry-run mode: "estimate" or "presort"
         #[arg(long, default_value = "estimate")]
         dry_run_mode: String,
+    },
+
+    /// Ingest a compiler-produced SCIP protobuf index (.scip) into a namespace
+    #[command(name = "ingest-scip")]
+    IngestScip {
+        /// Path to the .scip protobuf index file
+        scip_path: String,
+
+        /// The target namespace
+        namespace: String,
     },
 
     /// Export the memory graph to a JSON file
@@ -179,6 +200,51 @@ enum Commands {
 
         /// The memory ID to archive
         id: String,
+    },
+
+    /// Run the longitudinal benchmark suite and emit a JSON performance receipt
+    Bench {
+        /// Benchmark suite to run
+        #[arg(long, default_value = "all")]
+        suite: crate::bench::BenchSuite,
+        /// Number of iterations per suite
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+        /// Optional path to write the pretty JSON receipt
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Optional path to a previous receipt for regression comparison
+        #[arg(long)]
+        baseline: Option<std::path::PathBuf>,
+        /// Maximum allowed regression percentage
+        #[arg(long, default_value_t = 20.0)]
+        max_regression_pct: f64,
+        /// Exit non-zero when regression exceeds threshold
+        #[arg(long)]
+        fail_on_regression: bool,
+        /// Optional namespace to record latency samples into TimeSeriesStore
+        #[arg(long)]
+        record_metrics: Option<String>,
+    },
+
+    /// Run offline semantic competency and four-arm retrieval evaluation gate
+    #[command(name = "semantic-eval")]
+    SemanticEval {
+        /// Strict competency fixture path
+        #[arg(long)]
+        competency: std::path::PathBuf,
+        /// Strict retrieval fixture path
+        #[arg(long)]
+        retrieval: std::path::PathBuf,
+        /// Number of measured iterations (warmup excluded); must be >= 3
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Optional path for the strict JSON evidence receipt
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Exit nonzero on any validation, execution, or gate failure
+        #[arg(long)]
+        check: bool,
     },
 
     /// Report what the thalamic bus has done since the daemon started
@@ -260,13 +326,16 @@ enum Commands {
     Backup {
         /// Directory to write the backup into. Must not already exist
         dir: String,
+
+        /// Copy the database and WAL files directly without opening or checkpointing the store
+        #[arg(long)]
+        no_open: bool,
     },
 
     /// Report daemon and store state without touching anything
     ///
     /// Exit 0: a healthy daemon is serving. Exit 1: no daemon and the lock is
     /// free -- safe to start one. Exit 2: the lock is held but nothing answers;
-    /// a daemon is busy or finishing, so do not start another.
     /// a daemon is busy or finishing, so do not start another. Exit 3: the
     /// daemon is running an older/stale build (its probe handshake did not
     /// match), so it should be shut down and restarted.
@@ -357,6 +426,12 @@ enum Commands {
         action: HooksCommands,
     },
 
+    /// Project namespace lookups (no daemon, no database)
+    Namespace {
+        #[command(subcommand)]
+        action: NamespaceCommands,
+    },
+
     /// Share what your agents learn with the team's agents (SynapticMesh)
     ///
     /// The mesh is a standalone git repo the daemon owns; the project keeps
@@ -416,6 +491,339 @@ enum Commands {
         /// Target namespace
         #[arg(short, long, default_value = "NeuroStrata")]
         namespace: String,
+    },
+
+    /// Define, validate, apply, revert, or inspect kinetic Action Types
+    #[command(name = "action")]
+    Action {
+        #[command(subcommand)]
+        action: ActionCommands,
+    },
+
+    /// Create, stage, evaluate SPARQL, diff, commit, drop, or list counterfactual Ontology Scenarios
+    #[command(name = "scenario")]
+    Scenario {
+        #[command(subcommand)]
+        scenario: ScenarioCommands,
+    },
+
+    /// Hydrate a 360-degree Ontology Object View for a memory, symbol, file, task, or digital twin
+    #[command(name = "object-view")]
+    ObjectView {
+        /// Target namespace
+        namespace: String,
+        /// Memory ID or digital twin_id to inspect
+        id: String,
+        /// Optional counterfactual scenario ID
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Max recent action receipts to include in lineage (default 5, max 25)
+        #[arg(long, default_value_t = 5)]
+        include_history_limit: usize,
+        /// Evaluate ActionType preconditions (default true)
+        #[arg(long, default_value_t = true)]
+        evaluate_action_preconditions: bool,
+        /// Maximum serialized response bytes before truncation (default 8192)
+        #[arg(long, default_value_t = 8192)]
+        max_bytes: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+
+    /// Single-call compound Code Finder, Blast-Radius & Governance Locator
+    Locate {
+        /// Target namespace
+        namespace: String,
+        /// Symbol name, file path, or natural-language localization query
+        query: String,
+        /// Optional directory or file path prefix filter
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Only return spans anchored to a specific AST symbol
+        #[arg(long, default_value_t = false)]
+        symbols_only: bool,
+        /// Maximum ranked locations to return (default 8, max 20)
+        #[arg(long, default_value_t = 8)]
+        max_locations: usize,
+        /// Maximum serialized response byte budget (default 6144)
+        #[arg(long, default_value_t = 6144)]
+        max_bytes: usize,
+        /// Optional project root directory
+        #[arg(long)]
+        project_root: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+
+    /// Generate a 4-stop dependency-ordered Guided Diff Tour with blast-radius & GOVERNS audit
+    #[command(name = "diff-tour")]
+    DiffTour {
+        /// Target namespace
+        namespace: String,
+        /// Optional path to a unified diff file (or '-' for stdin)
+        #[arg(long)]
+        diff_file: Option<String>,
+        /// Inline unified diff text
+        #[arg(long)]
+        diff_text: Option<String>,
+        /// Optional project root directory
+        #[arg(long)]
+        project_root: Option<String>,
+        /// Maximum unchanged callers to list per item (default 15)
+        #[arg(long, default_value_t = 15)]
+        max_blast_radius_callers: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+
+    /// Evaluate and manage longitudinal Architectural & Governance Code Insights
+    #[command(name = "insights")]
+    Insights {
+        /// Target namespace
+        namespace: String,
+        /// Action: snapshot | series | define | remove
+        #[arg(default_value = "snapshot")]
+        action: String,
+        /// Insight slug (optional filter on snapshot/series; required on define/remove)
+        #[arg(long)]
+        name: Option<String>,
+        /// Human-readable title when defining a custom insight
+        #[arg(long)]
+        title: Option<String>,
+        /// Custom insight query kind (sparql | lexical | ast_calls)
+        #[arg(long)]
+        query_kind: Option<String>,
+        /// Custom insight query string
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional file/directory path prefix filter
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Optional start unix timestamp (seconds)
+        #[arg(long)]
+        from_ts: Option<i64>,
+        /// Optional end unix timestamp (seconds)
+        #[arg(long)]
+        to_ts: Option<i64>,
+        /// Optional number of bitemporal as_of backfill steps across [from_ts, to_ts]
+        #[arg(long)]
+        backfill_points: Option<usize>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+
+    /// Manage and query Subject-Matter Domain Expertise, SKOS Concept Taxonomy & SME Frontier Advisor
+    #[command(name = "taxonomy")]
+    Taxonomy {
+        #[command(subcommand)]
+        taxonomy: TaxonomyCommands,
+    },
+
+    /// Validate the 3-tier Documentation Manifest and surface-diff gate
+    #[command(name = "doc-gate")]
+    DocGate {
+        /// Optional project root directory (defaults to git root or current directory)
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// Output JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect and drive the pluggable workflow lifecycle state machine and connector
+    #[command(name = "workflow")]
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowCommands,
+    },
+    /// Interact with external data pools via registered DataConnectors
+    #[command(name = "data-connector")]
+    DataConnector {
+        #[command(subcommand)]
+        action: DataConnectorCommands,
+    },
+
+    /// Vault-LD sync: export/import vault notes + Canvas topology
+    #[command(name = "vault-sync")]
+    VaultSync {
+        /// Sync direction: export (memories -> vault) or import (vault -> memories)
+        action: String,
+        /// The exact project name
+        namespace: String,
+        /// Directory of the Markdown vault
+        vault_path: String,
+        /// Directory for generated artifacts (export only)
+        output_dir: String,
+        /// Optional ReBAC principal
+        principal: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum WorkflowCommands {
+    /// Show active workflow connector, captured scope, state digest, and changed paths
+    #[command(alias = "connector")]
+    Status {
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the formal workflow stage transition table
+    Transitions {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install or verify lifecycle triggers for the active workflow connector
+    #[command(alias = "install-triggers")]
+    Install {
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum DataConnectorCommands {
+    /// List all registered data connectors.
+    List,
+    /// Describe a registered pool on a connector.
+    #[command(name = "describe")]
+    Describe {
+        /// Connector ID (from `list`)
+        #[arg(long)]
+        connector_id: String,
+        /// Pool ID to describe
+        #[arg(long)]
+        pool_id: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Register a data pointer under the kernel's ReBAC + pre-gate enforcement.
+    #[command(name = "register-pointer")]
+    RegisterPointer {
+        /// Target namespace
+        namespace: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Connector ID
+        #[arg(long)]
+        connector_id: Option<String>,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: Option<String>,
+        /// Pool ID
+        #[arg(long)]
+        pool_id: Option<String>,
+        /// Pointer URI
+        #[arg(long)]
+        pointer_uri: Option<String>,
+        /// Entity type
+        #[arg(long)]
+        entity_type: Option<String>,
+        /// Captured-at timestamp in epoch seconds
+        #[arg(long)]
+        captured_at_secs: Option<u64>,
+        /// Maximum staleness in seconds
+        #[arg(long)]
+        max_staleness_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Resolve a bounded slice from a trusted pointer.
+    #[command(name = "resolve")]
+    Resolve {
+        /// Target namespace
+        namespace: String,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: String,
+        /// Offset into the slice (default 0)
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Maximum rows to resolve
+        #[arg(long)]
+        limit: u32,
+        /// Maximum bytes to resolve
+        #[arg(long)]
+        max_bytes: u32,
+        /// Optional captured-at timestamp (epoch seconds) for staleness override
+        #[arg(long)]
+        now_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Apply an external write-back guarded by receipt + CAS + pre/post gates.
+    #[command(name = "apply-effect")]
+    ApplyEffect {
+        /// Target namespace
+        namespace: String,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: String,
+        /// Operation name (e.g. "append", "replace")
+        #[arg(long)]
+        operation: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Action receipt ID
+        #[arg(long)]
+        action_receipt_id: String,
+        /// Idempotency key
+        #[arg(long)]
+        idempotency_key: String,
+        /// Expected source SHA-256
+        #[arg(long)]
+        expected_source_sha256: Option<String>,
+        /// Optional captured-at timestamp (epoch seconds) for staleness override
+        #[arg(long)]
+        now_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Mediate a workflow transition + bounded data slice resolution.
+    #[command(name = "mediate")]
+    Mediate {
+        /// Target namespace
+        namespace: String,
+        /// From workflow stage
+        #[arg(long)]
+        from_stage: String,
+        /// To workflow stage
+        #[arg(long)]
+        to_stage: String,
+        /// Whether the transition gate passed
+        #[arg(long)]
+        gate_passed: bool,
+        /// Pointer ID
+        #[arg(long)]
+        pointer_id: String,
+        /// Offset into the slice (default 0)
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Maximum rows to resolve
+        #[arg(long)]
+        limit: u32,
+        /// Maximum bytes to resolve
+        #[arg(long)]
+        max_bytes: u32,
+        /// Optional captured-at timestamp (epoch seconds) for staleness override
+        #[arg(long)]
+        now_secs: Option<u64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
     },
 }
 
@@ -492,6 +900,23 @@ pub(crate) enum TaskCommands {
         /// Path to the exported JSONL (bd export .beads/beads.jsonl)
         #[arg(long)]
         from_beads: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum NamespaceCommands {
+    /// Print the namespace configured for a project: the harness settings
+    /// the installer wrote (.claude/settings.local.json, the opencode, codex,
+    /// hermes, openclaw or GitHub CLI plugin config) in the checkout or its
+    /// main checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
+    /// .NeuroStrata/session_queries.json, else the main checkout's folder
+    /// name. Configs that disagree are reported on stderr; the first in that
+    /// order wins. Exits non-zero, naming the cause, when the directory does
+    /// not exist, a harness config cannot be read, or no usable namespace is
+    /// found. The git hooks call this.
+    Resolve {
+        /// Directory inside the project (default: the current directory)
+        dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -579,6 +1004,856 @@ pub(crate) enum MetricsCommands {
     },
 }
 
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum ActionCommands {
+    /// Define a new kinetic ActionType in a namespace
+    Define {
+        /// Target namespace
+        namespace: String,
+        /// ActionTypeDefinition JSON object string
+        definition: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Dry-run validate an ActionType invocation without writing
+    Validate {
+        /// Target namespace
+        namespace: String,
+        /// ActionType slug
+        slug: String,
+        /// JSON object of parameters
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Execute a kinetic ActionType atomically and record a private receipt
+    Apply {
+        /// Target namespace
+        namespace: String,
+        /// ActionType slug
+        slug: String,
+        /// JSON object of parameters
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Revert a previously applied action receipt
+    Revert {
+        /// Target namespace
+        namespace: String,
+        /// Receipt ID to revert
+        receipt_id: String,
+        /// Force revert across newer target versions (requires owner/admin)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// List redacted active action receipts in a namespace
+    Log {
+        /// Target namespace
+        namespace: String,
+        /// Maximum entries to return (default 100, max 1000)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+}
+
+fn action_command_to_json(action: &ActionCommands) -> anyhow::Result<serde_json::Value> {
+    match action {
+        ActionCommands::Define {
+            namespace,
+            definition,
+            principal,
+        } => {
+            let def_val: serde_json::Value = serde_json::from_str(definition)
+                .map_err(|e| anyhow::anyhow!("Invalid ActionTypeDefinition JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "define",
+                "definition": def_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Validate {
+            namespace,
+            slug,
+            params,
+            principal,
+        } => {
+            let params_val: serde_json::Value = serde_json::from_str(params)
+                .map_err(|e| anyhow::anyhow!("Invalid params JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "validate",
+                "slug": slug,
+                "params": params_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Apply {
+            namespace,
+            slug,
+            params,
+            principal,
+        } => {
+            let params_val: serde_json::Value = serde_json::from_str(params)
+                .map_err(|e| anyhow::anyhow!("Invalid params JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "apply",
+                "slug": slug,
+                "params": params_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Revert {
+            namespace,
+            receipt_id,
+            force,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "revert",
+                "receipt_id": receipt_id,
+                "force": force,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ActionCommands::Log {
+            namespace,
+            limit,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "log",
+                "limit": limit,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum ScenarioCommands {
+    /// Create a new counterfactual scenario overlay in a namespace
+    Create {
+        /// Target namespace
+        namespace: String,
+        /// Optional explicit scenario ID
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Optional human-readable scenario title
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional TTL in seconds (default 1800, max 86400)
+        #[arg(long)]
+        ttl_secs: Option<i64>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Stage a memory upsert/retirement inside a scenario overlay
+    #[command(name = "stage-memory")]
+    StageMemory {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Memory content
+        content: String,
+        /// Optional explicit memory ID
+        #[arg(long)]
+        memory_id: Option<String>,
+        /// Memory type (default "fact")
+        #[arg(long, default_value = "fact")]
+        memory_type: String,
+        /// Optional metadata JSON object
+        #[arg(long, default_value = "{}")]
+        metadata: String,
+        /// Optional live/staged memory ID to retire/supersede
+        #[arg(long)]
+        retire_id: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Stage a digital twin state mutation inside a scenario overlay
+    #[command(name = "stage-twin")]
+    StageTwin {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Digital twin ID
+        twin_id: String,
+        /// Variables JSON object (map of variable name -> finite f64)
+        #[arg(long)]
+        variables: String,
+        /// Merge variables into existing state (default true)
+        #[arg(long, default_value_t = true)]
+        merge: bool,
+        /// Optional TwinSchema ID
+        #[arg(long)]
+        schema_id: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Dry-run apply a kinetic ActionType inside a scenario overlay
+    #[command(name = "apply-action")]
+    ApplyAction {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// ActionType slug
+        slug: String,
+        /// Action parameters JSON object
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Evaluate a SPARQL query over the merged live + scenario RDF dataset
+    #[command(name = "eval")]
+    Eval {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// SPARQL query string
+        query: String,
+        /// Result format (json|xml|csv|tsv)
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Compute diff of a scenario against live state or another scenario
+    Diff {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Optional second scenario ID for side-by-side diff
+        #[arg(long)]
+        compare_to: Option<String>,
+    },
+    /// Atomically commit a scenario overlay to the live store with CAS + SHACL + ReBAC gates
+    Commit {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+        /// Enforce SHACL validation on commit (default true)
+        #[arg(long, default_value_t = true)]
+        enforce_shacl: bool,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Drop a scenario overlay without touching the live store
+    Drop {
+        /// Target namespace
+        namespace: String,
+        /// Scenario ID
+        scenario_id: String,
+    },
+    /// Zero-mutation ontology blast-radius & semantic closure diff (dry run)
+    PlanOntologyDiff {
+        /// Target namespace
+        namespace: String,
+        /// Optional overlay scenario ID (defaults to active namespace)
+        #[arg(long)]
+        scenario_id: Option<String>,
+        /// Turtle/N-Quads additions staged in the ephemeral sandbox
+        #[arg(long)]
+        add_turtle: Option<String>,
+        /// Canonical N-Triple/N-Quad patterns retracted in the sandbox
+        #[arg(long)]
+        retract_triples: Vec<String>,
+        /// Replacement SHACL shapes Turtle validated against the post-image
+        #[arg(long)]
+        candidate_shacl_turtle: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// List active scenario overlays in a namespace
+    List {
+        /// Target namespace
+        namespace: String,
+    },
+}
+
+fn scenario_command_to_json(scenario: &ScenarioCommands) -> anyhow::Result<serde_json::Value> {
+    match scenario {
+        ScenarioCommands::Create {
+            namespace,
+            scenario_id,
+            title,
+            ttl_secs,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "create",
+            });
+            if let Some(id) = scenario_id {
+                body["scenario_id"] = serde_json::json!(id);
+            }
+            if let Some(t) = title {
+                body["title"] = serde_json::json!(t);
+            }
+            if let Some(ttl) = ttl_secs {
+                body["ttl_secs"] = serde_json::json!(ttl);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::StageMemory {
+            namespace,
+            scenario_id,
+            content,
+            memory_id,
+            memory_type,
+            metadata,
+            retire_id,
+            principal,
+        } => {
+            let meta_val: serde_json::Value = serde_json::from_str(metadata)
+                .map_err(|e| anyhow::anyhow!("Invalid metadata JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "stage_memory",
+                "scenario_id": scenario_id,
+                "content": content,
+                "memory_type": memory_type,
+                "metadata": meta_val,
+            });
+            if let Some(id) = memory_id {
+                body["memory_id"] = serde_json::json!(id);
+            }
+            if let Some(rid) = retire_id {
+                body["retire_id"] = serde_json::json!(rid);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::StageTwin {
+            namespace,
+            scenario_id,
+            twin_id,
+            variables,
+            merge,
+            schema_id,
+            principal,
+        } => {
+            let vars_val: serde_json::Value = serde_json::from_str(variables)
+                .map_err(|e| anyhow::anyhow!("Invalid variables JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "stage_twin",
+                "scenario_id": scenario_id,
+                "twin_id": twin_id,
+                "variables": vars_val,
+                "merge": merge,
+            });
+            if let Some(sid) = schema_id {
+                body["schema_id"] = serde_json::json!(sid);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::ApplyAction {
+            namespace,
+            scenario_id,
+            slug,
+            params,
+            principal,
+        } => {
+            let params_val: serde_json::Value = serde_json::from_str(params)
+                .map_err(|e| anyhow::anyhow!("Invalid params JSON: {e}"))?;
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "apply_action",
+                "scenario_id": scenario_id,
+                "slug": slug,
+                "params": params_val,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::Eval {
+            namespace,
+            scenario_id,
+            query,
+            format,
+        } => Ok(serde_json::json!({
+            "namespace": namespace,
+            "action": "evaluate_sparql",
+            "scenario_id": scenario_id,
+            "query": query,
+            "format": format,
+        })),
+        ScenarioCommands::Diff {
+            namespace,
+            scenario_id,
+            compare_to,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "diff",
+                "scenario_id": scenario_id,
+            });
+            if let Some(other) = compare_to {
+                body["compare_to_scenario_id"] = serde_json::json!(other);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::Commit {
+            namespace,
+            scenario_id,
+            enforce_shacl,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "commit",
+                "scenario_id": scenario_id,
+                "enforce_shacl_on_commit": enforce_shacl,
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::Drop {
+            namespace,
+            scenario_id,
+        } => Ok(serde_json::json!({
+            "namespace": namespace,
+            "action": "drop",
+            "scenario_id": scenario_id,
+        })),
+        ScenarioCommands::PlanOntologyDiff {
+            namespace,
+            scenario_id,
+            add_turtle,
+            retract_triples,
+            candidate_shacl_turtle,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "action": "plan_ontology_diff",
+                "retract_triples": retract_triples,
+            });
+            if let Some(id) = scenario_id {
+                body["scenario_id"] = serde_json::json!(id);
+            }
+            if let Some(t) = add_turtle {
+                body["add_turtle"] = serde_json::json!(t);
+            }
+            if let Some(sh) = candidate_shacl_turtle {
+                body["candidate_shacl_turtle"] = serde_json::json!(sh);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        ScenarioCommands::List { namespace } => Ok(serde_json::json!({
+            "namespace": namespace,
+            "action": "list",
+        })),
+    }
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum TaxonomyCommands {
+    /// Set or atomically supersede the singleton Project Thesis for a namespace
+    #[command(name = "set-thesis")]
+    SetThesis {
+        /// Target namespace
+        namespace: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Primary domain slug
+        #[arg(long)]
+        primary_domain: Option<String>,
+        /// Project mission statement
+        #[arg(long)]
+        mission: Option<String>,
+        /// Strategic and architectural direction
+        #[arg(long)]
+        direction: Option<String>,
+        /// Comma-separated core pillar slugs
+        #[arg(long, value_delimiter = ',')]
+        core_pillars: Vec<String>,
+        /// Comma-separated adjacent domain slugs
+        #[arg(long, value_delimiter = ',')]
+        adjacent_domains: Vec<String>,
+        /// Comma-separated evaluation axis slugs
+        #[arg(long, value_delimiter = ',')]
+        evaluation_axes: Vec<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Upsert or atomically supersede a SKOS subject-matter concept
+    #[command(name = "upsert-concept")]
+    UpsertConcept {
+        /// Target namespace
+        namespace: String,
+        /// Optional JSON payload string or @file path
+        #[arg(long)]
+        payload: Option<String>,
+        /// Canonical kebab-case concept slug
+        #[arg(long)]
+        slug: Option<String>,
+        /// Preferred SKOS label
+        #[arg(long)]
+        pref_label: Option<String>,
+        /// Subject-matter definition
+        #[arg(long)]
+        definition: Option<String>,
+        /// Domain/pillar slug
+        #[arg(long)]
+        domain: Option<String>,
+        /// Comma-separated broader parent concept slugs
+        #[arg(long, value_delimiter = ',')]
+        broader: Vec<String>,
+        /// Comma-separated related concept slugs
+        #[arg(long, value_delimiter = ',')]
+        related_concepts: Vec<String>,
+        /// Comma-separated contrasting concept slugs
+        #[arg(long, value_delimiter = ',')]
+        contrasts_with: Vec<String>,
+        /// Realization status (unimplemented|partial|production|superseded)
+        #[arg(long)]
+        realization_status: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Render the hierarchical SKOS taxonomy tree
+    Tree {
+        /// Target namespace
+        namespace: String,
+        /// Optional domain filter
+        #[arg(long)]
+        domain: Option<String>,
+        /// Optional root concept slug
+        #[arg(long)]
+        root_slug: Option<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Generate an Ontology-Augmented Subject-Matter Briefing
+    Briefing {
+        /// Target namespace
+        namespace: String,
+        /// Topic or natural-language query
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional domain filter
+        #[arg(long)]
+        domain: Option<String>,
+        /// Multi-hop expansion radius (1..=4, default 2)
+        #[arg(long, default_value_t = 2)]
+        max_hops: usize,
+        /// Max seed concepts (default 8)
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Generate a Multi-Perspective Comparative Matrix across 2 or more concepts
+    Compare {
+        /// Target namespace
+        namespace: String,
+        /// Comma-separated concept slugs to compare (2 or more)
+        #[arg(long, value_delimiter = ',', required = true)]
+        slugs: Vec<String>,
+        /// Optional comma-separated evaluation axis slugs
+        #[arg(long, value_delimiter = ',')]
+        axes: Vec<String>,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Compute Epistemic Coverage & Ontology Anti-Pattern Gaps
+    Gaps {
+        /// Target namespace
+        namespace: String,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+    /// Run SME Opportunity & Frontier Synthesis Advisor
+    Advise {
+        /// Target namespace
+        namespace: String,
+        /// Optional query or topic focus
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional domain filter
+        #[arg(long)]
+        domain: Option<String>,
+        /// Max ranked recommendations to return (default 5, max 20)
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+        /// Optional requested principal
+        #[arg(long)]
+        principal: Option<String>,
+    },
+}
+
+fn parse_inline_or_file_json(raw: &str) -> anyhow::Result<serde_json::Value> {
+    let trimmed = raw.trim();
+    let content = if let Some(path) = trimmed.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read JSON file '{path}': {e}"))?
+    } else {
+        trimmed.to_string()
+    };
+    serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("invalid JSON payload: {e}"))
+}
+
+fn taxonomy_command_to_json(taxonomy: &TaxonomyCommands) -> anyhow::Result<serde_json::Value> {
+    match taxonomy {
+        TaxonomyCommands::SetThesis {
+            namespace,
+            payload,
+            primary_domain,
+            mission,
+            direction,
+            core_pillars,
+            adjacent_domains,
+            evaluation_axes,
+            principal,
+        } => {
+            let mut body = if let Some(raw) = payload {
+                parse_inline_or_file_json(raw)?
+            } else {
+                serde_json::json!({})
+            };
+            body["namespace"] = serde_json::json!(namespace);
+            body["operation"] = serde_json::json!("set_thesis");
+            if let Some(v) = primary_domain {
+                body["primary_domain"] = serde_json::json!(v);
+            }
+            if let Some(v) = mission {
+                body["mission"] = serde_json::json!(v);
+            }
+            if let Some(v) = direction {
+                body["direction"] = serde_json::json!(v);
+            }
+            if !core_pillars.is_empty() {
+                body["core_pillars"] = serde_json::json!(core_pillars);
+            }
+            if !adjacent_domains.is_empty() {
+                body["adjacent_domains"] = serde_json::json!(adjacent_domains);
+            }
+            if !evaluation_axes.is_empty() {
+                body["evaluation_axes"] = serde_json::json!(evaluation_axes);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::UpsertConcept {
+            namespace,
+            payload,
+            slug,
+            pref_label,
+            definition,
+            domain,
+            broader,
+            related_concepts,
+            contrasts_with,
+            realization_status,
+            principal,
+        } => {
+            let mut body = if let Some(raw) = payload {
+                parse_inline_or_file_json(raw)?
+            } else {
+                serde_json::json!({})
+            };
+            body["namespace"] = serde_json::json!(namespace);
+            body["operation"] = serde_json::json!("upsert_concept");
+            if let Some(v) = slug {
+                body["slug"] = serde_json::json!(v);
+            }
+            if let Some(v) = pref_label {
+                body["pref_label"] = serde_json::json!(v);
+            }
+            if let Some(v) = definition {
+                body["definition"] = serde_json::json!(v);
+            }
+            if let Some(v) = domain {
+                body["domain"] = serde_json::json!(v);
+            }
+            if !broader.is_empty() {
+                body["broader"] = serde_json::json!(broader);
+            }
+            if !related_concepts.is_empty() {
+                body["related_concepts"] = serde_json::json!(related_concepts);
+            }
+            if !contrasts_with.is_empty() {
+                body["contrasts_with"] = serde_json::json!(contrasts_with);
+            }
+            if let Some(v) = realization_status {
+                body["realization_status"] = serde_json::json!(v);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Tree {
+            namespace,
+            domain,
+            root_slug,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "tree",
+            });
+            if let Some(d) = domain {
+                body["domain"] = serde_json::json!(d);
+            }
+            if let Some(r) = root_slug {
+                body["root_slug"] = serde_json::json!(r);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Briefing {
+            namespace,
+            query,
+            domain,
+            max_hops,
+            limit,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "briefing",
+                "max_hops": max_hops,
+                "limit": limit,
+            });
+            if let Some(q) = query {
+                body["query"] = serde_json::json!(q);
+            }
+            if let Some(d) = domain {
+                body["domain"] = serde_json::json!(d);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Compare {
+            namespace,
+            slugs,
+            axes,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "compare",
+                "slugs": slugs,
+            });
+            if !axes.is_empty() {
+                body["axes"] = serde_json::json!(axes);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Gaps {
+            namespace,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "gaps",
+            });
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+        TaxonomyCommands::Advise {
+            namespace,
+            query,
+            domain,
+            top_k,
+            principal,
+        } => {
+            let mut body = serde_json::json!({
+                "namespace": namespace,
+                "operation": "advise",
+                "top_k": top_k,
+            });
+            if let Some(q) = query {
+                body["query"] = serde_json::json!(q);
+            }
+            if let Some(d) = domain {
+                body["domain"] = serde_json::json!(d);
+            }
+            if let Some(p) = principal {
+                body["principal"] = serde_json::json!(p);
+            }
+            Ok(body)
+        }
+    }
+}
+
 /// What a health probe actually found.
 ///
 /// Silence is the case worth naming. A daemon busy inside the engine answers
@@ -605,97 +1880,6 @@ fn classify_probe(reached: bool, refused: bool) -> DaemonProbe {
     } else {
         DaemonProbe::Silent
     }
-}
-
-/// Human-readable byte count for the startup summary: whole GiB/MiB
-/// render as such, anything else falls back to raw bytes.
-fn format_bytes_human(bytes: u64) -> String {
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
-    if bytes % GIB == 0 {
-        format!("{} GiB", bytes / GIB)
-    } else if bytes % MIB == 0 {
-        format!("{} MiB", bytes / MIB)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
-/// The startup summary line (Spec Feature 1): the resolved embedder and
-/// both store limits, each with the layer that supplied it, so an
-/// operator can always answer "why this model, why these limits?".
-/// Task 4 extends this same surface with the idle-unload segment rather
-/// than growing a second summary mechanism.
-fn format_startup_summary(
-    resolution: &embed::ResolvedModel,
-    profile: Option<config::CapacityProfile>,
-    limits: crate::store::StoreLimits,
-    sources: &config::StoreLimitSources,
-    idle_unload: Option<std::time::Duration>,
-) -> String {
-    let embedder_source = match resolution.source {
-        embed::ModelSource::Profile => match profile {
-            Some(profile) => format!("profile={}", profile.name()),
-            None => embed::ModelSource::Profile.label().to_string(),
-        },
-        source => source.label().to_string(),
-    };
-    format!(
-        "embedder: {} (source: {}) \u{b7} store: pool {} (source: {}), max DB {} (source: {}) \u{b7} {}",
-        resolution.model.model_name,
-        embedder_source,
-        format_bytes_human(limits.buffer_pool_bytes),
-        sources.pool.label(),
-        format_bytes_human(limits.max_db_bytes),
-        sources.max_db.label(),
-        embed::format_idle_unload_segment(idle_unload),
-    )
-}
-
-/// The outcome of startup resolution: everything a startup path needs to
-/// open its store consistently with what the summary line reported. The
-/// resolved model is carried, not discarded: the embedder is built from
-/// it (`embed::build_embedder_for`), so the printed provenance describes
-/// the constructed embedder by construction and resolution runs exactly
-/// once at startup.
-struct StartupResolution {
-    resolution: embed::ResolvedModel,
-    limits: crate::store::StoreLimits,
-}
-
-/// Resolve the capacity profile, the embedder, and the store limits once
-/// at startup; print the summary line (always, profile or not) and, on a
-/// profile/model disagreement, the single warning. This is a
-/// profile-consuming surface: an invalid `NEUROSTRATA_PROFILE` fails
-/// here, at embedder construction / store opening -- never on commands
-/// that do neither (Spec AC6).
-fn resolve_startup(config: &Config) -> anyhow::Result<StartupResolution> {
-    let profile = crate::config::CapacityProfile::from_env()?;
-    let resolution = embed::configured_resolution()?;
-    let (limits, sources) = config.store_limits_resolved(profile)?;
-    // Read here for the summary segment; embedder construction reads
-    // the same env-only setting through the same helper, so the line
-    // and the constructed embedder cannot disagree.
-    let idle_unload = embed::idle_unload_threshold()?;
-    println!(
-        "{}",
-        format_startup_summary(&resolution, profile, limits, &sources, idle_unload)
-    );
-    if let Some(disagreement) = embed::profile_disagreement(&resolution, profile) {
-        eprintln!("{}", embed::format_disagreement_warning(&disagreement));
-    }
-    Ok(StartupResolution {
-        resolution,
-        limits,
-    })
-}
-
-/// Store limits for a store-opening surface that is not a startup path:
-/// the profile is parsed by this caller and passed in, so
-/// `Config::store_limits()` itself stays profile-free.
-fn profiled_store_limits(config: &Config) -> anyhow::Result<crate::store::StoreLimits> {
-    let profile = crate::config::CapacityProfile::from_env()?;
-    config.store_limits_with_profile(profile)
 }
 
 /// Whether the answering daemon runs the build the binary on disk holds.
@@ -793,6 +1977,56 @@ fn config_db_path() -> Option<String> {
     }
 }
 
+/// Surface a pending first-run embedding-model choice, if materialization
+/// recorded one. Called at interactive dispatch only — the caller has
+/// already excluded the daemon and shutdown commands — and the seam
+/// re-checks that stdin is a terminal before anything is presented. Runs
+/// before the command executes, so a pick is persisted before any store
+/// creation on its path. A failure is reported, never fatal to the
+/// command.
+fn surface_pending_model_choice() {
+    use crate::model_choice::ChoiceResponse;
+    use std::io::{IsTerminal, Write};
+    let Some(db_path) = config_db_path() else {
+        return;
+    };
+    let interactive = std::io::stdin().is_terminal();
+    let mut responder = |offer: &str| -> ChoiceResponse {
+        println!("{offer}");
+        print!("Choose a model by number, or enter 0 to keep the current default: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return ChoiceResponse::Invalid;
+        }
+        // 0 is the documented decline input; a number picks that entry
+        // (an out-of-range number is invalid, handled by the seam);
+        // anything else — text, blank — is invalid, not a decline.
+        match line.trim().parse::<usize>() {
+            Ok(0) => ChoiceResponse::Decline,
+            Ok(n) => ChoiceResponse::Pick(n - 1),
+            Err(_) => ChoiceResponse::Invalid,
+        }
+    };
+    match crate::model_choice::surface_pending_choice(
+        &crate::embed::config_dir(),
+        std::path::Path::new(&db_path),
+        interactive,
+        &mut responder,
+    ) {
+        Ok(crate::model_choice::PendingChoiceOutcome::Chosen(name)) => {
+            println!("Embedding model set to {name} for this install.");
+        }
+        Ok(crate::model_choice::PendingChoiceOutcome::InvalidInput) => {
+            println!(
+                "That was not a valid choice, so nothing was changed. The embedding-model choice will be offered again at the next command."
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("Could not apply the pending embedding-model choice: {e}"),
+    }
+}
+
 /// Where crash breadcrumbs go: a `crash` directory beside the database.
 ///
 /// The database already lives under the user's own config directory, so the
@@ -835,7 +2069,7 @@ fn dispatch_project_context(
         }
         ProjectContextCommands::List => {
             let mut entries: Vec<_> = config.project_contexts.iter().collect();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             let output = if entries.is_empty() {
                 "No project contexts configured.".to_string()
             } else {
@@ -932,6 +2166,53 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
     }
 }
 
+/// Bind the fallback store's serving descriptor
+/// to the embedder an arm just built, through the concrete store
+/// behind the trait object — the same downcast the RepairHygiene arm
+/// uses. The fallback group constructs its store before any arm builds
+/// an embedder, so the construction-time builder cannot bind it; this
+/// post-build binding is what keys the store's identity checks on the
+/// model that will actually produce the arm's vectors.
+fn bind_fallback_serving_descriptor(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn crate::traits::Embedder>,
+) {
+    use crate::store::ladybug::LadybugStore;
+    if let Some(store) =
+        crate::traits::VectorStore::as_any(vector_store.as_ref()).downcast_ref::<LadybugStore>()
+    {
+        store.set_serving_descriptor(Some(embedder.embedding_descriptor()));
+    }
+}
+
+/// Prepare the fallback store for a write arm (Add, Edit, Ingest): bind the
+/// serving descriptor, then initialize the store under it.
+///
+/// `init` is the step that runs the store-state maintenance
+/// (`maintain_store_state`): on a store recorded pristine under a
+/// different model, it adopts the serving descriptor when serving
+/// matches the configuration — which is exactly the descriptor a
+/// fallback arm binds, because it built its embedder from the
+/// configuration. Without this step the write arms dispatched
+/// straight to `upsert`, whose first-write guard refuses a pristine
+/// store whose recorded descriptor differs from serving with
+/// restart guidance this path could never satisfy: re-running the
+/// command bound and upserted again, still with no init, so the
+/// demanded adoption never occurred (issue #75). The daemon write
+/// half has always ordered its work this way
+/// (`embed_dedup_and_upsert` inits before it embeds or upserts);
+/// the fallback write arms now follow the same pattern. Read arms
+/// deliberately do not use this helper: they gain no init side
+/// effects they do not have today.
+async fn prepare_fallback_write_store(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn crate::traits::Embedder>,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    bind_fallback_serving_descriptor(vector_store, embedder);
+    vector_store.init(namespace).await
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -943,9 +2224,47 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     match open_daemon_lock(db_path) {
         Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         Err(e) => {
-            tracing::warn!("daemon_holds_lock probe failed for {}: {e}", db_path.display());
+            tracing::warn!(
+                "daemon_holds_lock probe failed for {}: {e}",
+                db_path.display()
+            );
             false
         }
+    }
+}
+
+/// Take the store lock for an uncoordinated copy and keep it (#241).
+///
+/// The `--no-open` gate used to be a point-in-time probe: it took the lock,
+/// learned whether a daemon held it, and dropped the handle before the
+/// first file copy. A daemon that started in between was never seen, so the
+/// database, its WAL, and the checkpoint shadow could be captured at
+/// different instants while every per-file check still passed.
+///
+/// The returned guard holds the lock until it is dropped, so a daemon that
+/// starts during the copy window cannot open the store and cannot change
+/// what is being copied. The lock file is created when it does not exist
+/// yet: "nobody holds the lock" is decided by taking it, not by looking for
+/// it.
+///
+/// A lock that cannot be taken is not evidence that the store is free, so
+/// the failure is closed: the caller refuses instead of copying.
+fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = daemon_lock_path(db_path);
+    let file = open_daemon_lock(db_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing the uncoordinated file copy: the store lock could not be taken (could not open {}: {}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
+            lock_path.display(),
+            e
+        )
+    })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::anyhow!(
+            "Refusing the uncoordinated file copy: the store lock could not be taken ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
+            e
+        )),
     }
 }
 
@@ -1003,9 +2322,22 @@ fn git_toplevel() -> Option<std::path::PathBuf> {
 /// Section 5.1, path 2: no daemon to ask, so open the database for the
 /// metadata-only read. Dimensions come from config -- loading the embedding
 /// model would turn a `git push` into a model download.
+fn task_gate_request(
+    namespace: &str,
+    strict: bool,
+    scope: &crate::task::gate::GateScope,
+) -> serde_json::Value {
+    serde_json::json!({
+        "namespace": namespace,
+        "strict": strict,
+        "scope": scope,
+    })
+}
+
 async fn direct_report(
     config: &Config,
     namespace: &str,
+    scope: Option<&crate::task::gate::GateScope>,
 ) -> Result<crate::task::gate::GateReport, String> {
     let dimensions = embed::configured_dimensions().map_err(|e| {
         format!(
@@ -1013,24 +2345,16 @@ async fn direct_report(
             e
         )
     })?;
-    let embedder_id = embed::configured_embedder_id()
-        .map_err(|e| format!("the configured embedding identity could not be read: {}", e))?;
     let store: Arc<dyn VectorStore> = Arc::new(
-        LadybugStore::new_with_identity_limits(
-            config.db_path.to_string_lossy().to_string(),
-            dimensions,
-            embedder_id,
-            profiled_store_limits(config)
-                .map_err(|e| format!("store limits are invalid: {}", e))?,
-        )
-        .map_err(|e| format!("the database could not be opened: {}", e))?,
+        LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
+            .map_err(|e| format!("the database could not be opened: {}", e))?,
     );
     store
         .init(namespace)
         .await
         .map_err(|e| format!("the schema could not be opened: {}", e))?;
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    crate::task::gate::run(&store, &namespace)
+    crate::task::gate::run_scoped(&store, &namespace, scope)
         .await
         .map_err(|e| format!("the gate could not list the tasks: {}", e))
 }
@@ -1055,6 +2379,12 @@ fn cli_ingest_root(dir: &str) -> String {
 }
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
+
+/// Refusal for `backup --no-open` while the daemon lock is held (#209). The
+/// copy is uncoordinated: the mmapped database, its WAL, and the checkpoint
+/// shadow would be read at different instants while the daemon may be
+/// mid-checkpoint, producing a snapshot that verifies but cannot be restored.
+const NO_OPEN_LOCK_HELD_MESSAGE: &str = "Refusing --no-open while a process holds the store lock: the store may be mid-checkpoint, so the database, its write-ahead log, and the checkpoint shadow could be copied at different instants. Take a coordinated backup instead with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` and take the no-open copy once it has exited.";
 
 /// What `hooks install` writes, and where: the scaffolded hook text — the
 /// same bytes the task-setup payload ships — into the directory git
@@ -1128,7 +2458,9 @@ fn set_hook_executable(_path: &std::path::Path) -> std::io::Result<()> {
 /// Install the pre-commit hook; non-git repos skip this (session ledger is primary mechanism).
 fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let hooks_dir = crate::task::git_hooks_dir(root);
-    if !hooks_dir.is_dir() { std::fs::create_dir_all(&hooks_dir)?; }
+    if !hooks_dir.is_dir() {
+        std::fs::create_dir_all(&hooks_dir)?;
+    }
     let target = hooks_dir.join("pre-commit");
     // A pre-existing hook we did not scaffold is the user's; back it up
     // rather than silently destroying it by overwriting.
@@ -1150,24 +2482,41 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
 
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
 fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
-    use std::io::Write;
     if let Some(file) = DAEMON_LOCK.get() {
         let report = match outcome {
             Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
             Err(e) => format!("error: {}", e),
         };
-        let _ = file.set_len(0);
-        let _ = (&*file).write_all(report.as_bytes());
-        let _ = file.sync_all();
-        if let Err(e) = file.set_len(0) {
-            tracing::warn!("final checkpoint report truncate failed: {e}");
-        }
-        if let Err(e) = (&*file).write_all(report.as_bytes()) {
-            tracing::warn!("final checkpoint report write failed: {e}");
-        }
-        if let Err(e) = file.sync_all() {
-            tracing::warn!("final checkpoint report sync failed: {e}");
-        }
+        write_final_checkpoint_report(file, &report);
+    }
+}
+
+
+
+/// Writes the final-checkpoint report as the lock file's whole content.
+///
+/// `shutdown` compares the file against FINAL_CHECKPOINT_OK verbatim, so
+/// the report must start at offset 0 with nothing before or after it.
+/// `set_len` truncates without moving the file offset: a truncate-then-write
+/// sequence run from a nonzero offset writes past the new end of file and
+/// leaves a NUL hole in front of the report, which the comparison then
+/// rejects. Seek to the start, write once, and only then truncate away any
+/// tail a longer earlier report left behind.
+fn write_final_checkpoint_report(mut file: &std::fs::File, report: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        tracing::warn!("final checkpoint report seek failed: {e}");
+        return;
+    }
+    if let Err(e) = file.write_all(report.as_bytes()) {
+        tracing::warn!("final checkpoint report write failed: {e}");
+        return;
+    }
+    if let Err(e) = file.set_len(report.len() as u64) {
+        tracing::warn!("final checkpoint report truncate failed: {e}");
+    }
+    if let Err(e) = file.sync_all() {
+        tracing::warn!("final checkpoint report sync failed: {e}");
     }
 }
 
@@ -1216,6 +2565,142 @@ impl ReadSource {
             }
         }
     }
+}
+
+fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
+    match crate::learning::control::apply_control(&req) {
+        Ok(res) => match serde_json::to_string_pretty(&res) {
+            Ok(out) => println!("{}", out),
+            Err(e) => eprintln!("learn control result serialize failed: {}", e),
+        },
+        Err(e) => {
+            eprintln!("learn control failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the dedup dataset, train a candidate, evaluate it fail-closed, and
+/// promote it when the real eval report carries numeric metrics.
+async fn run_learn_train(version: &str) -> anyhow::Result<()> {
+    let root = crate::learning::control::default_learning_dir();
+    let paths = crate::judgment::laya_onnx::LearningPaths::new(root.clone());
+    let mgr = crate::judgment::laya_onnx::LearningRuntimeManager::new(paths.clone());
+    let rt_state = mgr.ensure_ready().await;
+    let runtime = std::sync::Arc::new(mgr.runtime()?);
+    let model_cache = runtime.model_cache.clone();
+    let trainer = crate::learning::trainer::Trainer::new(runtime);
+
+    let mut job_state = trainer.transition(
+        &crate::learning::trainer::TrainingJobState::WaitingForData,
+        crate::learning::trainer::TrainingJobState::Training,
+    )?;
+
+    let policy = crate::learning::dataset::DistancePolicy::load_from(&paths.root_dir());
+    policy.save_to(&paths.root_dir())?;
+    let dataset_report = crate::learning::dataset::build_dedup_dataset(
+        &paths.root_dir(),
+        &paths.root_dir().join("dataset"),
+    )
+    .await?;
+
+    trainer.train_candidate(&version.to_string()).await?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::ProxyShadow,
+    )?;
+
+    // The builtin train path writes under runtime model_cache, not LearningPaths.
+    let candidate_dir = model_cache.join("candidates").join(version);
+    let eval_path = candidate_dir.join("eval_report.json");
+    let eval_raw = std::fs::read_to_string(&eval_path).map_err(|_| {
+        anyhow::anyhow!(
+            "no eval_report.json for candidate {} at {}; training did not produce a measurable artifact; evaluation refused (fail-closed)",
+            version,
+            eval_path.display()
+        )
+    })?;
+    let eval_report: crate::learning::trainer::EvaluationReport = serde_json::from_str(&eval_raw)
+        .map_err(|e| {
+        anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
+    })?;
+    let score = trainer.evaluate_candidate(&eval_report)?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::GoldShadow,
+    )?;
+
+    let bundle = crate::learning::model_bundle::ModelBundle::load(&candidate_dir, "laya")?;
+
+    // Promote in the active manifest and persist it.
+    let manifest_path = paths.root_dir().join("active_manifest.json");
+    let mut manifest: crate::learning::trainer::ActiveManifest = if manifest_path.exists() {
+        match std::fs::read_to_string(&manifest_path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<crate::learning::trainer::ActiveManifest>(&raw)
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "active manifest at {} unreadable or unparseable, using defaults: {e}",
+                    manifest_path.display()
+                );
+                crate::learning::trainer::ActiveManifest::default()
+            }
+        }
+    } else {
+        crate::learning::trainer::ActiveManifest::default()
+    };
+    trainer.promote(&mut manifest, &version.to_string(), score)?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::Promoted,
+    )?;
+
+    std::fs::create_dir_all(paths.root_dir())?;
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    // Mirror promoted versions into status.json.
+    let mut status = crate::learning::control::load_status(&paths.root_dir());
+    status.active_version = manifest.active_version.clone();
+    status.previous_good_version = manifest.previous_good_version.clone();
+    status.candidate_version = None;
+    status.training_state = job_state;
+    status.runtime_state = match rt_state {
+        crate::judgment::laya_onnx::LayaReadiness::Ready => {
+            crate::judgment::laya_onnx::RuntimeState::Ready
+        }
+        crate::judgment::laya_onnx::LayaReadiness::Degraded { .. } => {
+            crate::judgment::laya_onnx::RuntimeState::Unavailable
+        }
+    };
+    status.latest_evaluation = Some(eval_report);
+    std::fs::write(
+        paths.root_dir().join("status.json"),
+        serde_json::to_string_pretty(&status)?,
+    )?;
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "version": version,
+            "rt_state": format!("{:?}", rt_state),
+            "score": score,
+            "active_version": manifest.active_version,
+            "previous_good_version": manifest.previous_good_version,
+            "checkpoint_path": bundle.checkpoint_path(),
+            "manifest_path": bundle.manifest_path(),
+            "dataset_report": dataset_report,
+            "train_jsonl": paths.train_jsonl(),
+            "proxy_eval_jsonl": paths.proxy_eval_jsonl(),
+            "base_model_dir": paths.base_model_dir(),
+            "candidate_dir": paths.candidate_dir(&version.to_string()),
+        })
+    );
+    Ok(())
 }
 
 async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()> {
@@ -1384,141 +2869,6 @@ async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()
 
     Ok(())
 }
-fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
-    match crate::learning::control::apply_control(&req) {
-        Ok(res) => match serde_json::to_string_pretty(&res) {
-            Ok(out) => println!("{}", out),
-            Err(e) => eprintln!("learn control result serialize failed: {}", e),
-        },
-        Err(e) => {
-            eprintln!("learn control failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Build the dedup dataset, train a candidate, evaluate it fail-closed, and
-/// promote it when the real eval report carries numeric metrics.
-async fn run_learn_train(version: &str) -> anyhow::Result<()> {
-    let root = crate::learning::control::default_learning_dir();
-    let paths = crate::judgment::laya_onnx::LearningPaths::new(root.clone());
-    let mgr = crate::judgment::laya_onnx::LearningRuntimeManager::new(paths.clone());
-    let rt_state = mgr.ensure_ready().await;
-    let runtime = std::sync::Arc::new(mgr.runtime()?);
-    let model_cache = runtime.model_cache.clone();
-    let trainer = crate::learning::trainer::Trainer::new(runtime);
-
-    let mut job_state = trainer.transition(
-        &crate::learning::trainer::TrainingJobState::WaitingForData,
-        crate::learning::trainer::TrainingJobState::Training,
-    )?;
-
-    let policy = crate::learning::dataset::DistancePolicy::load_from(&paths.root_dir());
-    policy.save_to(&paths.root_dir())?;
-    let dataset_report = crate::learning::dataset::build_dedup_dataset(
-        &paths.root_dir(),
-        &paths.root_dir().join("dataset"),
-    )
-    .await?;
-
-    trainer.train_candidate(&version.to_string()).await?;
-    job_state = trainer.transition(
-        &job_state,
-        crate::learning::trainer::TrainingJobState::ProxyShadow,
-    )?;
-
-    // The builtin train path writes under runtime model_cache, not LearningPaths.
-    let candidate_dir = model_cache.join("candidates").join(version);
-    let eval_path = candidate_dir.join("eval_report.json");
-    let eval_raw = std::fs::read_to_string(&eval_path).map_err(|_| {
-        anyhow::anyhow!(
-            "no eval_report.json for candidate {} at {}; training did not produce a measurable artifact; evaluation refused (fail-closed)",
-            version,
-            eval_path.display()
-        )
-    })?;
-    let eval_report: crate::learning::trainer::EvaluationReport =
-        serde_json::from_str(&eval_raw).map_err(|e| {
-            anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
-        })?;
-    let score = trainer.evaluate_candidate(&eval_report)?;
-    job_state = trainer.transition(
-        &job_state,
-        crate::learning::trainer::TrainingJobState::GoldShadow,
-    )?;
-
-    let bundle = crate::learning::model_bundle::ModelBundle::load(&candidate_dir, "laya")?;
-
-    // Promote in the active manifest and persist it.
-    let manifest_path = paths.root_dir().join("active_manifest.json");
-    let mut manifest: crate::learning::trainer::ActiveManifest = if manifest_path.exists() {
-        match std::fs::read_to_string(&manifest_path)
-            .map_err(|e| e.to_string())
-            .and_then(|raw| {
-                serde_json::from_str::<crate::learning::trainer::ActiveManifest>(&raw)
-                    .map_err(|e| e.to_string())
-            })
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    "active manifest at {} unreadable or unparseable, using defaults: {e}",
-                    manifest_path.display()
-                );
-                crate::learning::trainer::ActiveManifest::default()
-            }
-        }
-    } else {
-        crate::learning::trainer::ActiveManifest::default()
-    };
-    trainer.promote(&mut manifest, &version.to_string(), score)?;
-    job_state = trainer.transition(
-        &job_state,
-        crate::learning::trainer::TrainingJobState::Promoted,
-    )?;
-
-    std::fs::create_dir_all(paths.root_dir())?;
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
-
-    // Mirror promoted versions into status.json.
-    let mut status = crate::learning::control::load_status(&paths.root_dir());
-    status.active_version = manifest.active_version.clone();
-    status.previous_good_version = manifest.previous_good_version.clone();
-    status.candidate_version = None;
-    status.training_state = job_state;
-    status.runtime_state = match rt_state {
-        crate::judgment::laya_onnx::LayaReadiness::Ready => crate::judgment::laya_onnx::RuntimeState::Ready,
-        crate::judgment::laya_onnx::LayaReadiness::Degraded { .. } => crate::judgment::laya_onnx::RuntimeState::Unavailable,
-    };
-    status.latest_evaluation = Some(eval_report);
-    std::fs::write(
-        paths.root_dir().join("status.json"),
-        serde_json::to_string_pretty(&status)?,
-    )?;
-
-    println!(
-        "{}",
-        serde_json::json!({
-            "ok": true,
-            "version": version,
-            "rt_state": format!("{:?}", rt_state),
-            "score": score,
-            "active_version": manifest.active_version,
-            "previous_good_version": manifest.previous_good_version,
-            "checkpoint_path": bundle.checkpoint_path(),
-            "manifest_path": bundle.manifest_path(),
-            "dataset_report": dataset_report,
-            "train_jsonl": paths.train_jsonl(),
-            "proxy_eval_jsonl": paths.proxy_eval_jsonl(),
-            "base_model_dir": paths.base_model_dir(),
-            "candidate_dir": paths.candidate_dir(&version.to_string()),
-        })
-    );
-    Ok(())
-}
 
 async fn run_namespaces(read: &ReadSource) -> anyhow::Result<()> {
     let namespaces = read.namespaces().await?;
@@ -1556,13 +2906,103 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn copy_snapshot_into_place_is_failure_atomic_and_cleans_up_on_error() {
+        // Issue #87: a companion copy that fails midway must not leave the
+        // store file at the target — the restore is staged, committed only
+        // as a whole set, and the staged files are removed on error.
+        let root = std::env::temp_dir().join(format!("mcp-restore-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("ladybug.store"), b"store-bytes").unwrap();
+        // A directory where the WAL companion should be: fs::copy of it
+        // fails, after the store file copy already succeeded.
+        std::fs::create_dir_all(snapshot.join("ladybug.store.wal")).unwrap();
+
+        let target = root.join("restored");
+        let err = copy_snapshot_into_place(&snapshot, &target)
+            .expect_err("copying a directory as the WAL companion fails");
+        assert!(
+            !target.exists(),
+            "no partial store is left at the target after a failed companion copy: {err}"
+        );
+        let mut target_wal = target.as_os_str().to_os_string();
+        target_wal.push(".wal");
+        assert!(
+            !std::path::Path::new(&target_wal).exists(),
+            "no staged WAL survives a failed companion copy"
+        );
+        assert!(
+            !root
+                .join(format!("restored.restore-tmp-{}", std::process::id()))
+                .exists(),
+            "the staged store copy is removed on failure"
+        );
+        assert!(
+            !root
+                .join(format!("restored.wal.restore-tmp-{}", std::process::id()))
+                .exists(),
+            "the staged WAL copy is removed on failure"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_snapshot_into_place_refuses_sidecar_directory_and_preserves_target_wal() {
+        // Issue #95: a pre-existing target_wal file and a target_sidecar
+        // directory must not leave a half-committed target. The sidecar
+        // directory blocks the commit, so the call fails before target is
+        // touched, the pre-existing WAL is preserved intact, and the target
+        // file is absent.
+        let root =
+            std::env::temp_dir().join(format!("mcp-restore-sidecar-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("ladybug.store"), b"store-bytes").unwrap();
+
+        let target = root.join("restored");
+        let target_wal = root.join("restored.wal");
+        std::fs::write(&target_wal, b"preexisting-wal").unwrap();
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::create_dir_all(&target_sidecar).unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot, &target)
+            .expect_err("a directory at the sidecar path blocks the commit");
+        assert!(
+            !target.exists(),
+            "the target store file must be absent when the sidecar path is a directory: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&target_wal).unwrap(),
+            b"preexisting-wal",
+            "the pre-existing target WAL must survive the refusal intact"
+        );
+        assert!(
+            !root
+                .join(format!("restored.restore-tmp-{}", std::process::id()))
+                .exists(),
+            "the staged store copy is removed on refusal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+
     static STRICT_WAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+
 
     struct StrictWalTestEnvironment {
         strict: Option<std::ffi::OsString>,
         allow: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
+
+
 
     impl StrictWalTestEnvironment {
         fn force_strict() -> Self {
@@ -1579,6 +3019,8 @@ mod tests {
         }
     }
 
+
+
     impl Drop for StrictWalTestEnvironment {
         fn drop(&mut self) {
             if let Some(value) = &self.strict {
@@ -1594,570 +3036,15 @@ mod tests {
         }
     }
 
-    // Task 2 (capacity profiles): the startup summary line is the
-    // operator's answer to "why this model, why these limits" (Spec AC8).
 
-    #[test]
-    fn summary_line_reports_provenance() {
-        let resolution = embed::ResolvedModel {
-            model: embed::AcceptableEmbedder {
-                model_name: "BGESmallENV15Q".to_string(),
-                dimensions: 384,
-                base_url: None,
-                api_key_env: None,
-                api_model: None,
-                generated_by: None,
-                artifact_pin: None,
-                model_sha256: None,
-            },
-            source: embed::ModelSource::Profile,
-        };
-        let profile = Some(config::CapacityProfile::Low);
-        let limits = crate::store::StoreLimits {
-            buffer_pool_bytes: config::CapacityProfile::Low.buffer_pool_bytes(),
-            max_db_bytes: config::CapacityProfile::Low.max_db_bytes(),
-        };
-        let sources = config::StoreLimitSources {
-            pool: config::StoreLimitSource::Profile,
-            max_db: config::StoreLimitSource::Profile,
-        };
-        let line = format_startup_summary(&resolution, profile, limits, &sources, None);
-        assert!(line.contains("BGESmallENV15Q"), "{line}");
-        assert!(line.contains("idle unload: off"), "{line}");
-        assert!(line.contains("profile=low"), "{line}");
-        assert!(line.contains("64 MiB"), "{line}");
-        assert!(line.contains("2 GiB"), "{line}");
-        assert!(line.contains("source: profile"), "{line}");
-
-        // No profile, no explicit config: the sources name the
-        // auto-generated file and the built-in defaults.
-        let resolution = embed::ResolvedModel {
-            model: embed::AcceptableEmbedder {
-                model_name: "NomicEmbedTextV15".to_string(),
-                dimensions: 768,
-                base_url: None,
-                api_key_env: None,
-                api_model: None,
-                generated_by: None,
-                artifact_pin: None,
-                model_sha256: None,
-            },
-            source: embed::ModelSource::AutoGeneratedFile,
-        };
-        let sources = config::StoreLimitSources {
-            pool: config::StoreLimitSource::BuiltInDefault,
-            max_db: config::StoreLimitSource::BuiltInDefault,
-        };
-        let line = format_startup_summary(
-            &resolution,
-            None,
-            crate::store::StoreLimits::default(),
-            &sources,
-            None,
-        );
-        assert!(line.contains("file (auto-generated)"), "{line}");
-        assert!(line.contains("built-in default"), "{line}");
-        assert!(line.contains("idle unload: off"), "{line}");
-    }
-
-    /// Task 4 (idle unload): the summary line reports the opt-in idle
-    /// unload setting in the same surface as the embedder provenance.
-    #[test]
-    fn summary_line_reports_idle_unload_threshold() {
-        let resolution = embed::ResolvedModel {
-            model: embed::AcceptableEmbedder {
-                model_name: "BGESmallENV15Q".to_string(),
-                dimensions: 384,
-                base_url: None,
-                api_key_env: None,
-                api_model: None,
-                generated_by: None,
-                artifact_pin: None,
-                model_sha256: None,
-            },
-            source: embed::ModelSource::Profile,
-        };
-        let limits = crate::store::StoreLimits {
-            buffer_pool_bytes: config::CapacityProfile::Low.buffer_pool_bytes(),
-            max_db_bytes: config::CapacityProfile::Low.max_db_bytes(),
-        };
-        let sources = config::StoreLimitSources {
-            pool: config::StoreLimitSource::Profile,
-            max_db: config::StoreLimitSource::Profile,
-        };
-        let line = format_startup_summary(
-            &resolution,
-            Some(config::CapacityProfile::Low),
-            limits,
-            &sources,
-            Some(std::time::Duration::from_secs(300)),
-        );
-        assert!(
-            line.contains("idle unload: on (threshold 300s)"),
-            "{line}"
-        );
-    }
-
-    /// T19: the auto-spawned daemon's stderr goes to daemon.log via the
-    /// `daemon_stderr()` seam, while stdin/stdout stay null (Spec §5.2's
-    /// contract -- the fix plus both non-defects, in one pin). The pin is
-    /// structural, in the file's `include_str!("main.rs")` idiom: the
-    /// spawn region runs from `let exe = std::env::current_exe()` through
-    /// `.spawn()?`.
-    #[test]
-    fn daemon_spawn_stdio_contract_is_pinned() {
-        let source = include_str!("main.rs");
-        // The leading newline + spawn indentation keeps this search from
-        // matching this test's own literals.
-        let spawn_start = source
-            .find("\n            let exe = std::env::current_exe()")
-            .expect("the auto-spawn block exists");
-        let spawn_end = source[spawn_start..]
-            .find(".spawn()?")
-            .map(|offset| spawn_start + offset + ".spawn()?".len())
-            .expect("the auto-spawn block ends in .spawn()?");
-        let spawn = &source[spawn_start..spawn_end];
-        assert!(
-            spawn.contains("daemon_stderr()"),
-            "the spawn must route stderr through daemon_stderr():\n{spawn}"
-        );
-        assert!(
-            spawn.contains(".stdin(std::process::Stdio::null())"),
-            "the spawn's stdin must stay null:\n{spawn}"
-        );
-        assert!(
-            spawn.contains(".stdout(std::process::Stdio::null())"),
-            "the spawn's stdout must stay null:\n{spawn}"
-        );
-        assert!(
-            !spawn.contains(".stderr(std::process::Stdio::null())"),
-            "the spawn's stderr must not be discarded to null:\n{spawn}"
-        );
-    }
-
-    /// Std-only tempdir for the seam tests (Cargo.toml carries no
-    /// dev-dependencies): a pid/test-name-unique subdir of the system
-    /// temp dir, removed by the caller afterwards.
-    fn daemon_seam_tempdir(test_name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "neurostrata-daemon-seam-{}-{}",
-            std::process::id(),
-            test_name
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the seam test tempdir can be created");
-        dir
-    }
-
-    /// T19, Gate 0 Home β: the elected log home is the watchdog's
-    /// data-home file -- the home resolves to
-    /// `<home>/.local/share/neurostrata/daemon.log`, asserted
-    /// component by component. The fixture home is absolute on the
-    /// host platform: a bare `/home/op` is rooted but not absolute
-    /// on Windows (no drive or UNC prefix), and the expected path
-    /// is derived by the same joins the resolver performs, so the
-    /// elected join is pinned on every platform (PR #27, Codex P2).
-    #[test]
-    fn daemon_log_path_matches_the_elected_home() {
-        #[cfg(windows)]
-        let home = std::path::Path::new(r"C:\Users\op");
-        #[cfg(not(windows))]
-        let home = std::path::Path::new("/home/op");
-        let path = daemon_log_path_for(home);
-        assert!(path.is_absolute(), "{path:?}");
-        let normal_names = |path: &std::path::Path| -> Vec<String> {
-            path.components()
-                .filter_map(|component| match component {
-                    std::path::Component::Normal(name) => {
-                        Some(name.to_string_lossy().into_owned())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let mut expected_names = normal_names(home);
-        expected_names.extend(
-            [".local", "share", "neurostrata", "daemon.log"]
-                .into_iter()
-                .map(String::from),
-        );
-        assert_eq!(normal_names(&path), expected_names);
-        assert_eq!(
-            path,
-            home.join(".local")
-                .join("share")
-                .join("neurostrata")
-                .join("daemon.log")
-        );
-    }
-
-    /// T19: under a fresh home the elected construction is genuinely
-    /// nested with its parents absent; `daemon_stderr_for` creates
-    /// them, opens the log, and returns the `Log` variant.
-    #[test]
-    fn daemon_stderr_opens_a_log_under_a_fresh_home() {
-        let home = daemon_seam_tempdir("fresh-home");
-        let path = daemon_log_path_for(&home);
-        assert!(
-            !path.parent().expect("the log path has a parent").exists(),
-            "the log's parent directories must start absent"
-        );
-        let stderr = daemon_stderr_for(&path);
-        assert!(
-            matches!(stderr, DaemonStderr::Log(_)),
-            "a fresh home must yield the Log variant"
-        );
-        assert!(path.exists(), "the log file must exist: {path:?}");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// T19 (DD-3′): when the log cannot be opened -- here a regular
-    /// file sits where a parent directory must be created --
-    /// `daemon_stderr_for` returns `Null` and does not panic.
-    #[test]
-    fn daemon_stderr_falls_back_to_null_when_the_log_cannot_open() {
-        let home = daemon_seam_tempdir("blocked-home");
-        std::fs::write(home.join(".local"), b"not a directory")
-            .expect("the blocking regular file can be placed");
-        let path = daemon_log_path_for(&home);
-        let stderr = daemon_stderr_for(&path);
-        assert!(
-            matches!(stderr, DaemonStderr::Null),
-            "an unopenable log must yield the Null variant"
-        );
-        assert!(!path.exists(), "no log file can exist: {path:?}");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// Task 4 (idle unload), Spec GT-7: status never loads, reloads, or
-    /// touches the embedding session and never resets the idle clock.
-    /// The pin is structural, as with the profile pin above: neither
-    /// Status arm (dedicated or fallback) may gain a call into the
-    /// embedder, the session container, or the idle-unload setting.
-    /// Session state is reported, if at all, only from a lock-free
-    /// snapshot elsewhere -- never via the session.
-    #[test]
-    fn status_arms_never_touch_the_session() {
-        let source = include_str!("main.rs");
-        let dedicated_start = source
-            .find("\n            Commands::Status => {")
-            .expect("the dedicated Status arm exists");
-        let dedicated_end = source[dedicated_start..]
-            .find("Commands::Backup")
-            .map(|offset| dedicated_start + offset)
-            .expect("the Status arm is followed by the Backup arm");
-        let fallback_start = source
-            .find("\n                    Commands::Status => {")
-            .expect("the fallback Status arm exists");
-        let fallback_end = source[fallback_start..]
-            .find("Commands::Ingest")
-            .map(|offset| fallback_start + offset)
-            .expect("the fallback Status arm is followed by the Ingest arm");
-        for (label, arm) in [
-            ("dedicated", &source[dedicated_start..dedicated_end]),
-            ("fallback", &source[fallback_start..fallback_end]),
-        ] {
-            for needle in [
-                "session_loaded_snapshot",
-                "IdleSession",
-                "idle_unload",
-                "NEUROSTRATA_EMBEDDER_IDLE_UNLOAD_SECS",
-                "build_embedder",
-            ] {
-                assert!(
-                    !arm.contains(needle),
-                    "the {label} Status arm must not touch the embedding session ({needle})"
-                );
-            }
-        }
-    }
-
-    /// Spec AC6: the CLI Status path succeeds with an invalid
-    /// `NEUROSTRATA_PROFILE` set because it never consults the profile.
-    /// Status calls `std::process::exit`, so it cannot be exercised
-    /// in-process; the pin is structural -- the dedicated Status arm's
-    /// source must not reference the profile parser, the profile env var,
-    /// or embedder resolution. (A behavioral complement lives in
-    /// embed::tests::invalid_profile_scoped_error: the same invalid value
-    /// DOES fail the embedder-construction surface.)
-    #[test]
-    fn status_path_never_consults_the_profile_parser() {
-        let source = include_str!("main.rs");
-        // The leading newline + arm indentation keeps this search from
-        // matching this test's own literals.
-        let status_start = source
-            .find("\n            Commands::Status => {")
-            .expect("the dedicated Status arm exists");
-        let status_end = source[status_start..]
-            .find("Commands::Backup")
-            .map(|offset| status_start + offset)
-            .expect("the Status arm is followed by the Backup arm");
-        let status_arm = &source[status_start..status_end];
-        assert!(
-            !status_arm.contains("CapacityProfile"),
-            "the Status arm must not parse the capacity profile"
-        );
-        assert!(
-            !status_arm.contains("NEUROSTRATA_PROFILE"),
-            "the Status arm must not read NEUROSTRATA_PROFILE"
-        );
-        assert!(
-            !status_arm.contains("configured_resolution"),
-            "the Status arm must not resolve the embedder"
-        );
-        assert!(
-            !status_arm.contains("store_limits_with_profile"),
-            "the Status arm must not apply the profile to store limits"
-        );
-    }
-
-    /// Extract one top-level fn's body from this file's source, for the
-    /// structural routing pins below.
-    fn source_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
-        // Anchored to a line start so a signature named inside another
-        // test's string literals is not matched instead of the definition.
-        let anchored = format!("\n{signature}");
-        let start = source
-            .find(&anchored)
-            .unwrap_or_else(|| panic!("{signature} must exist"))
-            + 1;
-        let rest = &source[start + signature.len()..];
-        let end = [rest.find("\nfn "), rest.find("\nasync fn ")]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(rest.len());
-        &rest[..end]
-    }
-
-    /// Fix round 1 (Finding 1): the gate report and snapshot restore are
-    /// store-opening surfaces whose model resolution already goes through
-    /// the profile; their store limits must come from the profiled
-    /// resolution too, not plain `store_limits()`.
-    #[test]
-    fn gate_and_restore_store_opens_route_through_profiled_limits() {
-        let source = include_str!("main.rs");
-        for signature in ["async fn direct_report(", "async fn restore_snapshot_bundle("] {
-            let body = source_fn_body(source, signature);
-            assert!(
-                body.contains("profiled_store_limits(config)"),
-                "{signature} must resolve store limits through the profile"
-            );
-            assert!(
-                !body.contains(".store_limits()"),
-                "{signature} must not use plain store_limits()"
-            );
-        }
-    }
-
-    /// Fix round 1 (Finding 2): resolution runs once at startup -- the
-    /// `StartupResolution` carries the resolved model and both startup
-    /// arms build the embedder from that carried model, so the printed
-    /// summary describes the constructed embedder by construction.
-    #[test]
-    fn startup_paths_build_the_embedder_from_the_carried_resolution() {
-        let source = include_str!("main.rs");
-        assert!(
-            source.contains("resolution: embed::ResolvedModel,"),
-            "StartupResolution must carry the resolved model"
-        );
-        // Assembled from fragments so this test's own text is not counted.
-        let needle = ["build_embedder_for(&startup", ".resolution.model)"].concat();
-        assert_eq!(
-            source.matches(&needle).count(),
-            2,
-            "both startup arms must build from the carried resolution"
-        );
-    }
-
-    /// PR #140 remediation (F1): the Daemon arm acquires the daemon lock
-    /// exactly once. The sync merge welded a second acquisition -- through
-    /// an independently opened handle, which flock refuses even
-    /// in-process, so the arm exited with "Another NeuroStrata daemon is
-    /// already running" against itself -- plus a legacy embedder/store
-    /// shadow pair onto the startup-resolved sequence. The pin is
-    /// structural, as with the pins above: driving the arm would start a
-    /// real server. The lock semantics it relies on are covered
-    /// behaviourally by `a_held_daemon_lock_is_seen_and_goes_with_its_holder`.
-    #[test]
-    fn daemon_arm_takes_the_daemon_lock_once_and_keeps_the_resolved_store() {
-        let source = include_str!("main.rs");
-        // Assembled from fragments so this test's own text is not counted.
-        let lock_set = ["DAEMON_LOCK", ".set("].concat();
-        assert_eq!(
-            source.matches(&lock_set).count(),
-            1,
-            "exactly one daemon-lock acquisition site may exist"
-        );
-        let arm_start = source
-            .find("\n            Commands::Daemon => {")
-            .expect("the Daemon arm exists");
-        let arm_end = source[arm_start..]
-            .find("Commands::Laya")
-            .map(|offset| arm_start + offset)
-            .expect("the Daemon arm is followed by the Laya arm");
-        let arm = &source[arm_start..arm_end];
-        assert!(
-            arm.contains("new_with_identity_limits"),
-            "the Daemon arm must open the identity-limits store"
-        );
-        assert!(
-            !arm.contains("LadybugStore::new("),
-            "the Daemon arm must not shadow the resolved store with the legacy constructor"
-        );
-        assert!(
-            !arm.contains("build_embedder()?"),
-            "the Daemon arm must not shadow the resolved embedder with the legacy builder"
-        );
-    }
-
-    /// PR #140 remediation (F3): the standalone fallback dispatch and the
-    /// Backup arm each open the store exactly once -- the identity-aware
-    /// construction. The sync merge reintroduced the legacy plain opens
-    /// directly beneath the fork's identity opens; shadowing left the
-    /// first store alive-but-unused for the whole command while every
-    /// arm ran on the identity-less store with default limits, so the
-    /// embedding-identity guard and the profiled limits never fired.
-    /// The pin is structural: the dispatch lives inline in `run()` and
-    /// the tree has no CLI test harness.
-    #[test]
-    fn standalone_and_backup_arms_open_only_the_identity_store() {
-        let source = include_str!("main.rs");
-        let backup_start = source
-            .find("\n            Commands::Backup { dir } => {")
-            .expect("the Backup arm exists");
-        let backup_end = source[backup_start..]
-            .find("Commands::Restore")
-            .map(|offset| backup_start + offset)
-            .expect("the Backup arm is followed by the Restore arm");
-        let backup = &source[backup_start..backup_end];
-        assert!(
-            backup.contains("new_with_identity_limits"),
-            "the Backup arm must open the identity-limits store"
-        );
-        assert!(
-            !backup.contains("LadybugStore::new("),
-            "the Backup arm must not shadow the identity store with the legacy constructor"
-        );
-
-        // The fallback dispatch opens its store between the startup
-        // resolution (the second one in the file; the Daemon arm's is
-        // the first) and the `match other` dispatch.
-        let match_other = source
-            .find("\n                match other {")
-            .expect("the fallback dispatch exists");
-        let opens_start = source[..match_other]
-            .rfind("let startup = resolve_startup(&config)?;")
-            .expect("the fallback resolves startup before opening the store");
-        let opens = &source[opens_start..match_other];
-        assert!(
-            opens.contains("new_with_identity_limits"),
-            "the fallback dispatch must open the identity-limits store"
-        );
-        assert!(
-            !opens.contains("LadybugStore::new("),
-            "the fallback dispatch must not shadow the identity store with the legacy constructor"
-        );
-        assert!(
-            opens.contains("ReadSource::Direct"),
-            "the fallback dispatch reads through the opened store"
-        );
-    }
-
-    /// PR #140 remediation (F2): the Restore arm reports the validated
-    /// install `restore_snapshot_bundle` already made. The legacy inline
-    /// copy that followed the helper call overwrote the installed DB
-    /// with the raw snapshot bytes (and the installed WAL with the raw
-    /// snapshot WAL, or -- for a WAL-less snapshot -- left the
-    /// post-validation WAL paired with the pre-validation DB), then
-    /// re-opened the target with the plain constructor to re-list the
-    /// namespaces the helper had already returned. The pin is
-    /// structural: the arm lives inline in `run()` and exits the
-    /// process on its error paths. The helper's install behaviour is
-    /// covered behaviourally by the `restore_snapshot_bundle` tests.
-    #[test]
-    fn restore_arm_uses_the_helpers_install_without_recopying() {
-        let source = include_str!("main.rs");
-        let arm_start = source
-            .find("\n            Commands::Restore { dir, into } => {")
-            .expect("the Restore arm exists");
-        let arm_end = source[arm_start..]
-            .find("Commands::Task")
-            .map(|offset| arm_start + offset)
-            .expect("the Restore arm is followed by the Task arm");
-        let arm = &source[arm_start..arm_end];
-        assert!(
-            arm.contains("restore_snapshot_bundle("),
-            "the Restore arm must restore through the validating helper"
-        );
-        assert!(
-            !arm.contains("std::fs::copy("),
-            "the Restore arm must not copy snapshot files over the helper's install"
-        );
-        assert!(
-            !arm.contains("LadybugStore::new("),
-            "the Restore arm must not re-open the restored target with the legacy constructor"
-        );
-        assert!(
-            !arm.contains("list_namespaces"),
-            "the Restore arm must report the helper's namespaces, not re-list them"
-        );
-    }
-
-    /// PR #140 remediation (F5): the fallback Ingest arm ingests exactly
-    /// once, after the optional clear. The sync merge kept both evolved
-    /// forms of the arm sequentially, so one CLI ingest ran two full
-    /// staging/publication cycles and retained an unnecessary extra
-    /// generation -- and with NEUROSTRATA_CLEAR_BEFORE_INGEST set it
-    /// cleared the first cycle's result before rebuilding it. The same
-    /// union left a dead duplicate `Commands::Status` arm (with a
-    /// dangling comment fragment) behind the live one. The pin is
-    /// structural: the arm lives inline in `run()`; the
-    /// generation-count oracle would need a black-box binary run.
-    #[test]
-    fn ingest_arm_ingests_once_after_the_optional_clear() {
-        let source = include_str!("main.rs");
-        let arm_start = source
-            .find("\n                    Commands::Ingest {")
-            .expect("the fallback Ingest arm exists");
-        let arm_end = source[arm_start..]
-            .find("Commands::ExportGraph")
-            .map(|offset| arm_start + offset)
-            .expect("the Ingest arm is followed by the ExportGraph arm");
-        let arm = &source[arm_start..arm_end];
-        assert_eq!(
-            arm.matches("ingest_directory(").count(),
-            1,
-            "one CLI ingest must run exactly one ingest_directory cycle"
-        );
-        let clear_at = arm
-            .find("NEUROSTRATA_CLEAR_BEFORE_INGEST")
-            .expect("the opt-in pre-ingest clear stays");
-        let ingest_at = arm
-            .find("ingest_directory(")
-            .expect("the single ingest exists");
-        assert!(
-            clear_at < ingest_at,
-            "the optional clear must precede the single ingest"
-        );
-        assert!(
-            arm.contains("Failed to load schema"),
-            "the schema error path stays"
-        );
-        // Assembled from fragments so this test's own text is not counted.
-        let dead_arm = ["Commands::Status => ", "unreachable!"].concat();
-        assert_eq!(
-            source.matches(&dead_arm).count(),
-            0,
-            "the dead duplicate Status arm left by the union merge must be gone"
-        );
-    }
 
     fn release_test_barrier(path: &std::path::Path) {
         let mut release = path.as_os_str().to_os_string();
         release.push(".release");
         std::fs::write(std::path::PathBuf::from(release), "continue").unwrap();
     }
+
+
 
     async fn verify_wal_snapshot_restore(
         snapshot: &std::path::Path,
@@ -2198,13 +3085,7 @@ mod tests {
         );
 
         let dimensions = embed::configured_dimensions().unwrap();
-        let restored = LadybugStore::new_with_identity_limits(
-            target,
-            dimensions,
-            embed::configured_embedder_id().unwrap(),
-            config.store_limits().unwrap(),
-        )
-        .unwrap();
+        let restored = LadybugStore::new(target, dimensions).unwrap();
         restored.init("restore-recovery-test").await.unwrap();
         for (namespace, id, expected) in [
             (lookalike, "legacy-row", "legacy user-owned lookalike"),
@@ -2271,11 +3152,15 @@ mod tests {
             corrupt_snapshot.join("ladybug.store"),
         )
         .unwrap();
-        std::fs::copy(
-            snapshot.join("ladybug.store.embedding"),
-            corrupt_snapshot.join("ladybug.store.embedding"),
-        )
-        .unwrap();
+        // Legacy width sidecar inside the snapshot: present only when
+        // the snapshot was produced from a marker-carrying store.
+        if snapshot.join("ladybug.store.embedding").exists() {
+            std::fs::copy(
+                snapshot.join("ladybug.store.embedding"),
+                corrupt_snapshot.join("ladybug.store.embedding"),
+            )
+            .unwrap();
+        }
         let snapshot_wal = appended_path(&snapshot.join("ladybug.store"), ".wal");
         if snapshot_wal.exists() {
             std::fs::copy(
@@ -2314,6 +3199,8 @@ mod tests {
         drop(restored);
     }
 
+
+
     #[tokio::test]
     async fn restore_holds_target_open_lock_until_database_and_provenance_are_installed() {
         use crate::traits::MemoryPayload;
@@ -2323,16 +3210,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let source_db = root.join("source.store");
         let dimensions = embed::configured_dimensions().unwrap();
-        let embedder_id = embed::configured_embedder_id().unwrap();
-        let test_config: Config = serde_json::from_value(json!({})).unwrap();
-        let limits = test_config.store_limits().unwrap();
-        let source = LadybugStore::new_with_identity_limits(
-            &source_db,
-            dimensions,
-            embedder_id.clone(),
-            limits,
-        )
-        .unwrap();
+        let source = LadybugStore::new(&source_db, dimensions).unwrap();
         source.init("restore-lock-source").await.unwrap();
         source
             .upsert(
@@ -2381,9 +3259,8 @@ mod tests {
         }
 
         let open_target = target.clone();
-        let open_identity = embedder_id.clone();
         let opener = tokio::task::spawn_blocking(move || {
-            LadybugStore::new_with_identity_limits(open_target, dimensions, open_identity, limits)
+            LadybugStore::new(open_target, dimensions)
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
@@ -2417,6 +3294,8 @@ mod tests {
         );
     }
 
+
+
     #[tokio::test]
     async fn snapshot_restore_preserves_stage_provenance_and_legacy_lookalikes() {
         use crate::traits::MemoryPayload;
@@ -2429,13 +3308,7 @@ mod tests {
         let snapshot = root.join("snapshot");
         let target = root.join("restored.store");
         let dimensions = embed::configured_dimensions().unwrap();
-        let source_store = LadybugStore::new_with_identity_limits(
-            &source,
-            dimensions,
-            embed::configured_embedder_id().unwrap(),
-            crate::store::StoreLimits::default(),
-        )
-        .unwrap();
+        let source_store = LadybugStore::new(&source, dimensions).unwrap();
         source_store.init("snapshot-test").await.unwrap();
 
         let stage = format!(
@@ -2588,13 +3461,7 @@ mod tests {
             .await
             .unwrap();
         drop(source_store);
-        let source_store = LadybugStore::new_with_identity_limits(
-            &source,
-            dimensions,
-            embed::configured_embedder_id().unwrap(),
-            crate::store::StoreLimits::default(),
-        )
-        .unwrap();
+        let source_store = LadybugStore::new(&source, dimensions).unwrap();
         assert!(!source_store
             .list_namespaces()
             .await
@@ -2692,11 +3559,17 @@ mod tests {
         corrupted_wal[corrupt_offset] ^= 0x80;
         std::fs::write(&snapshot_wal, &corrupted_wal).unwrap();
         assert_ne!(std::fs::read(&snapshot_wal).unwrap(), source_wal_copy);
-        std::fs::copy(
-            crate::store::ladybug::width_marker_path(&source),
-            crate::store::ladybug::width_marker_path(&snapshot_db),
-        )
-        .unwrap();
+        // The width marker is a legacy sidecar, written only by stores
+        // from before the descriptor-based width record: copy it when
+        // the source carries one.
+        let source_marker = crate::store::ladybug::width_marker_path(&source);
+        if source_marker.exists() {
+            std::fs::copy(
+                &source_marker,
+                crate::store::ladybug::width_marker_path(&snapshot_db),
+            )
+            .unwrap();
+        }
         std::fs::write(
             snapshot.join("manifest.json"),
             serde_json::to_vec_pretty(&json!({
@@ -2712,7 +3585,9 @@ mod tests {
         let source_db_before = std::fs::read(&source).unwrap();
         let source_wal_before = std::fs::read(&source_wal).unwrap();
         let source_marker_path = crate::store::ladybug::width_marker_path(&source);
-        let source_marker_before = std::fs::read(&source_marker_path).unwrap();
+        // Legacy width sidecar: read when the source carries one (the
+        // merged store records width in its descriptor, not a marker).
+        let source_marker_before = std::fs::read(&source_marker_path).ok();
         let active_lease_path =
             crate::store::ladybug::ingest_stage_lease_path(&source, &stage).unwrap();
         let abandoned_lease_path =
@@ -2737,7 +3612,7 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), source_db_before);
         assert_eq!(std::fs::read(&source_wal).unwrap(), source_wal_before);
         assert_eq!(
-            std::fs::read(&source_marker_path).unwrap(),
+            std::fs::read(&source_marker_path).ok(),
             source_marker_before
         );
         assert_eq!(
@@ -2774,218 +3649,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    #[ignore = "F6 read-surface exactness deferred to B1 (owner ruling 2026-11-07): whether read-time-synthesized provenance is part of a record's default presentation at get — interim: get presents the synthesized edge_sources; this byte-exactness assertion reactivates when B1 rules on the F6 cluster"]
-    async fn strict_restore_rejects_or_exactly_replays_unverified_wal_capture() {
-        use crate::traits::MemoryPayload;
-        use serde_json::json;
-
-        let _strict_wal = StrictWalTestEnvironment::force_strict();
-        let root = std::env::temp_dir().join(format!("live-wal-capture-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let source = root.join("source.store");
-        let snapshot = root.join("snapshot");
-        let target = root.join("restored.store");
-        let config: Config = serde_json::from_value(json!({})).unwrap();
-        let dimensions = embed::configured_dimensions().unwrap();
-        let limits = config.store_limits().unwrap();
-        let source_store = LadybugStore::new_with_identity_limits(
-            &source,
-            dimensions,
-            embed::configured_embedder_id().unwrap(),
-            limits,
-        )
-        .unwrap();
-        source_store.init("live-wal-source").await.unwrap();
-
-        let fact_id = "wal-data::stable-fact";
-        source_store
-            .upsert(
-                "wal-data",
-                fact_id,
-                vec![0.125; dimensions],
-                MemoryPayload {
-                    content: "fact committed before unclean snapshot".into(),
-                    user_id: "owner".into(),
-                    memory_type: "fact".into(),
-                    agent_name: None,
-                    location: "facts/stable.json".into(),
-                    location_lines: "1".into(),
-                    metadata: json!({"stable": true}),
-                },
-            )
-            .await
-            .unwrap();
-        let rule_id = "wal-data::rule";
-        source_store
-            .upsert(
-                "wal-data",
-                rule_id,
-                vec![0.25; dimensions],
-                MemoryPayload {
-                    content: "rule declaration".into(),
-                    user_id: "owner".into(),
-                    memory_type: "rule".into(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: json!({"governs": [fact_id]}),
-                },
-            )
-            .await
-            .unwrap();
-        source_store.relink_edges("wal-data", "wal-source").await.unwrap();
-
-        let stage = format!(
-            "{}{}",
-            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
-            uuid::Uuid::new_v4()
-        );
-        let _stage_lease = source_store.begin_ingest_stage(&stage).await.unwrap();
-        let stage_row_id = format!("{stage}::src/pending.rs");
-        source_store
-            .upsert(
-                &stage,
-                &stage_row_id,
-                vec![0.5; dimensions],
-                MemoryPayload {
-                    content: "staged row from unverified WAL capture".into(),
-                    user_id: "auto-ingestor".into(),
-                    memory_type: "file".into(),
-                    agent_name: None,
-                    location: "src/pending.rs".into(),
-                    location_lines: String::new(),
-                    metadata: json!({}),
-                },
-            )
-            .await
-            .unwrap();
-
-        std::fs::create_dir(&snapshot).unwrap();
-        let snapshot_db = snapshot.join("ladybug.store");
-        std::fs::copy(&source, &snapshot_db).unwrap();
-        let source_wal = appended_path(&source, ".wal");
-        let snapshot_wal = appended_path(&snapshot_db, ".wal");
-        assert!(source_wal.is_file());
-        assert!(
-            std::fs::metadata(&source_wal).unwrap().len() > 0,
-            "live WAL capture must contain uncheckpointed writes"
-        );
-        std::fs::copy(&source_wal, &snapshot_wal).unwrap();
-        let source_marker = crate::store::ladybug::width_marker_path(&source);
-        let snapshot_marker = crate::store::ladybug::width_marker_path(&snapshot_db);
-        std::fs::copy(&source_marker, &snapshot_marker).unwrap();
-        std::fs::write(
-            snapshot.join("manifest.json"),
-            serde_json::to_vec_pretty(&json!({
-                "format": "neurostrata-snapshot",
-                "version": 2,
-                "created_at": chrono::Utc::now().to_rfc3339(),
-                "bytes": std::fs::metadata(&snapshot_db).unwrap().len(),
-                "stage_generations": [stage],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let source_db_before = std::fs::read(&source).unwrap();
-        let source_wal_before = std::fs::read(&source_wal).unwrap();
-        let source_marker_before = std::fs::read(&source_marker).unwrap();
-        let source_lease = crate::store::ladybug::ingest_stage_lease_path(&source, &stage).unwrap();
-        let source_lease_before = std::fs::read(&source_lease).unwrap();
-        let visible = match restore_snapshot_bundle(&snapshot, &target, &config).await {
-            Ok(visible) => visible,
-            Err(error) => {
-                assert!(
-                    error.to_string().contains("write-ahead log did not verify"),
-                    "strict mode may reject an unverified active-copy WAL, got: {error:#}"
-                );
-                assert!(
-                    !target.exists(),
-                    "failed validation must not install a database"
-                );
-                assert!(!appended_path(&target, ".wal").exists());
-                assert!(!crate::store::ladybug::width_marker_path(&target).exists());
-                assert!(!crate::store::ladybug::restore_in_progress_path(&target).exists());
-                assert_eq!(std::fs::read(&source).unwrap(), source_db_before);
-                assert_eq!(std::fs::read(&source_wal).unwrap(), source_wal_before);
-                assert_eq!(std::fs::read(&source_marker).unwrap(), source_marker_before);
-                assert_eq!(std::fs::read(&source_lease).unwrap(), source_lease_before);
-                drop(source_store);
-                let _ = std::fs::remove_dir_all(root);
-                return;
-            }
-        };
-        assert_eq!(visible, vec!["wal-data".to_string()]);
-
-        let restored = LadybugStore::new_with_identity_limits(
-            &target,
-            dimensions,
-            embed::configured_embedder_id().unwrap(),
-            limits,
-        )
-        .unwrap();
-        restored.init("live-wal-restored").await.unwrap();
-        let (fact_vector, fact) = restored.get("wal-data", fact_id).await.unwrap().unwrap();
-        assert_eq!(fact_vector, vec![0.125; dimensions]);
-        assert_eq!(fact.content, "fact committed before unclean snapshot");
-        assert_eq!(fact.memory_type, "fact");
-        assert_eq!(fact.metadata, json!({"stable": true}));
-        let (rule_vector, rule) = restored.get("wal-data", rule_id).await.unwrap().unwrap();
-        assert_eq!(rule_vector, vec![0.25; dimensions]);
-        assert_eq!(rule.content, "rule declaration");
-        assert_eq!(rule.metadata, json!({"governs": [fact_id]}));
-        let graph = restored
-            .export_graph(false, false, &std::collections::HashMap::new(), None)
-            .await
-            .unwrap();
-        assert!(graph["links"].as_array().unwrap().iter().any(|edge| {
-            edge["source"] == rule_id && edge["target"] == fact_id && edge["type"] == "GOVERNS"
-        }));
-        let (stage_vector, stage_payload) = restored
-            .get(&stage, &stage_row_id)
-            .await
-            .unwrap()
-            .expect("accepted WAL replay retains the staged file row");
-        assert_eq!(stage_vector, vec![0.5; dimensions]);
-        assert_eq!(
-            stage_payload.content,
-            "staged row from unverified WAL capture"
-        );
-        assert_eq!(stage_payload.user_id, "auto-ingestor");
-        assert_eq!(stage_payload.memory_type, "file");
-        assert_eq!(stage_payload.location, "src/pending.rs");
-        assert_eq!(stage_payload.metadata, json!({}));
-        assert!(!restored.list_namespaces().await.unwrap().contains(&stage));
-
-        let next_stage = format!(
-            "{}{}",
-            crate::traits::INTERNAL_INGEST_STAGE_PREFIX,
-            uuid::Uuid::new_v4()
-        );
-        let _next_lease = restored.begin_ingest_stage(&next_stage).await.unwrap();
-        assert!(restored.get(&stage, &stage_row_id).await.unwrap().is_none());
-        assert_eq!(
-            restored
-                .get("wal-data", fact_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .1
-                .content,
-            "fact committed before unclean snapshot"
-        );
-        assert_eq!(
-            std::fs::read(&source).unwrap(),
-            source_db_before,
-            "strict WAL handling must not mutate the source database"
-        );
-        assert_eq!(std::fs::read(&source_wal).unwrap(), source_wal_before);
-        assert_eq!(std::fs::read(&source_marker).unwrap(), source_marker_before);
-        assert_eq!(std::fs::read(&source_lease).unwrap(), source_lease_before);
-        drop(restored);
-        drop(source_store);
-        let _ = std::fs::remove_dir_all(root);
+    #[test]
+    fn bench_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "bench",
+            "--suite",
+            "all",
+            "--iterations",
+            "2",
+            "--max-regression-pct",
+            "10.0",
+            "--record-metrics",
+            "ns",
+        ])
+        .expect("bench parses");
+        assert!(matches!(cli.command, Some(Commands::Bench { .. })));
     }
 
     #[test]
@@ -3203,6 +3882,56 @@ mod tests {
         );
     }
 
+
+
+    #[test]
+    fn a_final_checkpoint_report_is_the_lock_files_whole_content() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let db = std::env::temp_dir()
+            .join(format!("ns-checkpoint-report-{}", uuid::Uuid::new_v4()))
+            .join("ladybug.db");
+        let file = open_daemon_lock(&db).expect("the lock file opens");
+        let path = daemon_lock_path(&db);
+
+        // The state that used to corrupt the report: earlier bytes in the
+        // file and the shared offset sitting past them, so a truncate-then-
+        // write lands beyond the new end of file.
+        let stale = b"error: an earlier, longer report";
+        (&file).write_all(stale).unwrap();
+        assert_eq!(
+            (&file).seek(SeekFrom::Current(0)).unwrap(),
+            stale.len() as u64,
+            "the offset starts where the last write left it"
+        );
+
+        write_final_checkpoint_report(&file, FINAL_CHECKPOINT_OK);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            FINAL_CHECKPOINT_OK,
+            "a completed checkpoint reads back as exactly the OK report"
+        );
+
+        // A longer error report replaces it completely, and a shorter OK
+        // report after that leaves none of the error's tail behind.
+        write_final_checkpoint_report(&file, "error: the checkpoint failed");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "error: the checkpoint failed"
+        );
+        write_final_checkpoint_report(&file, FINAL_CHECKPOINT_OK);
+        let mut raw = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(
+            raw,
+            FINAL_CHECKPOINT_OK.as_bytes(),
+            "no NUL hole in front, no tail behind"
+        );
+    }
+
     #[test]
     fn only_a_refusal_proves_no_daemon() {
         assert_eq!(classify_probe(false, true), DaemonProbe::Absent);
@@ -3322,7 +4051,10 @@ mod tests {
         let root = t4_repo(tag);
         let remote = root.join("remote.git");
         t4_git_ok(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
-        t4_git_ok(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        t4_git_ok(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         std::fs::write(root.join("file.txt"), "task 4\n").unwrap();
         t4_git_ok(&root, &["add", "file.txt"]);
         t4_git_ok(&root, &["commit", "-q", "-m", "task 4 seed"]);
@@ -3330,8 +4062,9 @@ mod tests {
     }
 
     /// A stub `neurostrata-mcp` whose exit code is STUB_GATE_EXIT; every
-    /// invocation appends a line to the marker file, so a test can prove
-    /// the hook actually ran the gate.
+    /// gate invocation appends a line to the marker file, so a test can
+    /// prove the hook actually ran the gate. `namespace resolve` answers
+    /// `example-project`, as the real binary would.
     #[cfg(unix)]
     fn t4_stub_bin(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -3339,7 +4072,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let marker = root.join("gate-ran.marker");
         let stub = format!(
-            "#!/bin/sh\necho ran >> \"{}\"\nexit ${{STUB_GATE_EXIT:-0}}\n",
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then echo example-project; exit 0; fi\necho ran >> \"{}\"\nexit ${{STUB_GATE_EXIT:-0}}\n",
             marker.display()
         );
         let stub_path = bin.join("neurostrata-mcp");
@@ -3408,6 +4141,25 @@ mod tests {
             .and_then(|deps| deps.parent())
             .map(|profile| profile.join("neurostrata-mcp"))
             .expect("the CLI binary path derives from the test binary path")
+    }
+
+    /// A plain `cargo test` builds the test harness, not the CLI bin; CI builds
+    /// the bin first. Build it on demand here, then let the caller skip with a
+    /// clear message if the toolchain cannot produce it.
+    #[cfg(unix)]
+    fn t4_ensure_cli_binary() -> Option<std::path::PathBuf> {
+        let bin = t4_cli_binary();
+        if bin.is_file() {
+            return Some(bin);
+        }
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let built = std::process::Command::new(cargo)
+            .args(["build", "--bin", "neurostrata-mcp"])
+            .status();
+        match built {
+            Ok(status) if status.success() && bin.is_file() => Some(bin),
+            _ => None,
+        }
     }
 
     /// Task 4, Step 1: with `core.hooksPath` set, `hooks install` writes
@@ -3543,7 +4295,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gate_cli_skip_is_logged_to_stderr_and_report() {
-        let bin = t4_cli_binary();
+        let Some(bin) = t4_ensure_cli_binary() else {
+            eprintln!(
+                "skipping: the CLI binary is not built at {} and `cargo build --bin neurostrata-mcp` failed",
+                t4_cli_binary().display()
+            );
+            return;
+        };
         assert!(
             bin.is_file(),
             "cargo test builds the CLI binary at {}",
@@ -3577,9 +4335,8 @@ mod tests {
             String::from_utf8_lossy(&skipped.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&skipped.stdout).contains(
-                "Task gate: skipped in 't4cli' (NEUROSTRATA_SKIP_GATE=1)."
-            ),
+            String::from_utf8_lossy(&skipped.stdout)
+                .contains("Task gate: skipped in 't4cli' (NEUROSTRATA_SKIP_GATE=1)."),
             "the skip appears in the stdout gate report: {}",
             String::from_utf8_lossy(&skipped.stdout)
         );
@@ -3658,14 +4415,14 @@ mod tests {
         // A PATH with git but no neurostrata-mcp anywhere on it.
         let out = t4_push(&root, "/usr/bin:/bin", None);
         assert!(
-            out.status.success(),
-            "a missing gate binary must not block the push: {}",
+            !out.status.success(),
+            "a missing gate binary must block the push: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
             String::from_utf8_lossy(&out.stderr)
-                .contains("warning: neurostrata-mcp not found — gate NOT run for this push"),
-            "the skip-by-absence is announced, never silent: {}",
+                .contains("error: neurostrata-mcp not found — gate NOT run for this push"),
+            "the missing binary is announced, never silent: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3679,21 +4436,22 @@ mod tests {
     /// pass left in the hook's own paths.
     #[cfg(unix)]
     #[test]
-    fn gate_exit_two_is_announced_and_passes() {
+    fn gate_exit_two_is_announced_and_blocks() {
         let root = t4_repo_with_remote("exittwo");
         install_pre_push_hook(&root, false).expect("install succeeds");
         let (stub_bin, marker) = t4_stub_bin(&root);
         let path = format!("{}:/usr/bin:/bin", stub_bin.display());
         let out = t4_push(&root, &path, Some("2"));
         assert!(
-            out.status.success(),
-            "an exit 2 never blocks the push: {}",
+            !out.status.success(),
+            "an exit 2 now blocks the push: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(marker.exists(), "the gate was invoked");
         assert!(
-            String::from_utf8_lossy(&out.stderr)
-                .contains("warning: neurostrata-mcp task gate exited 2"),
+            String::from_utf8_lossy(&out.stderr).contains(
+                "error: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push"
+            ),
             "the could-not-run is announced, never silent: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -3719,12 +4477,16 @@ mod tests {
         );
         for behavior in [
             "command -v neurostrata-mcp",
-            "NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
-            "neurostrata-mcp task gate \"$NAMESPACE\" --strict",
+            "NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo \"error: neurostrata-mcp namespace resolve failed — gate NOT run for this push",
+            "FOLDER_NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
+            "neurostrata-mcp task gate \"$GATE_NAMESPACE\" --strict",
             "code=$?",
             "if [ $code -eq 1 ]; then",
-            "echo \"Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push\" >&2",
-            "exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking",
+            "echo \"Push blocked: resolve the tasks above\" >&2",
+            "exit 1",
+            "if [ $code -ne 0 ]; then",
+            "echo \"error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push\" >&2",
+            "exit 1",
         ] {
             assert!(
                 hook.contains(behavior),
@@ -3732,25 +4494,23 @@ mod tests {
                 behavior
             );
         }
-        // Fix round (F5): an exit 2 is announced, never silent — and
-        // still never blocks. (Under --strict the gate CLI itself exits
-        // only 0 or 1, so a 2 is never a verdict: a stale, foreign, or
-        // dying binary.) The announcement branch must say so and must
-        // not exit 1.
+        // Fail-closed: any gate exit other than 0 blocks the push, including
+        // a 2 from a stale, foreign, or dying binary. The announcement
+        // branch must say so and must exit 1.
         let two_branch = hook
-            .split("if [ $code -eq 2 ]; then")
+            .split("if [ $code -ne 0 ]; then")
             .nth(1)
-            .expect("the exit-2 announcement branch exists")
+            .expect("the gate-failure announcement branch exists")
             .split("fi")
             .next()
             .unwrap();
         assert!(
             two_branch.contains("gate could NOT run for this push"),
-            "an exit 2 is announced as a could-not-run, never silent"
+            "a non-zero gate exit is announced as a could-not-run, never silent"
         );
         assert!(
-            !two_branch.contains("exit 1"),
-            "2 never blocks in the hook itself"
+            two_branch.contains("exit 1"),
+            "a non-zero gate exit blocks the push"
         );
     }
 
@@ -3866,6 +4626,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_namespace_resolve_command_parses() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(action, NamespaceCommands::Resolve { dir: None })
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve", "some/dir"])
+            .expect("parses with a dir");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(action, NamespaceCommands::Resolve { dir: Some("some/dir".into()) })
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
+        }
+    }
+
     /// Task 7's operator surface: both commands exist as spelled here, and
     /// `archive` takes the namespace and the id in the order the tool surface
     /// names them -- a swapped pair would archive a row that does not exist
@@ -3944,6 +4723,226 @@ mod tests {
             "alias broken: {:?}",
             cli.command
         );
+    }
+
+    #[test]
+    fn the_action_commands_parse() {
+        let def = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "define",
+            "MyProj",
+            r#"{"slug":"s","title":"t","description":"d","required_role":"editor","parameters":[],"submission_criteria":[],"effects":[]}"#,
+        ])
+        .expect("action define parses");
+        assert!(matches!(
+            def.command,
+            Some(Commands::Action {
+                action: ActionCommands::Define { .. }
+            })
+        ));
+
+        let val = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "validate",
+            "MyProj",
+            "recalibrate-loop",
+            "--params",
+            r#"{"twin_id":"loop-a"}"#,
+        ])
+        .expect("action validate parses");
+        assert!(matches!(
+            val.command,
+            Some(Commands::Action {
+                action: ActionCommands::Validate { .. }
+            })
+        ));
+
+        let app = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "apply",
+            "MyProj",
+            "recalibrate-loop",
+            "--params",
+            r#"{"twin_id":"loop-a"}"#,
+            "--principal",
+            "alice",
+        ])
+        .expect("action apply parses");
+        assert!(matches!(
+            app.command,
+            Some(Commands::Action {
+                action: ActionCommands::Apply { .. }
+            })
+        ));
+
+        let rev = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "revert",
+            "MyProj",
+            "rec-123",
+            "--force",
+        ])
+        .expect("action revert parses");
+        match rev.command {
+            Some(Commands::Action {
+                action:
+                    ActionCommands::Revert {
+                        namespace,
+                        receipt_id,
+                        force,
+                        ..
+                    },
+            }) => {
+                assert_eq!(namespace, "MyProj");
+                assert_eq!(receipt_id, "rec-123");
+                assert!(force);
+            }
+            other => panic!("expected Action::Revert, got {:?}", other),
+        }
+
+        let log = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "action",
+            "log",
+            "MyProj",
+            "--limit",
+            "25",
+        ])
+        .expect("action log parses");
+        match log.command {
+            Some(Commands::Action {
+                action:
+                    ActionCommands::Log {
+                        namespace, limit, ..
+                    },
+            }) => {
+                assert_eq!(namespace, "MyProj");
+                assert_eq!(limit, 25);
+            }
+            other => panic!("expected Action::Log, got {:?}", other),
+        }
+
+        let tax_adv = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "taxonomy",
+            "advise",
+            "NeuroStrata",
+            "--query",
+            "top 5 improvements",
+            "--top-k",
+            "5",
+        ])
+        .expect("taxonomy advise parses");
+        match tax_adv.command {
+            Some(Commands::Taxonomy {
+                taxonomy:
+                    TaxonomyCommands::Advise {
+                        namespace,
+                        query,
+                        top_k,
+                        ..
+                    },
+            }) => {
+                assert_eq!(namespace, "NeuroStrata");
+                assert_eq!(query.as_deref(), Some("top 5 improvements"));
+                assert_eq!(top_k, 5);
+            }
+            other => panic!("expected Taxonomy::Advise, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn the_scenario_commands_parse() {
+        let create = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "scenario",
+            "create",
+            "MyProj",
+            "--scenario-id",
+            "scen-1",
+            "--title",
+            "Cooling loop sandbox",
+        ])
+        .expect("scenario create parses");
+        assert!(matches!(
+            create.command,
+            Some(Commands::Scenario {
+                scenario: ScenarioCommands::Create { .. }
+            })
+        ));
+
+        let eval = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "scenario",
+            "eval",
+            "MyProj",
+            "scen-1",
+            "ASK { ?s a ns:TwinState }",
+        ])
+        .expect("scenario eval parses");
+        assert!(matches!(
+            eval.command,
+            Some(Commands::Scenario {
+                scenario: ScenarioCommands::Eval { .. }
+            })
+        ));
+
+        let diff = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "scenario",
+            "diff",
+            "MyProj",
+            "scen-1",
+            "--compare-to",
+            "scen-2",
+        ])
+        .expect("scenario diff parses");
+        assert!(matches!(
+            diff.command,
+            Some(Commands::Scenario {
+                scenario: ScenarioCommands::Diff { .. }
+            })
+        ));
+
+        let ov = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "object-view",
+            "MyProj",
+            "loop-a",
+            "--principal",
+            "bob",
+        ])
+        .expect("object-view parses");
+        assert!(matches!(ov.command, Some(Commands::ObjectView { .. })));
+
+        let loc = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "locate",
+            "MyProj",
+            "check_caller_path",
+            "--max-locations",
+            "5",
+        ])
+        .expect("locate parses");
+        assert!(matches!(loc.command, Some(Commands::Locate { .. })));
+
+        let dt = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "diff-tour",
+            "MyProj",
+            "--max-blast-radius-callers",
+            "10",
+        ])
+        .expect("diff-tour parses");
+        assert!(matches!(dt.command, Some(Commands::DiffTour { .. })));
+
+        let ins = Cli::try_parse_from(["neurostrata-mcp", "insights", "MyProj", "snapshot"])
+            .expect("insights parses");
+        assert!(matches!(ins.command, Some(Commands::Insights { .. })));
     }
 
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
@@ -4111,50 +5110,15 @@ mod tests {
         assert!(matches!(skew_verdict(Some(&info), (6, 8)), Skew::Stale(_)));
     }
 
-    /// Task 1 (J9): the gate trusts a daemon only when /info reports the
-    /// build fingerprint of the binary on disk. A foreign fingerprint is
-    /// refused with a message naming both, and a daemon that cannot
-    /// identify itself at all is refused too -- /health answering is not
-    /// identity, and a squatter answers /health.
-    #[test]
-    fn the_gate_verifies_daemon_identity_before_trusting_it() {
-        let own = (7u64, 8u64);
-        let good = serde_json::json!({ "version": "1.11.0", "exe_hash": 7u64, "exe_len": 8u64, "started_at": 1 });
-        assert!(gate_verify_daemon(Some(&good), own).is_ok());
 
-        let foreign = serde_json::json!({ "version": "9.9.9", "exe_hash": 0xdeadu64, "exe_len": 1u64, "started_at": 2 });
-        let err = gate_verify_daemon(Some(&foreign), own).unwrap_err();
-        assert!(
-            err.contains("000000000000dead") && err.contains("0000000000000007"),
-            "the refusal must name the reported and expected fingerprints: {err}"
-        );
-
-        assert!(gate_verify_daemon(None, own).is_err());
-    }
-
-    // ---- Task 19 (J26): the tracing subscriber these tests presume ----
-    //
-    // Until this task the crate declared `tracing` and emitted through
-    // ~50 call sites with no subscriber installed anywhere: every event
-    // went nowhere. The production seam is `init_tracing()` at the top
-    // of `main()`: it builds the subscriber via
-    // `tracing_fmt_subscriber(std::io::stderr, tracing_env_filter())`
-    // and installs it as the global default. The writer slot is stderr
-    // because stdout is the MCP stdio channel — a log line there would
-    // corrupt the protocol. These tests drive the same builder with a
-    // capture writer standing in the stderr slot, installed as a scoped
-    // default so they never contend for the process-global one.
-
-    /// An in-memory `Write` sink handed to the fmt layer through its
-    /// `MakeWriter` closure; cloning shares the one buffer.
-    #[derive(Clone, Default)]
-    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl CapturedLog {
         fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
     }
+
+
 
     impl std::io::Write for CapturedLog {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -4166,6 +5130,11 @@ mod tests {
             Ok(())
         }
     }
+
+
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     /// Serializes the tests that set `RUST_LOG` (env is process-global)
     /// and restores the caller's prior value on drop.
@@ -4188,6 +5157,8 @@ mod tests {
         }
     }
 
+
+
     impl Drop for RustLogRestore {
         fn drop(&mut self) {
             match &self.prior {
@@ -4196,6 +5167,8 @@ mod tests {
             }
         }
     }
+
+
 
     #[test]
     fn tracing_output_reaches_stderr() {
@@ -4223,6 +5196,8 @@ mod tests {
         );
     }
 
+
+
     #[test]
     fn stdout_carries_no_log_output() {
         let _env = RustLogRestore::set(None);
@@ -4244,10 +5219,14 @@ mod tests {
             "stdout carries protocol bytes only — no log output"
         );
         assert!(
-            captured.text().contains("stdout_carries_no_log_output marker"),
+            captured
+                .text()
+                .contains("stdout_carries_no_log_output marker"),
             "the log line went to the stderr slot instead"
         );
     }
+
+
 
     #[test]
     fn rust_log_filter_is_honored() {
@@ -4269,6 +5248,8 @@ mod tests {
             "the info event is suppressed by RUST_LOG=error: {text}"
         );
     }
+
+
 
     #[test]
     fn unparsable_rust_log_falls_back_to_info() {
@@ -4293,6 +5274,1618 @@ mod tests {
             !text.contains("unparsable_rust_log_falls_back_to_info debug marker"),
             "the debug event is suppressed — the fallback is info, not trace: {text}"
         );
+    }
+
+    /// Task 1 (J9): the gate trusts a daemon only when /info reports the
+    /// build fingerprint of the binary on disk. A foreign fingerprint is
+    /// refused with a message naming both, and a daemon that cannot
+    /// identify itself at all is refused too -- /health answering is not
+    /// identity, and a squatter answers /health.
+    #[test]
+    fn the_gate_verifies_daemon_identity_before_trusting_it() {
+        let own = (7u64, 8u64);
+        let good = serde_json::json!({ "version": "1.11.0", "exe_hash": 7u64, "exe_len": 8u64, "started_at": 1 });
+        assert!(gate_verify_daemon(Some(&good), own).is_ok());
+
+        let foreign = serde_json::json!({ "version": "9.9.9", "exe_hash": 0xdeadu64, "exe_len": 1u64, "started_at": 2 });
+        let err = gate_verify_daemon(Some(&foreign), own).unwrap_err();
+        assert!(
+            err.contains("000000000000dead") && err.contains("0000000000000007"),
+            "the refusal must name the reported and expected fingerprints: {err}"
+        );
+
+        assert!(gate_verify_daemon(None, own).is_err());
+    }
+
+    #[test]
+    fn strict_gate_request_carries_the_callers_git_scope() {
+        let scope = crate::task::gate::GateScope {
+            branch: Some("release/v1.17.3".to_string()),
+            worktree: Some("/repo/release".to_string()),
+        };
+        let body = task_gate_request("NeuroStrata", true, &scope);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "namespace": "NeuroStrata",
+                "strict": true,
+                "scope": {
+                    "branch": "release/v1.17.3",
+                    "worktree": "/repo/release",
+                },
+            })
+        );
+    }
+
+    /// An embedder serving ModelB at the fixture width: its descriptor
+    /// is the shape `FastEmbedder::embedding_descriptor` produces for
+    /// the ModelB entry, matching the descriptor the store synthesizes
+    /// for the same configured entry.
+    struct FallbackModelBEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for FallbackModelBEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.1, 0.2, 0.3, 0.4])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embedder_id(&self) -> &str {
+            "ModelB"
+        }
+        fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+            crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelB".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }
+        }
+    }
+
+    /// An embedder serving ModelA at the fixture width: the positive
+    /// control counterpart to `FallbackModelBEmbedder`, mirroring its
+    /// descriptor shape with the model the B9 seed store records.
+    struct FallbackModelAEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for FallbackModelAEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.1, 0.2, 0.3, 0.4])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embedder_id(&self) -> &str {
+            "ModelA"
+        }
+        fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+            crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }
+        }
+    }
+
+    /// Regression test for issue #75 (Codex finding T6 on PR #66): the
+    /// daemon-stopped fallback `add` on a store recorded pristine
+    /// under the default model, after the user configured a different
+    /// model. The fallback process serves the configured model, so
+    /// the pristine record must be adopted in this process and the
+    /// add must proceed — re-running `add` must not loop on the
+    /// guard's restart guidance forever.
+    #[tokio::test]
+    async fn fallback_add_on_pristine_store_adopts_configured_model_and_writes() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-add-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+
+        // The store as the daemon left it: recorded pristine under
+        // the default model (ModelA here).
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+        drop(seed);
+
+        // The user configured ModelB; the daemon is stopped, so the
+        // fallback arm runs: it constructs its store unbound, builds
+        // the configured embedder, and binds its descriptor.
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let vector = embedder
+            .embed("a memory added while the daemon is stopped")
+            .await
+            .expect("embed");
+        let payload = crate::traits::MemoryPayload {
+            content: "a memory added while the daemon is stopped".to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        vector_store
+            .upsert("probe", "fallback-m1", vector, payload)
+            .await
+            .expect("the fallback add must adopt the pristine record and proceed");
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
+        let found = vector_store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search under the adopted model");
+        assert!(!found.is_empty(), "the added row is searchable");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// The sibling fallback Edit arm shares the Add arm's shape —
+    /// bind a serving descriptor, then write through `edit_memory`'s
+    /// `upsert` with no init — so it shares the defect on any store
+    /// whose recorded state is still pristine when its upsert runs
+    /// (here: a row-bearing store whose sidecar still reads pristine,
+    /// the stale-label state the store-state tests construct by hand).
+    /// Its upsert is the same guard's subject, so the arm prepares
+    /// its store through the same helper and the edit proceeds after
+    /// the pristine record is adopted.
+    #[tokio::test]
+    async fn fallback_edit_on_pristine_labelled_store_adopts_and_edits() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-edit-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init("probe").await.expect("seed init");
+        seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
+            .await
+            .expect("seed upsert");
+        drop(seed);
+        // The stale label: the sidecar reads pristine under ModelA
+        // although the table holds the seeded row.
+        crate::model_choice::write_store_state_identity(
+            &db_path,
+            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
+        )
+        .expect("rewrite the sidecar to the pristine label");
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let outcome = crate::server::edit_memory(
+            &*vector_store,
+            &*embedder,
+            "probe",
+            "m1",
+            "probe",
+            "edited",
+            "",
+        )
+        .await
+        .expect("the fallback edit must adopt the pristine record and proceed");
+        assert!(
+            matches!(outcome, crate::server::EditOutcome::Edited),
+            "the seeded row is edited: {outcome:?}"
+        );
+        let (_, edited) = vector_store
+            .get("probe", "m1")
+            .await
+            .expect("get the edited row")
+            .expect("the edited row exists");
+        assert_eq!(edited.content, "edited");
+        let content = std::fs::read_to_string(crate::model_choice::store_state_path(&db_path))
+            .expect("sidecar exists");
+        let sidecar: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// Regression test for the Ingest arm of the issue #75 class
+    /// (class census follow-up to Task 4): the daemon-stopped fallback
+    /// `ingest` on a store recorded pristine under the default model,
+    /// after the user configured a different model. Ingest writes via
+    /// `ingest_directory` -> `vector_store.upsert`, the same guarded
+    /// entry point as Add/Edit, so it needs the same bind+init
+    /// preparation before any guarded write. This test exercises the
+    /// arm's call-sequence contract at the helper seam (the arms are
+    /// not invocable through `run()`): prepare via
+    /// `prepare_fallback_write_store`, then a guarded upsert exactly
+    /// as ingest performs it.
+    #[tokio::test]
+    async fn fallback_ingest_on_pristine_store_adopts_configured_model_and_writes() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-ingest-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+        drop(seed);
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let vector = embedder
+            .embed("a node ingested while the daemon is stopped")
+            .await
+            .expect("embed");
+        let payload = crate::traits::MemoryPayload {
+            content: "a node ingested while the daemon is stopped".to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        vector_store
+            .upsert("probe", "fallback-ingest-m1", vector, payload)
+            .await
+            .expect("the fallback ingest must adopt the pristine record and proceed");
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
+        let found = vector_store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search under the adopted model");
+        assert!(!found.is_empty(), "the ingested row is searchable");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// Regression test for the issue #96 P8-1 / #85 arm class: the
+    /// daemon-down fallback `SetMetadata` and `Archive` arms mutate the
+    /// store through `set_metadata` / `archive_memory`, both of which
+    /// write via `upsert` — the same guarded entry point Add, Edit, and
+    /// Ingest already prepare for. On a store whose recorded state is
+    /// stale (here: a row-bearing store whose sidecar still reads
+    /// pristine under the pre-switch model), the guard refuses the
+    /// write with restart guidance this path could never satisfy. The
+    /// arms now build their embedder and call `prepare_fallback_write_store`
+    /// before any mutation, so this test exercises the arm's
+    /// call-sequence contract at the helper seam (the arms are not
+    /// invocable through `run()`): prepare via the helper, then the
+    /// guarded metadata write and the guarded archive exactly as the
+    /// arms perform them.
+    #[tokio::test]
+    async fn fallback_write_arms_prepare_store_before_mutating() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-write-arms-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init("probe").await.expect("seed init");
+        seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
+            .await
+            .expect("seed upsert");
+        drop(seed);
+        // The stale label: the sidecar reads pristine under ModelA
+        // although the table holds the seeded row.
+        crate::model_choice::write_store_state_identity(
+            &db_path,
+            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
+        )
+        .expect("rewrite the sidecar to the pristine label");
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let outcome = crate::server::set_metadata(
+            &*vector_store,
+            "probe",
+            "m1",
+            serde_json::json!({ "k": "v" }),
+            "admin",
+        )
+        .await
+        .expect("the fallback SetMetadata arm must adopt the pristine record and proceed");
+        assert!(
+            matches!(outcome, crate::server::MetadataOutcome::Updated),
+            "the metadata write lands: {outcome:?}"
+        );
+        let (_, row) = vector_store
+            .get("probe", "m1")
+            .await
+            .expect("read the updated row")
+            .expect("the row exists");
+        assert_eq!(
+            row.metadata.get("k").and_then(serde_json::Value::as_str),
+            Some("v"),
+            "the fallback SetMetadata write survives the metadata round-trip"
+        );
+        let bus = Arc::new(crate::events::ThalamicBus::new(crate::daemon::BUS_CAPACITY));
+        let archive = crate::handlers::archive_memory::archive_memory(
+            serde_json::json!({ "namespace": "probe", "id": "m1" }),
+            vector_store.clone(),
+            bus,
+        )
+        .await;
+        assert!(
+            archive.is_archived(),
+            "the fallback Archive arm must retire the row the same metadata write left behind: {archive:?}"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// B9 (T5): the fallback `Commands::VaultSync` arm builds a live
+    /// embedder and hands it to `handle_vault_sync`; it must bind the
+    /// store's serving descriptor to that embedder first, exactly as
+    /// the sibling fallback arms do. Without the bind the store stays
+    /// unbound, `check_data_bearing_identity` passes vacuously, and a
+    /// vault import into a data-bearing store recorded under a
+    /// different model (same width included) silently lands freshly
+    /// embedded vectors from the wrong model. The arms are not
+    /// invocable through `run()`, so this test replays the arm's
+    /// call sequence at the seam: bind, then `handle_vault_sync`
+    /// import. The wiring guard below proves the arm itself binds.
+    #[tokio::test]
+    async fn b9_vault_sync_import_into_data_bearing_store_refuses_mismatched_bound_embedder() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-b9-mismatch-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let db_path = root.join("ladybug.db");
+        let ns = "vault_b9";
+
+        // Seed a data-bearing store recorded under ModelA: one upsert
+        // flips the sidecar to has_data under ModelA's descriptor.
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init(ns).await.expect("seed init");
+        seed.upsert(
+            ns,
+            "b9-seed-row",
+            vec![0.1, 0.2, 0.3, 0.4],
+            payload("seed row recorded under ModelA"),
+        )
+        .await
+        .expect("seed upsert");
+        drop(seed);
+        let sidecar_content =
+            std::fs::read_to_string(crate::model_choice::store_state_path(&db_path))
+                .expect("sidecar exists");
+        let sidecar: serde_json::Value = serde_json::from_str(&sidecar_content).unwrap();
+        assert_eq!(sidecar["has_data"], serde_json::json!(true));
+        assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
+
+        // A one-note vault on disk, written directly as Markdown.
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut note = crate::vault_ld::VaultNote {
+            id: "b9-imported-note".to_string(),
+            rdf_type: "yaml:fact".to_string(),
+            context: crate::vault_ld::YAML_LD_CONTEXT.to_string(),
+            epistemic_tier: "fact".to_string(),
+            canonical_sha256: String::new(),
+            related: Vec::new(),
+            content: "a note imported by the fallback vault sync".to_string(),
+        };
+        note.canonical_sha256 = note.fingerprint();
+        std::fs::write(vault.join("b9-imported-note.md"), note.to_markdown()).unwrap();
+
+        // Reopen unbound, exactly as the fallback group constructs its
+        // store, then replay the arm's fixed sequence: build the
+        // configured (ModelB) embedder, bind its descriptor, dispatch.
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        bind_fallback_serving_descriptor(&vector_store, &embedder);
+        let principal: Option<String> = None;
+        let args = serde_json::json!({
+            "action": "import",
+            "namespace": ns,
+            "vault_path": vault.to_string_lossy(),
+            "output_dir": vault.to_string_lossy(),
+            "principal": principal,
+        });
+        let response = crate::vault_ld::vault_sync::handle_vault_sync(
+            &args,
+            vector_store.clone(),
+            embedder,
+            Some(root.clone()),
+            None,
+        )
+        .await;
+        let out: crate::vault_ld::vault_sync::VaultImportResult =
+            serde_json::from_str(&response).expect("valid import result");
+        assert!(
+            !out.success,
+            "the mismatched import must be refused: {out:?}"
+        );
+        assert_eq!(out.notes_imported, 0);
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("refusing to open a store that has recorded data")),
+            "the refusal names the data-bearing identity check: {:?}",
+            out.errors
+        );
+        assert!(
+            vector_store
+                .get(ns, "b9-imported-note")
+                .await
+                .expect("get the imported note")
+                .is_none(),
+            "no vector from the wrong model lands"
+        );
+        let (_, seed_row) = vector_store
+            .get(ns, "b9-seed-row")
+            .await
+            .expect("get the seed row")
+            .expect("the seed row exists");
+        assert_eq!(seed_row.content, "seed row recorded under ModelA");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// B9 positive control: the same arm sequence with the embedder
+    /// matching the store's recorded model imports normally — the
+    /// bind must refuse only a genuine identity mismatch, never
+    /// vault import under a correct binding.
+    #[tokio::test]
+    async fn b9_vault_sync_import_with_matching_bound_embedder_succeeds() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-b9-matching-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let db_path = root.join("ladybug.db");
+        let ns = "vault_b9";
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init(ns).await.expect("seed init");
+        seed.upsert(
+            ns,
+            "b9-seed-row",
+            vec![0.1, 0.2, 0.3, 0.4],
+            payload("seed row recorded under ModelA"),
+        )
+        .await
+        .expect("seed upsert");
+        drop(seed);
+
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut note = crate::vault_ld::VaultNote {
+            id: "b9-imported-note".to_string(),
+            rdf_type: "yaml:fact".to_string(),
+            context: crate::vault_ld::YAML_LD_CONTEXT.to_string(),
+            epistemic_tier: "fact".to_string(),
+            canonical_sha256: String::new(),
+            related: Vec::new(),
+            content: "a note imported by the fallback vault sync".to_string(),
+        };
+        note.canonical_sha256 = note.fingerprint();
+        std::fs::write(vault.join("b9-imported-note.md"), note.to_markdown()).unwrap();
+
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelAEmbedder);
+        bind_fallback_serving_descriptor(&vector_store, &embedder);
+        let principal: Option<String> = None;
+        let args = serde_json::json!({
+            "action": "import",
+            "namespace": ns,
+            "vault_path": vault.to_string_lossy(),
+            "output_dir": vault.to_string_lossy(),
+            "principal": principal,
+        });
+        let response = crate::vault_ld::vault_sync::handle_vault_sync(
+            &args,
+            vector_store.clone(),
+            embedder,
+            Some(root.clone()),
+            None,
+        )
+        .await;
+        let out: crate::vault_ld::vault_sync::VaultImportResult =
+            serde_json::from_str(&response).expect("valid import result");
+        assert!(out.success, "the matching import must succeed: {out:?}");
+        assert_eq!(out.notes_imported, 1);
+        let (_, imported) = vector_store
+            .get(ns, "b9-imported-note")
+            .await
+            .expect("get the imported note")
+            .expect("the imported note exists");
+        assert_eq!(
+            imported.content,
+            "a note imported by the fallback vault sync"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// B9 wiring guard (source-level): the `Commands::VaultSync` arm
+    /// in this file binds the serving descriptor before it dispatches
+    /// to `handle_vault_sync`. The search is scoped to the arm's own
+    /// slice so neither the sibling arms' binds nor this test's own
+    /// literals can satisfy it; the start pattern carries a real
+    /// newline so it cannot match this test's escaped literal either.
+    #[test]
+    fn b9_vault_sync_arm_binds_serving_descriptor_before_handle_vault_sync() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("read src/main.rs");
+        let start = src
+            .find("Commands::VaultSync {\n")
+            .expect("the VaultSync arm exists");
+        let rest = &src[start..];
+        let end = rest
+            .find("Commands::NormalizeMetadata")
+            .expect("the next arm exists");
+        let arm = &rest[..end];
+        let bind = arm
+            .find("bind_fallback_serving_descriptor(&vector_store, &embedder);")
+            .expect("the VaultSync arm binds the serving descriptor");
+        let dispatch = arm
+            .find("handle_vault_sync(")
+            .expect("the VaultSync arm dispatches to handle_vault_sync");
+        assert!(
+            bind < dispatch,
+            "the bind precedes the handle_vault_sync dispatch"
+        );
+    }
+
+    fn restore_copy_fixture(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("ns-restore-copy-{}-{}", tag, uuid::Uuid::new_v4()));
+        let snapshot_dir = root.join("snapshot");
+        let target = root.join("target").join("ladybug.store");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"snapshot-db").unwrap();
+        (root, snapshot_dir, target)
+    }
+
+    fn restore_target_wal_path(target: &std::path::Path) -> std::path::PathBuf {
+        let mut wal = target.as_os_str().to_os_string();
+        wal.push(".wal");
+        std::path::PathBuf::from(wal)
+    }
+
+    #[test]
+    fn restore_copy_drops_orphan_target_wal_and_sidecar_when_snapshot_has_none() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("orphans");
+        // The target DB file is absent (the Restore arm's guard passes),
+        // but the old store's WAL and sidecar were left behind as orphans.
+        let target_wal = restore_target_wal_path(&target);
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::write(&target_wal, b"orphan-wal").unwrap();
+        std::fs::write(&target_sidecar, b"orphan-sidecar").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(
+            !target_wal.exists(),
+            "the orphan target WAL must not survive a restore whose snapshot has none"
+        );
+        assert!(
+            !target_sidecar.exists(),
+            "the orphan target sidecar must not survive a restore whose snapshot has none"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_overwrites_orphan_target_wal_and_sidecar_from_snapshot() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("overwrite");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"snapshot-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.store-state.json"),
+            b"snapshot-sidecar",
+        )
+        .unwrap();
+        let target_wal = restore_target_wal_path(&target);
+        let target_sidecar = crate::model_choice::store_state_path(&target);
+        std::fs::write(&target_wal, b"orphan-wal").unwrap();
+        std::fs::write(&target_sidecar, b"orphan-sidecar").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(std::fs::read(&target_wal).unwrap(), b"snapshot-wal");
+        assert_eq!(std::fs::read(&target_sidecar).unwrap(), b"snapshot-sidecar");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_without_snapshot_wal_or_sidecar_and_no_orphans_succeeds() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("plain");
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(!restore_target_wal_path(&target).exists());
+        assert!(!crate::model_choice::store_state_path(&target).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn restore_verify_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        // Built the way export builds a snapshot: a ladybug.store file,
+        // a manifest.json carrying the snapshot format/version, and a
+        // checksums.json written by write_checksums over the actual
+        // bytes (which also writes the manifest.json.zst copy). No WAL
+        // and no sidecar are written, so their checksums are absent —
+        // verify_snapshot treats an absent, unmentioned WAL (and
+        // sidecar) as not part of the snapshot.
+        let root = std::env::temp_dir().join(format!(
+            "ns-restore-verify-{}-{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot_dir = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"snapshot-db").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"provenance\":\"coordinated\",\"wal_kind\":\"none\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        crate::storage::snapshot::write_checksums(&snapshot_dir).unwrap();
+        (root, snapshot_dir)
+    }
+
+    #[test]
+    fn restore_verify_accepts_valid_snapshot() {
+        let (root, snapshot_dir) = restore_verify_fixture("valid");
+
+        ensure_snapshot_verified(&snapshot_dir).expect("a valid snapshot verifies");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_rejects_tampered_store_bytes() {
+        let (root, snapshot_dir) = restore_verify_fixture("tampered");
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"tampered-db").unwrap();
+
+        let result = ensure_snapshot_verified(&snapshot_dir);
+
+        assert!(
+            result.is_err(),
+            "store bytes that no longer match checksums.json must fail verification"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_rejects_missing_manifest() {
+        let (root, snapshot_dir) = restore_verify_fixture("no-manifest");
+        std::fs::remove_file(snapshot_dir.join("manifest.json")).unwrap();
+
+        let result = ensure_snapshot_verified(&snapshot_dir);
+
+        assert!(
+            result.is_err(),
+            "a snapshot with no manifest.json must fail verification"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_accepts_an_uncoordinated_snapshot_whose_integrity_holds() {
+        // #209: a `--no-open` snapshot is exactly what an operator restores
+        // after a crash, so the restore path accepts integrity even when the
+        // snapshot is not coordinated. It must not, however, claim full
+        // validity: the pair was captured without the store lock.
+        let (root, snapshot_dir) = restore_verify_fixture("uncoordinated");
+        let manifest = std::fs::read_to_string(snapshot_dir.join("manifest.json")).unwrap();
+        let manifest = manifest
+            .replacen("\"coordinated\":true", "\"coordinated\":false", 1)
+            .replacen(
+                "\"provenance\":\"coordinated\"",
+                "\"provenance\":\"unverified\"",
+                1,
+            );
+        std::fs::write(snapshot_dir.join("manifest.json"), manifest).unwrap();
+        crate::storage::snapshot::write_checksums(&snapshot_dir).unwrap();
+
+        let report = crate::storage::verify_snapshot(&snapshot_dir).expect("integrity holds");
+        assert!(report.integrity_ok);
+        assert!(
+            !report.valid,
+            "an uncoordinated snapshot is not fully valid (#209)"
+        );
+        ensure_snapshot_verified(&snapshot_dir)
+            .expect("an uncoordinated but intact snapshot stays restorable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_store_lock_is_held_across_the_uncoordinated_copy_window() {
+        // #241: the `--no-open` gate used to be a point-in-time probe: it took
+        // the store lock, learned whether a daemon held it, and dropped the
+        // handle before the first file copy. A daemon that started in between
+        // was never seen, so the database, its WAL, and the checkpoint shadow
+        // could be captured at different instants while every per-file check
+        // still passed. The copy has to hold the lock for its whole window: a
+        // competing lock must not be acquirable while it runs.
+        let root = std::env::temp_dir().join(format!("ns-lock-window-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        std::fs::write(root.join("ladybug.store.wal"), b"wal-bytes").unwrap();
+        std::fs::write(root.join("ladybug.store.shadow"), b"shadow-bytes").unwrap();
+        let out = root.join("snapshot");
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = observed.clone();
+        let lock_path = daemon_lock_path(&db);
+        export_uncoordinated_copy_observed(&db, &out, &|member| {
+            seen.lock().unwrap().push(member.to_string());
+            // A daemon starting now must not be able to take the store lock.
+            let contender = std::thread::spawn({
+                let lock_path = lock_path.clone();
+                move || {
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&lock_path)
+                        .expect("the lock file is reachable while the copy runs");
+                    file.try_lock()
+                }
+            });
+            let outcome = contender.join().expect("the contender thread finished");
+            assert!(
+                matches!(outcome, Err(std::fs::TryLockError::WouldBlock)),
+                "a competing lock must not be acquirable during the copy window (member {member})"
+            );
+        })
+        .expect("the uncoordinated copy holds the store lock");
+
+        let members = observed.lock().unwrap().clone();
+        assert!(
+            members.iter().any(|m| m == "ladybug.store"),
+            "the store was copied: {members:?}"
+        );
+        assert!(
+            members.iter().any(|m| m == "ladybug.store.wal"),
+            "the WAL was copied: {members:?}"
+        );
+        assert!(
+            members.iter().any(|m| m == "ladybug.store.shadow"),
+            "the checkpoint shadow was copied: {members:?}"
+        );
+        assert!(
+            out.join("ladybug.store").exists(),
+            "the snapshot carries the store"
+        );
+        assert!(
+            out.join("ladybug.store.wal").exists(),
+            "the snapshot carries the WAL"
+        );
+        assert!(
+            out.join("ladybug.store.shadow").exists(),
+            "the snapshot carries the checkpoint shadow"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_open_backup_refuses_while_the_daemon_lock_is_held() {
+        // #209: `--no-open` used to skip both coordination gates and copy the
+        // mmapped database and its WAL at different instants. While a process
+        // holds the store lock the store may be mid-checkpoint, so the
+        // uncoordinated file copy is refused; a quiescent store still exports.
+        let root = std::env::temp_dir().join(format!("ns-no-open-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+
+        let lock = open_daemon_lock(&db).expect("create the daemon lock");
+        lock.lock().expect("hold the daemon lock");
+        assert!(
+            daemon_holds_lock(&db),
+            "precondition: the lock probe sees the holder"
+        );
+
+        let err = hold_store_lock_for_copy(&db)
+            .expect_err("--no-open must be refused while the store lock is held");
+        assert!(
+            err.to_string().contains("--no-open"),
+            "the refusal names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("without --no-open"),
+            "the refusal names the coordinated route: {err}"
+        );
+        drop(lock);
+
+        let quiescent = root.join("quiescent.store");
+        hold_store_lock_for_copy(&quiescent)
+            .expect("a quiescent store still backs up without opening");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_open_backup_fails_closed_when_the_lock_cannot_be_taken() {
+        // #209 (V5): a lock that cannot be taken is not "the lock is free".
+        // The refusal must surface the failure rather than let the copy run
+        // against a store whose owner cannot be established.
+        let root = std::env::temp_dir().join(format!("ns-no-open-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        // A directory where the lock file belongs: the lock cannot be taken.
+        std::fs::create_dir_all(daemon_lock_path(&db)).unwrap();
+
+        let err = hold_store_lock_for_copy(&db)
+            .expect_err("a lock that cannot be taken must refuse --no-open");
+        let message = err.to_string();
+        assert!(
+            message.contains("lock"),
+            "the refusal names the lock it could not take: {message}"
+        );
+        assert!(
+            message.contains("--no-open"),
+            "the refusal names the flag: {message}"
+        );
+        assert!(
+            message.contains("without --no-open"),
+            "the refusal names the coordinated route: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_fallback_refuses_while_the_store_lock_is_held_and_copies_nothing() {
+        // #209 (J7): the automatic fallback after a refused strict open copies
+        // the same files as `--no-open`, so it must take the same lock gate —
+        // and it must take it before the first file copy, not after.
+        let root = std::env::temp_dir().join(format!("ns-fallback-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        let out = root.join("snapshot");
+
+        let lock = open_daemon_lock(&db).expect("create the daemon lock");
+        lock.lock().expect("hold the daemon lock");
+
+        let err = export_uncoordinated_fallback(&db, &out)
+            .expect_err("the fallback refuses while the store lock is held");
+        assert!(
+            err.to_string().contains("--no-open"),
+            "the refusal names the flag: {err}"
+        );
+        assert!(
+            !out.exists(),
+            "no snapshot directory is created when the fallback refuses"
+        );
+        drop(lock);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_fallback_refuses_when_the_lock_cannot_be_taken() {
+        // An untakeable lock means "cannot show the store is free", so the
+        // automatic fallback refuses and places no snapshot (#209, J7).
+        let root = std::env::temp_dir().join(format!("ns-fallback-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        std::fs::create_dir_all(daemon_lock_path(&db)).unwrap();
+        let out = root.join("snapshot");
+
+        let err = export_uncoordinated_fallback(&db, &out)
+            .expect_err("the fallback refuses a lock it cannot take");
+        assert!(
+            err.to_string().contains("lock"),
+            "the refusal names the lock it could not take: {err}"
+        );
+        assert!(
+            !out.exists(),
+            "no snapshot directory is created when the fallback refuses"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_no_open_copy_refuses_while_the_lock_is_held_and_copies_nothing() {
+        // The gate has to run before the first `export_database_files` call: a
+        // check that fires after the copy is not a gate (#209).
+        let root = std::env::temp_dir().join(format!("ns-no-open-arm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ladybug.store");
+        std::fs::write(&db, b"db-bytes").unwrap();
+        let out = root.join("snapshot");
+
+        let lock = open_daemon_lock(&db).expect("create the daemon lock");
+        lock.lock().expect("hold the daemon lock");
+
+        let err = export_uncoordinated_copy(&db, &out)
+            .expect_err("the no-open copy refuses while the store lock is held");
+        assert!(
+            err.to_string().contains("--no-open"),
+            "the refusal names the flag: {err}"
+        );
+        assert!(
+            !out.exists(),
+            "no snapshot directory is created when the copy refuses"
+        );
+        drop(lock);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_places_both_wal_sides_and_drops_stale_ones() {
+        // #209 (V5): a `wal_kind: both` snapshot restores both byte streams
+        // under their own names. The restore set owns both companion names, so
+        // whatever the target held before is replaced or dropped as a unit.
+        let (root, snapshot_dir, target) = restore_copy_fixture("both-wal");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.wal.checkpoint"),
+            b"frozen-bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"both\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        // Stale one-sided state at the target: an old active WAL, an old
+        // frozen WAL, and a shadow the snapshot does not carry. All three are
+        // superseded by the restore set.
+        std::fs::write(restore_companion_path(&target, ".wal"), b"stale-active").unwrap();
+        std::fs::write(
+            restore_companion_path(&target, ".wal.checkpoint"),
+            b"stale-frozen",
+        )
+        .unwrap();
+        std::fs::write(restore_companion_path(&target, ".shadow"), b"stale-shadow").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal")).unwrap(),
+            b"active-bytes",
+            "the active side lands under <db>.wal"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal.checkpoint")).unwrap(),
+            b"frozen-bytes",
+            "the frozen side lands under <db>.wal.checkpoint"
+        );
+        assert!(
+            !restore_companion_path(&target, ".shadow").exists(),
+            "a stale shadow the snapshot does not carry is dropped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_both_wal_snapshot_missing_a_side() {
+        // Fail closed: a manifest that promises both sides but carries one must
+        // not restore as a homogeneous pair.
+        let (root, snapshot_dir, target) = restore_copy_fixture("both-missing");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"both\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a both-kind snapshot with one side is refused");
+        assert!(
+            err.to_string().contains("frozen"),
+            "the refusal names the missing side: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_reads_a_version_1_legacy_snapshot_as_active() {
+        // Pre-#209 snapshots are version 1 with no `wal_kind`; their WAL was
+        // the active `.wal`, so it keeps restoring under that name.
+        let (root, snapshot_dir, target) = restore_copy_fixture("v1-legacy");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"legacy-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":1,\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal")).unwrap(),
+            b"legacy-wal"
+        );
+        assert!(!restore_companion_path(&target, ".wal.checkpoint").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_version_1_manifest_claiming_both() {
+        // #209 (J7): `both` needs format version 2. A version 1 manifest that
+        // claims it is refused instead of trusted, because a v1 reader would
+        // drop the frozen side.
+        let (root, snapshot_dir, target) = restore_copy_fixture("v1-both");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.wal.checkpoint"),
+            b"frozen-bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":1,\"created_at\":\"2026-01-01T00:00:00Z\",\"wal_kind\":\"both\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a version 1 manifest claiming both is refused");
+        assert!(
+            err.to_string().contains("version 1"),
+            "the refusal names the version: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_version_2_manifest_without_wal_kind() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("v2-no-kind");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"wal-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":2,\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a version 2 manifest without wal_kind is refused");
+        assert!(
+            err.to_string().contains("wal_kind"),
+            "the refusal names the missing field: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_none_wal_snapshot_carrying_a_wal_member() {
+        // #209 (Codex P2): the manifest says there is no WAL, so a WAL member
+        // is refused before any file is staged rather than silently dropped.
+        let (root, snapshot_dir, target) = restore_copy_fixture("none-with-wal");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"unexpected-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a none-wal snapshot carrying a WAL is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("none") && message.contains("ladybug.store.wal"),
+            "the refusal names the inconsistency: {message}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_restores_a_clean_none_wal_snapshot() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("none-clean");
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"none\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert!(
+            !restore_companion_path(&target, ".wal").exists(),
+            "a none-wal snapshot places no active WAL"
+        );
+        assert!(
+            !restore_companion_path(&target, ".wal.checkpoint").exists(),
+            "a none-wal snapshot places no frozen WAL"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_one_sided_snapshot_carrying_the_frozen_member() {
+        // #209 (J7): `active` plus a leftover frozen member is not a pair this
+        // reader owns; restoring it would place bytes the manifest never
+        // promised.
+        let (root, snapshot_dir, target) = restore_copy_fixture("active-with-frozen");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-bytes").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.wal.checkpoint"),
+            b"leftover-frozen",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"active\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a one-sided snapshot carrying the frozen member is refused");
+        assert!(
+            err.to_string().contains("ladybug.store.wal.checkpoint"),
+            "the refusal names the unexpected member: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_refuses_a_both_wal_snapshot_missing_the_active_side() {
+        let (root, snapshot_dir, target) = restore_copy_fixture("both-missing-active");
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.wal.checkpoint"),
+            b"frozen-bytes",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":true,\"wal_kind\":\"both\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("a both-kind snapshot missing the active side is refused");
+        assert!(
+            err.to_string().contains("active"),
+            "the refusal names the missing side: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused restore places no store at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn restore_companion_path(target: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut path = target.as_os_str().to_os_string();
+        path.push(suffix);
+        std::path::PathBuf::from(path)
+    }
+
+    #[test]
+    fn restore_copy_preserves_a_frozen_wal_and_the_checkpoint_shadow() {
+        // #209: a snapshot of a crashed checkpoint restores its WAL under the
+        // frozen name, together with the shadow and pinned marker the engine
+        // needs to replay the checkpointed prefix.
+        let (root, snapshot_dir, target) = restore_copy_fixture("frozen");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"frozen-wal").unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store.shadow"), b"shadow-pages").unwrap();
+        std::fs::write(
+            snapshot_dir.join("ladybug.store.pinned.tmp"),
+            b"pinned-marker",
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"frozen\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"snapshot-db");
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal.checkpoint")).unwrap(),
+            b"frozen-wal",
+            "a frozen checkpoint WAL is restored under its frozen name (#209)"
+        );
+        assert!(
+            !restore_companion_path(&target, ".wal").exists(),
+            "a frozen WAL must never be restored as the active WAL"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".shadow")).unwrap(),
+            b"shadow-pages",
+            "the checkpoint shadow is restored beside the store"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".pinned.tmp")).unwrap(),
+            b"pinned-marker",
+            "the pinned-checkpoint marker is restored beside the store"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_keeps_an_active_wal_active() {
+        // Legacy snapshots carry no `wal_kind`; their WAL was copied from the
+        // active `<db>.wal`, so it restores under that name as before.
+        let (root, snapshot_dir, target) = restore_copy_fixture("active");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"active-wal").unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal")).unwrap(),
+            b"active-wal"
+        );
+        assert!(!restore_companion_path(&target, ".wal.checkpoint").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_copy_drops_a_stale_active_wal_when_the_snapshot_wal_is_frozen() {
+        // A leftover active `.wal` beside the target would pair with the
+        // restored frozen `.wal.checkpoint` and make the engine refuse the
+        // store, so the restore set owns both names (#209).
+        let (root, snapshot_dir, target) = restore_copy_fixture("stale-active");
+        std::fs::write(snapshot_dir.join("ladybug.store.wal"), b"frozen-wal").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\"coordinated\":false,\"provenance\":\"unverified\",\"wal_kind\":\"frozen\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            restore_companion_path(&target, ".wal"),
+            b"orphan-active-wal",
+        )
+        .unwrap();
+
+        copy_snapshot_into_place(&snapshot_dir, &target).expect("restore copy");
+
+        assert!(
+            !restore_companion_path(&target, ".wal").exists(),
+            "a stale active WAL must not survive a frozen-WAL restore"
+        );
+        assert_eq!(
+            std::fs::read(restore_companion_path(&target, ".wal.checkpoint")).unwrap(),
+            b"frozen-wal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -4445,6 +7038,8 @@ async fn run_bus_metrics(
     Ok(0)
 }
 
+
+
 async fn restore_snapshot_bundle(
     snapshot_dir: &std::path::Path,
     target: &std::path::Path,
@@ -4495,8 +7090,6 @@ async fn restore_snapshot_bundle(
     };
 
     let dimensions = embed::configured_dimensions()?;
-    let embedder_id = embed::configured_embedder_id()?;
-    let limits = profiled_store_limits(config)?;
     let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
     let writer_target = target.to_path_buf();
@@ -4549,12 +7142,7 @@ async fn restore_snapshot_bundle(
         if snapshot_marker.exists() {
             std::fs::copy(&snapshot_marker, &temp_marker)?;
         }
-        let candidate = LadybugStore::new_with_identity_limits(
-            &temp_db,
-            dimensions,
-            embedder_id.clone(),
-            limits,
-        )?;
+        let candidate = LadybugStore::new(&temp_db, dimensions)?;
         candidate.init("restore-validation").await?;
         let mut db_stages = candidate.ingest_stage_namespaces().await?;
         db_stages.sort();
@@ -4595,8 +7183,7 @@ async fn restore_snapshot_bundle(
         // The database plus all sibling provenance is now complete. Verify the
         // installed copy after removing the interlock; a failure leaves a
         // complete, inspectable restore rather than deleting the snapshot data.
-        let restored =
-            LadybugStore::new_with_identity_limits(target, dimensions, embedder_id, limits)?;
+        let restored = LadybugStore::new(target, dimensions)?;
         restored.init("restore-validation").await?;
         restored.list_namespaces().await
     }
@@ -4618,10 +7205,14 @@ async fn restore_snapshot_bundle(
     outcome
 }
 
+
+
 #[cfg(test)]
 static TEST_RESTORE_TARGET_LOCK_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
 > = std::sync::OnceLock::new();
+
+
 
 #[cfg(test)]
 fn set_test_restore_target_lock_barrier(target: std::path::PathBuf, barrier: std::path::PathBuf) {
@@ -4630,6 +7221,8 @@ fn set_test_restore_target_lock_barrier(target: std::path::PathBuf, barrier: std
         .lock()
         .unwrap() = Some((target, barrier));
 }
+
+
 
 #[cfg(test)]
 fn test_restore_target_lock_barrier(target: &std::path::Path) {
@@ -4657,11 +7250,15 @@ fn test_restore_target_lock_barrier(target: &std::path::Path) {
     }
 }
 
+
+
 fn appended_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     std::path::PathBuf::from(value)
 }
+
+
 
 /// Install the process-wide `tracing` subscriber — until this existed,
 /// the crate's ~50 `tracing::` call sites emitted into the void (J26):
@@ -4680,6 +7277,8 @@ fn init_tracing() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
+
+
 /// The filter for the startup subscriber: `RUST_LOG` when it is set and
 /// parses, the `info` default otherwise. An unparsable `RUST_LOG`
 /// falls back to the default rather than bricking startup on a typo.
@@ -4687,6 +7286,8 @@ fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
+
+
 
 /// The fmt subscriber over an arbitrary writer: production passes
 /// `std::io::stderr`; the tests pass a capture buffer in the same
@@ -4726,11 +7327,335 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
+/// The uncoordinated copy, with an observer that is told which member was
+/// just copied.
+///
+/// The observer runs while the copy is still in flight, so a caller can ask
+/// what the store looks like *during* the copy window rather than only
+/// before or after it.
+///
+/// The store lock is held for the whole window (#241): the guard is dropped
+/// only after the export returns, so a daemon that starts mid-copy cannot
+/// change the database, its WAL, or the checkpoint shadow under the
+/// snapshot's feet.
+fn export_uncoordinated_copy_observed(
+    db_path: &std::path::Path,
+    dir: &std::path::Path,
+    during_copy: &dyn Fn(&str),
+) -> anyhow::Result<()> {
+    let _lock = hold_store_lock_for_copy(db_path)?;
+    LadybugStore::export_database_files_observed(db_path, dir, during_copy)
+}
+
+/// The uncoordinated copy: the store lock is taken and held for the whole
+/// window (#241).
+fn export_uncoordinated_copy(
+    db_path: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    export_uncoordinated_copy_observed(db_path, dir, &|_| {})
+}
+
+/// The automatic no-open fallback used when a strict open refuses the store
+/// (#196). It copies exactly the same files as `--no-open`, so it takes the
+/// same lock gate before the first copy (#209) and holds the store lock for
+/// the whole copy window (#241).
+fn export_uncoordinated_fallback(
+    db_path: &std::path::Path,
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    export_uncoordinated_copy(db_path, dir)
+}
+
+/// Verify a snapshot directory before a restore copies anything from it.
+///
+/// Export writes `manifest.json` and `checksums.json` precisely so an
+/// import can check them; restoring without this call would import a
+/// tampered or corrupt snapshot — including its store-state sidecar, a
+/// checksummed member — as recorded identity with no integrity check.
+/// Err carries the verification error, or the report's error text when
+/// verification completed but judged the snapshot invalid.
+fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
+    match crate::storage::verify_snapshot(dir) {
+        Ok(report) if report.integrity_ok => {
+            // #209: an uncoordinated (`--no-open`) snapshot is precisely what
+            // an operator restores after a crash, so integrity is the bar for
+            // restoring. It is not a full `valid` verdict, and the restore
+            // says so rather than silently promoting the snapshot.
+            if !report.coordinated {
+                eprintln!(
+                    "WARN: snapshot in {} is uncoordinated ({}): its bytes match their checksums, but it was taken without the store lock, so the database, WAL, and shadow came from separate instants.",
+                    dir.display(),
+                    report.provenance
+                );
+            }
+            Ok(())
+        }
+        Ok(report) => Err(anyhow::anyhow!(
+            "{}",
+            report
+                .error
+                .unwrap_or_else(|| "snapshot is not valid".to_string())
+        )),
+        Err(e) => Err(anyhow::anyhow!("{}", e)),
+    }
+}
+
+/// Copy a snapshot's files into place for a restore: the store file, its
+/// WAL under the role the snapshot recorded, the checkpoint shadow and its
+/// pinned marker, and the store-state sidecar. Extracted from the Restore arm
+/// so the copy logic is testable without driving the whole CLI.
+///
+/// The copies are staged at temporary sibling paths (`<target>.restore-tmp-<pid>`)
+/// and renamed into place only after the whole set copied: a companion
+/// copy that fails must not leave the store file (or a half-written
+/// companion) at the target, and a failed restore must not trample a
+/// pre-existing store's companions (issue #87).
+///
+/// Companion names belong to the restore set as a group (#209): a snapshot
+/// whose WAL was frozen restores `<db>.wal.checkpoint`, so a stale
+/// `<db>.wal` at the target is removed with the set rather than left to pair
+/// with it; a mixed pair (`wal_kind: both`) restores both streams. Snapshots
+/// written before #209 carry no `wal_kind`; their WAL was copied from the
+/// active `<db>.wal`, so they restore under that name.
+fn copy_snapshot_into_place(
+    snapshot_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    let pid = std::process::id();
+    let appended = |base: &std::path::Path, suffix: &str| {
+        let mut os = base.as_os_str().to_os_string();
+        os.push(suffix);
+        std::path::PathBuf::from(os)
+    };
+
+    // Which name(s) the snapshot's WAL belongs under (#209). Version 1 has no
+    // role and its WAL was the active `.wal`; version 2 requires the role and
+    // is the only one that can express a mixed pair. Reading the rules here as
+    // well as in `verify_snapshot` keeps a direct caller from restoring a
+    // snapshot the verifier would refuse.
+    let (version, wal_kind) = snapshot_version_and_wal_kind(snapshot_dir)?;
+    if !crate::storage::snapshot::snapshot_version_supported(version) {
+        return Err(anyhow::anyhow!(
+            "unsupported snapshot format version {}; this build reads version {} and legacy version {}",
+            version,
+            crate::storage::snapshot::SNAPSHOT_VERSION,
+            crate::storage::snapshot::SNAPSHOT_VERSION_LEGACY
+        ));
+    }
+    let legacy = version == crate::storage::snapshot::SNAPSHOT_VERSION_LEGACY;
+    if legacy && wal_kind.as_deref() == Some(crate::storage::snapshot::WAL_KIND_BOTH) {
+        return Err(anyhow::anyhow!(
+            "version {} snapshot claims wal_kind \"both\", which only format version {} can express; a v1 reader would verify it and drop the frozen side",
+            crate::storage::snapshot::SNAPSHOT_VERSION_LEGACY,
+            crate::storage::snapshot::SNAPSHOT_VERSION
+        ));
+    }
+    if !legacy && wal_kind.is_none() {
+        return Err(anyhow::anyhow!(
+            "version {} snapshot records no wal_kind; version {} manifests must record active, frozen, both or none",
+            version,
+            crate::storage::snapshot::SNAPSHOT_VERSION
+        ));
+    }
+    let declares_both = wal_kind.as_deref() == Some(crate::storage::snapshot::WAL_KIND_BOTH);
+    let wal_suffix = match wal_kind.as_deref() {
+        Some(crate::storage::snapshot::WAL_KIND_FROZEN) => ".wal.checkpoint",
+        Some(crate::storage::snapshot::WAL_KIND_NONE) => "",
+        _ => ".wal",
+    };
+    let snapshot_wal = snapshot_dir.join("ladybug.store.wal");
+    let snapshot_checkpoint_wal = snapshot_dir.join("ladybug.store.wal.checkpoint");
+    // #209 (Codex P2): `none` promises no WAL member. Refuse it before staging
+    // instead of restoring the store and silently leaving the WAL out.
+    if wal_kind.as_deref() == Some(crate::storage::snapshot::WAL_KIND_NONE) && snapshot_wal.exists()
+    {
+        return Err(anyhow::anyhow!(
+            "the snapshot records wal_kind \"none\" but carries ladybug.store.wal; refusing to restore a WAL the manifest says does not exist",
+        ));
+    }
+    if declares_both && !snapshot_wal.exists() {
+        return Err(anyhow::anyhow!(
+            "the snapshot records wal_kind \"both\" but carries no active ladybug.store.wal"
+        ));
+    }
+    if declares_both && !snapshot_checkpoint_wal.exists() {
+        return Err(anyhow::anyhow!(
+            "the snapshot records wal_kind \"both\" but carries no frozen ladybug.store.wal.checkpoint"
+        ));
+    }
+    if !declares_both && snapshot_checkpoint_wal.exists() {
+        return Err(anyhow::anyhow!(
+            "the snapshot carries ladybug.store.wal.checkpoint but its wal_kind is {:?}; a mixed pair is recorded as \"both\"",
+            wal_kind
+        ));
+    }
+
+    // (snapshot member, target path) for every file the restore may place.
+    let mut members: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        vec![(snapshot_dir.join("ladybug.store"), target.to_path_buf())];
+    if !wal_suffix.is_empty() {
+        members.push((snapshot_wal.clone(), appended(target, wal_suffix)));
+    }
+    if declares_both {
+        members.push((snapshot_checkpoint_wal, appended(target, ".wal.checkpoint")));
+    }
+    members.push((
+        snapshot_dir.join("ladybug.store.store-state.json"),
+        crate::model_choice::store_state_path(target),
+    ));
+    members.push((
+        snapshot_dir.join("ladybug.store.shadow"),
+        appended(target, ".shadow"),
+    ));
+    members.push((
+        snapshot_dir.join("ladybug.store.pinned.tmp"),
+        appended(target, ".pinned.tmp"),
+    ));
+
+    // Every companion name the target could hold, whether or not this
+    // snapshot produces it: stale siblings of the wrong role, or from an
+    // older store, must not survive the commit.
+    let companion_suffixes = [
+        ".wal",
+        ".wal.checkpoint",
+        ".store-state.json",
+        ".shadow",
+        ".pinned.tmp",
+    ];
+
+    // Step A0: refuse a directory at any companion path BEFORE touching
+    // anything. remove_file/rename cannot succeed there, so the commit would
+    // fail partway and leave the target half-committed.
+    for suffix in companion_suffixes {
+        let path = appended(target, suffix);
+        if path.is_dir() {
+            return Err(anyhow::anyhow!(
+                "the restore target's {} path is a directory: {}",
+                suffix,
+                path.display()
+            ));
+        }
+    }
+
+    // Step A: stage every member the snapshot carries beside the target.
+    let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for (index, (from, to)) in members.iter().enumerate() {
+        if index > 0 && !from.exists() {
+            continue;
+        }
+        let stage = appended(to, &format!(".restore-tmp-{pid}"));
+        if let Err(e) = std::fs::copy(from, &stage) {
+            for (_, staged_path) in &staged {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            let _ = std::fs::remove_file(&stage);
+            return Err(e.into());
+        }
+        staged.push((to.clone(), stage));
+    }
+
+    // Step A2: stash any pre-existing companion aside so the commit can
+    // replace it or drop it, and a refused commit can put it back.
+    let mut stashed: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for suffix in companion_suffixes {
+        let path = appended(target, suffix);
+        if !path.exists() {
+            continue;
+        }
+        let prev = appended(target, &format!("{}.prev-tmp-{pid}", suffix));
+        if let Err(e) = std::fs::rename(&path, &prev) {
+            for (_, staged_path) in &staged {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            for (prev_path, dest) in &stashed {
+                let _ = std::fs::rename(prev_path, dest);
+            }
+            return Err(anyhow::anyhow!(
+                "could not move the existing {} out of the way: {}",
+                suffix,
+                e
+            ));
+        }
+        stashed.push((prev, path));
+    }
+
+    // Step B: commit the staged set with full rollback on error.
+    let rollback = |committed: usize| {
+        // Remove any target files created by a partial commit.
+        for (dest, _) in staged.iter().take(committed) {
+            let _ = std::fs::remove_file(dest);
+        }
+        // Restore stashed companions, if any.
+        for (prev, dest) in &stashed {
+            let _ = std::fs::rename(prev, dest);
+        }
+        for (_, stage) in &staged {
+            let _ = std::fs::remove_file(stage);
+        }
+    };
+
+    for (index, (dest, stage)) in staged.iter().enumerate() {
+        if let Err(e) = std::fs::rename(stage, dest) {
+            rollback(index);
+            return Err(anyhow::anyhow!(
+                "could not move the staged {} into place: {}",
+                dest.display(),
+                e
+            ));
+        }
+    }
+
+    // Step C: the commit succeeded; the stashed companions are now
+    // superseded by the new set, so discard them.
+    for (prev, _) in &stashed {
+        let _ = std::fs::remove_file(prev);
+    }
+    Ok(())
+}
+
+/// The format version and WAL role a snapshot recorded in its manifest
+/// (#209).
+///
+/// Version 1 (legacy, and a directory with no manifest at all — which
+/// `ensure_snapshot_verified` refuses on the real restore path anyway) has no
+/// `wal_kind`; its WAL member is the active `<db>.wal`. Version 2 requires the
+/// role, because only v2 can express a mixed pair.
+fn snapshot_version_and_wal_kind(
+    snapshot_dir: &std::path::Path,
+) -> anyhow::Result<(u32, Option<String>)> {
+    let manifest_path = snapshot_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok((crate::storage::snapshot::SNAPSHOT_VERSION_LEGACY, None));
+    }
+    let raw = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "could not read the snapshot manifest {:?} to learn its WAL role: {}",
+            manifest_path,
+            e
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&raw)?;
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    Ok((
+        version,
+        manifest
+            .get("wal_kind")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    ))
+}
+
 fn main() -> anyhow::Result<()> {
     init_tracing();
     let runtime = runtime()?;
     runtime.block_on(run())
 }
+
+
 
 /// The elected daemon log path for a given home (T19, Gate 0 Home β):
 /// `<home>/.local/share/neurostrata/daemon.log`.
@@ -4740,6 +7665,8 @@ fn daemon_log_path_for(home: &std::path::Path) -> std::path::PathBuf {
         .join("neurostrata")
         .join("daemon.log")
 }
+
+
 
 /// Where an auto-spawned daemon child's stderr is sent (T19).
 ///
@@ -4758,6 +7685,8 @@ fn daemon_log_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| daemon_log_path_for(&home))
 }
 
+
+
 /// Where the auto-spawned daemon child's stderr goes: the daemon log
 /// file, or nowhere. The decision is an enum (not a `Stdio`) because
 /// `std::process::Stdio` offers no introspection for tests to match on.
@@ -4765,6 +7694,8 @@ enum DaemonStderr {
     Log(std::fs::File),
     Null,
 }
+
+
 
 /// Resolve the daemon child's stderr target (T19, DD-3′/DD-4′).
 fn daemon_stderr() -> DaemonStderr {
@@ -4779,6 +7710,8 @@ fn daemon_stderr() -> DaemonStderr {
         }
     }
 }
+
+
 
 /// Open `path` (append + create, parent directories created) as the
 /// daemon child's stderr target.
@@ -4825,6 +7758,41 @@ async fn run() -> anyhow::Result<()> {
             Config::from_default_path()?;
         }
         println!("{}", dispatch_project_context(action, &config_path)?);
+        return Ok(());
+    }
+
+    // Run by every git hook: answer at once, without probing or starting a
+    // daemon and without opening the database.
+    if let Some(Commands::Namespace { action }) = cli.command.as_ref() {
+        match action {
+            NamespaceCommands::Resolve { dir } => {
+                let dir = match dir {
+                    Some(d) => d.clone(),
+                    None => std::env::current_dir()?,
+                };
+                // Fail closed: a missing directory, a harness config that
+                // cannot be read, or no usable namespace exits non-zero, and
+                // the pre-push hook blocks the push.
+                let resolved = match crate::task::harness_plugins::resolve_namespace(&dir) {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        eprintln!("error: namespace resolve: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let configs = &resolved.configs;
+                if configs.iter().any(|(_, ns)| *ns != configs[0].1) {
+                    let listed: Vec<String> =
+                        configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
+                    eprintln!(
+                        "warning: harness configs name different namespaces ({}); using {}",
+                        listed.join(", "),
+                        configs[0].1
+                    );
+                }
+                println!("{}", resolved.namespace);
+            }
+        }
         return Ok(());
     }
 
@@ -4943,22 +7911,43 @@ async fn run() -> anyhow::Result<()> {
 
     // Now parse using clap
     if let Some(command) = cli.command {
+        // Deferred embedding-model choice: materialization
+        // only ever records a pending choice; it is surfaced here, at
+        // interactive dispatch, before the command runs — never on the
+        // daemon/serving path, and not on the way to shutting down.
+        if !matches!(command, Commands::Daemon { .. } | Commands::Shutdown) {
+            surface_pending_model_choice();
+        }
         match command {
-            Commands::Daemon => {
+            Commands::Daemon { profile } => {
+                if profile {
+                    procmem::enable_profile();
+                }
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
+                // Pre-flight: refuse a data-bearing store under a
+                // commensurably different configured model before the
+                // daemon lock is taken, the embedder is built, or the
+                // engine opens — a refused start leaves the store
+                // byte-untouched. The store-level check on the true
+                // serving descriptor remains the authoritative gate.
+                crate::model_choice::check_daemon_open_identity(
+                    &config.db_path,
+                    &crate::embed::config_dir(),
+                )?;
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
-                let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
-                let startup = resolve_startup(&config)?;
-                let embedder = embed::build_embedder_for(&startup.resolution.model)?;
-                let vector_store: Arc<dyn VectorStore> =
-                    Arc::new(LadybugStore::new_with_identity_limits(
+                if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
+                    tracing::debug!("DAEMON_LOCK was already initialized");
+                }
+                let embedder = build_embedder()?;
+                let vector_store: Arc<dyn VectorStore> = Arc::new(
+                    LadybugStore::new(
                         config.db_path.to_string_lossy().to_string(),
                         embedder.dimensions(),
-                        embedder.embedder_id().to_string(),
-                        startup.limits,
-                    )?);
+                    )?
+                    .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                );
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
                     embedder,
@@ -4972,8 +7961,12 @@ async fn run() -> anyhow::Result<()> {
             Commands::Laya { model, out_dir } => {
                 let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
                 let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
-                crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir).await?;
-                println!("Laya model '{}' fetched and verified to '{}'", model_id, target_dir);
+                crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir)
+                    .await?;
+                println!(
+                    "Laya model '{}' fetched and verified to '{}'",
+                    model_id, target_dir
+                );
             }
             Commands::Learn { action } => match action {
                 LearnCommands::Status => {
@@ -5013,9 +8006,12 @@ async fn run() -> anyhow::Result<()> {
                                 purge_observations: true,
                             });
                         } else {
-                            let result = crate::learning::control::purge_observations_offline(confirm_purge);
+                            let result =
+                                crate::learning::control::purge_observations_offline(confirm_purge);
                             match result {
-                                Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
+                                Ok(res) => {
+                                    println!("{}", serde_json::to_string_pretty(&res).unwrap())
+                                }
                                 Err(e) => {
                                     eprintln!("{}", e);
                                     std::process::exit(1);
@@ -5057,7 +8053,8 @@ async fn run() -> anyhow::Result<()> {
                 };
                 let mut svc = crate::synaptic_mesh::MeshService::new(project_root);
                 let reply =
-                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc).await;
+                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc)
+                        .await;
                 println!("{}", reply);
                 // Hook piggyback contract (spec §Hooks): the hook target
                 // ALWAYS exits 0, even when its reply carries a failure —
@@ -5073,13 +8070,14 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             Commands::Kge {
-                action: KgeCommands::Train {
-                    namespace,
-                    all,
-                    epochs,
-                    dim,
-                    kge_weight,
-                },
+                action:
+                    KgeCommands::Train {
+                        namespace,
+                        all,
+                        epochs,
+                        dim,
+                        kge_weight,
+                    },
             } => {
                 if !all && namespace.is_none() {
                     anyhow::bail!("--namespace <ns> or --all is required");
@@ -5091,7 +8089,13 @@ async fn run() -> anyhow::Result<()> {
                     anyhow::bail!("--kge-weight must be in [0, 0.3]");
                 }
                 // Run TransE KGE training over the namespace graph (spec §5.4).
-                crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim), Some(kge_weight))?;
+                crate::kge::cli_train(
+                    namespace.as_deref(),
+                    all,
+                    Some(epochs),
+                    Some(dim),
+                    Some(kge_weight),
+                )?;
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;
@@ -5157,8 +8161,6 @@ async fn run() -> anyhow::Result<()> {
                     if daemon_holds_lock(&db_path) {
                         saw_lock = true;
                     } else if saw_lock {
-                        let report =
-                            std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
                         let report = match std::fs::read_to_string(daemon_lock_path(&db_path)) {
                             Ok(report) => report,
                             Err(e) => {
@@ -5204,6 +8206,56 @@ async fn run() -> anyhow::Result<()> {
                     attempts / 10
                 );
                 std::process::exit(1);
+            }
+            Commands::Bench {
+                suite,
+                iterations,
+                output,
+                baseline,
+                max_regression_pct,
+                fail_on_regression,
+                record_metrics,
+            } => {
+                let cfg = crate::bench::BenchConfig {
+                    suite,
+                    iterations,
+                    output,
+                    baseline,
+                    max_regression_pct,
+                    fail_on_regression,
+                    record_metrics,
+                };
+                let receipt = crate::bench::run_benchmarks(&cfg).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+                if fail_on_regression {
+                    if let Some(cmp) = &receipt.comparison {
+                        if !cmp.passed {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            Commands::SemanticEval {
+                competency,
+                retrieval,
+                iterations,
+                output,
+                check,
+            } => {
+                let outcome =
+                    crate::semantic_eval::run_semantic_eval(&competency, &retrieval, iterations)
+                        .await;
+                let json = serde_json::to_string_pretty(&outcome.receipt)?;
+                if let Some(path) = &output {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, &json)?;
+                }
+                println!("{json}");
+                if check && !outcome.passed {
+                    std::process::exit(1);
+                }
             }
             Commands::BusMetrics => {
                 // Answered from the daemon, never from a bus built here: the
@@ -5275,10 +8327,11 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            Commands::Backup { dir } => {
-                // The database is single-writer. When a daemon holds it, ask the
-                // daemon to do the work rather than fighting it for the lock.
-                if daemon_running {
+            Commands::Backup { dir, no_open } => {
+                // The database is single-writer. When a daemon holds it and
+                // `--no-open` was not requested, ask the daemon to do the work
+                // rather than fighting it for the lock.
+                if daemon_running && !no_open {
                     // /backup is destructive-class: bearer + operator (DR-5).
                     let res = daemon_operator_client()
                         .post("http://127.0.0.1:34343/backup")
@@ -5296,20 +8349,59 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 let config = Config::from_default_path()?;
-                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                if !no_open && daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
+                if no_open {
+                    // #209: an uncoordinated copy is only honest when nobody
+                    // else owns the store. While the daemon lock is held the
+                    // database, its WAL, and the checkpoint shadow can be
+                    // read at different instants, which is exactly the
+                    // verify-but-cannot-restore pair this refuses. A
+                    // coordinated backup goes through the daemon above.
+                    //
+                    // #241: the lock is not probed and released — it is held
+                    // for the whole copy, so a daemon that starts mid-copy
+                    // cannot change the files being copied. The guard is
+                    // dropped only after the export returns.
+                    let _lock = match hold_store_lock_for_copy(&config.db_path) {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    };
+                    LadybugStore::export_database_files(
+                        &config.db_path,
+                        std::path::Path::new(&dir),
+                    )?;
+                    println!("Backed up to {} (no-open file copy)", dir);
+                    return Ok(());
+                }
                 // The width opens the store; exporting never embeds anything.
-                let vector_store: Arc<dyn VectorStore> =
-                    Arc::new(LadybugStore::new_with_identity_limits(
-                        config.db_path.to_string_lossy().to_string(),
-                        embed::configured_dimensions()?,
-                        embed::configured_embedder_id()?,
-                        profiled_store_limits(&config)?,
-                    )?);
-                vector_store.export_database(&dir).await?;
-                println!("Backed up to {}", dir);
+                // If strict WAL verification refuses to open the store (#196),
+                // fall back to a no-open file-copy snapshot so the operator can
+                // still capture a verified backup before recovery.
+                match LadybugStore::new(
+                    config.db_path.to_string_lossy().to_string(),
+                    embed::configured_dimensions()?,
+                ) {
+                    Ok(store) => {
+                        let vector_store: Arc<dyn VectorStore> = Arc::new(store);
+                        vector_store.export_database(&dir).await?;
+                        println!("Backed up to {}", dir);
+                    }
+                    Err(e) if e.to_string().contains("Refusing to open:") => {
+                        eprintln!(
+                            "WARN: store open refused by strict WAL verification ({}); falling back to --no-open file-copy backup so the unrecovered store and WAL are captured intact.",
+                            e
+                        );
+                        export_uncoordinated_fallback(&config.db_path, std::path::Path::new(&dir))?;
+                        println!("Backed up to {} (no-open file copy)", dir);
+                    }
+                    Err(e) => return Err(e),
+                }
                 return Ok(());
             }
             Commands::Restore { dir, into } => {
@@ -5328,8 +8420,62 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("Then point db_path in ~/.config/neurostrata/config.json at it once you have checked it.");
                     std::process::exit(1);
                 }
-                let namespaces =
-                    restore_snapshot_bundle(std::path::Path::new(&dir), &target, &config).await?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let snapshot = std::path::Path::new(&dir).join("ladybug.store");
+                if !snapshot.exists() {
+                    eprintln!(
+                        "{:?} does not look like a snapshot: no ladybug.store inside it.",
+                        dir
+                    );
+                    std::process::exit(1);
+                }
+                if let Err(e) = ensure_snapshot_verified(std::path::Path::new(&dir)) {
+                    eprintln!("Snapshot verification failed: {}", e);
+                    std::process::exit(1);
+                }
+                copy_snapshot_into_place(std::path::Path::new(&dir), &target)?;
+
+                // Opened only after the copy, to verify the restored store
+                // reads back and to report what it holds.
+                let vector_store: Arc<dyn VectorStore> = match LadybugStore::new(
+                    target.to_string_lossy().to_string(),
+                    embed::configured_dimensions()?,
+                ) {
+                    Ok(store) => Arc::new(store),
+                    Err(e) => {
+                        // The snapshot verified, but the store it placed
+                        // will not open — leaving it at the target would
+                        // park an unopenable store where a live one was
+                        // expected. Roll the copy back entirely so a
+                        // failed restore leaves the target absent (issue
+                        // #87); the snapshot itself is untouched and the
+                        // restore can be retried.
+                        let _ = std::fs::remove_file(&target);
+                        // Every companion the restore set may have placed,
+                        // in either WAL role plus the checkpoint state (#209):
+                        // a failed restore leaves the target absent rather
+                        // than parking an unopenable partial set.
+                        for suffix in [".wal", ".wal.checkpoint", ".shadow", ".pinned.tmp"] {
+                            let mut companion = target.as_os_str().to_os_string();
+                            companion.push(suffix);
+                            let _ = std::fs::remove_file(std::path::PathBuf::from(companion));
+                        }
+                        let _ =
+                            std::fs::remove_file(crate::model_choice::store_state_path(&target));
+                        return Err(e);
+                    }
+                };
+
+                let namespaces = match vector_store.list_namespaces().await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("restore list_namespaces check failed: {e}");
+                        Vec::new()
+                    }
+                };
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
                     println!(
@@ -5386,9 +8532,8 @@ async fn run() -> anyhow::Result<()> {
                     }
 
                     // Both policies print the escape hatch (section 5.1).
-                    if skip_gate_value_skips(
-                        std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref(),
-                    ) {
+                    if skip_gate_value_skips(std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref())
+                    {
                         eprintln!(
                             "[neurostrata:gate] NEUROSTRATA_SKIP_GATE=1 is set; skipping the gate for '{}'.",
                             namespace
@@ -5400,6 +8545,8 @@ async fn run() -> anyhow::Result<()> {
                         return Ok(());
                     }
 
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let scope = crate::task::gate::GateScope::capture(&cwd);
                     let outcome: Result<serde_json::Value, String> = if probe
                         == DaemonProbe::Responsive
                     {
@@ -5416,38 +8563,29 @@ async fn run() -> anyhow::Result<()> {
                             Err(e) => Err(e),
                             Ok(()) => match daemon_http_client()
                                 .post("http://127.0.0.1:34343/tasks/gate")
-                                .json(&serde_json::json!({
-                                    "namespace": namespace,
-                                    "strict": strict,
-                                }))
+                                .json(&task_gate_request(&namespace, strict, &scope))
                                 .timeout(std::time::Duration::from_secs(10))
                                 .send()
                                 .await
                             {
-                                Ok(resp) if resp.status().is_success() => {
-                                    match resp.text().await {
-                                        Ok(body) => {
-                                            serde_json::from_str::<serde_json::Value>(&body)
-                                                .map_err(|e| {
-                                                    format!(
-                                                        "the daemon's gate reply could not be read: {}",
-                                                        e
-                                                    )
-                                                })
-                                        }
-                                        Err(e) => Err(format!(
-                                            "the daemon's gate reply could not be read: {}",
-                                            e
-                                        )),
-                                    }
-                                }
+                                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                                    Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                                        .map_err(|e| {
+                                            format!(
+                                                "the daemon's gate reply could not be read: {}",
+                                                e
+                                            )
+                                        }),
+                                    Err(e) => Err(format!(
+                                        "the daemon's gate reply could not be read: {}",
+                                        e
+                                    )),
+                                },
                                 Ok(resp) => Err(format!(
                                     "the daemon answered {} on /tasks/gate",
                                     resp.status()
                                 )),
-                                Err(e) => {
-                                    Err(format!("the request to the daemon failed: {}", e))
-                                }
+                                Err(e) => Err(format!("the request to the daemon failed: {}", e)),
                             },
                         }
                     } else {
@@ -5459,12 +8597,11 @@ async fn run() -> anyhow::Result<()> {
                                 } else if probe == DaemonProbe::Silent {
                                     Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
                                 } else {
-                                    let cwd = std::env::current_dir().unwrap_or_default();
-                                    let line = crate::task::hook_hygiene(&cwd);
+                                    let line = crate::task::hook_hygiene_from_cli(&cwd);
                                     if !line.is_empty() {
                                         println!("{}", line);
                                     }
-                                    direct_report(&config, &namespace)
+                                    direct_report(&config, &namespace, Some(&scope))
                                         .await
                                         .map(|report| report.gate_json())
                                 }
@@ -5489,7 +8626,19 @@ async fn run() -> anyhow::Result<()> {
                     });
 
                     match outcome {
-                        Ok(violations) => {
+                        Ok(mut violations) => {
+                            if strict && cwd.join("docs").join("manifest.json").is_file() {
+                                let doc_report = crate::doc_gate::evaluate_doc_gate(&cwd, None);
+                                if !doc_report.passed {
+                                    for v in &doc_report.violations {
+                                        violations.push(serde_json::json!({
+                                            "kind": format!("doc_gate:{}", v.kind),
+                                            "id": v.rule_id,
+                                            "detail": format!("{}: {}", v.path, v.detail),
+                                        }));
+                                    }
+                                }
+                            }
                             for violation in &violations {
                                 println!(
                                     "- [{}] {}: {}",
@@ -5527,9 +8676,9 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!(
                                 "[neurostrata:gate] {}",
                                 if strict {
-                                    "--strict: an unavailable database blocks the push. Skip explicitly with NEUROSTRATA_SKIP_GATE=1 git push."
+                                    "--strict: an unavailable database blocks the push."
                                 } else {
-                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Set NEUROSTRATA_SKIP_GATE=1 to silence this, or pass --strict to block."
+                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Pass --strict to block."
                                 }
                             );
                             std::process::exit(gate_exit_code(None, strict));
@@ -5566,7 +8715,6 @@ async fn run() -> anyhow::Result<()> {
                                         })
                                 })
                             }
-                            _ => None,
                             Ok(resp) => {
                                 tracing::debug!(
                                     "daemon /mcp task_validate answered HTTP {}; falling back to the direct report",
@@ -5601,7 +8749,7 @@ async fn run() -> anyhow::Result<()> {
                                     namespace, DAEMON_BUSY_MESSAGE
                                 );
                             }
-                            Ok(config) => match direct_report(&config, &namespace).await {
+                            Ok(config) => match direct_report(&config, &namespace, None).await {
                                 Ok(report) => {
                                     println!(
                                         "{}",
@@ -5655,13 +8803,13 @@ async fn run() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                         let embedder = build_embedder()?;
-                        let vector_store: Arc<dyn VectorStore> =
-                            Arc::new(LadybugStore::new_with_identity_limits(
+                        let vector_store: Arc<dyn VectorStore> = Arc::new(
+                            LadybugStore::new(
                                 config.db_path.to_string_lossy().to_string(),
-                                embedder.dimensions(),
-                                embedder.embedder_id().to_string(),
-                                profiled_store_limits(&config)?,
-                            )?);
+                                embed::configured_dimensions()?,
+                            )?
+                            .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                        );
                         let res = match crate::task::import_beads(
                             vector_store.clone(),
                             embedder.clone(),
@@ -5726,11 +8874,103 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
+            Commands::DocGate { root, json } => {
+                let target_root = root
+                    .or_else(git_toplevel)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let report = crate::doc_gate::evaluate_doc_gate(&target_root, None);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                } else if report.passed {
+                    println!(
+                        "PASS doc-gate (connector={}, tiers={}, rules={})",
+                        report.connector_id, report.checked_tiers, report.checked_rules
+                    );
+                } else {
+                    eprintln!(
+                        "FAIL doc-gate (connector={}, violations={}):",
+                        report.connector_id,
+                        report.violations.len()
+                    );
+                    for v in &report.violations {
+                        eprintln!("  - [{} / {}] {}: {}", v.rule_id, v.kind, v.path, v.detail);
+                    }
+                }
+                if !report.passed {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Workflow { action } => {
+                match action {
+                    WorkflowCommands::Status { root, json: _ } => {
+                        let target_root = root
+                            .or_else(git_toplevel)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let connector = crate::workflow::resolve_workflow_connector(&target_root);
+                        let scope = connector.capture_scope(&target_root);
+                        let (revision_id, dirty_state_hash) =
+                            connector.capture_state_digest(&target_root);
+                        let changed_paths = connector.changed_paths(&target_root);
+                        let payload = serde_json::json!({
+                            "connector_id": connector.connector_id(),
+                            "scope": scope,
+                            "state_digest": {
+                                "revision_id": revision_id,
+                                "dirty_state_hash": dirty_state_hash,
+                            },
+                            "changed_paths": changed_paths,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    }
+                    WorkflowCommands::Transitions { json: _ } => {
+                        let sample = crate::workflow::evaluate_workflow_transition(
+                            crate::workflow::WorkflowStage::Unpreflighted,
+                            crate::workflow::WorkflowEvent::LoadContext,
+                        );
+                        let payload = serde_json::json!({
+                            "initial_stage": sample.from,
+                            "after_load_context": sample.to,
+                            "edges": crate::workflow::WORKFLOW_TABLE,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&payload).unwrap_or_default()
+                        );
+                    }
+                    WorkflowCommands::Install { root, json: _ } => {
+                        let target_root = root
+                            .or_else(git_toplevel)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let connector = crate::workflow::resolve_workflow_connector(&target_root);
+                        match connector.install_triggers(&target_root) {
+                            Ok(report) => {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("ERROR: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            Commands::DataConnector { .. } => { /* handled after store open */ }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
-                    let root = git_toplevel()
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap();
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
                         Some(r) => r,
                         None => {
@@ -5748,12 +8988,26 @@ async fn run() -> anyhow::Result<()> {
                     match install_pre_push_hook(&root, force) {
                         Ok(target) => {
                             let _ = install_pre_commit_hook(&root);
-                            let repo_ns = root
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("default");
+                            // Harness configs get a namespace only from an
+                            // explicit source (a harness config or
+                            // NEUROSTRATA_NAMESPACE), never the ledger or the
+                            // folder name; each config keeps its own.
+                            let explicit =
+                                match crate::task::harness_plugins::namespace_for_refresh(
+                                    &root, true,
+                                ) {
+                                    Ok(ns) => ns,
+                                    Err(e) => {
+                                        eprintln!("warning: harness configs left as they are: {e}");
+                                        None
+                                    }
+                                };
                             let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                                &root, repo_ns, None,
+                                &root,
+                                crate::task::harness_plugins::ConfigNamespace::Keep(
+                                    explicit.as_deref(),
+                                ),
+                                None,
                             );
                             println!(
                                 "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
@@ -5768,9 +9022,6 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 HooksCommands::InstallPreCommit => {
-                    let root = git_toplevel()
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap();
                     let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
                         Some(r) => r,
                         None => {
@@ -5832,7 +9083,14 @@ async fn run() -> anyhow::Result<()> {
 
                 // AW-C4: `--dry-run` is read-only — it never opens the store —
                 // so it runs even while the daemon holds the lock.
-                if let Commands::Ingest { dry_run: true, dir, namespace, schema_path, dry_run_mode } = &other {
+                if let Commands::Ingest {
+                    dry_run: true,
+                    dir,
+                    namespace,
+                    schema_path,
+                    dry_run_mode,
+                } = &other
+                {
                     let dir_str = cli_ingest_root(dir);
                     let dir_path_owned = std::path::PathBuf::from(&dir_str);
                     let schema_str = if let Some(path) = schema_path {
@@ -5847,12 +9105,57 @@ async fn run() -> anyhow::Result<()> {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("Failed to load schema: {}", e);
-                            return Err(e.into());
+                            return Err(e);
                         }
                     };
-                    let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                    let report = crate::parser::ingest::dry_run_directory(
+                        &dir_path_owned,
+                        &schema,
+                        dry_run_mode,
+                    )
+                    .await?;
                     println!("Namespace: {}", namespace);
                     println!("{}", report);
+                    return Ok(());
+                }
+
+                // `storage status` and `storage verify-snapshot` are path-only
+                // filesystem inspections (spec 2026-10-28-tdb2-storage-hygiene-design.md)
+                // and must run without opening `LadybugStore` so they remain
+                // available when strict WAL verification refuses an open or
+                // when a daemon holds the lock (#196).
+                if let Commands::Storage { action } = other {
+                    match action {
+                        StorageCommands::Status => {
+                            let out = crate::server::handle_storage_status_from_config();
+                            println!("{}", out);
+                        }
+                        StorageCommands::VerifySnapshot { dir } => {
+                            match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
+                                Ok(report) if report.valid => {
+                                    println!("Verified snapshot in {}: valid", dir);
+                                }
+                                Ok(report) if report.integrity_ok => {
+                                    // #209: the bytes match their checksums,
+                                    // but the snapshot was taken without the
+                                    // store lock. That is restorable and it is
+                                    // not a full `valid` verdict.
+                                    println!(
+                                        "Verified snapshot in {}: integrity ok, uncoordinated ({}) -- the bytes match their checksums, but the database, WAL, and checkpoint state were captured without the store lock, so this is not a coordinated snapshot",
+                                        dir, report.provenance
+                                    );
+                                }
+                                Ok(report) => {
+                                    eprintln!("Snapshot verification failed: {:?}", report.error);
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Snapshot verification failed: {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -5873,7 +9176,6 @@ async fn run() -> anyhow::Result<()> {
                             .expect("export graph target resolved before daemon dispatch");
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
                         // AW-A2: `--source-id <id>` on the CLI scopes the
                         // export just like the env var it falls back to.
                         let source_id = cli_source_id
@@ -5971,7 +9273,13 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("{}", body);
                             std::process::exit(1);
                         }
-                        Commands::Edit { namespace, id, new_namespace, content, location } => {
+                        Commands::Edit {
+                            namespace,
+                            id,
+                            new_namespace,
+                            content,
+                            location,
+                        } => {
                             let res = daemon_http_client()
                                 .post(format!("http://{DAEMON_ADDR}/edit"))
                                 .json(&serde_json::json!({
@@ -6001,8 +9309,13 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Edit failed: {}", body);
                             std::process::exit(1);
                         }
-                        Commands::SetMetadata { namespace, id, metadata } => {
-                            let new_metadata: serde_json::Value = serde_json::from_str(metadata).map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
+                        Commands::SetMetadata {
+                            namespace,
+                            id,
+                            metadata,
+                        } => {
+                            let new_metadata: serde_json::Value = serde_json::from_str(metadata)
+                                .map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
                             let res = daemon_http_client()
                                 .post(format!("http://{DAEMON_ADDR}/set-metadata"))
                                 .json(&serde_json::json!({
@@ -6024,10 +9337,251 @@ async fn run() -> anyhow::Result<()> {
                                 std::process::exit(1);
                             }
                             if status == reqwest::StatusCode::CONFLICT {
-                                eprintln!("{} was written by directory ingestion and cannot be updated.", id);
+                                eprintln!(
+                                    "{} was written by directory ingestion and cannot be updated.",
+                                    id
+                                );
                                 std::process::exit(1);
                             }
                             eprintln!("Set-metadata failed: {}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::Action { action } => {
+                            let req_body = action_command_to_json(action)?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/action"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("action request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
+                        Commands::Scenario { scenario } => {
+                            let req_body = scenario_command_to_json(scenario)?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/scenario"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("scenario request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
+                        Commands::ObjectView {
+                            namespace,
+                            id,
+                            scenario_id,
+                            include_history_limit,
+                            evaluate_action_preconditions,
+                            max_bytes,
+                            principal,
+                        } => {
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "id": id,
+                                "include_history_limit": include_history_limit,
+                                "evaluate_action_preconditions": evaluate_action_preconditions,
+                                "max_bytes": max_bytes,
+                            });
+                            if let Some(s) = scenario_id {
+                                req_body["scenario_id"] = serde_json::json!(s);
+                            }
+                            if let Some(p) = principal {
+                                req_body["principal"] = serde_json::json!(p);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/object-view"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("object-view request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
+                        Commands::Locate {
+                            namespace,
+                            query,
+                            path_prefix,
+                            symbols_only,
+                            max_locations,
+                            max_bytes,
+                            project_root,
+                            principal,
+                        } => {
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "query": query,
+                                "symbols_only": symbols_only,
+                                "max_locations": max_locations,
+                                "max_bytes": max_bytes,
+                            });
+                            if let Some(p) = path_prefix {
+                                req_body["path_prefix"] = serde_json::json!(p);
+                            }
+                            if let Some(r) = project_root {
+                                req_body["project_root"] = serde_json::json!(r);
+                            }
+                            if let Some(p) = principal {
+                                req_body["principal"] = serde_json::json!(p);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/locate"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("locate request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
+                        Commands::DiffTour {
+                            namespace,
+                            diff_file,
+                            diff_text,
+                            project_root,
+                            max_blast_radius_callers,
+                            principal,
+                        } => {
+                            let resolved_diff = if let Some(t) = diff_text {
+                                Some(t.clone())
+                            } else if let Some(f) = diff_file {
+                                if f == "-" {
+                                    use std::io::Read;
+                                    let mut buf = String::new();
+                                    let _ = std::io::stdin().read_to_string(&mut buf);
+                                    Some(buf)
+                                } else {
+                                    std::fs::read_to_string(f).ok()
+                                }
+                            } else {
+                                None
+                            };
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "max_blast_radius_callers": max_blast_radius_callers,
+                            });
+                            if let Some(d) = resolved_diff {
+                                req_body["diff_text"] = serde_json::json!(d);
+                            }
+                            if let Some(r) = project_root {
+                                req_body["project_root"] = serde_json::json!(r);
+                            }
+                            if let Some(p) = principal {
+                                req_body["principal"] = serde_json::json!(p);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/diff-tour"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("diff-tour request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
+                        Commands::Insights {
+                            namespace,
+                            action,
+                            name,
+                            title,
+                            query_kind,
+                            query,
+                            path_prefix,
+                            from_ts,
+                            to_ts,
+                            backfill_points,
+                            principal,
+                        } => {
+                            let mut req_body = serde_json::json!({
+                                "namespace": namespace,
+                                "action": action,
+                            });
+                            if let Some(v) = name {
+                                req_body["name"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = title {
+                                req_body["title"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = query_kind {
+                                req_body["query_kind"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = query {
+                                req_body["query"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = path_prefix {
+                                req_body["path_prefix"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = from_ts {
+                                req_body["from_ts"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = to_ts {
+                                req_body["to_ts"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = backfill_points {
+                                req_body["backfill_points"] = serde_json::json!(v);
+                            }
+                            if let Some(v) = principal {
+                                req_body["principal"] = serde_json::json!(v);
+                            }
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/insights"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("insights request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
+                            std::process::exit(1);
+                        }
+                        Commands::Taxonomy { taxonomy } => {
+                            let req_body = taxonomy_command_to_json(taxonomy)?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/taxonomy"))
+                                .json(&req_body)
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("taxonomy request failed: {e}"))?;
+                            let body = res.text().await.unwrap_or_default();
+                            println!("{}", body);
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                return Ok(());
+                            }
                             std::process::exit(1);
                         }
                         _ => {}
@@ -6043,63 +9597,249 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
-                let startup = resolve_startup(&config)?;
-                let embedder = embed::build_embedder_for(&startup.resolution.model)?;
-                let vector_store: Arc<dyn VectorStore> =
-                    Arc::new(LadybugStore::new_with_identity_limits(
-                        config.db_path.to_string_lossy().to_string(),
-                        embedder.dimensions(),
-                        embedder.embedder_id().to_string(),
-                        startup.limits,
-                    )?);
+                let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
+                    config.db_path.to_string_lossy().to_string(),
+                    embed::configured_dimensions()?,
+                ) {
+                    Ok(store) => Arc::new(store),
+                    Err(e) => {
+                        if matches!(other, Commands::Doctor { .. }) {
+                            let status = crate::storage::compute_storage_status(
+                                &config.db_path,
+                                &config.storage_hygiene,
+                            );
+                            eprintln!(
+                                "Doctor: store at {:?} could not be opened: {}",
+                                config.db_path, e
+                            );
+                            eprintln!(
+                                "Storage diagnostics (no-open): store_bytes={}, wal_bytes={}, wal_age_secs={:?}, wal_recovery_artifact_count={}, wal_recovery_artifact_bytes={}",
+                                status.store_bytes,
+                                status.wal_bytes,
+                                status.wal_age_secs,
+                                status.wal_recovery_artifact_count,
+                                status.wal_recovery_artifact_bytes,
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
+                let vector_store: Arc<dyn VectorStore> = concrete_store.clone();
+
+                if let Commands::DataConnector { action } = &other {
+                    let workspace_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let (namespace, args_json, principal) = match action {
+                        DataConnectorCommands::List => (
+                            "NeuroStrata".to_string(),
+                            serde_json::json!({ "operation": "list_connectors" }),
+                            None,
+                        ),
+                        DataConnectorCommands::Describe {
+                            connector_id,
+                            pool_id,
+                            principal,
+                        } => (
+                            "NeuroStrata".to_string(),
+                            serde_json::json!({
+                                "operation": "describe_pool",
+                                "connector_id": connector_id,
+                                "pool_id": pool_id,
+                            }),
+                            principal.clone(),
+                        ),
+                        DataConnectorCommands::RegisterPointer {
+                            namespace,
+                            payload,
+                            connector_id,
+                            pointer_id,
+                            pool_id,
+                            pointer_uri,
+                            entity_type,
+                            captured_at_secs,
+                            max_staleness_secs,
+                            principal,
+                        } => {
+                            let payload_value: serde_json::Value = match payload {
+                                Some(raw) => {
+                                    let text = if let Some(file_path) = raw.strip_prefix('@') {
+                                        std::fs::read_to_string(file_path).map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "read payload file {}: {}",
+                                                file_path,
+                                                e
+                                            )
+                                        })?
+                                    } else {
+                                        raw.clone()
+                                    };
+                                    serde_json::from_str(&text)
+                                        .context("data-connector register-pointer payload must be valid JSON")?
+                                }
+                                None => serde_json::json!({}),
+                            };
+                            let pointer_id_value = pointer_id
+                                .clone()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let record = serde_json::json!({
+                                "pointer_id": pointer_id_value,
+                                "connector_id": connector_id.clone().unwrap_or_else(|| "memory_pool".to_string()),
+                                "pool_id": pool_id.clone().unwrap_or_else(|| "default".to_string()),
+                                "pointer_uri": pointer_uri.clone().unwrap_or_else(|| "records".to_string()),
+                                "entity_type": entity_type.clone().unwrap_or_else(|| "json_record".to_string()),
+                                "expected_source_sha256": payload_value.get("expected_source_sha256").cloned().unwrap_or(serde_json::Value::Null),
+                                "captured_at_secs": captured_at_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                                "max_staleness_secs": max_staleness_secs.unwrap_or(0),
+                            });
+                            (
+                                namespace.clone(),
+                                serde_json::json!({ "operation": "register_pointer", "record": record }),
+                                principal.clone(),
+                            )
+                        }
+                        DataConnectorCommands::Resolve {
+                            namespace,
+                            pointer_id,
+                            offset,
+                            limit,
+                            max_bytes,
+                            now_secs,
+                            principal,
+                        } => (
+                            namespace.clone(),
+                            serde_json::json!({
+                                "operation": "resolve_pointer",
+                                "req": {
+                                    "pointer_id": pointer_id,
+                                    "offset": offset,
+                                    "limit": limit,
+                                    "max_bytes": max_bytes,
+                                },
+                                "now_secs": now_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                            }),
+                            principal.clone(),
+                        ),
+                        DataConnectorCommands::ApplyEffect {
+                            namespace,
+                            pointer_id,
+                            operation,
+                            payload,
+                            action_receipt_id,
+                            idempotency_key,
+                            expected_source_sha256,
+                            now_secs,
+                            principal,
+                        } => {
+                            let payload_value: serde_json::Value = match payload {
+                                Some(raw) => {
+                                    let text = if let Some(file_path) = raw.strip_prefix('@') {
+                                        std::fs::read_to_string(file_path).map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "read payload file {}: {}",
+                                                file_path,
+                                                e
+                                            )
+                                        })?
+                                    } else {
+                                        raw.clone()
+                                    };
+                                    serde_json::from_str(&text).context(
+                                        "data-connector apply-effect payload must be valid JSON",
+                                    )?
+                                }
+                                None => serde_json::json!({}),
+                            };
+                            (
+                                namespace.clone(),
+                                serde_json::json!({
+                                    "operation": "apply_effect",
+                                    "req": {
+                                        "pointer_id": pointer_id,
+                                        "operation": operation,
+                                        "payload": payload_value,
+                                        "action_receipt_id": action_receipt_id,
+                                        "expected_source_sha256": expected_source_sha256,
+                                        "idempotency_key": idempotency_key,
+                                    },
+                                    "now_secs": now_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                                }),
+                                principal.clone(),
+                            )
+                        }
+                        DataConnectorCommands::Mediate {
+                            namespace,
+                            from_stage,
+                            to_stage,
+                            gate_passed,
+                            pointer_id,
+                            offset,
+                            limit,
+                            max_bytes,
+                            now_secs,
+                            principal,
+                        } => (
+                            namespace.clone(),
+                            serde_json::json!({
+                                "operation": "mediate",
+                                "from_stage": from_stage,
+                                "to_stage": to_stage,
+                                "gate_passed": gate_passed,
+                                "slice_req": {
+                                    "pointer_id": pointer_id,
+                                    "offset": offset,
+                                    "limit": limit,
+                                    "max_bytes": max_bytes,
+                                },
+                                "now_secs": now_secs.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                            }),
+                            principal.clone(),
+                        ),
+                    };
+                    if let Err(error) = crate::server::enforce_external_connector_principal(
+                        args_json
+                            .get("operation")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                        principal.as_deref(),
+                    ) {
+                        eprintln!("data-connector error: {}", error);
+                        std::process::exit(1);
+                    }
+                    let bus = Arc::new(crate::events::ThalamicBus::new(daemon::BUS_CAPACITY));
+                    let kernel = crate::kernel::AgentKernel::new(
+                        concrete_store.clone(),
+                        bus,
+                        workspace_root,
+                    );
+                    match kernel
+                        .execute_connector_command(&namespace, &args_json, principal.as_deref())
+                        .await
+                    {
+                        Ok(value) => {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&value).unwrap_or_default()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("data-connector error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                    return Ok(());
+                }
+
                 let read = ReadSource::Direct(vector_store.clone());
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let line = crate::task::hook_hygiene(&cwd);
+                let line = crate::task::hook_hygiene_from_cli(&cwd);
                 if !line.is_empty() {
                     println!("{}", line);
                 }
 
                 match other {
-                    Commands::Doctor { namespace } => {
-                        run_doctor(&read, namespace.as_deref()).await?;
-                    }
-                    Commands::Laya { model, out_dir } => {
-                        let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
-                        let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
-                        let _ = crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(
-                            &model_id,
-                            &target_dir,
-                        )
-                        .await;
-                    }
-                    Commands::Storage { action } => match action {
-                        StorageCommands::Status => {
-                            let out =
-                                crate::server::handle_storage_status(vector_store.clone()).await;
-                            println!("{}", out);
-                        }
-                        StorageCommands::VerifySnapshot { dir } => {
-                            match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
-                                Ok(report) => {
-                                    if report.valid {
-                                        println!("Verified snapshot in {}: valid", dir);
-                                    } else {
-                                        eprintln!(
-                                            "Snapshot verification failed: {:?}",
-                                            report.error
-                                        );
-                                        std::process::exit(1);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Snapshot verification failed: {}", e);
-                                    std::process::exit(1);
-                                }
-                            }
-                        }
-                    },
+                    Commands::Storage { .. } => unreachable!("handled before store open"),
                     Commands::Chat { action } => match action {
                         ChatCommands::Ask {
                             namespace,
@@ -6107,6 +9847,7 @@ async fn run() -> anyhow::Result<()> {
                             top_k,
                         } => {
                             let embedder = build_embedder()?;
+                            bind_fallback_serving_descriptor(&vector_store, &embedder);
                             let args = serde_json::json!({
                                 "namespace": namespace,
                                 "question": question,
@@ -6156,6 +9897,226 @@ async fn run() -> anyhow::Result<()> {
                             crate::server::handle_graphql_query(&args, vector_store.clone()).await;
                         println!("{}", out);
                     }
+                    Commands::Action { action } => {
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let args = action_command_to_json(&action)?;
+                        let out = crate::server::handle_action(
+                            &args,
+                            embedder.clone(),
+                            vector_store.clone(),
+                        )
+                        .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Scenario { scenario } => {
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let args = scenario_command_to_json(&scenario)?;
+                        let out = crate::server::handle_scenario(
+                            &args,
+                            embedder.clone(),
+                            vector_store.clone(),
+                        )
+                        .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::ObjectView {
+                        namespace,
+                        id,
+                        scenario_id,
+                        include_history_limit,
+                        evaluate_action_preconditions,
+                        max_bytes,
+                        principal,
+                    } => {
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "id": id,
+                            "include_history_limit": include_history_limit,
+                            "evaluate_action_preconditions": evaluate_action_preconditions,
+                            "max_bytes": max_bytes,
+                        });
+                        if let Some(s) = scenario_id {
+                            args["scenario_id"] = serde_json::json!(s);
+                        }
+                        if let Some(p) = principal {
+                            args["principal"] = serde_json::json!(p);
+                        }
+                        let out =
+                            crate::server::handle_object_view(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Locate {
+                        namespace,
+                        query,
+                        path_prefix,
+                        symbols_only,
+                        max_locations,
+                        max_bytes,
+                        project_root,
+                        principal,
+                    } => {
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "query": query,
+                            "symbols_only": symbols_only,
+                            "max_locations": max_locations,
+                            "max_bytes": max_bytes,
+                        });
+                        if let Some(p) = path_prefix {
+                            args["path_prefix"] = serde_json::json!(p);
+                        }
+                        if let Some(r) = project_root {
+                            args["project_root"] = serde_json::json!(r);
+                        }
+                        if let Some(p) = principal {
+                            args["principal"] = serde_json::json!(p);
+                        }
+                        let embedder = build_embedder().ok();
+                        let out = crate::server::handle_locate_with_auth(
+                            &args,
+                            Some("admin"),
+                            embedder.as_ref(),
+                            vector_store.clone(),
+                        )
+                        .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::DiffTour {
+                        namespace,
+                        diff_file,
+                        diff_text,
+                        project_root,
+                        max_blast_radius_callers,
+                        principal,
+                    } => {
+                        let resolved_diff = if let Some(t) = diff_text {
+                            Some(t)
+                        } else if let Some(f) = diff_file {
+                            if f == "-" {
+                                use std::io::Read;
+                                let mut buf = String::new();
+                                let _ = std::io::stdin().read_to_string(&mut buf);
+                                Some(buf)
+                            } else {
+                                std::fs::read_to_string(&f).ok()
+                            }
+                        } else {
+                            None
+                        };
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "max_blast_radius_callers": max_blast_radius_callers,
+                        });
+                        if let Some(d) = resolved_diff {
+                            args["diff_text"] = serde_json::json!(d);
+                        }
+                        if let Some(r) = project_root {
+                            args["project_root"] = serde_json::json!(r);
+                        }
+                        if let Some(p) = principal {
+                            args["principal"] = serde_json::json!(p);
+                        }
+                        let out =
+                            crate::server::handle_diff_tour(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Insights {
+                        namespace,
+                        action,
+                        name,
+                        title,
+                        query_kind,
+                        query,
+                        path_prefix,
+                        from_ts,
+                        to_ts,
+                        backfill_points,
+                        principal,
+                    } => {
+                        let mut args = serde_json::json!({
+                            "namespace": namespace,
+                            "action": action,
+                        });
+                        if let Some(v) = name {
+                            args["name"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = title {
+                            args["title"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = query_kind {
+                            args["query_kind"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = query {
+                            args["query"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = path_prefix {
+                            args["path_prefix"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = from_ts {
+                            args["from_ts"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = to_ts {
+                            args["to_ts"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = backfill_points {
+                            args["backfill_points"] = serde_json::json!(v);
+                        }
+                        if let Some(v) = principal {
+                            args["principal"] = serde_json::json!(v);
+                        }
+                        let out =
+                            crate::server::handle_insights(&args, vector_store.clone()).await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Commands::Taxonomy { taxonomy } => {
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let args = taxonomy_command_to_json(&taxonomy)?;
+                        let out = crate::server::handle_taxonomy(
+                            &args,
+                            embedder.clone(),
+                            vector_store.clone(),
+                        )
+                        .await;
+                        println!("{}", out);
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&out).unwrap_or_default();
+                        if parsed.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                            std::process::exit(1);
+                        }
+                    }
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
                     }
@@ -6169,23 +10130,19 @@ async fn run() -> anyhow::Result<()> {
                         run_list(&read, &namespace).await?;
                     }
                     // Reached only through the fallback; the dedicated Status
-                    // arm exits before the store opens. Reported faithfully
-                    // anyway: the daemon is provably not running in this arm.
-                    Commands::Status => {
-                        println!("store: {:?}", config.db_path);
-                        println!("daemon: not running");
-                        println!(
-                            "lock: {}",
-                            if daemon_holds_lock(&config.db_path) {
-                                "held"
-                            } else {
-                                "free"
-                            }
-                        );
-                        println!(
-                            "status: down -- safe to start exactly one: neurostrata-mcp daemon"
-                        );
-                        std::process::exit(1);
+                    // arm exits before the store opens.
+                    Commands::Status => unreachable!("handled before store open"),
+                    Commands::IngestScip {
+                        scip_path,
+                        namespace,
+                    } => {
+                        let report = crate::parser::scip::ingest_scip_index(
+                            vector_store.clone(),
+                            &namespace,
+                            std::path::Path::new(&scip_path),
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     Commands::Ingest {
                         dir,
@@ -6195,6 +10152,8 @@ async fn run() -> anyhow::Result<()> {
                         dry_run_mode: _,
                     } => {
                         let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -6210,7 +10169,7 @@ async fn run() -> anyhow::Result<()> {
                             Ok(s) => s,
                             Err(e) => {
                                 eprintln!("Failed to load schema: {}", e);
-                                return Err(e.into());
+                                return Err(e);
                             }
                         };
                         // Opt-in pre-ingest hygiene: drop the ingester-owned
@@ -6285,7 +10244,6 @@ async fn run() -> anyhow::Result<()> {
                         // the search and snapshot read surfaces use.
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
                         // AW-A2: `--source-id <id>` on the CLI scopes the
                         // export just like the env var it falls back to.
                         let source_id = cli_source_id
@@ -6309,7 +10267,37 @@ async fn run() -> anyhow::Result<()> {
                             eprintln!("Warning: failed to clear export freshness: {e}");
                         }
                     }
+                    Commands::VaultSync {
+                        action,
+                        namespace,
+                        vault_path,
+                        output_dir,
+                        principal,
+                    } => {
+                        use crate::vault_ld::vault_sync::handle_vault_sync;
+                        let args = serde_json::json!({
+                            "action": action,
+                            "namespace": namespace,
+                            "vault_path": vault_path,
+                            "output_dir": output_dir,
+                            "principal": principal,
+                        });
+                        let embedder = build_embedder()?;
+                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        let response = handle_vault_sync(
+                            &args,
+                            vector_store.clone(),
+                            embedder,
+                            None,
+                            None,
+                        )
+                        .await;
+                        println!("{}", response);
+                    }
                     Commands::NormalizeMetadata { namespace } => {
+                        let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         use crate::store::ladybug::KnownIds;
                         let all = vector_store.list(&namespace, None, None).await?;
                         let ingested_ids: Vec<String> = all
@@ -6382,24 +10370,24 @@ async fn run() -> anyhow::Result<()> {
                         if all {
                             let namespaces = vector_store.list_namespaces().await?;
                             let mut total_shape = 0usize;
-                            let mut total_dangling_reports = 0usize;
+                            let mut total_dangling = 0usize;
                             for ns in &namespaces {
-                                let (fixed_shape, reported_dangling) =
+                                let (fixed_shape, fixed_dangling) =
                                     direct.repair_namespace_hygiene(ns).await?;
                                 total_shape += fixed_shape;
-                                total_dangling_reports += reported_dangling;
+                                total_dangling += fixed_dangling;
                             }
                             println!(
-                                "Namespace hygiene repaired across {} namespaces: {} shape fixes, {} rows with dangling refs reported (declarations kept).",
+                                "Namespace hygiene repaired across {} namespaces: {} shape fixes, {} dangling fixes.",
                                 namespaces.len(),
                                 total_shape,
-                                total_dangling_reports
+                                total_dangling
                             );
                         } else {
                             let ns = namespace.ok_or_else(|| anyhow::anyhow!("Provide <NAMESPACE> or --all"))?;
-                            let (fixed_shape, reported_dangling) =
+                            let (fixed_shape, fixed_dangling) =
                                 direct.repair_namespace_hygiene(&ns).await?;
-                            println!("Namespace hygiene repaired: {} shape fixes, {} rows with dangling refs reported (declarations kept).", fixed_shape, reported_dangling);
+                            println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
                         }
                     }
                     Commands::Delete { namespace, id } => {
@@ -6407,6 +10395,9 @@ async fn run() -> anyhow::Result<()> {
                         println!("Memory deleted successfully.");
                     }
                     Commands::Archive { namespace, id } => {
+                        let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         // The same handler `neurostrata_archive_memory` calls,
                         // so the CLI and the tool cannot disagree about what
                         // "archived" means. It needs a bus to announce the
@@ -6477,6 +10468,8 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -6501,6 +10494,8 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,
@@ -6533,6 +10528,9 @@ async fn run() -> anyhow::Result<()> {
                         id,
                         metadata,
                     } => {
+                        let embedder = build_embedder()?;
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let new_metadata: serde_json::Value = serde_json::from_str(&metadata)
                             .map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
                         match crate::server::set_metadata(
@@ -6540,6 +10538,7 @@ async fn run() -> anyhow::Result<()> {
                             &namespace,
                             &id,
                             new_metadata,
+                            "admin",
                         )
                         .await?
                         {
@@ -6560,7 +10559,7 @@ async fn run() -> anyhow::Result<()> {
                         }
                     }
                     // Handled above, before the database is ever opened.
-                    Commands::Daemon
+                    Commands::Daemon { .. }
                     | Commands::Shutdown
                     | Commands::Run { .. }
                     | Commands::SynapticMesh { .. }
@@ -6570,8 +10569,14 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::Setup { .. }
                     | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
-                    | Commands::Hooks { .. }
                     | Commands::Kge { .. }
+                    | Commands::DocGate { .. }
+                    | Commands::Workflow { .. }
+                    | Commands::DataConnector { .. }
+                    | Commands::Hooks { .. }
+                    | Commands::Bench { .. }
+                    | Commands::SemanticEval { .. }
+                    | Commands::Namespace { .. }
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),
@@ -6587,3 +10592,5 @@ async fn run() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+use std::collections::HashSet;

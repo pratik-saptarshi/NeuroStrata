@@ -9,9 +9,7 @@ use std::collections::HashMap;
 
 const MENTION_CAP: usize = 32;
 
-const STOPWORDS: &[&str] = &[
-    "id", "x", "i", "t", "n", "ok", "err", "new", "get", "set",
-];
+const STOPWORDS: &[&str] = &["id", "x", "i", "t", "n", "ok", "err", "new", "get", "set"];
 
 /// Strip surrounding punctuation from a token, returning the inner string.
 fn strip_surrounding_punct(s: &str) -> String {
@@ -20,7 +18,10 @@ fn strip_surrounding_punct(s: &str) -> String {
     let bytes = s.as_bytes();
     while start < end {
         let c = bytes[start] as char;
-        if matches!(c, '`' | '"' | '\'' | '(' | '[' | '{' | '<' | ',' | ';' | ':' | '.' | '!' | '?') {
+        if matches!(
+            c,
+            '`' | '"' | '\'' | '(' | '[' | '{' | '<' | ',' | ';' | ':' | '.' | '!' | '?'
+        ) {
             start += 1;
         } else {
             break;
@@ -28,7 +29,10 @@ fn strip_surrounding_punct(s: &str) -> String {
     }
     while end > start {
         let c = bytes[end - 1] as char;
-        if matches!(c, '`' | '"' | '\'' | ')' | ']' | '}' | '>' | ',' | ';' | ':' | '.' | '!' | '?') {
+        if matches!(
+            c,
+            '`' | '"' | '\'' | ')' | ']' | '}' | '>' | ',' | ';' | ':' | '.' | '!' | '?'
+        ) {
             end -= 1;
         } else {
             break;
@@ -65,23 +69,26 @@ pub fn build_candidates(index: &KnownIds) -> HashMap<String, String> {
         pairs.push((logical.clone(), id.to_string()));
         // File path portion before '#'.
         let file_path = logical.split('#').next().unwrap_or("").to_string();
-        if !file_path.is_empty() && file_path != logical {
-            if !is_short_alias(&file_path) || alias_allowed(&file_path) {
-                pairs.push((file_path.clone(), id.to_string()));
-            }
+        if !file_path.is_empty()
+            && file_path != logical
+            && (!is_short_alias(&file_path) || alias_allowed(&file_path))
+        {
+            pairs.push((file_path.clone(), id.to_string()));
         }
         // Symbol name after kind: (e.g. functions:bar -> bar)
         let rest = logical.split('#').nth(1).unwrap_or("");
         let name = if rest.contains(':') {
-            rest.split(':').last().unwrap_or(rest)
+            rest.split(':').next_back().unwrap_or(rest)
         } else {
             rest
         };
         let name = name.to_string();
-        if !name.is_empty() && name != logical && name != file_path {
-            if !is_short_alias(&name) || alias_allowed(&name) {
-                pairs.push((name.clone(), id.to_string()));
-            }
+        if !name.is_empty()
+            && name != logical
+            && name != file_path
+            && (!is_short_alias(&name) || alias_allowed(&name))
+        {
+            pairs.push((name.clone(), id.to_string()));
         }
         // Short aliases (final path components), guard + uniqueness handled later.
         if !file_path.is_empty() {
@@ -125,10 +132,9 @@ fn has_unattached_occurrence(text: &str, needle: &str) -> bool {
     for (pos, mat) in text.match_indices(needle) {
         let left = text[..pos].chars().next_back();
         let right = text[pos + mat.len()..].chars().next();
-        let glued = |c: char| {
-            matches!(c, '/' | '\\' | ':' | '-' | '_' | '.') || c.is_alphanumeric()
-        };
-        if !left.map_or(false, glued) && !right.map_or(false, glued) {
+        let glued =
+            |c: char| matches!(c, '/' | '\\' | ':' | '-' | '_' | '.') || c.is_alphanumeric();
+        if !left.is_some_and(glued) && !right.is_some_and(glued) {
             return true;
         }
     }

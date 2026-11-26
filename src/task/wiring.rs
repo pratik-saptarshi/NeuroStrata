@@ -9,7 +9,7 @@
 //!
 //! Rule: never hand a project a reminder where a machine will do.
 //!
-//! Registry size: 13 automatic wires and 7 reminder wires. The counts are
+//! Registry size: 14 automatic wires and 7 reminder wires. The counts are
 //! stated here so a stale "four wires" claim in prose cannot outlive the
 //! registry it describes.
 
@@ -133,6 +133,12 @@ pub const AUTOMATIC_WIRES: &[Wire] = &[
         blocks: true,
         reason: "a gate that passes its own test is not a gate: plant a violation, expect fail, prove byte-identical restore",
     },
+    Wire {
+        id: "doc-manifest-gate",
+        runs_in: RunsIn::ProjectPipeline,
+        blocks: true,
+        reason: "enforced by task gate --strict, scripts/task-coverage-gate.sh, and neurostrata-mcp doc-gate across vision, features-api, and extend tiers",
+    },
 ];
 
 pub const REMINDER_WIRES: &[Reminder] = &[
@@ -174,12 +180,17 @@ pub const REMINDER_WIRES: &[Reminder] = &[
     Reminder {
         id: "graph-first-lookup",
         fires_on: "during-work",
-        text: "before blind grep/glob or file edits, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges",
+        text: "before blind grep/glob or file edits, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (mode hybrid default, include_references true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges",
     },
     Reminder {
         id: "subagent-context-propagation",
         fires_on: "before-edit",
         text: "subagents start with zero memory context: paste the subagent_prompt_injection block from neurostrata_task_claim into EVERY subagent prompt you spawn",
+    },
+    Reminder {
+        id: "formal-lean-verification-check",
+        fires_on: "during-work",
+        text: "when adding or modifying a state machine, gate, sovereignty/ACL rule, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to factor the pure decision into src/formal_kernel.rs, prove its invariants in proofs/NeuroStrata/*.lean (zero sorry/axiom), and add parity rows in tests/lean_parity_test.rs",
     },
 ];
 
@@ -191,27 +202,6 @@ pub fn known_wire_ids() -> Vec<&'static str> {
         .map(|w| w.id)
         .chain(REMINDER_WIRES.iter().map(|r| r.id))
         .collect()
-}
-
-/// Whether `name` is an automatic wire id at all (as opposed to a reminder).
-pub fn is_automatic_wire(name: &str) -> bool {
-    AUTOMATIC_WIRES.iter().any(|w| w.id == name)
-}
-
-/// Whether `name` is a reminder wire id whose trigger is a member of the
-/// closed `fires_on` enum. An ENFORCED rule citing one of these names a
-/// reminder where a machine belongs.
-pub fn is_reminder_wire(name: &str) -> bool {
-    REMINDER_WIRES
-        .iter()
-        .any(|r| r.id == name && is_valid_fires_on(r.fires_on))
-}
-
-/// Whether the automatic wire `name` hard-fails. An ENFORCED rule needs a
-/// machine that blocks: citing an advisory wire (`blocks == false`) as the
-/// sole guard is an enforcement claim no machine carries.
-pub fn is_blocking_automatic_wire(name: &str) -> bool {
-    AUTOMATIC_WIRES.iter().any(|w| w.id == name && w.blocks)
 }
 
 /// The closed set of `fires_on` triggers a `Reminder` may name — the
@@ -231,7 +221,11 @@ pub const VALID_FIRES_ON: &[&str] = &[
 pub fn compute_lifecycle_delta(
     configured_wires: &[String],
     configured_fires_on: &[String],
-) -> (Vec<&'static Wire>, Vec<&'static Reminder>, Vec<&'static str>) {
+) -> (
+    Vec<&'static Wire>,
+    Vec<&'static Reminder>,
+    Vec<&'static str>,
+) {
     let new_auto: Vec<&'static Wire> = AUTOMATIC_WIRES
         .iter()
         .filter(|w| !configured_wires.iter().any(|c| c == w.id))
@@ -281,8 +275,14 @@ mod tests {
         assert!(!new_rem.is_empty());
         assert!(!new_fires.is_empty());
         let (new_auto2, new_rem2, new_fires2) = compute_lifecycle_delta(
-            &known_wire_ids().into_iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-            &VALID_FIRES_ON.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &known_wire_ids()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            &VALID_FIRES_ON
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
         );
         assert!(new_auto2.is_empty());
         assert!(new_rem2.is_empty());

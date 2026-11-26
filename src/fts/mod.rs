@@ -43,7 +43,13 @@ impl Field {
     }
 }
 
-pub const ALL_FIELDS: [Field; 5] = [Field::Content, Field::Symbol, Field::Location, Field::Namespace, Field::MemoryType];
+pub const ALL_FIELDS: [Field; 5] = [
+    Field::Content,
+    Field::Symbol,
+    Field::Location,
+    Field::Namespace,
+    Field::MemoryType,
+];
 pub const DEFAULT_FIELD_WEIGHTS: [f64; 5] = [1.0, 2.0, 1.5, 3.0, 0.5];
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
@@ -72,6 +78,15 @@ pub struct LexicalDoc {
     pub registry: bool,
     /// SynapticMesh conflict placeholders stay out of every read surface.
     pub conflicting: bool,
+    /// Staged-ingestion generation of this row (`0` = not generation-scoped).
+    /// A row is visible only while its generation is active for its source.
+    #[serde(default)]
+    pub generation: u64,
+    /// The source (worktree) whose pointer governs this row's generation.
+    /// Empty for rows written before the source stamp or by non-ingest
+    /// writers; those fall back to the namespace's active set.
+    #[serde(default)]
+    pub source_key: String,
 }
 
 impl LexicalDoc {
@@ -102,6 +117,8 @@ impl LexicalDoc {
             structural,
             registry: false,
             conflicting: false,
+            generation: 0,
+            source_key: String::new(),
         }
     }
 
@@ -113,7 +130,10 @@ impl LexicalDoc {
             (Field::Symbol, Field::Symbol.tokenize(&self.symbol)),
             (Field::Location, Field::Location.tokenize(&self.location)),
             (Field::Namespace, Field::Namespace.tokenize(&self.namespace)),
-            (Field::MemoryType, Field::MemoryType.tokenize(&self.memory_type)),
+            (
+                Field::MemoryType,
+                Field::MemoryType.tokenize(&self.memory_type),
+            ),
         ]
     }
 
@@ -142,13 +162,6 @@ pub struct NamespaceIndex {
 }
 
 impl NamespaceIndex {
-    pub fn new() -> Self {
-        Self {
-            field_weights: DEFAULT_FIELD_WEIGHTS,
-            ..Self::default()
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.docs.len()
     }
@@ -265,10 +278,7 @@ impl LexicalIndex {
             return;
         }
         let namespace = doc.namespace.clone();
-        self.namespaces
-            .entry(namespace)
-            .or_insert_with(NamespaceIndex::new)
-            .add(doc);
+        self.namespaces.entry(namespace).or_default().add(doc);
     }
 
     /// Insert or replace a document, returning whether it replaced one.
@@ -276,7 +286,10 @@ impl LexicalIndex {
         // Non-recall material never enters the index (§5.6 indexing filter);
         // say so at debug level so a silent skip is diagnosable.
         if doc.structural || doc.registry || doc.conflicting {
-            tracing::debug!("skipping non-indexable doc {} in LexicalIndex::upsert", doc.id);
+            tracing::debug!(
+                "skipping non-indexable doc {} in LexicalIndex::upsert",
+                doc.id
+            );
             return false;
         }
         let key = doc.key();
@@ -508,7 +521,11 @@ fn push_token(groups: &mut Vec<Vec<Clause>>, raw: &str, fuzzy_max: usize) {
         return;
     }
     if token.eq_ignore_ascii_case("OR") {
-        if groups.last().map(|group| !group.is_empty()).unwrap_or(false) {
+        if groups
+            .last()
+            .map(|group| !group.is_empty())
+            .unwrap_or(false)
+        {
             groups.push(Vec::new());
         }
         return;
@@ -566,7 +583,7 @@ pub fn tokenize_whitespace(text: &str) -> Vec<String> {
 /// boundaries, lowercase, and strip punctuation from the edges.
 pub fn tokenize_code(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for segment in text.split(|c: char| matches!(c, '/' | '\\' | '.' | ':' | '_' | '-')) {
+    for segment in text.split(['/', '\\', '.', ':', '_', '-']) {
         let segment = segment.trim_matches(|c: char| !c.is_alphanumeric());
         if segment.is_empty() {
             continue;
@@ -639,17 +656,22 @@ pub(crate) fn doc_visible(doc: &LexicalDoc, opts: &SearchOptions) -> bool {
 }
 
 fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
+    // Presence, not sign: an absent `valid_to` means "no expiry"; a present
+    // value retires once it is at or before the visible moment (an explicit 0
+    // is in the past). This is the store's `is_retired_at` rule, and the
+    // Tantivy index mirrors it with its `has_valid_to` field, so the query
+    // filter and the per-hit veto cannot disagree and starve a page slot.
     match as_of {
-        None => doc.valid_to.map_or(true, |v| v > 0 && v > now),
-        Some(ts) => {
-            doc.valid_from.unwrap_or(0) <= ts
-                && doc.valid_to.map_or(true, |v| v > 0 && ts < v)
-        }
+        None => doc.valid_to.is_none_or(|v| v > now),
+        Some(ts) => doc.valid_from.unwrap_or(0) <= ts && doc.valid_to.is_none_or(|v| ts < v),
     }
 }
 
 fn domain_matches(doc: &LexicalDoc, domains: &[String]) -> bool {
-    domains.is_empty() || domains.iter().any(|d| doc.domains.iter().any(|own| own == d))
+    domains.is_empty()
+        || domains
+            .iter()
+            .any(|d| doc.domains.iter().any(|own| own == d))
 }
 
 #[derive(Debug)]
@@ -884,10 +906,7 @@ fn finalize(mut scored: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
     if scored.is_empty() {
         return Vec::new();
     }
-    let max_score = scored
-        .iter()
-        .map(|hit| hit.score)
-        .fold(0.0_f32, f32::max);
+    let max_score = scored.iter().map(|hit| hit.score).fold(0.0_f32, f32::max);
     if max_score > 0.0 {
         for hit in &mut scored {
             hit.score = (1.0 - hit.score / max_score).clamp(0.0, 1.0);
@@ -897,11 +916,7 @@ fn finalize(mut scored: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
             hit.score = 0.0;
         }
     }
-    scored.sort_by(|a, b| {
-        a.score
-            .total_cmp(&b.score)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    scored.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
     let limit = limit.max(1);
     scored.truncate(limit);
     scored

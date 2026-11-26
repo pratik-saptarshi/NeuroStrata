@@ -1,7 +1,7 @@
 //! Validated ONNX model bundle: manifest, checkpoint, calibration tier.
-use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// A bundle of ONNX artifacts produced by the bridge probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +27,10 @@ impl ModelBundle {
         let root = bundle_dir.to_path_buf();
         let manifest_path = root.join("manifest.json");
         let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| {
-            anyhow::anyhow!("Cannot read bundle manifest {}: {e}", manifest_path.display())
+            anyhow::anyhow!(
+                "Cannot read bundle manifest {}: {e}",
+                manifest_path.display()
+            )
         })?;
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
             .map_err(|e| anyhow::anyhow!("Bad bundle manifest JSON: {e}"))?;
@@ -44,7 +47,9 @@ impl ModelBundle {
         if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
             calibration_tier = match t {
                 "gold" | "Gold" | "GoldShipped" => crate::judgment::CalibrationTier::Gold,
-                "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => crate::judgment::CalibrationTier::ProxyInternal,
+                "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => {
+                    crate::judgment::CalibrationTier::ProxyInternal
+                }
                 other => {
                     tracing::warn!(
                         "unknown calibration_tier '{other}' in {}, defaulting to ProxyInternal",
@@ -70,7 +75,8 @@ impl ModelBundle {
             if !e.is_empty() && e != embedder_id {
                 return Err(anyhow::anyhow!(
                     "Manifest embedder_id '{}' does not match expected '{}'",
-                    e, embedder_id
+                    e,
+                    embedder_id
                 ));
             }
         }
@@ -99,8 +105,7 @@ mod tests {
     use super::*;
 
     fn temp_bundle_with_manifest(label: &str, manifest: Option<&str>) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ns-bundle-{label}-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("ns-bundle-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         if let Some(manifest) = manifest {
             std::fs::write(dir.join("manifest.json"), manifest).unwrap();
@@ -134,7 +139,8 @@ mod tests {
 
     #[test]
     fn bundle_load_fails_when_manifest_declares_no_version() {
-        let dir = temp_bundle_with_manifest("noversion", Some(r#"{"embedder_id":"test-embedder"}"#));
+        let dir =
+            temp_bundle_with_manifest("noversion", Some(r#"{"embedder_id":"test-embedder"}"#));
         assert!(ModelBundle::load(&dir, "test-embedder").is_err());
     }
 
@@ -155,10 +161,17 @@ mod tests {
     #[test]
     fn load_parses_manifest_version_and_tier() {
         let d = temp_bundle("version-tier");
-        fs::write(d.join("manifest.json"), r#"{"model_version":"v2.1.0","calibration_tier":"gold","embedder_id":"e1"}"#).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            r#"{"model_version":"v2.1.0","calibration_tier":"gold","embedder_id":"e1"}"#,
+        )
+        .unwrap();
         let b = ModelBundle::load(&d, "e1").unwrap();
         assert_eq!(b.version, "v2.1.0");
-        assert!(matches!(b.calibration_tier, crate::judgment::CalibrationTier::Gold));
+        assert!(matches!(
+            b.calibration_tier,
+            crate::judgment::CalibrationTier::Gold
+        ));
         assert_eq!(b.embedder_id, "e1");
         let _ = fs::remove_dir_all(&d);
     }
@@ -166,7 +179,11 @@ mod tests {
     #[test]
     fn load_rejects_embedder_id_mismatch() {
         let d = temp_bundle("mismatch");
-        fs::write(d.join("manifest.json"), r#"{"model_version":"v1","embedder_id":"other"}"#).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            r#"{"model_version":"v1","embedder_id":"other"}"#,
+        )
+        .unwrap();
         let res = ModelBundle::load(&d, "expected");
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
@@ -185,7 +202,14 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(model_content);
         let expected = hex::encode(hasher.finalize());
-        fs::write(d.join("manifest.json"), format!(r#"{{"model_version":"v1","model_sha256":"{}","embedder_id":"e"}}"#, expected)).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                r#"{{"model_version":"v1","model_sha256":"{}","embedder_id":"e"}}"#,
+                expected
+            ),
+        )
+        .unwrap();
         let b = ModelBundle::load(&d, "e").unwrap();
         assert_eq!(b.version, "v1");
         // mismatch case

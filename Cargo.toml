@@ -1,11 +1,12 @@
 [workspace]
-members = ["crates/neurostrata-wasm"]
+members = ["crates/neurostrata-wasm", "crates/ontobug"]
 exclude = ["src-tauri"]
 
 [package]
 name = "neurostrata-mcp"
-version = "1.16.1"
+version = "1.19.0"
 edition = "2021"
+license = "MIT"
 exclude = ["tools/runtime-validation/**"]
 
 [[bin]]
@@ -38,6 +39,13 @@ path = "tests/context/freshness_test.rs"
 name = "staged_publication_test"
 path = "tests/ingest/staged_publication_test.rs"
 
+# Task 5 (lean4-formal-verification): Rust -> Lean parity + Aeneas extractability
+# contract. Compiles the crate-free formal kernel from its real path (see the
+# file's module comment) because the crate ships a binary target only.
+[[test]]
+name = "lean_parity_test"
+path = "tests/lean_parity_test.rs"
+
 # emrz: version-gated re-parse contract. Compiles the crate-free schema and
 # generation helpers from their real paths.
 [[test]]
@@ -68,12 +76,15 @@ path = "tests/fts/lexical_test.rs"
 # (tokio PR #8435) breaks the two federation test fixtures, which respond
 # without reading the request. The Phase 1/2 tracked item in this change's
 # PR body is the exit: fixture fix first, then the bound relaxes to a caret.
-tokio = { version = ">=1.53.3, <1.54", features = ["full"] }
+tokio = { version = ">=1.53.3, <1.55", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"
 anyhow = "1.0"
+serde_yaml = "0.9"
+ontobug = { path = "crates/ontobug" }
+fs2 = "0.4"
 fastembed = { version = "7", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
     "hf-hub-rustls-tls",
@@ -83,12 +94,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 futures = "0.3.34"
 dirs = "7.0.0"
-toml = "1.1.6"
+toml = "1.2.1"
 dunce = "1"
-uuid = { version = "1.26", features = ["v4", "v5", "v7", "serde"] }
+uuid = { version = "1.29", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
-tree-sitter = "0.26.8"
-ignore = "0.4.33"
+tree-sitter = "0.27.1"
+ignore = "0.4.34"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
@@ -96,8 +107,8 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 regex = "1.13"
 tempfile = "3.14"
-cxx = "=1.0.195"
-lbug = "0.22.1"
+cxx = "=1.0.205"
+lbug = "0.22.3"
 arc-swap = "1"
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "blocking"] }
@@ -113,6 +124,7 @@ hex = "0.4"
 tar = "0.4"
 flate2 = "1.1"
 oxrdf = { version = "0.3", features = ["rdf-12"] }
+reasonable = { version = "0.5.0-a1", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
 zstd = "0.14"
 spargebra = { version = "0.4", features = ["sparql-12"] }
@@ -121,7 +133,7 @@ spareval = { version = "0.2", features = ["sparql-12"] }
 sparesults = { version = "0.3", features = ["sparql-12"] }
 oxiri = "0.2"
 graphql-parser = "0.4"
-shacl = "0.3"
+notify = "8.2"
 
 # native-tls (pulled in by reqwest, ureq and hf-hub) only needs OpenSSL on
 # platforms without a system TLS stack: Windows uses SChannel and Apple targets
@@ -129,24 +141,39 @@ shacl = "0.3"
 # source for nothing -- and on Windows that build additionally needs Perl and
 # NASM. This condition mirrors native-tls's own target gate.
 #
-# Except: lbug 0.20.4's build script unconditionally emits link directives for
+# Except: lbug 0.22.3's build script unconditionally emits link directives for
 # libssl/libcrypto on every target (its C++ core hard-requires OpenSSL), so
 # Windows now needs a vendored build to satisfy the linker. Apple targets keep
 # the system-path resolution that already works.
-ort = { version = "2.0.0-rc.13" }
+ort = { version = "2.0.0-rc.15" }
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 ndarray = { version = "0.17.2" }
 petgraph = { version = "0.8" }
 leiden-rs = { version = "0.8", default-features = false, features = ["petgraph"] }
 rand = { version = "0.10" }
 tantivy = { version = "0.27" }
-openssl = { version = "0.10.81", features = ["vendored"] }
+scip = "0.10"
+protobuf = "=3.7.2"
+unidiff = "0.4"
+openssl = { version = "0.10.82", features = ["vendored"] }
+
+[dev-dependencies]
+# Already in the tree as axum's transitive dependency (same version in
+# Cargo.lock); the direct dev edge only exposes `ServiceExt::oneshot`
+# so the daemon middleware wiring test can drive a Router in-process.
+tower = { version = "0.5", features = ["util"] }
+
+# Canonicalize the nightly verification cfg name used by the formal-kernel
+# `cfg(kani)` gates: register it as a known cfg instead of blanket-allowing.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [build-dependencies]
-cxx-build = "=1.0.195"
+cxx-build = "=1.0.205"
 
 [features]
 default = []
+nats-mesh = []
 
 
 [[test]]
@@ -169,6 +196,10 @@ path = "tests/recall_exact_identifier.rs"
 name = "procedure_ack_contract"
 path = "tests/procedure_ack_contract.rs"
 
+[[test]]
+name = "semantic_eval_metrics_test"
+path = "tests/semantic_eval_metrics_test.rs"
+
 
 
 
@@ -190,3 +221,16 @@ path = "tests/search/upgraded_search_test.rs"
 [[test]]
 name = "validator_test"
 path = "tests/guard/validator_test.rs"
+
+# Prevent 20+ GB target/ directories across worktrees: strip DWARF debug info
+# from third-party C++/Rust dependencies (lbug, ort, tantivy, shacl, openssl)
+# and retain line-tables-only for workspace backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+

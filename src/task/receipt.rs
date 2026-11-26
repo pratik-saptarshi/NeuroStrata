@@ -1,7 +1,5 @@
 //! Receipt binds to HEAD_sha + dirty_tree_hash (Task 7).
 
-use sha2::{Digest, Sha256};
-
 #[derive(Debug, Clone)]
 pub struct Receipt {
     pub task_id: String,
@@ -36,42 +34,12 @@ impl Receipt {
 /// identity — a receipt bound to those values only ever matches itself, so it
 /// never blocks.
 pub fn compute_worktree_state(worktree: &std::path::Path) -> (String, String) {
-    // Fallback identity: SHA-256 of the worktree path (not readable by git).
-    let path_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(worktree.to_string_lossy().as_bytes());
-        hex_encode(&hasher.finalize())
-    };
-
-    let head_sha = std::process::Command::new("git")
-        .args(["-C", &worktree.to_string_lossy(), "rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_else(|| format!("none-{path_hash}"));
-
-    let dirty_tree_hash = std::process::Command::new("git")
-        .args(["-C", &worktree.to_string_lossy(), "status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| {
-            let mut hasher = Sha256::new();
-            hasher.update(&out.stdout);
-            hex_encode(&hasher.finalize())
-        })
-        .unwrap_or_else(|| format!("clean-{path_hash}"));
-
-    (head_sha, dirty_tree_hash)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
+    // Receipt binding is a trust-bearing input: it must be pure git
+    // observation, never a repo-supplied manifest's declared values
+    // (PR #206 V-3). The Git connector preserves the base non-git fallback
+    // (`none-{path_hash}` / `clean-{path_hash}`) inside its digest.
+    use crate::workflow::connector::WorkflowConnector as _;
+    crate::workflow::connector::GitWorkflowConnector.capture_state_digest(worktree)
 }
 
 #[cfg(test)]
@@ -81,7 +49,12 @@ mod tests {
 
     #[test]
     fn receipt_matches_when_sha_and_hash_align() {
-        let r = Receipt { task_id: "t1".into(), worktree: "w".into(), head_sha: "a".into(), dirty_tree_hash: "b".into() };
+        let r = Receipt {
+            task_id: "t1".into(),
+            worktree: "w".into(),
+            head_sha: "a".into(),
+            dirty_tree_hash: "b".into(),
+        };
         assert!(r.is_current("a", "b"));
     }
 
@@ -96,7 +69,12 @@ mod tests {
             let mut cmd = std::process::Command::new("git");
             cmd.arg("-C").arg(&repo).args(args);
             let out = cmd.output().expect("git available in test env");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
 
         run(&["init", "-q"]);
@@ -108,7 +86,10 @@ mod tests {
 
         let r = Receipt::capture("t1", Path::new(&repo));
         let (head_sha, dirty_hash) = compute_worktree_state(Path::new(&repo));
-        assert!(r.is_current(&head_sha, &dirty_hash), "fresh capture must be current");
+        assert!(
+            r.is_current(&head_sha, &dirty_hash),
+            "fresh capture must be current"
+        );
         assert_ne!(r.head_sha, "none");
 
         // A new commit moves HEAD, so a receipt bound to the old tree is stale.
@@ -117,7 +98,10 @@ mod tests {
         run(&["commit", "-m", "change"]);
 
         let (head_sha_after, dirty_hash_after) = compute_worktree_state(Path::new(&repo));
-        assert!(!r.is_current(&head_sha_after, &dirty_hash_after), "stale receipt must not be current");
+        assert!(
+            !r.is_current(&head_sha_after, &dirty_hash_after),
+            "stale receipt must not be current"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

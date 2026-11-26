@@ -390,11 +390,7 @@ impl EventOutbox {
     /// rolls the file back to its pre-append length on any write or sync
     /// failure, so the caller can fail the operation knowing the outbox
     /// does not half-hold the pulse, in the mirror or on disk.
-    pub fn append(
-        &self,
-        class: EventClass,
-        pulse: &ThalamicPulse,
-    ) -> Result<u64, OutboxError> {
+    pub fn append(&self, class: EventClass, pulse: &ThalamicPulse) -> Result<u64, OutboxError> {
         let mut inner = self.inner.lock().expect("outbox lock poisoned");
         let seq = inner.next_seq;
         let entry = OutboxEntry {
@@ -442,11 +438,7 @@ impl EventOutbox {
     /// returning, so an acknowledged entry is never redelivered by a later
     /// process mistaking volatile state for durable. Offsets never move
     /// backwards.
-    pub fn advance_offset(
-        &self,
-        class: EventClass,
-        seq: u64,
-    ) -> Result<(), OutboxError> {
+    pub fn advance_offset(&self, class: EventClass, seq: u64) -> Result<(), OutboxError> {
         let mut inner = self.inner.lock().expect("outbox lock poisoned");
         if seq <= inner.offsets.get(class) {
             return Ok(());
@@ -633,10 +625,7 @@ mod tests {
         let ob = EventOutbox::open(&dir).expect("the outbox opens");
         ob.append(EventClass::Mesh, &created("before")).unwrap();
         {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&file_path)
-                .unwrap();
+            let mut file = OpenOptions::new().append(true).open(&file_path).unwrap();
             file.write_all(&[0xff, 0xfe, b'\n']).unwrap();
         }
         ob.append(EventClass::Mesh, &created("after")).unwrap();
@@ -677,7 +666,10 @@ mod tests {
             EventClass::class_of_subscriber("mesh_outbox"),
             Some(EventClass::Mesh)
         );
-        assert_eq!(EventClass::class_of_subscriber("episodic_pointer_echo"), None);
+        assert_eq!(
+            EventClass::class_of_subscriber("episodic_pointer_echo"),
+            None
+        );
     }
 
     /// A real file whose writes stop after a fixed byte budget and then
@@ -745,10 +737,7 @@ mod tests {
         let mut line = serde_json::to_vec(&entry).unwrap();
         line.push(b'\n');
         let mut failing = FailAfterFile {
-            file: OpenOptions::new()
-                .append(true)
-                .open(&file_path)
-                .unwrap(),
+            file: OpenOptions::new().append(true).open(&file_path).unwrap(),
             budget: 10,
             len_at_failure: None,
         };

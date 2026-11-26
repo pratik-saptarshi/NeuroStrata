@@ -1,4 +1,4 @@
-use crate::config::{DeduplicationConfig, DedupProviderMode};
+use crate::config::{DedupProviderMode, DeduplicationConfig};
 use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
@@ -12,12 +12,39 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// The daemon's token directory: `~/.config/neurostrata`, the directory
-/// that also holds `embedders.json`.
+/// The daemon's token directory. `NEUROSTRATA_TOKEN_DIR` overrides it for
+/// operators and tests alike; under `cargo test` an unset variable yields a
+/// process-scoped temp directory, so a test binary never reads, creates, or
+/// deletes the operator's real `~/.config/neurostrata/daemon.token`.
 fn token_config_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".config").join("neurostrata")
+    if let Ok(val) = std::env::var("NEUROSTRATA_TOKEN_DIR") {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    #[cfg(test)]
+    {
+        TEST_TOKEN_DIR
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!("neurostrata-test-token-{}", std::process::id()))
+            })
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".config").join("neurostrata")
+    }
 }
+
+/// The daemon token file's full path. One source of truth for the daemon and
+/// for the server proxy tests, so an isolated token dir is honored by both.
+pub(crate) fn token_path() -> PathBuf {
+    token_config_dir().join("daemon.token")
+}
+
+#[cfg(test)]
+static TEST_TOKEN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// A fresh token: two v4 UUIDs' raw bytes, hex-encoded (64 chars) --
 /// ~244 bits of CSPRNG entropy (122 per UUID after the version and
@@ -48,7 +75,10 @@ fn tighten_token_permissions(path: &Path) {
         if metadata.permissions().mode() & 0o077 != 0 {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .inspect_err(|e| {
-                    tracing::warn!("failed to tighten token file permissions on {}: {e}", path.display());
+                    tracing::warn!(
+                        "failed to tighten token file permissions on {}: {e}",
+                        path.display()
+                    );
                 });
         }
     }
@@ -67,7 +97,10 @@ fn load_or_create_token_file(path: &Path) -> String {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
         if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!("failed to create token file directory {}: {e}", dir.display());
+            tracing::warn!(
+                "failed to create token file directory {}: {e}",
+                dir.display()
+            );
         }
     }
     #[cfg(unix)]
@@ -104,7 +137,7 @@ fn load_or_create_token_file(path: &Path) -> String {
 /// Load or create the per-user daemon bearer <redacted> Stored at
 /// `~/.config/neurostrata/daemon.token` with mode 0600.
 pub(crate) fn load_or_create_daemon_token() -> String {
-    load_or_create_token_file(&token_config_dir().join("daemon.token"))
+    load_or_create_token_file(&token_path())
 }
 
 /// Load or create the daemon's operator token (DR-5): the second token
@@ -121,7 +154,6 @@ pub(crate) fn load_or_create_daemon_token() -> String {
 pub(crate) fn load_or_create_operator_token() -> String {
     load_or_create_token_file(&token_config_dir().join("operator.token"))
 }
-
 /// Read a token file's contents for a client: the trimmed value, or None
 /// when no usable token is there. Creation is the daemon's job; clients
 /// only read.
@@ -142,6 +174,47 @@ pub(crate) fn read_token_file(name: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// The one lock serializing every test in this crate that creates,
+/// reads, rewrites, or deletes the real credential files
+/// (`daemon.token` / `operator.token` in the token config dir): the
+/// server proxy tests replace the file with fixture tokens, and the
+/// daemon tests spawn daemons that load-or-create it and reread it to
+/// authorize shutdown. Those spans share one path on disk but no
+/// funnel, so without a common lock a local parallel run can hand a
+/// spawning or stopping daemon a fixture (or absent) token and hang
+/// its shutdown on a 401. CI runs the suite with --test-threads=1;
+/// this lock keeps local parallel runs deterministic too. It lives
+/// here because this module owns the token files; exactly one lock
+/// object exists for the whole test binary.
+#[cfg(test)]
+pub(crate) static CREDENTIAL_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the credential-file test lock (see
+/// `CREDENTIAL_FILE_TEST_LOCK`). Poisoning is recovered: the holders
+/// restore shared state on drop (the server guard rewrites the real
+/// token file; a daemon holder's task is awaited before the guard
+/// drops), so one test's panic cannot cascade into every other
+/// credential test.
+#[cfg(test)]
+pub(crate) fn credential_file_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    CREDENTIAL_FILE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `std::env` is process-global, so tests that mutate or depend on
+/// `NEUROSTRATA_PROJECT_ROOT` (`PROJECT_ROOT_ENV`) across modules must share a
+/// single lock.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn project_root_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Constant-time equality for credential comparison: a wrong token must
@@ -280,6 +353,13 @@ async fn auth_middleware(
         }
     }
 
+    // The label is built lazily: `begin_lazy` invokes the closure only
+    // when profiling is enabled, so the disabled fast path allocates
+    // nothing here. The guard is still created for every authenticated
+    // non-/mcp request, exactly as before.
+    let _memory_guard = (req.uri().path() != "/mcp").then(|| {
+        crate::procmem::CallGuard::begin_lazy(|| format!("http:{}", req.uri().path()), None)
+    });
     next.run(req).await
 }
 
@@ -355,6 +435,8 @@ struct AppState {
     /// the destructive routes (/delete, /shutdown, /backup). Persisted to
     /// ~/.config/neurostrata/operator.token.
     operator_token: String,
+    /// The watch service for daemon watch composition and HTTP parity shims.
+    watch: Arc<crate::ingest_watch::IngestWatchService>,
 }
 
 #[derive(Deserialize)]
@@ -417,6 +499,30 @@ pub async fn start_daemon(
     vector_store: Arc<dyn VectorStore>,
     deduplication_config: Option<DeduplicationConfig>,
 ) -> anyhow::Result<()> {
+    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
+    // over the startup root and every configured project context directory, so
+    // existing workspaces are upgraded immediately on daemon boot. This runs
+    // here and not in `start_daemon_on` because the in-process test daemons
+    // start there: they would write `.claude/` and `.NeuroStrata/plugins/`
+    // into the directory `cargo test` runs in and into every configured
+    // project.
+    // Each harness config keeps its own namespace; a config naming none is
+    // not written (an empty or made-up namespace is never written).
+    let startup_root = resolve_project_root();
+    let _ = crate::task::harness_plugins::auto_install_detected_plugins(
+        &startup_root,
+        crate::task::harness_plugins::ConfigNamespace::Keep(None),
+        None,
+    );
+    if let Ok(cfg) = crate::config::Config::load() {
+        for dir in cfg.project_contexts.values() {
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
+                dir,
+                crate::task::harness_plugins::ConfigNamespace::Keep(None),
+                None,
+            );
+        }
+    }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire
     // contract, so production never does. Tests pass an ephemeral address to
     // `start_daemon_on` directly.
@@ -524,8 +630,7 @@ pub(crate) fn check_caller_path(
         return Ok(resolved);
     }
     for entry in allowlist {
-        let canonical_entry =
-            std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+        let canonical_entry = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
         if resolved.starts_with(&canonical_entry) {
             return Ok(resolved);
         }
@@ -575,7 +680,10 @@ fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
             }
             return Ok(resolved);
         }
-        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+        match (
+            cursor.file_name().map(|n| n.to_os_string()),
+            cursor.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 remainder.push(name);
                 cursor = parent.to_path_buf();
@@ -819,7 +927,11 @@ fn auto_pull_interval_for_policy(
 /// entry (the `Notify` edge). A drain is synchronous git + file I/O, so it is
 /// called directly rather than awaited — the mesh repo is tiny and the
 /// interval is seconds, so it never meaningfully blocks the executor.
-async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>, store: Arc<dyn VectorStore>) {
+async fn mesh_drain_loop(
+    project_root: PathBuf,
+    wake: Arc<tokio::sync::Notify>,
+    store: Arc<dyn VectorStore>,
+) {
     let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -844,8 +956,6 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
 
     let mesh_dir = match MeshStorage::read_pointer(project_root) {
         Ok(Some((_mesh_id, dir, _remote))) => dir,
-        _ => return,
-        Ok(None) => return,
         Err(e) => {
             tracing::warn!(
                 "mesh pointer read failed for {}: {e}",
@@ -853,6 +963,7 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
             );
             return;
         }
+        _ => return,
     };
     let node_id = resolve_node_id();
     let mesh = match MeshStorage::open(&mesh_dir) {
@@ -881,7 +992,9 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
         &outbox,
         &namespaces,
         epoch,
-    ).await {
+    )
+    .await
+    {
         tracing::warn!("mesh outbox reconcile failed: {e}");
     }
     match drain_once(&outbox, &mesh, &node_id).await {
@@ -906,6 +1019,7 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
     }
 }
 
+#[allow(clippy::manual_is_multiple_of)]
 pub(crate) async fn start_daemon_on(
     bind_addr: String,
     embedder: Arc<dyn Embedder>,
@@ -957,11 +1071,9 @@ pub(crate) async fn start_daemon_on(
     };
 
     // Initialize guard validator for behavioral constraint checking
-    let guard_validator = Arc::new(crate::guard::GuardValidator::new(
-        vector_store.clone(),
-        embedder.clone(),
-        "guard",
-    ).await);
+    let guard_validator = Arc::new(
+        crate::guard::GuardValidator::new(vector_store.clone(), embedder.clone(), "guard").await,
+    );
 
     // Generate or load the per-user daemon bearer token. Stored at
     // ~/.config/neurostrata/daemon.token (mode 0600) so CLI clients can read it.
@@ -992,9 +1104,47 @@ pub(crate) async fn start_daemon_on(
     // class's sequence order.
     bus.attach_event_outbox(token_config_dir());
 
+    let startup_root = resolve_project_root();
+
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let fingerprint = exe_fingerprint();
+    // Watch service composition root
+    let allowed_external_dirs = load_allowed_external_dirs();
+    let watch_service = {
+        // Fail closed: a config path we cannot resolve must not silently
+        // relocate the durable watch registry into the process CWD.
+        let config_path = crate::config::Config::default_path()
+            .map_err(|e| anyhow::anyhow!("watch registry config path unavailable: {e}"))?;
+        let registry_path = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("watch registry config path has no parent directory"))?
+            .join("watch_registrations.json");
+
+        let event_source = crate::ingest_watch::NotifyEventSource::new()
+            .map_err(|e| anyhow::anyhow!("failed to create watch event source: {e}"))?;
+
+        let registration_store = Arc::new(crate::ingest_watch::JsonFileRegistrationStore::new(
+            registry_path,
+        ));
+
+        let trigger = Arc::new(crate::ingest_watch::IngestJobsTrigger::new(
+            ingests.clone(),
+            crate::parser::schema::ParserSchema::load(include_str!("schema.json"))
+                .map_err(|e| anyhow::anyhow!("schema load failed: {e}"))?,
+            embedder.clone(),
+            vector_store.clone(),
+        ));
+
+        Arc::new(crate::ingest_watch::IngestWatchService::new(
+            Box::new(event_source),
+            registration_store,
+            trigger,
+            startup_root.clone(),
+            allowed_external_dirs.clone(),
+        ))
+    };
+
     let state = AppState {
         embedder,
         vector_store: vector_store.clone(),
@@ -1003,8 +1153,8 @@ pub(crate) async fn start_daemon_on(
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         deduplication_checker,
         guard_validator,
-        startup_root: resolve_project_root(),
-        allowed_external_dirs: load_allowed_external_dirs(),
+        startup_root: startup_root.clone(),
+        allowed_external_dirs,
         build: BuildInfo {
             version: env!("CARGO_PKG_VERSION"),
             exe_hash: fingerprint.0,
@@ -1014,13 +1164,25 @@ pub(crate) async fn start_daemon_on(
         },
         daemon_token: daemon_token.clone(),
         operator_token: operator_token.clone(),
+        watch: watch_service.clone(),
     };
+
+    // Start the watch service (load registry, canonicalize roots, activate notify watchers)
+    watch_service
+        .start()
+        .await
+        .map_err(|e| anyhow::anyhow!("watch service start failed: {e}"))?;
+
+    // Spawn the watch event loop with its own shutdown channel
+    let (watch_shutdown_tx, watch_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let watch_handle = tokio::spawn(watch_service.run(watch_shutdown_rx));
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/info", get(handle_info))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
+        .route("/ingest-scip", post(handle_ingest_scip))
         .route("/delete", post(handle_delete))
         .route("/memory/archive", post(handle_memory_archive))
         .route("/edit", post(handle_edit))
@@ -1036,15 +1198,26 @@ pub(crate) async fn start_daemon_on(
         .route("/sparql", post(handle_http_sparql))
         .route("/graphql", post(handle_http_graphql))
         .route("/chat/ask", post(handle_http_chat_ask))
-        .route("/storage/status", get(handle_http_storage_status).post(handle_http_storage_status))
+        .route(
+            "/storage/status",
+            get(handle_http_storage_status).post(handle_http_storage_status),
+        )
         .route("/learning/status", get(handle_http_learning_status))
         .route("/learning/control", post(handle_http_learning_control))
+        .route("/action", post(handle_http_action))
+        .route("/scenario", post(handle_http_scenario))
+        .route("/object-view", post(handle_http_object_view))
+        .route("/locate", post(handle_http_locate))
+        .route("/diff-tour", post(handle_http_diff_tour))
+        .route("/insights", post(handle_http_insights))
+        .route("/taxonomy", post(handle_http_taxonomy))
+        .route("/data-connector", post(handle_http_data_connector))
+        .route("/vault-sync", post(handle_http_vault_sync))
         .route("/shutdown", post(handle_shutdown))
+        .route("/ingest/watch/status", get(handle_ingest_watch_status))
+        .route("/ingest/watch/unwatch", post(handle_ingest_watch_unwatch))
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            auth_middleware,
-        ));
+        .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
 
     // Bound the loss window for anything that kills us without warning.
     //
@@ -1070,6 +1243,9 @@ pub(crate) async fn start_daemon_on(
     // already started runs on a blocking thread that abort cannot reach, and the
     // final checkpoint would then contend with it.
     let (stop_periodic, mut periodic_stopped) = tokio::sync::watch::channel(false);
+    // The memory time series stops on the same signal (see procmem).
+    crate::procmem::mark_daemon_process();
+    let memory_sampler = crate::procmem::spawn_sampler(periodic_stopped.clone());
     let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;
         let mut failures: u32 = 0;
@@ -1097,8 +1273,7 @@ pub(crate) async fn start_daemon_on(
                         if let Err(e) = ls.flush_metrics().await {
                             tracing::warn!("periodic flush_metrics failed: {e}");
                         }
-                        match crate::storage::compute_storage_status(ls.local_path(), &hygiene)
-                        {
+                        match crate::storage::compute_storage_status(ls.local_path(), &hygiene) {
                             status if status.wal_warn_threshold_exceeded => {
                                 if !wal_warned {
                                     eprintln!(
@@ -1127,7 +1302,7 @@ pub(crate) async fn start_daemon_on(
                     // attempt would bury the log without adding anything.
                     if failures == 1 {
                         eprintln!("WARNING: checkpoint failed, so recent writes stay in the log until one succeeds. Retrying: {}", e);
-                    } else if failures % 10 == 0 {
+                    } else if failures.is_multiple_of(10) {
                         eprintln!("WARNING: {} checkpoints in a row have failed -- everything written since the last success would be lost to a hard kill: {}", failures, e);
                     }
                     wait = checkpoint_backoff(failures);
@@ -1140,17 +1315,24 @@ pub(crate) async fn start_daemon_on(
     eprintln!("NeuroStrata Daemon listening on {bind_addr}");
     let cause = Arc::new(Mutex::new(ShutdownCause::Requested));
     let recorded_cause = cause.clone();
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let why = shutdown_signal(shutdown_rx).await;
-            if let Ok(mut slot) = recorded_cause.lock() {
-                *slot = why;
-            }
             *recorded_cause.lock().unwrap_or_else(|e| e.into_inner()) = why;
         })
-        .await?;
+        .await;
 
     let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
+
+    // Stop the watch event loop and wait for it to finish before checkpointing.
+    // Do this before propagating a serve error so a failed startup never
+    // strands the spawned run() task.
+    let _ = watch_shutdown_tx.send(());
+    if let Err(e) = watch_handle.await {
+        tracing::warn!("watch service task join error: {e}");
+    }
+
+    serve_result?;
 
     // An ingest runs detached from the request that started it, so the graceful
     // shutdown above did not wait for it. Stopping without waiting left the
@@ -1165,6 +1347,7 @@ pub(crate) async fn start_daemon_on(
     if let Err(e) = periodic.await {
         tracing::warn!("periodic checkpoint task join error: {e}");
     }
+    let _ = memory_sampler.await;
 
     // The whole point of stopping gracefully: get everything on disk before exit.
     // A checkpoint needs every transaction to drain, and detached work such as
@@ -1245,7 +1428,10 @@ async fn handle_get_graph(
             anchor_override.as_ref(),
         )
         .await
-        .map_err(|e| { tracing::warn!("handle_get_graph export_graph failed: {e}"); axum::http::StatusCode::INTERNAL_SERVER_ERROR })?;
+        .map_err(|e| {
+            tracing::warn!("handle_get_graph export_graph failed: {e}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     if query.all.unwrap_or(false) {
         return Ok(Json(data));
@@ -1339,6 +1525,12 @@ async fn handle_ingest(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Auto-register the root after successful ingest
+    state
+        .watch
+        .on_ingest_success(&namespace, Path::new(&dir))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     let progress_value = serde_json::to_value(&progress).map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1346,6 +1538,31 @@ async fn handle_ingest(
         )
     })?;
     Ok(Json(progress_value))
+}
+
+#[derive(Deserialize)]
+struct IngestScipReq {
+    scip_path: String,
+    namespace: String,
+}
+
+async fn handle_ingest_scip(
+    State(state): State<AppState>,
+    Json(req): Json<IngestScipReq>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let scip_file = caller_path_refusal(&state, &req.scip_path)?;
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    let report =
+        crate::parser::scip::ingest_scip_index(state.vector_store.clone(), &namespace, &scip_file)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let val = serde_json::to_value(&report).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize SCIP report: {e}"),
+        )
+    })?;
+    Ok(Json(val))
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
@@ -1413,9 +1630,12 @@ async fn handle_export_graph(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    std::fs::write(&target, serde_json::to_string_pretty(&data).map_err(|e| {
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(
+        &target,
+        serde_json::to_string_pretty(&data)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    )
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Graph exported to {}", req.target))
 }
 
@@ -1469,33 +1689,34 @@ async fn handle_cli_read(
     State(state): State<AppState>,
     Json(req): Json<ReadReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let value =
-        match req.op.as_str() {
-            "namespaces" => {
-                let namespaces =
-                    state.vector_store.list_namespaces().await.map_err(|e| {
-                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                    })?;
-                serde_json::json!({ "namespaces": namespaces })
-            }
-            "list" => {
-                let ns = req.namespace.unwrap_or_default();
-                let rows =
-                    state.vector_store.list(&ns, None, None).await.map_err(|e| {
-                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-                    })?;
-                serde_json::json!({ "rows": rows })
-            }
-            other => {
-                return Err((
-                    axum::http::StatusCode::BAD_REQUEST,
-                    format!(
-                        "unknown read op '{}': expected 'namespaces' or 'list'",
-                        other
-                    ),
-                ))
-            }
-        };
+    let value = match req.op.as_str() {
+        "namespaces" => {
+            let namespaces = state
+                .vector_store
+                .list_namespaces()
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "namespaces": namespaces })
+        }
+        "list" => {
+            let ns = req.namespace.unwrap_or_default();
+            let rows = state
+                .vector_store
+                .list(&ns, None, None)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "rows": rows })
+        }
+        other => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown read op '{}': expected 'namespaces' or 'list'",
+                    other
+                ),
+            ))
+        }
+    };
     Ok(value.to_string())
 }
 
@@ -1626,13 +1847,15 @@ async fn handle_edit(
     .await
     {
         Ok(crate::server::EditOutcome::Edited) => Ok("OK"),
-        Ok(crate::server::EditOutcome::NotFound) => {
-            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
-        }
+        Ok(crate::server::EditOutcome::NotFound) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Memory not found".to_string(),
+        )),
         // The next ingest of that namespace would overwrite the edit.
-        Ok(crate::server::EditOutcome::Ingested) => {
-            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the edit".to_string()))
-        }
+        Ok(crate::server::EditOutcome::Ingested) => Err((
+            axum::http::StatusCode::CONFLICT,
+            "The next ingest of that namespace would overwrite the edit".to_string(),
+        )),
         Err(e) => {
             eprintln!("edit of {} in {} failed: {}", req.id, old_namespace, e);
             Err((
@@ -1655,15 +1878,26 @@ async fn handle_set_metadata(
     Json(req): Json<SetMetadataReq>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata).await
+    // The daemon is bearer-authenticated per user, so its caller is the local
+    // operator: the same admin default the CLI uses.
+    match crate::server::set_metadata(
+        &*state.vector_store,
+        &namespace,
+        &req.id,
+        req.metadata,
+        "admin",
+    )
+    .await
     {
         Ok(crate::server::MetadataOutcome::Updated) => Ok("OK"),
-        Ok(crate::server::MetadataOutcome::NotFound) => {
-            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
-        }
-        Ok(crate::server::MetadataOutcome::Ingested) => {
-            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the metadata".to_string()))
-        }
+        Ok(crate::server::MetadataOutcome::NotFound) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Memory not found".to_string(),
+        )),
+        Ok(crate::server::MetadataOutcome::Ingested) => Err((
+            axum::http::StatusCode::CONFLICT,
+            "The next ingest of that namespace would overwrite the metadata".to_string(),
+        )),
         Err(e) => {
             eprintln!("set-metadata of {} in {} failed: {}", req.id, namespace, e);
             Err((
@@ -1678,22 +1912,32 @@ async fn handle_set_metadata(
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
-        let response = crate::server::process_mcp_request(
+        // JSON-RPC 2.0: a notification (no `id`) is never answered. 202 with an
+        // empty body, as MCP's HTTP transport answers one; the stdio proxy
+        // writes nothing for an empty body.
+        let is_notification = rpc_req.id.is_none();
+        let response = crate::server::process_mcp_request_with_watch(
             rpc_req,
             state.embedder.clone(),
             state.vector_store.clone(),
             state.ingests.clone(),
             state.deduplication_checker.clone(),
             state.bus.clone(),
+            Some(state.watch.clone()),
         )
         .await;
-        Json(response)
+        if is_notification {
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        }
+        Json(response).into_response()
     } else {
         Json(
             serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}),
         )
+        .into_response()
     }
 }
 
@@ -1713,22 +1957,21 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
     let os_signal = async {
         let mut close = match tokio::signal::windows::ctrl_close() {
             Ok(s) => s,
-            Err(_) => return std::future::pending::<ShutdownCause>().await,
-        };
-        let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
-            Ok(s) => s,
-            Err(_) => return std::future::pending::<ShutdownCause>().await,
             Err(_) => {
-                tracing::warn!("signal registration failed: could not register shutdown signal listener");
-                return std::future::pending::<ShutdownCause>().await
-            },
+                tracing::warn!(
+                    "signal registration failed: could not register shutdown signal listener"
+                );
+                return std::future::pending::<ShutdownCause>().await;
+            }
         };
         let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
             Ok(s) => s,
             Err(_) => {
-                tracing::warn!("signal registration failed: could not register shutdown signal listener");
-                return std::future::pending::<ShutdownCause>().await
-            },
+                tracing::warn!(
+                    "signal registration failed: could not register shutdown signal listener"
+                );
+                return std::future::pending::<ShutdownCause>().await;
+            }
         };
         tokio::select! {
             _ = close.recv() => eprintln!("Console is closing, shutting down."),
@@ -1743,9 +1986,11 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(_) => {
-                tracing::warn!("signal registration failed: could not register shutdown signal listener");
-                return std::future::pending::<ShutdownCause>().await
-            },
+                    tracing::warn!(
+                        "signal registration failed: could not register shutdown signal listener"
+                    );
+                    return std::future::pending::<ShutdownCause>().await;
+                }
             };
         term.recv().await;
         eprintln!("Received SIGTERM, shutting down.");
@@ -1823,8 +2068,6 @@ async fn handle_validate(
     State(state): State<AppState>,
     Json(request): Json<crate::guard::ValidateRequest>,
 ) -> Result<Json<crate::guard::ValidateResponse>, (axum::http::StatusCode, String)> {
-    // Use sandbox if podman is available
-    let use_sandbox = true;
     // The caller's identity is genuinely consumed, not just carried: trace it
     // so every verdict can be tied back to the requesting agent.
     tracing::debug!(
@@ -1860,6 +2103,9 @@ struct TaskGateReq {
     /// it, because one gate serves MCP, CLI, and the hook (section 4).
     #[serde(default)]
     strict: bool,
+    /// Caller-supplied Git identity; absent keeps the legacy global verdict.
+    #[serde(default)]
+    scope: Option<crate::task::gate::GateScope>,
 }
 
 /// POST /tasks/gate -- what the pre-push hook sees (section 4).
@@ -1874,7 +2120,7 @@ async fn handle_tasks_gate(
     Json(req): Json<TaskGateReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    let report = crate::task::gate::run(&state.vector_store, &namespace)
+    let report = crate::task::gate::run_scoped(&state.vector_store, &namespace, req.scope.as_ref())
         .await
         .map_err(|e| {
             eprintln!("[neurostrata:gate] gate for '{}' failed: {}", namespace, e);
@@ -1890,6 +2136,33 @@ async fn handle_tasks_gate(
     Ok(Json(report.gate_json()))
 }
 
+/// Watch composition root HTTP parity shims (Task 4)
+async fn handle_ingest_watch_status(
+    State(state): State<AppState>,
+    Query(query): Query<crate::ingest_watch::WatchStatusQuery>,
+) -> Result<Json<crate::ingest_watch::WatchStatusReport>, (axum::http::StatusCode, String)> {
+    let report = state.watch.status(query.namespace.as_deref());
+    Ok(Json(report))
+}
+
+async fn handle_ingest_watch_unwatch(
+    State(state): State<AppState>,
+    Json(req): Json<crate::ingest_watch::WatchUnwatchReq>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // J6 path policy first, so an outside path is 403 (not an opaque 500),
+    // and the resolved canonical path is what the core unregisters.
+    let canonical = caller_path_refusal(&state, &req.dir_path)?;
+    let removed = state
+        .watch
+        .unregister(&req.namespace, &canonical)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "namespace": req.namespace,
+        "canonical_path": canonical.to_string_lossy().to_string(),
+    })))
+}
+
 async fn handle_http_sparql(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1899,7 +2172,11 @@ async fn handle_http_sparql(
     // to the federation handler on the underlying LadybugStore. Security per
     // deployment: served-host/namespace allowlists and peers come from env,
     // and everything outside the allowlists is denied.
-    if req.get("federated").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if req
+        .get("federated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         let config = crate::rdf::federation::FederationConfig {
             served_namespaces: env_csv("NEUROSTRATA_SPARQL_SERVED_NAMESPACES"),
             served_hosts: env_csv("NEUROSTRATA_SPARQL_SERVED_HOSTS"),
@@ -2004,12 +2281,9 @@ async fn handle_http_chat_ask(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
-    let body = crate::server::handle_chat_ask(
-        &req,
-        state.embedder.clone(),
-        state.vector_store.clone(),
-    )
-    .await;
+    let body =
+        crate::server::handle_chat_ask(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
@@ -2026,8 +2300,167 @@ async fn handle_http_storage_status(
     )
 }
 
-async fn handle_http_learning_status() -> (axum::http::StatusCode, axum::Json<crate::learning::status::LearnStatus>) {
-    let status = crate::learning::control::load_status(&crate::learning::control::default_learning_dir());
+async fn handle_http_action(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_action(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_data_connector(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_data_connector(&req, state.vector_store.clone(), state.bus.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+/// `/vault-sync` — Vault-LD bidirectional Markdown sync. The caller's
+/// `vault_path` (and `output_dir`, when named) are validated through
+/// [`check_caller_path`] against the daemon's startup root and the
+/// configured allowlist BEFORE any filesystem access (Task 2 re-file / J6).
+async fn handle_http_vault_sync(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<
+    ([(axum::http::header::HeaderName, &'static str); 1], String),
+    (axum::http::StatusCode, String),
+> {
+    let vault_path = req
+        .get("vault_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".")
+        .to_string();
+    let _ = caller_path_refusal(&state, &vault_path)?;
+    if let Some(output_dir) = req.get("output_dir").and_then(|v| v.as_str()) {
+        let _ = caller_path_refusal(&state, output_dir)?;
+    }
+    let body = crate::vault_ld::vault_sync::handle_vault_sync(
+        &req,
+        state.vector_store.clone(),
+        state.embedder.clone(),
+        Some(state.startup_root.clone()),
+        Some(state.allowed_external_dirs.clone()),
+    )
+    .await;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    ))
+}
+
+async fn handle_http_scenario(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_scenario(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_object_view(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_object_view(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_locate(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body =
+        crate::server::handle_locate(&req, state.embedder.clone(), state.vector_store.clone())
+            .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_diff_tour(
+    State(state): State<AppState>,
+    Json(mut req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    if let Some(raw_root) = req
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        match caller_path_refusal(&state, raw_root) {
+            Ok(canonical) => {
+                req["project_root"] = serde_json::json!(canonical.to_string_lossy().into_owned());
+            }
+            Err((status, msg)) => {
+                return (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({ "ok": false, "error": msg }).to_string(),
+                );
+            }
+        }
+    }
+    let body = crate::server::handle_diff_tour(&req, state.vector_store.clone()).await;
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_insights(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_insights(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_taxonomy(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+        &req,
+        state.embedder.clone(),
+        state.vector_store.clone(),
+        Some(state.bus.clone()),
+    )
+    .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_learning_status() -> (
+    axum::http::StatusCode,
+    axum::Json<crate::learning::status::LearnStatus>,
+) {
+    let status =
+        crate::learning::control::load_status(&crate::learning::control::default_learning_dir());
     (axum::http::StatusCode::OK, axum::Json(status))
 }
 
@@ -2050,14 +2483,150 @@ async fn handle_http_learning_control(
 }
 
 #[cfg(test)]
+// These legacy tests hold process-wide env/credential locks across awaits by
+// design (they serialize filesystem/token fixtures), and their fixture types
+// predate the newer clippy lints. Scope the allows to tests only.
+#[allow(
+    clippy::await_holding_lock,
+    clippy::type_complexity,
+    clippy::cloned_ref_to_slice_refs
+)]
 mod tests {
+    #[test]
+    fn gate_scope_is_optional_for_older_cli_callers() {
+        let old: TaskGateReq = serde_json::from_value(serde_json::json!({
+            "namespace": "NeuroStrata",
+            "strict": true,
+        }))
+        .unwrap();
+        assert_eq!(old.scope, None);
+
+        let scoped: TaskGateReq = serde_json::from_value(serde_json::json!({
+            "namespace": "NeuroStrata",
+            "strict": true,
+            "scope": { "branch": "main", "worktree": "/repo/main" },
+        }))
+        .unwrap();
+        assert_eq!(scoped.scope.unwrap().branch.as_deref(), Some("main"));
+    }
+
     use super::*;
     use crate::events::{RecursionToken, ThalamicPulse};
-    use crate::test_support::{ENV_LOCK, TOKEN_FILE_TEST_LOCK};
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
 
+    /// A `MakeWriter` that appends formatted tracing output to a shared
+    /// buffer, so a test can assert that a log event actually fired.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log capture lock").clone())
+                .expect("captured log output is utf-8")
+        }
+    }
+
+    #[test]
+    fn drain_mesh_once_logs_a_pointer_read_failure() {
+        // Regression test for a shadowed warn arm: the doc on
+        // `drain_mesh_once` promises every failure is a logged no-op. A
+        // guard-free `_` arm sat above the `Err(e)` warn arm, so a
+        // pointer-read failure was silently swallowed.
+        use crate::guard::testkit::MockStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-drain-mesh-once-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pointer_dir = dir.join(".NeuroStrata");
+        std::fs::create_dir_all(&pointer_dir).unwrap();
+        // A malformed pointer (not three tab-separated fields) makes
+        // `MeshStorage::read_pointer` return Err, which is the path whose
+        // warn arm was shadowed. The store is never reached on that path.
+        std::fs::write(pointer_dir.join("synaptic-mesh-ref"), "not-a-pointer").unwrap();
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .finish();
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The current-thread runtime runs the drain on this thread, so the
+        // thread-local default subscriber applies for the whole call.
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(drain_mesh_once(&dir, &store));
+        });
+        let logs = capture.text();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            logs.contains("mesh pointer read failed"),
+            "expected the warn log for a pointer-read failure, captured: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_token_tests_never_touch_real_home_config() {
+        let path = token_path();
+        if let Ok(dir) = std::env::var("NEUROSTRATA_TOKEN_DIR") {
+            assert!(
+                path.starts_with(dir),
+                "the token path must honor NEUROSTRATA_TOKEN_DIR, got {}",
+                path.display()
+            );
+        } else {
+            let temp = std::env::temp_dir();
+            assert!(
+                path.starts_with(&temp),
+                "under test the token path must live in a process-isolated temp dir, got {}",
+                path.display()
+            );
+            assert!(
+                path.to_string_lossy()
+                    .contains(&format!("neurostrata-test-token-{}", std::process::id())),
+                "the temp dir is scoped to this process: {}",
+                path.display()
+            );
+        }
+        let real = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".config")
+            .join("neurostrata")
+            .join("daemon.token");
+        assert_ne!(
+            path, real,
+            "token tests must never resolve to the operator's real daemon.token"
+        );
+    }
 
     #[test]
     fn the_first_retry_comes_quickly() {
@@ -2217,6 +2786,8 @@ mod tests {
         async fn clear_ingested(&self, _namespace: &str) -> anyhow::Result<()> {
             Ok(())
         }
+
+
         async fn publish_ingested(
             &self,
             namespace: &str,
@@ -2296,11 +2867,11 @@ mod tests {
         }
     }
 
-impl crate::traits::AsAny for RecordingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    impl crate::traits::AsAny for RecordingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
-}
 
     /// A throwaway project root, named like the subscriber tests' scratch
     /// directories so an earlier run's leftover can never be read as this
@@ -2536,12 +3107,11 @@ impl crate::traits::AsAny for RecordingStore {
     /// daemon.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bus_is_live_before_the_first_request() {
-        // This test spawns its daemon directly rather than through the
-        // helpers, so it takes the credential lock itself: startup
-        // creates the token files and the test rereads them below. The
-        // guard is bound for the whole body, so it drops only after
-        // the daemon task has finished at the end.
-        let _credential_guard = credential_test_lock();
+        // This test spawns outside the spawn_test_daemon funnel, so it
+        // takes the credential-file lock itself, before the spawn and
+        // until after its inline shutdown below completes -- the same
+        // span the funnel covers (see CREDENTIAL_FILE_TEST_LOCK).
+        let _credential_guard = credential_file_test_lock();
         // An ephemeral port, and the full production startup sequence: the
         // machine's live daemon owns 34343, and a test must never contend
         // with it.
@@ -2560,24 +3130,7 @@ impl crate::traits::AsAny for RecordingStore {
 
         // Wait for the listener to answer at all; a daemon that could not
         // bind fails its own join below rather than hanging here.
-        let mut serving = false;
-        // Startup fingerprints the executable before binding. The test binary
-        // can be very large when native dependencies are statically linked,
-        // so allow that initialization to finish in constrained CI containers.
-        for _ in 0..3000 {
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                serving = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(serving, "daemon never started serving on {addr}");
+        wait_for_serving(&client, &addr).await;
 
         // The authenticated client is built only AFTER the daemon answers:
         // the daemon creates daemon.token during startup, and reading the
@@ -2585,12 +3138,14 @@ impl crate::traits::AsAny for RecordingStore {
         // does not exist yet, the client goes out tokenless, and every
         // authenticated route answers 401.
         let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token_dir = token_config_dir();
+        let daemon_path = token_dir.join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&daemon_path) {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                if let Ok(val) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed))
+                {
                     headers.insert(reqwest::header::AUTHORIZATION, val);
                 }
             }
@@ -2598,7 +3153,7 @@ impl crate::traits::AsAny for RecordingStore {
         // The helper client is the operator's own client: it also carries
         // the operator token, so the destructive routes (its /shutdown
         // cleanup above all) keep working under the operator tier.
-        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        let operator_path = token_dir.join("operator.token");
         if let Ok(operator) = std::fs::read_to_string(&operator_path) {
             let trimmed = operator.trim();
             if !trimmed.is_empty() {
@@ -2607,7 +3162,10 @@ impl crate::traits::AsAny for RecordingStore {
                 }
             }
         }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -2631,25 +3189,41 @@ impl crate::traits::AsAny for RecordingStore {
         daemon.await.unwrap().unwrap();
     }
 
-    /// The crate-wide credential lock (see `crate::test_support`),
-    /// taken by the spawn helpers below before the daemon starts —
-    /// startup creates the token files — and handed to the matching
-    /// stop helper, which drops it once the daemon task has finished:
-    /// shutdown rereads the files, so the span the lock covers is the
-    /// daemon's whole life, not just its start.
-    fn credential_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        TOKEN_FILE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Wait until the daemon on `addr` answers `GET /health`, or panic.
+    /// The budget is ~20 s (2000 x 10 ms): debug startup on a slow machine
+    /// takes longer than the old 5 s budget, dominated by `exe_fingerprint`
+    /// hashing the ~700 MB debug test binary before bind. A genuinely
+    /// wedged daemon fails here instead of hanging.
+    async fn wait_for_serving(client: &reqwest::Client, addr: &str) {
+        let base = format!("http://{addr}");
+        let mut serving = false;
+        for _ in 0..2000 {
+            if client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(serving, "daemon never started serving on {addr}");
     }
 
     /// The daemon on an ephemeral port, and a client that has waited until it
     /// answers. An ephemeral port because the machine's live daemon owns
     /// 34343, and the full production startup sequence so the routes under test
-    /// are the ones production registers. The fourth element is the
-    /// credential lock guard: hand it to `stop_test_daemon`, or — if
-    /// the test stops its daemon by hand — drop it only after the
-    /// daemon task has finished.
+    /// are the ones production registers.
+    ///
+    /// Also returns the credential-file test lock guard, acquired BEFORE
+    /// the spawn: startup load-or-creates the real token files and this
+    /// helper (and `stop_test_daemon`) reread them, while the server
+    /// proxy tests replace the same files with fixtures. The caller
+    /// binds the guard for its whole body, so it drops only after the
+    /// daemon has been stopped -- see `CREDENTIAL_FILE_TEST_LOCK`.
     async fn spawn_test_daemon_with(
         store: Arc<RecordingStore>,
     ) -> (
@@ -2658,7 +3232,7 @@ impl crate::traits::AsAny for RecordingStore {
         tokio::task::JoinHandle<anyhow::Result<()>>,
         std::sync::MutexGuard<'static, ()>,
     ) {
-        let credential_guard = credential_test_lock();
+        let credential_guard = credential_file_test_lock();
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -2674,24 +3248,7 @@ impl crate::traits::AsAny for RecordingStore {
 
         // Wait for the listener to answer at all; a daemon that could not bind
         // fails its own join below rather than hanging here.
-        let mut serving = false;
-        // Keep the helper's readiness window consistent with the explicit
-        // startup-order test above; native test binaries may take longer to
-        // fingerprint than the production executable.
-        for _ in 0..3000 {
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                serving = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(serving, "daemon never started serving on {addr}");
+        wait_for_serving(&client, &addr).await;
 
         // The authenticated client is built only AFTER the daemon answers:
         // the daemon creates daemon.token during startup, and reading the
@@ -2701,12 +3258,14 @@ impl crate::traits::AsAny for RecordingStore {
         // folded into Task 1: the archive-route test failed 401-for-404 in
         // CI while passing wherever a token file already existed.
         let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let token_dir = token_config_dir();
+        let daemon_path = token_dir.join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&daemon_path) {
             let trimmed = token.trim();
             if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                if let Ok(val) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed))
+                {
                     headers.insert(reqwest::header::AUTHORIZATION, val);
                 }
             }
@@ -2714,7 +3273,7 @@ impl crate::traits::AsAny for RecordingStore {
         // The helper client is the operator's own client: it also carries
         // the operator token, so the destructive routes (its /shutdown
         // cleanup above all) keep working under the operator tier.
-        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        let operator_path = token_dir.join("operator.token");
         if let Ok(operator) = std::fs::read_to_string(&operator_path) {
             let trimmed = operator.trim();
             if !trimmed.is_empty() {
@@ -2723,7 +3282,10 @@ impl crate::traits::AsAny for RecordingStore {
                 }
             }
         }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         (base, client, daemon, credential_guard)
     }
@@ -2746,8 +3308,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// The contents of one of the daemon's token files, or "" if it cannot
     /// be read -- the same read every first-party client performs.
     fn token_file(name: &str) -> String {
-        let home = dirs::home_dir().unwrap_or_default();
-        std::fs::read_to_string(home.join(".config").join("neurostrata").join(name))
+        std::fs::read_to_string(token_config_dir().join(name))
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     }
@@ -2760,30 +3321,102 @@ impl crate::traits::AsAny for RecordingStore {
     /// bearer + operator headers on /shutdown, then require the task to
     /// finish. (Against a daemon without the operator tier the extra header
     /// is ignored, so the same cleanup works on both sides of the change.)
-    /// The credential guard is dropped only after the task finishes —
-    /// the /shutdown above rereads the token files, so the span the
-    /// lock covers ends at the join, not at the post.
-    async fn stop_test_daemon(
-        base: &str,
-        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
-        credential_guard: std::sync::MutexGuard<'static, ()>,
-    ) {
+    async fn stop_test_daemon(base: &str, daemon: tokio::task::JoinHandle<anyhow::Result<()>>) {
         let client = bare_client();
         let _ = client
             .post(format!("{base}/shutdown"))
-            .header(reqwest::header::AUTHORIZATION, bearer(&token_file("daemon.token")))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                bearer(&token_file("daemon.token")),
+            )
             .header("x-neurostrata-operator", token_file("operator.token"))
             .send()
             .await;
         daemon.await.unwrap().unwrap();
-        drop(credential_guard);
+    }
+
+    /// JSON-RPC over /mcp: a method the server does not implement is answered
+    /// with -32601 and the request's id (Claude Code's `server/discover` probe
+    /// used to get a bare `{}` and wait out its timeout), and a notification
+    /// gets no reply body at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_methods_get_method_not_found_and_notifications_no_reply() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let discover = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(discover.status().is_success());
+        let body: serde_json::Value = discover.json().await.unwrap();
+        assert_eq!(body["jsonrpc"], serde_json::json!("2.0"), "{body}");
+        assert_eq!(body["id"], serde_json::json!(7), "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+
+        let initialized = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(
+            initialized.text().await.unwrap(),
+            "",
+            "a notification is not answered"
+        );
+
+        let ping = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": "p", "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = ping.json().await.unwrap();
+        assert_eq!(body["id"], serde_json::json!("p"), "{body}");
+        assert_eq!(body["result"], serde_json::json!({}), "{body}");
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// An explicit `"id": null` is a request id, not the notification marker
+    /// (an *omitted* `id`): it must be answered with a real response whose
+    /// top-level `id` is `null`, not swallowed as a 202 empty-body notification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_id_null_request_is_answered_not_treated_as_a_notification() {
+        let (base, authed, daemon, _credential_guard) = spawn_test_daemon().await;
+
+        let explicit_null = authed
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": null, "method": "server/discover"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit_null.status(),
+            axum::http::StatusCode::OK,
+            "{explicit_null:?}"
+        );
+        let body: serde_json::Value = explicit_null.json().await.unwrap();
+        assert!(body.get("id").is_some(), "{body}");
+        assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!(-32601), "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            serde_json::json!("Method not found: server/discover"),
+            "{body}"
+        );
+
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: no credential at all is a 401 on authenticated routes --
     /// a representative read route and /mcp, the product's primary surface.
     #[tokio::test(flavor = "multi_thread")]
     async fn request_without_token_is_401() {
-        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let info = client.get(format!("{base}/info")).send().await.unwrap();
@@ -2797,25 +3430,28 @@ impl crate::traits::AsAny for RecordingStore {
             .unwrap();
         assert_eq!(mcp.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-        stop_test_daemon(&base, daemon, credential_guard).await;
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: a wrong credential is the same 401 as none -- the refusal
     /// must not distinguish "no token" from "wrong token".
     #[tokio::test(flavor = "multi_thread")]
     async fn request_with_wrong_token_is_401() {
-        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let info = client
             .get(format!("{base}/info"))
-            .header(reqwest::header::AUTHORIZATION, bearer("not-the-daemon-token"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                bearer("not-the-daemon-token"),
+            )
             .send()
             .await
             .unwrap();
         assert_eq!(info.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-        stop_test_daemon(&base, daemon, credential_guard).await;
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1 (DR-5): the destructive routes refuse a bearer-only caller
@@ -2825,14 +3461,20 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn destructive_routes_require_the_operator_token() {
         let store = Arc::new(RecordingStore::holding("trust-test", "m1", "fact"));
-        let (base, _authed, daemon, credential_guard) = spawn_test_daemon_with(store).await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon_with(store).await;
         let client = bare_client();
         let daemon_token = token_file("daemon.token");
         let operator_token = token_file("operator.token");
 
         for (route, body) in [
-            ("/delete", serde_json::json!({"namespace": "trust-test", "id": "m1"})),
-            ("/backup", serde_json::json!({"dir": "/tmp/ns-trust-backup"})),
+            (
+                "/delete",
+                serde_json::json!({"namespace": "trust-test", "id": "m1"}),
+            ),
+            (
+                "/backup",
+                serde_json::json!({"dir": "/tmp/ns-trust-backup"}),
+            ),
         ] {
             let refused = client
                 .post(format!("{base}{route}"))
@@ -2879,7 +3521,7 @@ impl crate::traits::AsAny for RecordingStore {
             "bearer + operator must delete"
         );
 
-        stop_test_daemon(&base, daemon, credential_guard).await;
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: the DNS-rebinding leg. A request whose Host is not loopback
@@ -2889,7 +3531,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// passes.
     #[tokio::test(flavor = "multi_thread")]
     async fn hostile_host_and_origin_are_403_even_with_a_valid_token() {
-        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
         let daemon_token = token_file("daemon.token");
 
@@ -2925,7 +3567,7 @@ impl crate::traits::AsAny for RecordingStore {
             "a loopback Origin is a local tool, not a rebinding page"
         );
 
-        stop_test_daemon(&base, daemon, credential_guard).await;
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: /health stays unauthenticated -- liveness probes (the
@@ -2933,7 +3575,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// liveness ONLY: status 200, body exactly "ok", no version, no data.
     #[tokio::test(flavor = "multi_thread")]
     async fn health_is_open_and_minimal() {
-        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let health = client.get(format!("{base}/health")).send().await.unwrap();
@@ -2951,7 +3593,7 @@ impl crate::traits::AsAny for RecordingStore {
             .unwrap();
         assert_eq!(hostile_host.status(), axum::http::StatusCode::FORBIDDEN);
 
-        stop_test_daemon(&base, daemon, credential_guard).await;
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// Task 1: both token files exist with owner-only permissions. The
@@ -2962,10 +3604,10 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn token_files_have_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
-        let home = dirs::home_dir().unwrap_or_default();
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
+        let token_dir = token_config_dir();
         for name in ["daemon.token", "operator.token"] {
-            let path = home.join(".config").join("neurostrata").join(name);
+            let path = token_dir.join(name);
             let metadata = std::fs::metadata(&path)
                 .unwrap_or_else(|e| panic!("{name} must exist once the daemon runs: {e}"));
             assert_eq!(
@@ -2974,7 +3616,7 @@ impl crate::traits::AsAny for RecordingStore {
                 "{name} must be mode 0600"
             );
         }
-        stop_test_daemon(&base, daemon, credential_guard).await;
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// `POST /memory/archive` must reach the one handler the MCP tool surface
@@ -2992,7 +3634,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_archive_route_delegates_to_the_handler_the_tool_also_calls() {
         let store = Arc::new(RecordingStore::holding("bus-test", "m1", "fact"));
-        let (base, client, daemon, credential_guard) = spawn_test_daemon_with(store.clone()).await;
+        let (base, client, daemon, _credential_guard) = spawn_test_daemon_with(store.clone()).await;
 
         let missing = client
             .post(format!("{base}/memory/archive"))
@@ -3065,7 +3707,6 @@ impl crate::traits::AsAny for RecordingStore {
             .await
             .unwrap();
         daemon.await.unwrap().unwrap();
-        drop(credential_guard);
     }
 
     /// `POST /bus/metrics` and `neurostrata-mcp bus-metrics` must be the same
@@ -3075,7 +3716,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// assert that two different buses report different subscriber counts.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bus_metrics_route_answers_in_the_shared_handlers_shape() {
-        let (base, client, daemon, credential_guard) = spawn_test_daemon().await;
+        let (base, client, daemon, _credential_guard) = spawn_test_daemon().await;
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -3122,7 +3763,6 @@ impl crate::traits::AsAny for RecordingStore {
             .await
             .unwrap();
         daemon.await.unwrap().unwrap();
-        drop(credential_guard);
     }
 
     #[tokio::test]
@@ -3184,6 +3824,14 @@ impl crate::traits::AsAny for RecordingStore {
     /// captured, not the variable. The client carries both token files,
     /// like the operator's own client (the /backup and /shutdown routes
     /// are destructive-class under DR-5).
+    ///
+    /// Also returns the credential-file test lock guard, acquired BEFORE
+    /// the spawn for the same reason as in `spawn_test_daemon_with`:
+    /// startup load-or-creates the real token files and this helper
+    /// rereads them for the client. The caller binds the guard for its
+    /// whole body (these tests already hold ENV_LOCK the same way), so
+    /// it drops only after `stop_daemon` completes. Lock order is
+    /// ENV_LOCK then this lock, everywhere both are held.
     async fn spawn_daemon_serving(
         root: &Path,
     ) -> (
@@ -3192,12 +3840,7 @@ impl crate::traits::AsAny for RecordingStore {
         tokio::task::JoinHandle<anyhow::Result<()>>,
         std::sync::MutexGuard<'static, ()>,
     ) {
-        // The credential lock, taken before the spawn like the other
-        // spawn helper's: startup creates the token files and this
-        // helper rereads them for the client. Hand the guard to
-        // `stop_daemon`. (Callers already hold ENV_LOCK for the env
-        // var set below, so the order is ENV before TOKEN everywhere.)
-        let credential_guard = credential_test_lock();
+        let credential_guard = credential_file_test_lock();
         std::env::set_var(PROJECT_ROOT_ENV, root);
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
@@ -3210,27 +3853,9 @@ impl crate::traits::AsAny for RecordingStore {
         ));
         let base = format!("http://{addr}");
         let bare = reqwest::Client::new();
-        let mut serving = false;
-        // Keep the helper's readiness window consistent with the sibling
-        // spawn helpers above; native test binaries may take longer to
-        // fingerprint than the production executable.
-        for _ in 0..3000 {
-            if bare
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                serving = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(serving, "daemon never started serving on {addr}");
+        wait_for_serving(&bare, &addr).await;
         std::env::remove_var(PROJECT_ROOT_ENV);
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_dir = home.join(".config").join("neurostrata");
+        let token_dir = token_config_dir();
         let token = std::fs::read_to_string(token_dir.join("daemon.token"))
             .expect("the daemon created its token file before serving");
         let operator = std::fs::read_to_string(token_dir.join("operator.token"))
@@ -3275,6 +3900,31 @@ impl crate::traits::AsAny for RecordingStore {
         dir
     }
 
+    /// The in-process test daemon must not install harness plugins into the
+    /// root it serves. That root is the directory `cargo test` runs in unless
+    /// a test names another, so an install here leaves `.claude/` and
+    /// `.NeuroStrata/plugins/` in the developer's checkout. A `.claude/`
+    /// directory in the scratch root makes the Claude harness count as
+    /// detected without any environment variable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_daemon_does_not_install_plugins_into_its_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("no-plugin-install");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
+        assert!(
+            !root.join(".NeuroStrata").exists(),
+            "the test daemon wrote .NeuroStrata/ into {}",
+            root.display()
+        );
+        assert!(
+            !root.join(".claude").join("settings.local.json").exists(),
+            "the test daemon wrote .claude/settings.local.json into {}",
+            root.display()
+        );
+    }
+
     /// Task 2 re-file (J6): a caller-named backup destination outside the
     /// served project root is refused before any use, and the refusal names
     /// the path and the `allowed_external_dirs` escape hatch. (PR #29's
@@ -3287,7 +3937,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_root("t2r-backup-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/backup"))
@@ -3309,7 +3959,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file pin: a backup destination inside the served root
@@ -3319,7 +3969,7 @@ impl crate::traits::AsAny for RecordingStore {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-backup-inside-root");
         std::fs::create_dir_all(&root).unwrap();
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
         let dest = root.join("snapshots");
         let res = client
             .post(format!("{base}/backup"))
@@ -3333,7 +3983,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("Backed up to"),
             "the handler's own answer: {body}"
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file (J6): a backup destination spelled with `..` that
@@ -3346,7 +3996,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_root("t2r-dotdot-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         // Both scratch dirs sit directly under the temp dir, so
         // `<root>/../<outside-name>` canonicalizes onto the outside dir.
@@ -3371,7 +4021,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file (J6, Review Focus #4): a symlink planted inside the
@@ -3386,7 +4036,7 @@ impl crate::traits::AsAny for RecordingStore {
         let outside = scratch_root("t2r-backup-link-target");
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
         let res = client
             .post(format!("{base}/backup"))
             .json(&serde_json::json!({ "dir": root.join("escape").display().to_string() }))
@@ -3398,7 +4048,7 @@ impl crate::traits::AsAny for RecordingStore {
             axum::http::StatusCode::FORBIDDEN,
             "the canonical target governs, not the spelling inside the root"
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file (J6): an ingest directory outside the served root is
@@ -3411,7 +4061,7 @@ impl crate::traits::AsAny for RecordingStore {
         let root = scratch_root("t2r-ingest-root");
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_tree("t2r-ingest-outside");
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/ingest"))
@@ -3436,7 +4086,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file pin: an ingest tree inside the served root is walked
@@ -3448,7 +4098,7 @@ impl crate::traits::AsAny for RecordingStore {
         let tree = root.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/ingest"))
@@ -3465,7 +4115,7 @@ impl crate::traits::AsAny for RecordingStore {
             "an in-root ingest proceeds: {}",
             res.text().await.unwrap()
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file (J6, the /export-graph leg): R22 added this route
@@ -3480,7 +4130,7 @@ impl crate::traits::AsAny for RecordingStore {
         let outside = scratch_root("t2r-export-outside");
         std::fs::create_dir_all(&outside).unwrap();
         let target = outside.join("graph.json");
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
@@ -3503,7 +4153,7 @@ impl crate::traits::AsAny for RecordingStore {
             "a refused export writes nothing: {} must not exist",
             target.display()
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file pin: an export target inside the served root is
@@ -3514,7 +4164,7 @@ impl crate::traits::AsAny for RecordingStore {
         let root = scratch_root("t2r-export-inside-root");
         std::fs::create_dir_all(&root).unwrap();
         let target = root.join("graph.json");
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
@@ -3533,7 +4183,7 @@ impl crate::traits::AsAny for RecordingStore {
             "the export lands at the in-root target: {}",
             target.display()
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file (J6): a beads file outside the served root is
@@ -3547,7 +4197,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&outside).unwrap();
         let beads = outside.join("issues.jsonl");
         std::fs::write(&beads, "this is not a beads file\n").unwrap();
-        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/tasks/import"))
@@ -3568,7 +4218,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon, credential_guard).await;
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
     }
 
     /// Task 2 re-file (J6), unit leg: a not-yet-existing destination
@@ -3581,8 +4231,10 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let sneaky = root.join("new").join("..").join("..").join("escape");
         let err = check_caller_path(&sneaky, &root, &[]).expect_err("a `..` remainder refuses");
+        // Windows resolves `new\..` lexically, so the escape is caught by
+        // the containment check instead of the unresolvable-remainder check.
         assert!(
-            err.contains("cannot be resolved"),
+            err.contains("cannot be resolved") || err.contains("outside the project root"),
             "the refusal says which check failed: {err}"
         );
     }
@@ -3656,11 +4308,27 @@ impl crate::traits::AsAny for RecordingStore {
     async fn caller_path_state(root: &Path, allowlist: Vec<PathBuf>) -> AppState {
         let store = Arc::new(RecordingStore::default());
         let embedder = Arc::new(StubEmbedder { dimensions: 8 });
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let watch_service = Arc::new(crate::ingest_watch::IngestWatchService::new(
+            Box::new(crate::ingest_watch::TestEventSource::channel()),
+            Arc::new(crate::ingest_watch::JsonFileRegistrationStore::new(
+                root.join("watch_registrations.json"),
+            )),
+            Arc::new(crate::ingest_watch::IngestJobsTrigger::new(
+                ingests.clone(),
+                crate::parser::schema::ParserSchema::load(include_str!("schema.json"))
+                    .expect("test schema loads"),
+                embedder.clone(),
+                store.clone(),
+            )),
+            root.to_path_buf(),
+            allowlist.clone(),
+        ));
         AppState {
             embedder: embedder.clone(),
             vector_store: store.clone(),
             bus: build_thalamic_bus(store.clone(), 8, root.to_path_buf()),
-            ingests: Arc::new(crate::ingest_jobs::IngestJobs::new()),
+            ingests: ingests.clone(),
             shutdown: Arc::new(Mutex::new(None)),
             deduplication_checker: None,
             guard_validator: Arc::new(
@@ -3677,7 +4345,85 @@ impl crate::traits::AsAny for RecordingStore {
             },
             daemon_token: "test-daemon-token".to_string(),
             operator_token: "test-operator-token".to_string(),
+            watch: watch_service,
         }
+    }
+
+    /// F-10 wiring pin: `auth_middleware` creates the memory guard for
+    /// an authenticated non-/mcp route (a guard is in flight inside the
+    /// handler), and for nothing else at this layer — /health returns
+    /// before the guard site and /mcp is excluded from it. The handlers
+    /// record procmem's in-flight count; assertions are relative to the
+    /// count immediately before each request, the same baseline shape
+    /// as procmem's own in-flight counting test.
+    #[tokio::test]
+    async fn auth_middleware_guards_only_authenticated_non_mcp_routes() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("f10-middleware-wiring");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = caller_path_state(&root, vec![]).await;
+        let seen: Arc<Mutex<Vec<(&'static str, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = |name: &'static str, seen: Arc<Mutex<Vec<(&'static str, usize)>>>| {
+            move || {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push((name, crate::procmem::in_flight_for_test()));
+                    "ok"
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/health", get(record("health", seen.clone())))
+            .route("/dummy", get(record("dummy", seen.clone())))
+            .route("/mcp", post(record("mcp", seen.clone())))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+
+        let drive = |app: Router, uri: &'static str, method: axum::http::Method, auth: bool| async move {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::HOST, "127.0.0.1");
+            if auth {
+                builder = builder.header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer test-daemon-token",
+                );
+            }
+            let before = crate::procmem::in_flight_for_test();
+            let response = app
+                .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            (response.status(), before)
+        };
+
+        let (status, before) = drive(app.clone(), "/health", axum::http::Method::GET, false).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("health", before)),
+            "/health runs with no guard active"
+        );
+
+        let (status, before) = drive(app.clone(), "/dummy", axum::http::Method::GET, true).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("dummy", before + 1)),
+            "an authenticated route runs with the guard in flight"
+        );
+
+        let (status, before) = drive(app, "/mcp", axum::http::Method::POST, true).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().last().copied(),
+            Some(("mcp", before)),
+            "/mcp runs with no guard at the middleware layer"
+        );
     }
 
     /// Task 2 re-file (J6): an export target under an
@@ -3744,6 +4490,393 @@ impl crate::traits::AsAny for RecordingStore {
             out.0
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_action_route_matches_mcp_and_cli_parses_every_subcommand() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _credential_guard = credential_file_test_lock();
+        let root = scratch_root("daemon-action-parity");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_dir = root.join("db");
+        let lb_store = Arc::new(
+            crate::store::LadybugStore::for_testing(&db_dir, 8).expect("open LadybugStore"),
+        );
+        std::env::set_var(PROJECT_ROOT_ENV, &root);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let daemon = tokio::spawn(start_daemon_on(
+            addr.clone(),
+            Arc::new(StubEmbedder { dimensions: 8 }),
+            lb_store,
+            None,
+        ));
+        let base = format!("http://{addr}");
+        let bare = reqwest::Client::new();
+        wait_for_serving(&bare, &addr).await;
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        let token_dir = token_config_dir();
+        let token = std::fs::read_to_string(token_dir.join("daemon.token")).unwrap();
+        let operator = std::fs::read_to_string(token_dir.join("operator.token")).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
+        );
+        headers.insert(
+            "x-neurostrata-operator",
+            reqwest::header::HeaderValue::from_str(operator.trim()).unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+
+        let def_payload = serde_json::json!({
+            "namespace": "daemon-act-ns",
+            "action": "define",
+            "definition": {
+                "slug": "daemon-create-fact",
+                "title": "Daemon Create Fact",
+                "description": "Creates a governed fact via POST /action",
+                "required_role": "editor",
+                "parameters": {
+                    "note": { "param_type": "string", "required": true }
+                },
+                "submission_criteria": [],
+                "effects": [
+                    {
+                        "op": "upsert_memory",
+                        "memory_type": "fact",
+                        "content_template": "Daemon note: {{note}}",
+                        "metadata_template": {}
+                    }
+                ]
+            }
+        });
+
+        let def_res = client
+            .post(format!("{base}/action"))
+            .json(&def_payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(def_res.status(), axum::http::StatusCode::OK);
+        let def_json: serde_json::Value = def_res.json().await.unwrap();
+        assert_eq!(
+            def_json["ok"],
+            serde_json::json!(true),
+            "daemon define: {def_json}"
+        );
+        assert_eq!(
+            def_json["defined"]["slug"],
+            serde_json::json!("daemon-create-fact")
+        );
+
+        let val_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "validate",
+                "slug": "daemon-create-fact",
+                "params": { "note": "hello" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let val_json: serde_json::Value = val_res.json().await.unwrap();
+        assert_eq!(val_json["ok"], serde_json::json!(true));
+        assert_eq!(val_json["valid"], serde_json::json!(true));
+
+        let apply_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "apply",
+                "slug": "daemon-create-fact",
+                "params": { "note": "hello" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let apply_json: serde_json::Value = apply_res.json().await.unwrap();
+        assert_eq!(
+            apply_json["ok"],
+            serde_json::json!(true),
+            "daemon apply: {apply_json}"
+        );
+        let receipt_id = apply_json["applied"]["receipt_id"]
+            .as_str()
+            .expect("receipt_id")
+            .to_string();
+
+        let rev_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "revert",
+                "receipt_id": receipt_id
+            }))
+            .send()
+            .await
+            .unwrap();
+        let rev_json: serde_json::Value = rev_res.json().await.unwrap();
+        assert_eq!(
+            rev_json["ok"],
+            serde_json::json!(true),
+            "daemon revert: {rev_json}"
+        );
+
+        let log_res = client
+            .post(format!("{base}/action"))
+            .json(&serde_json::json!({
+                "namespace": "daemon-act-ns",
+                "action": "log",
+                "limit": 10
+            }))
+            .send()
+            .await
+            .unwrap();
+        let log_json: serde_json::Value = log_res.json().await.unwrap();
+        assert_eq!(log_json["ok"], serde_json::json!(true));
+        assert_eq!(log_json["entries"].as_array().unwrap().len(), 2);
+
+        stop_daemon(&client, &base, daemon, _credential_guard).await;
+    }
+
+    /// Focused tests for Task 4: daemon watch composition and HTTP parity shims
+    mod watch {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::Router;
+        use tower::ServiceExt;
+
+        fn scratch_root(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "neurostrata-watch-test-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        async fn make_test_app(root: &Path) -> (Router, AppState) {
+            let state = caller_path_state(root, vec![]).await;
+            let app = Router::new()
+                .route("/ingest/watch/status", get(handle_ingest_watch_status))
+                .route("/ingest/watch/unwatch", post(handle_ingest_watch_unwatch))
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ));
+            (app, state)
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_shim_maps_valid_path() {
+            let root = scratch_root("watch-unwatch-valid");
+            std::fs::create_dir_all(&root).unwrap();
+            let (app, state) = make_test_app(&root).await;
+            // Registration belongs to the core port, not to an HTTP route.
+            state
+                .watch
+                .register("test-ns", &root)
+                .expect("core registration succeeds");
+            let canonical = std::fs::canonicalize(&root).unwrap();
+
+            let req = serde_json::json!({
+                "namespace": "test-ns",
+                "dir_path": root.display().to_string()
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/ingest/watch/unwatch")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(req.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["removed"], true);
+            assert_eq!(json["namespace"], "test-ns");
+            assert_eq!(
+                json["canonical_path"],
+                canonical.to_string_lossy().to_string()
+            );
+            assert!(
+                state.watch.status(Some("test-ns")).roots.is_empty(),
+                "the core dropped the registration"
+            );
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_shim_refuses_j6_outside_path() {
+            let root = scratch_root("watch-unwatch-outside");
+            std::fs::create_dir_all(&root).unwrap();
+            let (app, _state) = make_test_app(&root).await;
+
+            // Try to unwatch a path outside the root: the J6 gate must refuse
+            // before the core is reached.
+            let outside = std::env::temp_dir().join("outside-watch-test");
+            std::fs::create_dir_all(&outside).unwrap();
+            let req = serde_json::json!({
+                "namespace": "test-ns",
+                "dir_path": outside.display().to_string()
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/ingest/watch/unwatch")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(req.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Should be 403 FORBIDDEN due to J6 path policy
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn watch_status_shim_serializes_all_fields_and_filters() {
+            let root = scratch_root("watch-status");
+            std::fs::create_dir_all(&root).unwrap();
+            let (app, state) = make_test_app(&root).await;
+
+            // Register two namespaces over the core port; the status shim
+            // is the surface under test here.
+            for ns in ["ns-a", "ns-b"] {
+                state
+                    .watch
+                    .register(ns, &root)
+                    .expect("core registration succeeds");
+            }
+
+            // Get status without filter (both namespaces)
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/ingest/watch/status")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let roots = json["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 2);
+            // Check all fields present
+            for root in roots {
+                assert!(root["namespace"].is_string());
+                assert!(root["canonical_path"].is_string());
+                assert!(root["dirty"].is_boolean());
+                assert!(root["pending_paths_count"].is_number());
+                assert!(root["last_event_unix"].is_number() || root["last_event_unix"].is_null());
+                assert!(
+                    root["last_trigger_unix"].is_number() || root["last_trigger_unix"].is_null()
+                );
+                assert!(
+                    root["last_ingest_state"].is_string() || root["last_ingest_state"].is_null()
+                );
+                assert!(
+                    root["last_ingest_finished_unix"].is_number()
+                        || root["last_ingest_finished_unix"].is_null()
+                );
+                assert!(root["backoff_attempt"].is_number());
+                assert!(root["next_retry_unix"].is_number() || root["next_retry_unix"].is_null());
+                assert!(root["watch_active"].is_boolean());
+            }
+
+            // Get status with namespace filter
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/ingest/watch/status?namespace=ns-a")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let roots = json["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0]["namespace"], "ns-a");
+        }
+
+        #[tokio::test]
+        async fn watch_ingest_success_auto_registers() {
+            let root = scratch_root("watch-auto-register");
+            std::fs::write(root.join("lib.rs"), "pub fn probe() {}\n").unwrap();
+            let (app, state) = make_test_app(&root).await;
+
+            // Exercise the real handler so the auto-register hook call site
+            // is covered, not just the core method it delegates to.
+            let namespace = "auto-reg-ns";
+            let out = handle_ingest(
+                State(state),
+                Json(IngestReq {
+                    dir: root.display().to_string(),
+                    namespace: namespace.to_string(),
+                }),
+            )
+            .await
+            .expect("ingest succeeds");
+            assert!(
+                out.0.get("state").is_some(),
+                "the handler answered with ingest progress"
+            );
+
+            // Verify the root was registered by checking status
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/ingest/watch/status")
+                        .header("Authorization", "Bearer test-daemon-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let roots = json["roots"].as_array().unwrap();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0]["namespace"], namespace);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3754,7 +4887,9 @@ pub enum DaemonState {
 
 pub fn daemon_status(db_path: &std::path::Path) -> DaemonState {
     if daemon_holds_lock_local(db_path) {
-        DaemonState::Running { since: "active".to_string() }
+        DaemonState::Running {
+            since: "active".to_string(),
+        }
     } else {
         DaemonState::Stopped
     }

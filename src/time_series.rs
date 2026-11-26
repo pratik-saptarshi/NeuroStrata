@@ -9,15 +9,26 @@ pub use crate::telemetry::anomaly::MetricKind;
 
 pub type SeriesKey = (String, MetricKind, String);
 
+/// Callback invoked with each anomalous sample pushed to the store.
+pub type AnomalyCallback = Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>;
+
+/// Process-wide singleton time-series store used by CLI/daemon surfaces that
+/// do not own a LadybugStore (e.g. the `bench` command's `--record-metrics`).
+pub fn global_store() -> &'static TimeSeriesStore {
+    static STORE: std::sync::OnceLock<TimeSeriesStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(TimeSeriesStore::default)
+}
+
 /// Every metric kind the store tracks. A cross-stage query without an explicit
 /// `kind` sweeps all of these rather than guessing one.
-pub const ALL_METRIC_KINDS: [MetricKind; 6] = [
+pub const ALL_METRIC_KINDS: [MetricKind; 7] = [
     MetricKind::AccessCount,
     MetricKind::EnrichmentFailure,
     MetricKind::EnrichmentLatencyMs,
     MetricKind::RetrievalDistance,
     MetricKind::MemoryCount,
     MetricKind::IngestLatencyMs,
+    MetricKind::ArchitecturalInsight,
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,7 +196,7 @@ pub struct Series {
 pub struct TimeSeriesStore {
     pub series: RwLock<BTreeMap<SeriesKey, Series>>,
     pub config: SeriesConfig,
-    pub anomaly_cb: Option<Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>>,
+    pub anomaly_cb: Option<AnomalyCallback>,
     pub detector: crate::telemetry::AnomalyDetector,
     pub anomalies: RwLock<Vec<crate::telemetry::AnomalyEvent>>,
 }
@@ -201,7 +212,7 @@ impl TimeSeriesStore {
         }
     }
 
-    pub fn with_anomaly_callback(mut self, cb: Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>) -> Self {
+    pub fn with_anomaly_callback(mut self, cb: AnomalyCallback) -> Self {
         self.anomaly_cb = Some(cb);
         self
     }
@@ -216,10 +227,7 @@ impl TimeSeriesStore {
             return;
         }
 
-        let mut guard = self
-            .series
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.series.write().unwrap_or_else(|e| e.into_inner());
         let capacity = self.config.capacity.max(1);
 
         let series = guard.entry(key.clone()).or_insert_with(|| Series {
@@ -295,10 +303,7 @@ impl TimeSeriesStore {
     }
 
     pub fn recent_anomalies(&self, namespace: &str) -> Vec<crate::telemetry::AnomalyEvent> {
-        let guard = self
-            .anomalies
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = self.anomalies.read().unwrap_or_else(|e| e.into_inner());
         guard
             .iter()
             .filter(|ev| namespace.is_empty() || ev.namespace == namespace)
@@ -306,7 +311,15 @@ impl TimeSeriesStore {
             .collect()
     }
 
-    pub fn record(&self, namespace: &str, metric: MetricKind, stage: &str, ts: i64, value: f64, labels: BTreeMap<String, String>) {
+    pub fn record(
+        &self,
+        namespace: &str,
+        metric: MetricKind,
+        stage: &str,
+        ts: i64,
+        value: f64,
+        labels: BTreeMap<String, String>,
+    ) {
         let sample = Sample {
             id: String::new(),
             seq: 0,
@@ -342,9 +355,7 @@ impl TimeSeriesStore {
         }
 
         let mut result: Vec<Sample> = merged.into_values().collect();
-        result.sort_by(|a, b| {
-            (a.ts, a.seq, a.id.clone()).cmp(&(b.ts, b.seq, b.id.clone()))
-        });
+        result.sort_by_key(|a| (a.ts, a.seq, a.id.clone()));
         result
     }
 
@@ -432,7 +443,7 @@ impl TimeSeriesStore {
             let key = (namespace.to_string(), metric, st.to_string());
             if let Some(series) = guard.get(&key) {
                 for s in series.samples.iter() {
-                    if from.map_or(true, |f| s.ts >= f) && to.map_or(true, |t| s.ts <= t) {
+                    if from.is_none_or(|f| s.ts >= f) && to.is_none_or(|t| s.ts <= t) {
                         all_samples.push(s.clone());
                     }
                 }
@@ -441,7 +452,7 @@ impl TimeSeriesStore {
             for (key, series) in guard.iter() {
                 if key.0 == namespace && key.1 == metric {
                     for s in series.samples.iter() {
-                        if from.map_or(true, |f| s.ts >= f) && to.map_or(true, |t| s.ts <= t) {
+                        if from.is_none_or(|f| s.ts >= f) && to.is_none_or(|t| s.ts <= t) {
                             let samp = s.clone();
                             // Ensure stage field reflects stage from series key
                             // (already embedded via id, but keep as-is)
@@ -458,7 +469,7 @@ impl TimeSeriesStore {
         for s in all_samples {
             seen.insert(s.id.clone(), s);
         }
-        for (_, samp) in db_map.iter() {
+        for samp in db_map.values() {
             // DB sample ids embed their `namespace`, `metric` and `stage`
             // segments (`namespace::metric::stage::ts::seq`; legacy rows use
             // single colons). Every segment must match the query: a substring
@@ -478,15 +489,13 @@ impl TimeSeriesStore {
                 }
             }
             // Include DB sample if it matches range
-            if from.map_or(true, |f| samp.ts >= f) && to.map_or(true, |t| samp.ts <= t) {
+            if from.is_none_or(|f| samp.ts >= f) && to.is_none_or(|t| samp.ts <= t) {
                 seen.insert(samp.id.clone(), samp.clone());
             }
         }
 
         let mut result_samples: Vec<Sample> = seen.into_values().collect();
-        result_samples.sort_by(|a, b| {
-            (a.ts, a.seq, a.id.clone()).cmp(&(b.ts, b.seq, b.id.clone()))
-        });
+        result_samples.sort_by_key(|a| (a.ts, a.seq, a.id.clone()));
 
         // Compute aggregate
         let count = result_samples.len() as u64;
@@ -495,12 +504,18 @@ impl TimeSeriesStore {
         let min_val = if result_samples.is_empty() {
             0.0
         } else {
-            result_samples.iter().map(|s| s.value).fold(f64::INFINITY, f64::min)
+            result_samples
+                .iter()
+                .map(|s| s.value)
+                .fold(f64::INFINITY, f64::min)
         };
         let max_val = if result_samples.is_empty() {
             0.0
         } else {
-            result_samples.iter().map(|s| s.value).fold(f64::NEG_INFINITY, f64::max)
+            result_samples
+                .iter()
+                .map(|s| s.value)
+                .fold(f64::NEG_INFINITY, f64::max)
         };
         // Compute EWMA sequentially over sorted values with the configured alpha
         let alpha = self.config.ewma_alpha;
@@ -514,18 +529,20 @@ impl TimeSeriesStore {
                 ewma_val = alpha * s.value + (1.0 - alpha) * ewma_val;
             }
         }
-        let ewma_final = if result_samples.is_empty() { 0.0 } else { ewma_val };
+        let ewma_final = if result_samples.is_empty() {
+            0.0
+        } else {
+            ewma_val
+        };
 
         let samples_json: Vec<serde_json::Value> = result_samples
             .iter()
             .map(|s| {
-                let stage_str = stage
-                    .map(|st| st.to_string())
-                    .unwrap_or_else(|| {
-                        // Derive stage from sample id: last segment before ts/seq is stage
-                        // id format: namespace::metric::stage::ts::seq
-                        s.id.split("::").nth(2).unwrap_or("").to_string()
-                    });
+                let stage_str = stage.map(|st| st.to_string()).unwrap_or_else(|| {
+                    // Derive stage from sample id: last segment before ts/seq is stage
+                    // id format: namespace::metric::stage::ts::seq
+                    s.id.split("::").nth(2).unwrap_or("").to_string()
+                });
                 serde_json::json!({
                     "id": s.id,
                     "seq": s.seq,
@@ -569,7 +586,11 @@ mod tests {
         });
         for i in 0..5 {
             store.push(
-                ("test".to_string(), MetricKind::AccessCount, "search".to_string()),
+                (
+                    "test".to_string(),
+                    MetricKind::AccessCount,
+                    "search".to_string(),
+                ),
                 Sample {
                     id: String::new(),
                     seq: 0,
@@ -579,7 +600,13 @@ mod tests {
                 },
             );
         }
-        let agg = store.aggregate(&("test".to_string(), MetricKind::AccessCount, "search".to_string())).unwrap();
+        let agg = store
+            .aggregate(&(
+                "test".to_string(),
+                MetricKind::AccessCount,
+                "search".to_string(),
+            ))
+            .unwrap();
         assert_eq!(agg.count, 3);
         assert_eq!(agg.sum, 3.0 + 4.0 + 5.0);
         assert!((agg.min - 3.0).abs() < 1e-6);
@@ -589,7 +616,11 @@ mod tests {
     #[test]
     fn rolling_aggregate_correctness() {
         let store = TimeSeriesStore::default();
-        let key = ("ns".to_string(), MetricKind::EnrichmentLatencyMs, "embed".to_string());
+        let key = (
+            "ns".to_string(),
+            MetricKind::EnrichmentLatencyMs,
+            "embed".to_string(),
+        );
         store.push(
             key.clone(),
             Sample {
@@ -621,7 +652,11 @@ mod tests {
     #[test]
     fn range_filter_and_dedup() {
         let store = TimeSeriesStore::default();
-        let key = ("r".to_string(), MetricKind::RetrievalDistance, "search".to_string());
+        let key = (
+            "r".to_string(),
+            MetricKind::RetrievalDistance,
+            "search".to_string(),
+        );
         store.push(
             key.clone(),
             Sample {
@@ -642,15 +677,13 @@ mod tests {
                 labels: BTreeMap::new(),
             },
         );
-        let db = vec![
-            Sample {
-                id: "a::retrieval_distance::search::100::1".to_string(),
-                seq: 1,
-                ts: 100,
-                value: 1.5,
-                labels: BTreeMap::new(),
-            },
-        ];
+        let db = vec![Sample {
+            id: "a::retrieval_distance::search::100::1".to_string(),
+            seq: 1,
+            ts: 100,
+            value: 1.5,
+            labels: BTreeMap::new(),
+        }];
         let samples = store.range(&key, 150, 250, &db);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].ts, 200);
@@ -666,7 +699,11 @@ mod tests {
         });
         let store = TimeSeriesStore::new(SeriesConfig::default()).with_anomaly_callback(cb);
         store.push(
-            ("cb".to_string(), MetricKind::MemoryCount, "housekeeping".to_string()),
+            (
+                "cb".to_string(),
+                MetricKind::MemoryCount,
+                "housekeeping".to_string(),
+            ),
             Sample {
                 id: String::new(),
                 seq: 0,
@@ -714,7 +751,11 @@ mod tests {
     fn determinism_identical_samples() {
         let s1 = TimeSeriesStore::default();
         let s2 = TimeSeriesStore::default();
-        let key = ("d".to_string(), MetricKind::IngestLatencyMs, "upsert".to_string());
+        let key = (
+            "d".to_string(),
+            MetricKind::IngestLatencyMs,
+            "upsert".to_string(),
+        );
         for _ in 0..3 {
             s1.push(
                 key.clone(),
@@ -740,8 +781,22 @@ mod tests {
         let agg1 = s1.aggregate(&key).unwrap();
         let agg2 = s2.aggregate(&key).unwrap();
         assert_eq!(agg1, agg2);
-        let q1 = s1.query_metrics("d", MetricKind::IngestLatencyMs, Some("upsert"), Some(0), Some(100), &[]);
-        let q2 = s2.query_metrics("d", MetricKind::IngestLatencyMs, Some("upsert"), Some(0), Some(100), &[]);
+        let q1 = s1.query_metrics(
+            "d",
+            MetricKind::IngestLatencyMs,
+            Some("upsert"),
+            Some(0),
+            Some(100),
+            &[],
+        );
+        let q2 = s2.query_metrics(
+            "d",
+            MetricKind::IngestLatencyMs,
+            Some("upsert"),
+            Some(0),
+            Some(100),
+            &[],
+        );
         assert_eq!(q1, q2);
     }
 
@@ -858,7 +913,11 @@ mod tests {
         ];
         let out = store.query_metrics("alpha", MetricKind::MemoryCount, Some("s"), None, None, &db);
         let samples = out["samples"].as_array().expect("samples array");
-        assert_eq!(samples.len(), 1, "foreign-namespace DB sample must be filtered out");
+        assert_eq!(
+            samples.len(),
+            1,
+            "foreign-namespace DB sample must be filtered out"
+        );
         assert_eq!(samples[0]["id"], "alpha::memory_count::s::50::2");
         assert!(out["aggregate"]["sum"].as_f64().unwrap() - 2.0 < 1e-6);
     }
@@ -941,10 +1000,7 @@ mod tests {
         // other stage but still drops the foreign metric and the look-alike.
         let sweep = store.query_metrics("alpha", MetricKind::MemoryCount, None, None, None, &db);
         let swept = sweep["samples"].as_array().expect("samples array");
-        let swept_ids: Vec<&str> = swept
-            .iter()
-            .filter_map(|s| s["id"].as_str())
-            .collect();
+        let swept_ids: Vec<&str> = swept.iter().filter_map(|s| s["id"].as_str()).collect();
         assert_eq!(
             swept_ids,
             vec![

@@ -186,6 +186,14 @@ impl MeshOutbox {
         {
             return None;
         }
+        if payload.memory_type == "action_receipt"
+            && !crate::formal_kernel::is_action_memory_shareable(
+                crate::formal_kernel::ActionMemoryKind::ActionReceipt,
+                true,
+            )
+        {
+            return None;
+        }
         if !is_shareable_memory_type(&payload.memory_type) {
             return None;
         }
@@ -567,7 +575,11 @@ mod tests {
     /// and versioned-derived data (F4).
     #[tokio::test]
     async fn a_derived_row_is_not_captured_in_any_marker_shape() {
-        for derived in [serde_json::json!("true"), serde_json::json!(1), serde_json::json!(true)] {
+        for derived in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+        ] {
             let dir = scratch("derived");
             let outbox_dir = dir.join("mesh");
             let wake = Arc::new(Notify::new());
@@ -579,7 +591,10 @@ mod tests {
                     "ns",
                     &id,
                     vec![0.0; TEST_DIMENSIONS],
-                    payload("rule", serde_json::json!({ "eligibility": "shareable", "derived": derived })),
+                    payload(
+                        "rule",
+                        serde_json::json!({ "eligibility": "shareable", "derived": derived }),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -630,7 +645,10 @@ impl MeshOutbox {
     ) -> Result<usize, String> {
         let mut re_emitted = 0usize;
         for ns in namespaces {
-            let results = store.list(ns, None, None).await.map_err(|e| format!("{}", e))?;
+            let results = store
+                .list(ns, None, None)
+                .await
+                .map_err(|e| format!("{}", e))?;
             for sr in results {
                 let payload = &sr.payload;
                 // Only shareable types.
@@ -638,7 +656,9 @@ impl MeshOutbox {
                     continue;
                 }
                 // Structural rows are strictly local.
-                if payload.user_id == "auto-ingestor" || sr.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                if payload.user_id == "auto-ingestor"
+                    || sr.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                {
                     continue;
                 }
                 // Derived artifacts (KGE vectors, community labels, inferred
@@ -648,13 +668,28 @@ impl MeshOutbox {
                 }
                 // Eligibility gate (worker also re-checks, but skip early).
                 // Default is private; only shareable records are published.
-                if payload.metadata.get("eligibility").and_then(|v| v.as_str()) != Some("shareable") {
+                if payload.metadata.get("eligibility").and_then(|v| v.as_str()) != Some("shareable")
+                {
                     continue;
                 }
 
-                // Check if mesh file exists.
-                let subdir = if payload.memory_type == "procedure" { "procedures" } else { "memories" };
-                let mesh_file = mesh_root.join(ns).join(subdir).join(format!("{}.json", sr.id));
+                // Check if mesh file exists (supporting UUIDv5 mapping for deterministic taxonomy IDs).
+                let subdir = if payload.memory_type == "procedure" {
+                    "procedures"
+                } else {
+                    "memories"
+                };
+                let mesh_id = crate::synaptic_mesh::worker::parse_or_derive_mesh_uuid(
+                    ns,
+                    &payload.memory_type,
+                    &sr.id,
+                )
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| sr.id.clone());
+                let mesh_file = mesh_root
+                    .join(ns)
+                    .join(subdir)
+                    .join(format!("{mesh_id}.json"));
                 if mesh_file.exists() {
                     continue;
                 }
@@ -672,7 +707,7 @@ impl MeshOutbox {
                     ts: chrono::Utc::now().timestamp(),
                     epoch,
                 };
-                outbox.append(&entry).map_err(|e| format!("{}", e))?;
+                outbox.append(&entry).map_err(|e| e.to_string())?;
                 re_emitted += 1;
             }
         }

@@ -72,7 +72,6 @@ pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceId
     let root_canonical = canonical(root);
     let repo_id = git_output(root, &["remote", "get-url", "origin"])
         .unwrap_or_else(|| root_canonical.clone());
-    let checkout_id = root_canonical.clone();
     // Linked worktrees share one common checkout: `--git-common-dir` points
     // every worktree at the main repository's git dir, so they agree on
     // `checkout_id` while `worktree_id` keeps them distinct. The path git
@@ -90,7 +89,8 @@ pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceId
         })
         .unwrap_or_else(|| root_canonical.clone());
     let worktree_id = root_canonical;
-    let revision = git_output(root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let revision =
+        git_output(root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = git_output(root, &["status", "--porcelain"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
@@ -148,5 +148,3 @@ mod tests {
         assert_eq!(id.relative_path, "src/lib.rs");
     }
 }
-
-

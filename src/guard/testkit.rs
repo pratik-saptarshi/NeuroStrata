@@ -36,6 +36,8 @@ pub struct MockStore {
     fail_next_upsert_in_namespace: Mutex<Option<String>>,
     /// Toggle to make search/search_with_domain return an error.
     search_fails: Mutex<bool>,
+    /// Toggle to make `get` return an error.
+    get_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
     incremented_ids: Mutex<Vec<(String, String)>>,
     /// Track every batched increment call as (namespace, ids), in call order.
@@ -49,6 +51,7 @@ impl MockStore {
             fail_upsert_containing: Mutex::new(None),
             fail_next_upsert_in_namespace: Mutex::new(None),
             search_fails: Mutex::new(false),
+            get_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
             batch_calls: Mutex::new(Vec::new()),
         }
@@ -104,6 +107,11 @@ impl MockStore {
             .fail_next_upsert_in_namespace
             .lock()
             .expect("mock store lock") = namespace;
+    }
+
+    /// Configure whether `get` should fail, as a store read error would.
+    pub(crate) fn set_get_fails(&self, fails: bool) {
+        *self.get_fails.lock().expect("mock store lock") = fails;
     }
 }
 
@@ -200,15 +208,14 @@ impl VectorStore for MockStore {
 
     async fn search_with_domain(
         &self,
-        namespace: &str,
-        _vector: Vec<f32>,
-        limit: usize,
-        _include_tasks: bool,
-        _include_archived: bool,
-        domains: &[String],
-        _query_text: Option<&str>,
-        _exact: bool,
+        params: crate::traits::SearchWithDomainParams<'_>,
     ) -> Result<DomainSearchOutcome> {
+        let crate::traits::SearchWithDomainParams {
+            namespace,
+            limit,
+            domains,
+            ..
+        } = params;
         if *self.search_fails.lock().expect("mock store lock") {
             return Err(anyhow::anyhow!(
                 "MockStore search_with_domain configured to fail"
@@ -390,20 +397,29 @@ impl VectorStore for MockStore {
         Ok(0)
     }
 
-
     async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> Result<usize> {
         Ok(0)
     }
 
-    async fn list(&self, namespace: &str, user_id: Option<&str>, _memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+    async fn list(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()
             .filter(|r| r.namespace == namespace)
             .filter(|r| user_id.map(|u| r.payload.user_id == u).unwrap_or(true))
+            .filter(|r| {
+                memory_type
+                    .map(|mt| r.payload.memory_type == mt)
+                    .unwrap_or(true)
+            })
             .map(|r| SearchResult {
                 id: r.id.clone(),
-                score: 1.0,
+                score: 0.0,
                 payload: r.payload.clone(),
                 evidence: None,
             })
@@ -411,6 +427,9 @@ impl VectorStore for MockStore {
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
+        if *self.get_fails.lock().expect("mock store lock") {
+            return Err(anyhow::anyhow!("MockStore get configured to fail"));
+        }
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()

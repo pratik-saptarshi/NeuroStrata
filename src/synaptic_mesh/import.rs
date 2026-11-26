@@ -44,9 +44,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::conflict::{self, ConflictKind};
+
+use crate::formal_kernel::{evaluate_import_precheck, KernelImportPrecheck};
+
 use super::manifest::Trust;
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, RdfBlock, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
 use super::storage::{remote_refs_present, run, run_ok, MeshStorage};
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
@@ -55,10 +58,18 @@ use crate::traits::{Embedder, MemoryPayload, VectorStore};
 pub const IMPORT_CURSOR_SCHEMA_VERSION: &str = "synaptic-mesh-import-cursor/v1";
 
 /// Memory types a mesh record may carry for it to be applied (the v1
-/// shareable set, spec §"Sharing boundary"). `structural` records are
-/// project-local AST nodes and never travel; anything unknown (future
-/// vocabulary) is rejected at import (hard error), never applied, never crash.
-const SHAREABLE_MEMORY_TYPES: [&str; 3] = ["rule", "fact", "procedure"];
+/// shareable set, spec §"Sharing boundary", plus opt-in `action_type`
+/// definitions). `action_receipt` and `structural` records are strictly
+/// node-local and never travel; anything unknown (future vocabulary) is
+/// rejected at import (hard error), never applied, never crash.
+const SHAREABLE_MEMORY_TYPES: [&str; 6] = [
+    "rule",
+    "fact",
+    "procedure",
+    "action_type",
+    "thesis",
+    "concept",
+];
 
 /// Runtime procedure counters are strictly local (spec §"Record format":
 /// "they never leave the node"). A shared record carrying ANY of these keys
@@ -313,7 +324,6 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
     out
 }
 
-
 /// The reusable innards: diff the committed content against the accepted
 /// cursor, validate every candidate, apply the survivors through the store
 /// traits, then advance the cursor. The caller must have completed its fetch
@@ -441,18 +451,18 @@ pub async fn apply_changed(
         if let Some(stream) = load_record_patch(&root.join(&rel)) {
             record.patch = Some(stream);
         }
-        match apply_one(
+        match apply_one(ApplyOneParams {
             root,
-            &mesh_id,
+            mesh_id: &mesh_id,
             record,
-            store.clone(),
-            emb.clone(),
+            store: store.clone(),
+            emb: emb.clone(),
             concurrent,
             import_trust,
             head_signature,
-            &signature_disposition,
-            false,
-        )
+            signature_disposition: &signature_disposition,
+            from_bundle: false,
+        })
         .await
         {
             Disposition::Applied => {
@@ -516,18 +526,18 @@ pub async fn apply_changed(
             Some(r) => r,
             None => continue,
         };
-        match apply_one(
+        match apply_one(ApplyOneParams {
             root,
-            &mesh_id,
+            mesh_id: &mesh_id,
             record,
-            store.clone(),
-            emb.clone(),
+            store: store.clone(),
+            emb: emb.clone(),
             concurrent,
             import_trust,
             head_signature,
-            &signature_disposition,
-            true,
-        )
+            signature_disposition: &signature_disposition,
+            from_bundle: true,
+        })
         .await
         {
             Disposition::Applied => {
@@ -663,7 +673,10 @@ pub async fn changed_paths(
         // commit (rewritten or divergent history falls through to the
         // validated full-tree reconciliation; nothing is blindly applied).
         let approach = format!("{cursor}^{{commit}}");
-        if run_ok(mesh_root, &["cat-file", "-e", &approach]).await.is_ok() {
+        if run_ok(mesh_root, &["cat-file", "-e", &approach])
+            .await
+            .is_ok()
+        {
             if let Ok(out) = run_ok(
                 mesh_root,
                 &["diff", "--name-only", "-z", &format!("{cursor}..{head}")],
@@ -677,7 +690,6 @@ pub async fn changed_paths(
     Ok((tracked_paths(mesh_root).await?, true))
 }
 
-
 /// Committed content via the index. apply_changed always runs after a
 /// ff-merge (index == HEAD) or against a clean checkout, so the index never
 /// outlives what is committed here.
@@ -685,7 +697,6 @@ async fn tracked_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
     let out = run_ok(mesh_root, &["ls-files", "-z"]).await?;
     Ok(split_nul(&out.stdout))
 }
-
 
 fn split_nul(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
@@ -852,9 +863,7 @@ fn validate_parsed_record(
     // beside, not instead of, the served-namespace parity check below: a
     // peer's namespace must be a legal name before it matters whether this
     // node serves it.
-    if let Err(e) = crate::domain::validate_namespace(&record.namespace) {
-        return Err(e);
-    }
+    crate::domain::validate_namespace(&record.namespace)?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
@@ -903,7 +912,9 @@ fn validate_parsed_record(
     // exactly as it arrived — no metadata mutation before verify_record_signature.
     let mut diagnostic = None;
     if let Some(ref rdf_block) = record.rdf {
-        if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
+        if let Err(violations) =
+            crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block)
+        {
             // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
             // applied. The violation is carried out-of-band for later attachment.
             tracing::warn!(
@@ -956,7 +967,6 @@ fn validate_parsed_record(
     Ok((record, diagnostic))
 }
 
-
 /// The epoch gate (spec §"Deletion & erasure" / §"Import validation"): a
 /// record's `origin_mesh_epoch` is compared against the mesh manifest's
 /// current `epoch` at apply time.
@@ -969,13 +979,14 @@ fn validate_parsed_record(
 ///   future, so a validator refuses what it does not understand rather than
 ///   silently accepting it.
 pub fn epoch_gate(candidate_epoch: u32, manifest_epoch: u32) -> Result<(), String> {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    match candidate_epoch.cmp(&manifest_epoch) {
-        Equal => Ok(()),
-        Less => Err(format!(
+    use crate::formal_kernel::epoch_gate_decision;
+    use crate::formal_kernel::KernelEpochDecision;
+    match epoch_gate_decision(candidate_epoch, manifest_epoch) {
+        KernelEpochDecision::Apply => Ok(()),
+        KernelEpochDecision::QuarantineOld => Err(format!(
             "old-epoch record (origin_mesh_epoch {candidate_epoch} < manifest epoch {manifest_epoch}); quarantined, not replayed"
         )),
-        Greater => Err(format!(
+        KernelEpochDecision::RefuseFuture => Err(format!(
             "future-epoch record (origin_mesh_epoch {candidate_epoch} > manifest epoch {manifest_epoch}); refused, not understood"
         )),
     }
@@ -1166,106 +1177,138 @@ fn classify_merge(
     cand: &MeshRecord,
     concurrent: bool,
 ) -> MergeDecision {
-    use LifecycleState::*;
     let cand_state = cand.lifecycle.state;
     let cand_sup = cand.lifecycle.superseded_by;
     let content_changed = local_content != content_text(cand);
+    // Derive the boolean the kernel expects: same superseded-by target.
+    let same_superseded_by = local_superseded_by == cand_sup;
 
-    // Tombstone is terminal: deletion wins over every stale update, and the
-    // deleted content is never re-served nor retained in a conflict artifact.
-    if local_state.is_terminal() {
-        return match cand_state {
-            Tombstoned => MergeDecision::Skip,
-            _ => {
-                MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
-            }
-        };
-    }
+    // Pure kernel decision (zero external dependencies).
+    let kernel = crate::formal_kernel::classify_merge_decision(
+        local_state.to_kernel(),
+        cand_state.to_kernel(),
+        same_superseded_by,
+        content_changed,
+        concurrent,
+    );
 
-    // A retired (superseded) id never reactivates — can_transition_to refuses
-    // every superseded -> live hop. The merge table's supersede rows branch
-    // from this one gate.
-    if local_state == Superseded {
-        return match cand_state {
-            // Tombstone wins even over a retired id.
-            Tombstoned => MergeDecision::Apply,
-            Superseded => {
-                if cand_sup != local_superseded_by {
-                    MergeDecision::Conflict("two different replacements")
-                } else {
-                    MergeDecision::Skip
-                }
-            }
-            // supersede + content edit: replacement authoritative; the losing
-            // edit is preserved as a new record (handled by the caller).
-            Active if content_changed => MergeDecision::SupersedeWinsPreserveEdit,
-            // restore (or archive) of a retired id is refused, never stomped.
-            _ => MergeDecision::Refuse("superseded; rejected stale restore".to_string()),
-        };
-    }
-
-    // Incoming tombstone always wins over a live row.
-    if cand_state == Tombstoned {
-        return MergeDecision::Apply;
-    }
-
-    // Live -> superseded is always legal.
-    if cand_state == Superseded {
-        // supersede + content edit (reverse direction): the incoming
-        // supersession is authoritative, the local edit is preserved as a new
-        // record.
-        if local_state == Active && content_changed {
-            return MergeDecision::SupersedeWinsPreserveEdit;
+    // Map the 10 KernelMergeDecision variants back to the 6 MergeDecision
+    // variants with their exact existing reason strings.
+    match kernel {
+        crate::formal_kernel::KernelMergeDecision::Apply => MergeDecision::Apply,
+        crate::formal_kernel::KernelMergeDecision::ApplyCombinationArchiveEdit => {
+            MergeDecision::ApplyCombination("archive + edit; edited content stays archived")
         }
-        return MergeDecision::Apply;
-    }
-
-    // Both live (active/archived): gate the state change through the spec
-    // transition table, then overlay the merge-table combinations.
-    if cand_state != local_state {
-        // A legal transition gate in at least one direction is the
-        // precondition for ANY combination overlay — `archive + edit`
-        // only ever pairs Active with Archived, both of which connect
-        // through the state machine. When neither direction is legal the
-        // pair is a candidate-state the gate cannot accept at all
-        // (e.g. two live states a future vocabulary might introduce), and
-        // the merge table must refuse before decorating the decision.
-        let any_direction_legal = local_state.can_transition_to(cand_state)
-            || cand_state.can_transition_to(local_state);
-        if content_changed {
-            return if any_direction_legal {
-                MergeDecision::ApplyCombination(
-                    "archive + edit; edited content stays archived",
-                )
-            } else {
-                MergeDecision::Refuse(format!(
-                    "illegal transition {local_state} -> {cand_state}"
-                ))
-            };
+        crate::formal_kernel::KernelMergeDecision::Skip => MergeDecision::Skip,
+        crate::formal_kernel::KernelMergeDecision::RefuseTombstoneWins => {
+            MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
         }
-        // Same content, one side archived and the other restored: the spec's
-        // "restore + archive" pair — unresolved only when concurrent.
-        if concurrent {
-            return MergeDecision::Conflict("restore + archive");
+        crate::formal_kernel::KernelMergeDecision::RefuseStaleRestore => {
+            MergeDecision::Refuse("superseded; rejected stale restore".to_string())
         }
-        // The single gate every applied lifecycle change passes through.
-        return if local_state.can_transition_to(cand_state) {
-            MergeDecision::Apply
-        } else {
+        crate::formal_kernel::KernelMergeDecision::RefuseIllegalTransition => {
             MergeDecision::Refuse(format!("illegal transition {local_state} -> {cand_state}"))
-        };
-    }
-
-    // Same live state: a content change is a forward edit (apply) or, when
-    // the two versions diverged, an incompatible-edit conflict.
-    if content_changed {
-        return if concurrent {
+        }
+        crate::formal_kernel::KernelMergeDecision::ConflictTwoReplacements => {
+            MergeDecision::Conflict("two different replacements")
+        }
+        crate::formal_kernel::KernelMergeDecision::ConflictRestoreArchive => {
+            MergeDecision::Conflict("restore + archive")
+        }
+        crate::formal_kernel::KernelMergeDecision::ConflictIncompatibleEdits => {
             MergeDecision::Conflict("incompatible content edits")
-        } else {
-            MergeDecision::Apply
-        };
+        }
+        crate::formal_kernel::KernelMergeDecision::SupersedeWinsPreserveEdit => {
+            MergeDecision::SupersedeWinsPreserveEdit
+        }
     }
-    MergeDecision::Skip
+}
+
+/// Canonical merge-decision tag names mirroring the Lean 4 truth table
+/// (`proofs/NeuroStrata`): the single canonical string each [`MergeDecision`]
+/// outcome maps to, consumed by the Rust↔Lean parity suite (task
+/// `neurostrata-ngd9`).
+const PARITY_REPLACED_BY_A: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
+const PARITY_REPLACED_BY_B: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0002);
+
+/// Classify one synthetic `(local, candidate)` merge pair over the parity
+/// inputs and return the canonical Lean-parity tag for the decision.
+///
+/// `same_superseded_by` / `content_changed` / `concurrent` are the finite
+/// parity dimensions (replacement identity, content divergence, genuine
+/// divergence); the pair is evaluated through the real [`classify_merge`] so
+/// the tag can never drift from the production table.
+pub fn classify_merge_parity_tag(
+    local_state: LifecycleState,
+    cand_state: LifecycleState,
+    same_superseded_by: bool,
+    content_changed: bool,
+    concurrent: bool,
+) -> &'static str {
+    let cand_text = if content_changed { "edited" } else { "base" };
+    let cand = MeshRecord {
+        schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+        id: Uuid::new_v4(),
+        namespace: "probe".to_string(),
+        memory_type: "rule".to_string(),
+        lifecycle: Lifecycle {
+            state: cand_state,
+            created_at: chrono::Utc::now(),
+            created_by: "node-peer-1".to_string(),
+            superseded_by: if cand_state == LifecycleState::Superseded {
+                Some(PARITY_REPLACED_BY_A)
+            } else {
+                None
+            },
+            archived_at: None,
+            tombstoned_at: None,
+        },
+        content: json!({ "text": cand_text }),
+        metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+        rdf: None,
+        relationships: vec![],
+        update_id: Uuid::new_v4(),
+        origin_mesh_epoch: 1,
+        trust: Trust::Untrusted,
+        signature: None,
+        signer_did: None,
+        public_key: None,
+        patch: None,
+    };
+    let local_superseded_by = if local_state == LifecycleState::Superseded {
+        Some(if same_superseded_by {
+            PARITY_REPLACED_BY_A
+        } else {
+            PARITY_REPLACED_BY_B
+        })
+    } else {
+        None
+    };
+    let decision = classify_merge(local_state, local_superseded_by, "base", &cand, concurrent);
+    match decision {
+        MergeDecision::Apply => "apply",
+        MergeDecision::ApplyCombination(_) => "apply_combination_archive_edit",
+        MergeDecision::Skip => "skip",
+        MergeDecision::Refuse(reason) => {
+            if reason.contains("tombstone") {
+                "refuse_tombstone_wins"
+            } else if reason.contains("superseded") {
+                "refuse_stale_restore"
+            } else {
+                "refuse_illegal_transition"
+            }
+        }
+        MergeDecision::Conflict(reason) => {
+            if reason == "two different replacements" {
+                "conflict_two_replacements"
+            } else if reason == "restore + archive" {
+                "conflict_restore_archive"
+            } else {
+                "conflict_incompatible_edits"
+            }
+        }
+        MergeDecision::SupersedeWinsPreserveEdit => "supersede_wins_preserve_edit",
+    }
 }
 
 /// The current lifecycle state of a mesh-owned row, read from its
@@ -1359,7 +1402,6 @@ async fn head_commit_signature_state(root: &Path) -> &'static str {
         Err(_) => "unverifiable",
     }
 }
-
 
 /// Merge the 1.8.0 read-side conventions (`archived: true`,
 /// `superseded_by`) and the mesh terminal marker (`tombstoned: true`) onto a
@@ -1494,21 +1536,37 @@ fn load_record_patch(record_path: &Path) -> Option<crate::streaming::Stream> {
 /// this record's signature; it keys the provenance stamp in
 /// `apply_effective`, so a signature that verified only over the RDF
 /// projection is never stamped as full-record verified.
-async fn apply_one(
-    root: &Path,
-    mesh_id: &str,
-    record: MeshRecord,
-    store: std::sync::Arc<dyn VectorStore>,
-    emb: std::sync::Arc<dyn Embedder>,
-    concurrent: bool,
-    import_trust: Trust,
-    head_signature: &str,
-    signature_disposition: &SignatureDisposition,
+/// Parameters for `apply_one`, in the function's original parameter
+/// order.
+struct ApplyOneParams<'a> {
+    pub root: &'a Path,
+    pub mesh_id: &'a str,
+    pub record: MeshRecord,
+    pub store: std::sync::Arc<dyn VectorStore>,
+    pub emb: std::sync::Arc<dyn Embedder>,
+    pub concurrent: bool,
+    pub import_trust: Trust,
+    pub head_signature: &'a str,
+    pub signature_disposition: &'a SignatureDisposition,
     // Route flag for the tracked-stale-bundle guard (issue #44): `true`
     // only for records that arrived through the bundle-only loop, never
     // for `.json` candidates.
-    from_bundle: bool,
-) -> Disposition {
+    pub from_bundle: bool,
+}
+
+async fn apply_one(params: ApplyOneParams<'_>) -> Disposition {
+    let ApplyOneParams {
+        root,
+        mesh_id,
+        record,
+        store,
+        emb,
+        concurrent,
+        import_trust,
+        head_signature,
+        signature_disposition,
+        from_bundle,
+    } = params;
     let id = record.id.to_string();
     let namespace = record.namespace.clone();
     if let Err(e) = store.init(&namespace).await {
@@ -1523,161 +1581,165 @@ async fn apply_one(
         Err(e) => return Disposition::Ignored(format!("store read failed for {id}: {e}")),
     };
 
+    let existing_update_id = existing
+        .as_ref()
+        .and_then(|(_, payload)| mesh_update_id_of(&payload.metadata));
+    let same_update_id = existing_update_id.as_deref() == Some(&record.update_id.to_string());
+
+    match evaluate_import_precheck(
+        existing.is_some(),
+        existing_update_id.is_some(),
+        same_update_id,
+    ) {
+        KernelImportPrecheck::SkipSameUpdateId => return Disposition::Skipped,
+        KernelImportPrecheck::RefusePrivateSovereign => {
+            return Disposition::Ignored(format!(
+                "private memory owns id {id} — never overwritten, never deleted"
+            ));
+        }
+        KernelImportPrecheck::FreshInsert => {}
+        KernelImportPrecheck::ProceedMeshMerge => {}
+    }
+
+    // Mesh-owned row at another revision: gate the transition.
     if let Some((vector, payload)) = existing {
-        match mesh_update_id_of(&payload.metadata) {
-            Some(accepted) if accepted == record.update_id.to_string() => {
-                return Disposition::Skipped;
-            }
-            None => {
-                return Disposition::Ignored(format!(
-                    "private memory owns id {id} — never overwritten, never deleted"
-                ));
-            }
-            // Mesh-owned row at another revision: gate the transition.
-            Some(accepted) => {
-                let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata)
-                else {
-                    return Disposition::Ignored(format!(
-                        "mesh row {id} has unreadable lifecycle provenance"
-                    ));
-                };
-                // Tracked-stale-bundle guard (issue #44, Gate G2 option
-                // (a)): a bundle-only candidate on a DIFF pass whose
-                // UUIDv7 update_id predates the accepted revision would
-                // otherwise pass `classify_merge` as a plain forward edit
-                // and silently roll the live row back. The guard is
-                // deliberately narrow — bundle route only, diff pass
-                // only (full-tree passes stay concurrent/conflicted),
-                // both sides live and in the SAME state (transitions and
-                // combinations are untouched), content actually
-                // differing, and both update_ids UUIDv7 with the
-                // candidate STRICTLY older (millisecond comparison;
-                // ties and any non-v7 id leave it inert).
-                if from_bundle && !concurrent {
-                    let both_live_same_state = matches!(
-                        local_state,
-                        LifecycleState::Active | LifecycleState::Archived
-                    ) && record.lifecycle.state == local_state;
-                    if both_live_same_state && payload.content != content_text(&record) {
-                        let accepted_v7 = Uuid::parse_str(&accepted)
-                            .ok()
-                            .and_then(|u| update_id_v7_millis(&u));
-                        let candidate_v7 = update_id_v7_millis(&record.update_id);
-                        if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7)
-                        {
-                            if candidate_ts < accepted_ts {
-                                return Disposition::Ignored(format!(
+        let accepted = existing_update_id.as_deref().unwrap();
+        let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata) else {
+            return Disposition::Ignored(format!(
+                "mesh row {id} has unreadable lifecycle provenance"
+            ));
+        };
+        // Tracked-stale-bundle guard (issue #44, Gate G2 option
+        // (a)): a bundle-only candidate on a DIFF pass whose
+        // UUIDv7 update_id predates the accepted revision would
+        // otherwise pass `classify_merge` as a plain forward edit
+        // and silently roll the live row back. The guard is
+        // deliberately narrow — bundle route only, diff pass
+        // only (full-tree passes stay concurrent/conflicted),
+        // both sides live and in the SAME state (transitions and
+        // combinations are untouched), content actually
+        // differing, and both update_ids UUIDv7 with the
+        // candidate STRICTLY older (millisecond comparison;
+        // ties and any non-v7 id leave it inert).
+        if from_bundle && !concurrent {
+            let both_live_same_state = matches!(
+                local_state,
+                LifecycleState::Active | LifecycleState::Archived
+            ) && record.lifecycle.state == local_state;
+            if both_live_same_state && payload.content != content_text(&record) {
+                let accepted_v7 = Uuid::parse_str(&accepted)
+                    .ok()
+                    .and_then(|u| update_id_v7_millis(&u));
+                let candidate_v7 = update_id_v7_millis(&record.update_id);
+                if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7) {
+                    if candidate_ts < accepted_ts {
+                        return Disposition::Ignored(format!(
                                     "{id}: stale bundle revision refused — candidate update_id {} predates accepted {accepted}",
                                     record.update_id
                                 ));
-                            }
-                        }
                     }
-                }
-                match classify_merge(
-                    local_state,
-                    local_superseded_by,
-                    &payload.content,
-                    &record,
-                    concurrent,
-                ) {
-                    MergeDecision::Skip => return Disposition::Skipped,
-                    MergeDecision::Refuse(reason) => {
-                        return Disposition::Ignored(format!("{id}: {reason}"));
-                    }
-                    MergeDecision::Conflict(reason) => {
-                        // Preserve the candidate, register the overlay, and
-                        // annotate the EXISTING row (content untouched) with
-                        // the suppression marker.
-                        if let Err(e) = conflict::register_conflict(
-                            root,
-                            &namespace,
-                            &id,
-                            &record.update_id.to_string(),
-                            reason,
-                            ConflictKind::Unresolved,
-                            &record,
-                        ) {
-                            return Disposition::Ignored(format!(
-                                "conflict overlay write failed for {id}: {e}"
-                            ));
-                        }
-                        if let Err(e) =
-                            annotate_conflicting(&store, &namespace, &id, &vector, &payload, reason)
-                                .await
-                        {
-                            return Disposition::Ignored(format!(
-                                "conflict marker write failed for {id}: {e}"
-                            ));
-                        }
-                        return Disposition::Conflicted(id);
-                    }
-                    MergeDecision::SupersedeWinsPreserveEdit => {
-                        return preserve_superseded_edit(
-                            root,
-                            mesh_id,
-                            &id,
-                            &namespace,
-                            local_state,
-                            &payload,
-                            &record,
-                            store,
-                            emb,
-                            import_trust,
-                            head_signature,
-                            signature_disposition,
-                        )
-                        .await;
-                    }
-                    MergeDecision::ApplyCombination(reason) => {
-                        // Edited content stays archived. The edited content
-                        // is whichever side is ACTIVE (they edited; we
-                        // archived, or vice-versa).
-                        let edited = if local_state == LifecycleState::Archived {
-                            content_text(&record)
-                        } else {
-                            payload.content.clone()
-                        };
-                        return match apply_effective(
-                            root,
-                            mesh_id,
-                            &id,
-                            &namespace,
-                            &record,
-                            store,
-                            emb,
-                            ApplyShape::ArchivedCombination { edited },
-                            Some(import_trust),
-                            head_signature,
-                            signature_disposition,
-                        )
-                        .await
-                        {
-                            Disposition::Applied => {
-                                Disposition::AppliedCombination(reason.to_string())
-                            }
-                            other => other,
-                        };
-                    }
-                    MergeDecision::Apply => {}
                 }
             }
         }
+        match classify_merge(
+            local_state,
+            local_superseded_by,
+            &payload.content,
+            &record,
+            concurrent,
+        ) {
+            MergeDecision::Skip => return Disposition::Skipped,
+            MergeDecision::Refuse(reason) => {
+                return Disposition::Ignored(format!("{id}: {reason}"));
+            }
+            MergeDecision::Conflict(reason) => {
+                // Preserve the candidate, register the overlay, and
+                // annotate the EXISTING row (content untouched) with
+                // the suppression marker.
+                if let Err(e) = conflict::register_conflict(
+                    root,
+                    &namespace,
+                    &id,
+                    &record.update_id.to_string(),
+                    reason,
+                    ConflictKind::Unresolved,
+                    &record,
+                ) {
+                    return Disposition::Ignored(format!(
+                        "conflict overlay write failed for {id}: {e}"
+                    ));
+                }
+                if let Err(e) =
+                    annotate_conflicting(&store, &namespace, &id, &vector, &payload, reason).await
+                {
+                    return Disposition::Ignored(format!(
+                        "conflict marker write failed for {id}: {e}"
+                    ));
+                }
+                return Disposition::Conflicted(id);
+            }
+            MergeDecision::SupersedeWinsPreserveEdit => {
+                return preserve_superseded_edit(PreserveSupersededEditParams {
+                    root,
+                    mesh_id,
+                    id: &id,
+                    namespace: &namespace,
+                    local_state,
+                    local_payload: &payload,
+                    cand: &record,
+                    store,
+                    emb,
+                    import_trust,
+                    head_signature,
+                    signature_disposition,
+                })
+                .await;
+            }
+            MergeDecision::ApplyCombination(reason) => {
+                // Edited content stays archived. The edited content
+                // is whichever side is ACTIVE (they edited; we
+                // archived, or vice-versa).
+                let edited = if local_state == LifecycleState::Archived {
+                    content_text(&record)
+                } else {
+                    payload.content.clone()
+                };
+                return match apply_effective(ApplyEffectiveParams {
+                    root,
+                    mesh_id,
+                    id: &id,
+                    namespace: &namespace,
+                    record: &record,
+                    store,
+                    emb,
+                    shape: ApplyShape::ArchivedCombination { edited },
+                    trust_stamp: Some(import_trust),
+                    head_signature,
+                    signature_disposition,
+                })
+                .await
+                {
+                    Disposition::Applied => Disposition::AppliedCombination(reason.to_string()),
+                    other => other,
+                };
+            }
+            MergeDecision::Apply => {}
+        }
     }
 
-    apply_effective(
+    apply_effective(ApplyEffectiveParams {
         root,
         mesh_id,
-        &id,
-        &namespace,
-        &record,
+        id: &id,
+        namespace: &namespace,
+        record: &record,
         store,
         emb,
-        ApplyShape::AsCandidate,
-        Some(import_trust),
+        shape: ApplyShape::AsCandidate,
+        trust_stamp: Some(import_trust),
         head_signature,
         signature_disposition,
-    )
+    })
     .await
 }
 
@@ -1691,19 +1753,36 @@ async fn apply_one(
 /// the record's own trust key as the record builder set it — the
 /// preserved-edit path, whose builder is itself funnel code that has
 /// already decided the stamp. Non-procedure records are never stamped.
-async fn apply_effective(
-    root: &Path,
-    mesh_id: &str,
-    id: &str,
-    namespace: &str,
-    record: &MeshRecord,
-    store: std::sync::Arc<dyn VectorStore>,
-    emb: std::sync::Arc<dyn Embedder>,
-    shape: ApplyShape,
-    trust_stamp: Option<Trust>,
-    head_signature: &str,
-    signature_disposition: &SignatureDisposition,
-) -> Disposition {
+/// Parameters for `apply_effective`, in the function's original
+/// parameter order.
+struct ApplyEffectiveParams<'a> {
+    pub root: &'a Path,
+    pub mesh_id: &'a str,
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub record: &'a MeshRecord,
+    pub store: std::sync::Arc<dyn VectorStore>,
+    pub emb: std::sync::Arc<dyn Embedder>,
+    pub shape: ApplyShape,
+    pub trust_stamp: Option<Trust>,
+    pub head_signature: &'a str,
+    pub signature_disposition: &'a SignatureDisposition,
+}
+
+async fn apply_effective(params: ApplyEffectiveParams<'_>) -> Disposition {
+    let ApplyEffectiveParams {
+        root,
+        mesh_id,
+        id,
+        namespace,
+        record,
+        store,
+        emb,
+        shape,
+        trust_stamp,
+        head_signature,
+        signature_disposition,
+    } = params;
     // 54-B: only an as-candidate apply stores the record the candidate's
     // signature was verified over. An archived combination stores a
     // (content, state) pair that was never the subject of that
@@ -1856,10 +1935,12 @@ async fn apply_effective(
     // matching concept_iri. Idempotent on replay.
     let current_update_id = record.update_id.to_string();
     let already_imported = match store.get(namespace, id).await {
-        Ok(found) => found
-            .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
-            .as_deref()
-            == Some(current_update_id.as_str()),
+        Ok(found) => {
+            found
+                .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
+                .as_deref()
+                == Some(current_update_id.as_str())
+        }
         Err(e) => {
             tracing::warn!("[neurostrata:mesh] store read failed for {id}: {e}");
             false
@@ -1870,7 +1951,10 @@ async fn apply_effective(
         if let Some(concept_val) = metadata.get("concept_iri").cloned() {
             let iris: Vec<String> = match &concept_val {
                 Value::String(s) => vec![s.clone()],
-                Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                Value::Array(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
                 _ => vec![],
             };
             let rid = crate::registry::registry_row_id(namespace);
@@ -1878,9 +1962,7 @@ async fn apply_effective(
                 Ok(Some((_, rp))) => crate::registry::registry_domain_entries(&rp.metadata),
                 Ok(None) => vec![],
                 Err(e) => {
-                    tracing::warn!(
-                        "[neurostrata:mesh] registry row {rid} unreadable: {e}"
-                    );
+                    tracing::warn!("[neurostrata:mesh] registry row {rid} unreadable: {e}");
                     vec![]
                 }
             };
@@ -1890,7 +1972,9 @@ async fn apply_effective(
                     .iter()
                     .filter_map(|e| {
                         if e.get("concept_iri").and_then(|v| v.as_str()) == Some(iri.as_str()) {
-                            e.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string())
+                            e.get("slug")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
                         } else {
                             None
                         }
@@ -1907,7 +1991,8 @@ async fn apply_effective(
                         // ambiguous
                         tracing::warn!(
                             "[neurostrata:mesh] ambiguous concept_iri {} matches {} local domains",
-                            iri, n
+                            iri,
+                            n
                         );
                     }
                 }
@@ -1915,7 +2000,10 @@ async fn apply_effective(
             if !matched_slugs.is_empty() {
                 let mut existing: Vec<String> = match metadata.get("domain") {
                     Some(Value::String(s)) => vec![s.clone()],
-                    Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
                     _ => vec![],
                 };
                 for s in &matched_slugs {
@@ -1960,13 +2048,9 @@ async fn apply_effective(
     // Union the imported record's domain into the local registry (a cache).
     // A failure here is a warning, never a refusal: the row is already stored.
     if let Some(domain) = imported_domain {
-        if let Some(warning) = crate::registry::write_registry(
-            &store,
-            &emb,
-            namespace,
-            std::slice::from_ref(&domain),
-        )
-        .await
+        if let Some(warning) =
+            crate::registry::write_registry(&store, &emb, namespace, std::slice::from_ref(&domain))
+                .await
         {
             tracing::warn!(
                 "registry union failed for imported record {id} in {namespace}: {warning}"
@@ -1991,20 +2075,38 @@ async fn apply_effective(
 /// metadata and relationships. Fixed 2026-10-11 (slice-6b): the preserved
 /// record now carries the row's structured content, merged metadata and
 /// reconstructed relationships — see [`preserved_edit_record`].
-async fn preserve_superseded_edit(
-    root: &Path,
-    mesh_id: &str,
-    id: &str,
-    namespace: &str,
-    local_state: LifecycleState,
-    local_payload: &MemoryPayload,
-    cand: &MeshRecord,
-    store: std::sync::Arc<dyn VectorStore>,
-    emb: std::sync::Arc<dyn Embedder>,
-    import_trust: Trust,
-    head_signature: &str,
-    signature_disposition: &SignatureDisposition,
-) -> Disposition {
+/// Parameters for `preserve_superseded_edit`, in the function's
+/// original parameter order.
+struct PreserveSupersededEditParams<'a> {
+    pub root: &'a Path,
+    pub mesh_id: &'a str,
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub local_state: LifecycleState,
+    pub local_payload: &'a MemoryPayload,
+    pub cand: &'a MeshRecord,
+    pub store: std::sync::Arc<dyn VectorStore>,
+    pub emb: std::sync::Arc<dyn Embedder>,
+    pub import_trust: Trust,
+    pub head_signature: &'a str,
+    pub signature_disposition: &'a SignatureDisposition,
+}
+
+async fn preserve_superseded_edit(params: PreserveSupersededEditParams<'_>) -> Disposition {
+    let PreserveSupersededEditParams {
+        root,
+        mesh_id,
+        id,
+        namespace,
+        local_state,
+        local_payload,
+        cand,
+        store,
+        emb,
+        import_trust,
+        head_signature,
+        signature_disposition,
+    } = params;
     // Which side holds the edit, and must the incoming supersession apply?
     // `source_metadata` is the metadata the new record inherits from the
     // losing edit's side (candidate metadata for direction A, the existing
@@ -2037,19 +2139,19 @@ async fn preserve_superseded_edit(
         };
 
     if apply_supersession {
-        match apply_effective(
+        match apply_effective(ApplyEffectiveParams {
             root,
             mesh_id,
             id,
             namespace,
-            cand,
-            store.clone(),
-            emb.clone(),
-            ApplyShape::AsCandidate,
-            Some(import_trust),
+            record: cand,
+            store: store.clone(),
+            emb: emb.clone(),
+            shape: ApplyShape::AsCandidate,
+            trust_stamp: Some(import_trust),
             head_signature,
             signature_disposition,
-        )
+        })
         .await
         {
             Disposition::Applied => {}
@@ -2057,17 +2159,17 @@ async fn preserve_superseded_edit(
         }
     }
 
-    let new_record = preserved_edit_record(
+    let new_record = preserved_edit_record(PreservedEditRecordParams {
         namespace,
-        id,
+        original_id: id,
         content,
         memory_type,
         created_by,
         source_rels,
         source_metadata,
         import_trust,
-        cand.origin_mesh_epoch,
-    );
+        origin_mesh_epoch: cand.origin_mesh_epoch,
+    });
     let new_id = new_record.id.to_string();
     // No trust_stamp: `preserved_edit_record` is funnel code and has
     // already set the preserved record's stamp from `import_trust`
@@ -2075,19 +2177,19 @@ async fn preserve_superseded_edit(
     // stamping again here would only repeat the funnel's own decision.
     // The preserved record is built unsigned, so its signature
     // disposition is `Unsigned` and it earns no verification stamp.
-    apply_effective(
+    apply_effective(ApplyEffectiveParams {
         root,
         mesh_id,
-        &new_id,
+        id: &new_id,
         namespace,
-        &new_record,
+        record: &new_record,
         store,
         emb,
-        ApplyShape::AsCandidate,
-        None,
+        shape: ApplyShape::AsCandidate,
+        trust_stamp: None,
         head_signature,
-        &SignatureDisposition::Unsigned,
-    )
+        signature_disposition: &SignatureDisposition::Unsigned,
+    })
     .await
 }
 
@@ -2101,10 +2203,7 @@ fn local_origin(payload: &MemoryPayload) -> String {
     payload
         .metadata
         .get("mesh")
-        .and_then(|m| {
-            m.get("claimed_created_by")
-                .or_else(|| m.get("origin"))
-        })
+        .and_then(|m| m.get("claimed_created_by").or_else(|| m.get("origin")))
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
@@ -2165,17 +2264,32 @@ fn local_relationships(payload: &MemoryPayload) -> Vec<Relationship> {
 /// the edit carried survives. `import_trust` is the trust the stored row
 /// carries (defaulting to untrusted, honoring the manifest's
 /// `imported_procedures_trust` when it is configured differently).
-fn preserved_edit_record(
-    namespace: &str,
-    original_id: &str,
-    content: Value,
-    memory_type: String,
-    created_by: String,
-    source_rels: Vec<Relationship>,
-    source_metadata: Value,
-    import_trust: Trust,
-    origin_mesh_epoch: u32,
-) -> MeshRecord {
+/// Parameters for `preserved_edit_record`, in the function's original
+/// parameter order.
+struct PreservedEditRecordParams<'a> {
+    pub namespace: &'a str,
+    pub original_id: &'a str,
+    pub content: Value,
+    pub memory_type: String,
+    pub created_by: String,
+    pub source_rels: Vec<Relationship>,
+    pub source_metadata: Value,
+    pub import_trust: Trust,
+    pub origin_mesh_epoch: u32,
+}
+
+fn preserved_edit_record(params: PreservedEditRecordParams<'_>) -> MeshRecord {
+    let PreservedEditRecordParams {
+        namespace,
+        original_id,
+        content,
+        memory_type,
+        created_by,
+        source_rels,
+        source_metadata,
+        import_trust,
+        origin_mesh_epoch,
+    } = params;
     let mut rels = source_rels;
     if let Ok(original_id) = Uuid::parse_str(original_id) {
         rels.push(Relationship {
@@ -2218,39 +2332,48 @@ fn preserved_edit_record(
     // Curated metadata for RDF projection
     let eligibility = metadata.get("eligibility").and_then(|v| v.as_str());
     let source = metadata.get("source").and_then(|v| v.as_str());
-    let tags: Vec<String> = metadata.get("tags").and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let tags: Vec<String> = metadata
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let concept_iri = metadata.get("concept_iri").and_then(|v| v.as_str());
-    let rdf_relationships: Vec<(String, String)> = rels.iter()
+    let rdf_relationships: Vec<(String, String)> = rels
+        .iter()
         .map(|r| (r.kind.clone(), r.target.to_string()))
         .collect();
     let state_str = "active";
     let id = Uuid::new_v4();
     let update_id = Uuid::new_v4();
     let (nquads_text, digest_str) = crate::rdf::dataset_canonical::build_mesh_canonical_nquads(
-        &id.to_string(),
-        namespace,
-        &memory_type,
-        state_str,
-        &created_at.to_rfc3339(),
-        &created_by,
-        None,
-        None,
-        None,
-        &content_str,
-        eligibility,
-        source,
-        &tags,
-        concept_iri,
-        &rdf_relationships,
-        &update_id.to_string(),
-        origin_mesh_epoch,
-        &import_trust.to_string(),
-        None,
-        None,
-        None,
-        None,
+        crate::rdf::dataset_canonical::MeshCanonicalRecord {
+            id: &id.to_string(),
+            namespace,
+            memory_type: &memory_type,
+            lifecycle_state: state_str,
+            created_at: &created_at.to_rfc3339(),
+            created_by: &created_by,
+            superseded_by: None,
+            archived_at: None,
+            tombstoned_at: None,
+            content: &content_str,
+            eligibility,
+            source,
+            tags: &tags,
+            concept_iri,
+            relationships: &rdf_relationships,
+            update_id: &update_id.to_string(),
+            origin_mesh_epoch,
+            trust: &import_trust.to_string(),
+            trigger: None,
+            initial_fires: None,
+            valid_to: None,
+            rehearsal_script: None,
+        },
     );
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
@@ -2284,7 +2407,6 @@ fn preserved_edit_record(
     }
 }
 
-
 // --- git plumbing (fail-soft, non-interactive; via storage.rs's funnel) ---
 
 /// The checkout's dirty porcelain paths (`git status --porcelain`, run
@@ -2299,7 +2421,6 @@ async fn dirty_checkout_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
         .map(str::to_string)
         .collect())
 }
-
 
 /// Outcome of Ed25519 signature verification on a [`MeshRecord`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2485,32 +2606,32 @@ async fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)
         if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-                    if path.to_string_lossy().ends_with(".bundle.zst") {
-                        // Local-only (git-ignored or untracked) bundles
-                        // never replay; tracked bundles are the transport.
-                        let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
-                        if !tracked_bundles.contains(rel) {
+                if path.extension().and_then(|e| e.to_str()) == Some("zst")
+                    && path.to_string_lossy().ends_with(".bundle.zst")
+                {
+                    // Local-only (git-ignored or untracked) bundles
+                    // never replay; tracked bundles are the transport.
+                    let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
+                    if !tracked_bundles.contains(rel) {
+                        tracing::debug!(
+                            "mesh bundle {} is local-only (not tracked) — skipped",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    match read_compressed_bundle(&path) {
+                        Ok(records) => {
                             tracing::debug!(
-                                "mesh bundle {} is local-only (not tracked) — skipped",
-                                path.display()
+                                "mesh bundle {} decoded: {} record(s)",
+                                path.display(),
+                                records.len()
                             );
-                            continue;
+                            for record in records {
+                                bundled_records.push((path.clone(), record));
+                            }
                         }
-                        match read_compressed_bundle(&path) {
-                            Ok(records) => {
-                                tracing::debug!(
-                                    "mesh bundle {} decoded: {} record(s)",
-                                    path.display(),
-                                    records.len()
-                                );
-                                for record in records {
-                                    bundled_records.push((path.clone(), record));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
-                            }
+                        Err(e) => {
+                            tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
                         }
                     }
                 }
@@ -2571,8 +2692,6 @@ async fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)
 }
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
-
-
 
 /// Program Task 3 (c): classify procedure rows written before stamping
 /// existed, discriminating on mesh provenance. An unstamped procedure
@@ -2677,7 +2796,6 @@ pub async fn backfill_imported_procedure_trust(
     (stamped_local, stamped_untrusted)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2733,7 +2851,8 @@ mod tests {
             "import-tests",
             &["probe".to_string()],
             None,
-        ).await
+        )
+        .await
         .unwrap();
         (base, mesh)
     }
@@ -2754,7 +2873,8 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("epoch migration", "node-import-test").await
+        mesh.commit_all("epoch migration", "node-import-test")
+            .await
             .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
@@ -2775,7 +2895,8 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("signer allowlist", "node-import-test").await
+        mesh.commit_all("signer allowlist", "node-import-test")
+            .await
             .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
@@ -2901,14 +3022,15 @@ mod tests {
         // `/bundles/*.bundle.zst` rule git-ignores it (local-only), so
         // the fixture commits the bootstrap files, then force-tracks
         // the bundle — the legitimate transport route.
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store("bundle-only").await;
 
-        let report =
-            apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
-                .await
-                .expect("full-tree replay applies the bundle record");
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("full-tree replay applies the bundle record");
 
         assert_eq!(report.applied, 1, "report: {report:?}");
         assert!(
@@ -3000,7 +3122,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "newer revision")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("ignored-stale-bundle").await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
@@ -3146,7 +3269,8 @@ mod tests {
             "memories",
             &id,
             &serde_json::to_string(local).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store(tag).await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served, store.clone(), emb())
@@ -3159,7 +3283,9 @@ mod tests {
             &[candidate],
         )
         .expect("bundle writes");
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/rev.bundle.zst");
         if full_tree {
             std::fs::remove_file(
@@ -3170,7 +3296,8 @@ mod tests {
             )
             .unwrap();
             mesh.commit_all("withdraw json carrier", "node-peer-1")
-                .await.unwrap();
+                .await
+                .unwrap();
             std::fs::remove_file(cursor_file(mesh.root())).unwrap();
         }
         let second = apply_changed(&mesh, &served, store.clone(), emb())
@@ -3479,13 +3606,8 @@ mod tests {
             v7_update_id(REV_OLD_MILLIS, 0x18),
         ))
         .unwrap();
-        let (report, store) = tracked_bundle_second_pass(
-            "tracked-stale-cross-state",
-            &local,
-            candidate,
-            false,
-        )
-        .await;
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-stale-cross-state", &local, candidate, false).await;
         assert!(
             !report
                 .ignored
@@ -3585,7 +3707,9 @@ mod tests {
             &[candidate],
         )
         .expect("bundle writes");
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/priv.bundle.zst");
 
         let report = apply_changed(&mesh, &served, store.clone(), emb())
@@ -3673,7 +3797,9 @@ mod tests {
             &[record],
         )
         .expect("bundle writes");
-        mesh.commit_all("bundle artifact", "node-peer-1").await.unwrap();
+        mesh.commit_all("bundle artifact", "node-peer-1")
+            .await
+            .unwrap();
         force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -3701,7 +3827,8 @@ mod tests {
             "memories",
             id,
             &serde_json::to_string(value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -4376,7 +4503,8 @@ mod tests {
             "memories",
             &id,
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -4385,10 +4513,7 @@ mod tests {
     }
 
     /// The stored `metadata.mesh` provenance object of an applied row.
-    async fn stored_mesh_provenance(
-        store: &std::sync::Arc<dyn VectorStore>,
-        id: &Uuid,
-    ) -> Value {
+    async fn stored_mesh_provenance(store: &std::sync::Arc<dyn VectorStore>, id: &Uuid) -> Value {
         let (_, payload) = store
             .get("probe", &id.to_string())
             .await
@@ -4428,10 +4553,7 @@ mod tests {
         // so the RDF payload still verifies; the canonical-JSON payload
         // covers `metadata`, so the JSON branch fails.
         if let Some(obj) = record.metadata.as_object_mut() {
-            obj.insert(
-                "unprojected_note".to_string(),
-                json!("added after signing"),
-            );
+            obj.insert("unprojected_note".to_string(), json!("added after signing"));
         }
         let (report, store) =
             run_bundle_route_with_signers("rdf-only-tampered", record, None, signers).await;
@@ -4605,8 +4727,7 @@ mod tests {
         sign_record_legacy_rdf(&mut record, &key_path);
         let signer_did = record.signer_did.clone().expect("signed record has a DID");
         let signers = vec![signer_entry_for(&record)];
-        let (report, store) =
-            run_json_route_with_signers("rdf-only-json", record, signers).await;
+        let (report, store) = run_json_route_with_signers("rdf-only-json", record, signers).await;
         assert_eq!(report.applied, 1, "report: {report:?}");
         assert!(
             report.applied_ids.contains(&id.to_string()),
@@ -4706,13 +4827,9 @@ mod tests {
             .clone()
             .expect("signed record has a DID");
         let rdf_signers = vec![signer_entry_for(&rdf_record)];
-        let (rdf_report, rdf_store) = run_bundle_route_with_signers(
-            "rdf-only-attribution",
-            rdf_record,
-            None,
-            rdf_signers,
-        )
-        .await;
+        let (rdf_report, rdf_store) =
+            run_bundle_route_with_signers("rdf-only-attribution", rdf_record, None, rdf_signers)
+                .await;
         assert_eq!(rdf_report.applied, 1, "report: {rdf_report:?}");
         assert_eq!(rdf_report.rdf_only_verified, 1, "report: {rdf_report:?}");
         assert_eq!(rdf_report.verified_signed, 0, "report: {rdf_report:?}");
@@ -4744,13 +4861,9 @@ mod tests {
             .clone()
             .expect("signed record has a DID");
         let full_signers = vec![signer_entry_for(&full_record)];
-        let (full_report, full_store) = run_bundle_route_with_signers(
-            "full-attribution",
-            full_record,
-            None,
-            full_signers,
-        )
-        .await;
+        let (full_report, full_store) =
+            run_bundle_route_with_signers("full-attribution", full_record, None, full_signers)
+                .await;
         assert_eq!(full_report.applied, 1, "report: {full_report:?}");
         assert_eq!(full_report.verified_signed, 1, "report: {full_report:?}");
         assert_eq!(full_report.rdf_only_verified, 0, "report: {full_report:?}");
@@ -4795,8 +4908,7 @@ mod tests {
         candidate.lifecycle.archived_at = Some(chrono::Utc::now());
         let key_dir = scratch("combo-local-active-key");
         let key_path = key_dir.join("signing.key");
-        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path)
-            .expect("record signs");
+        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path).expect("record signs");
         let signers = vec![signer_entry_for(&candidate)];
 
         let (_base, mesh) = mesh_with_commit("combo-local-active").await;
@@ -4811,7 +4923,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "local active content")).unwrap(),
-        ).await;
+        )
+        .await;
         let first = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 1 applies");
@@ -4831,7 +4944,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 2 applies");
@@ -4907,7 +5021,8 @@ mod tests {
                 "local archived content",
             ))
             .unwrap(),
-        ).await;
+        )
+        .await;
         let first = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 1 applies");
@@ -4928,7 +5043,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .expect("pass 2 applies");
@@ -5029,7 +5145,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("happy").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5085,7 +5202,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "deterministic dedup")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("reapply").await;
         let served = ["probe".to_string()];
 
@@ -5158,7 +5276,8 @@ mod tests {
                 "memories",
                 &exec_id.to_string(),
                 &serde_json::to_string(&simple_rule(exec_id, "executable payload")).unwrap(),
-            ).await;
+            )
+            .await;
             let exec_path = mesh
                 .root()
                 .join("probe")
@@ -5220,7 +5339,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&future).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("schema").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5268,7 +5388,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("epoch-older").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5303,7 +5424,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("epoch-equal").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5334,7 +5456,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("epoch-future").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5397,7 +5520,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("oversized").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5432,7 +5556,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&other).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("foreign").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5467,7 +5592,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "the mesh's version")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("private").await;
         store.init("probe").await.unwrap();
         store
@@ -5532,7 +5658,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("archived").await;
 
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -5642,7 +5769,8 @@ mod tests {
             "memories",
             &a.to_string(),
             &serde_json::to_string(&simple_rule(a, "first commit")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("cursor").await;
         let served = ["probe".to_string()];
 
@@ -5657,7 +5785,8 @@ mod tests {
             "memories",
             &b.to_string(),
             &serde_json::to_string(&simple_rule(b, "second commit")).unwrap(),
-        ).await;
+        )
+        .await;
 
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
@@ -5710,7 +5839,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "the committed content")).unwrap(),
-        ).await;
+        )
+        .await;
         // Dirty BOTH ways: a modified tracked record (uncommitted content is
         // exactly what a full-tree pass would wrongly read off disk) and an
         // untracked extra file.
@@ -5751,7 +5881,9 @@ mod tests {
         );
 
         // Committed (clean again): the same pass applies normally.
-        mesh.commit_all("clean local edits", "node-peer-1").await.unwrap();
+        mesh.commit_all("clean local edits", "node-peer-1")
+            .await
+            .unwrap();
         let report = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
             .await
             .expect("clean checkout applies");
@@ -5776,7 +5908,8 @@ mod tests {
             "memories",
             &a.to_string(),
             &serde_json::to_string(&simple_rule(a, "first commit")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("dirty-diff").await;
         let served = ["probe".to_string()];
         let first = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
@@ -5793,7 +5926,8 @@ mod tests {
             "memories",
             &b.to_string(),
             &serde_json::to_string(&simple_rule(b, "second commit")).unwrap(),
-        ).await;
+        )
+        .await;
         let junk_name = format!("{}.txt", Uuid::new_v4());
         let junk_rel = format!("probe/memories/{junk_name}");
         std::fs::write(mesh.root().join(&junk_rel), "untracked junk").unwrap();
@@ -6111,6 +6245,165 @@ mod tests {
         );
     }
 
+    /// Task 1 of the Lean4 formal-verification series (`neurostrata-ngd9`): the
+    /// `Superseded` + `Archived` concurrent-edit pairs must preserve the losing
+    /// edit (`SupersedeWinsPreserveEdit`), and `classify_merge_parity_tag` must
+    /// expose the canonical Lean truth-table tag for each decision.
+    #[test]
+    fn supersede_and_archived_preserve_edit_and_parity_tags() {
+        let u1 = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
+
+        // Superseded local + archived candidate + content edit → preserve edit.
+        let archived_cand = record_at(Uuid::new_v4(), LifecycleState::Archived, None, "edited");
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(u1),
+                "orig",
+                &archived_cand,
+                true
+            ),
+            MergeDecision::SupersedeWinsPreserveEdit
+        );
+        // Archived local + superseded candidate + content edit → preserve edit.
+        let superseded_cand =
+            record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "orig");
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Archived,
+                None,
+                "edited",
+                &superseded_cand,
+                true
+            ),
+            MergeDecision::SupersedeWinsPreserveEdit
+        );
+        // Same content on a retired id is a stale restore: refused, never applied.
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(u1),
+                "same",
+                &record_at(Uuid::new_v4(), LifecycleState::Archived, None, "same"),
+                true
+            ),
+            MergeDecision::Refuse("superseded; rejected stale restore".to_string())
+        );
+        // Same content on an archived row with a superseding candidate: apply.
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Archived,
+                None,
+                "same",
+                &record_at(Uuid::new_v4(), LifecycleState::Superseded, Some(u1), "same"),
+                true
+            ),
+            MergeDecision::Apply
+        );
+
+        // Parity tags: one canonical string per merge decision.
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Archived,
+                true,
+                true,
+                true
+            ),
+            "supersede_wins_preserve_edit"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Archived,
+                LifecycleState::Superseded,
+                true,
+                true,
+                true
+            ),
+            "supersede_wins_preserve_edit"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Tombstoned,
+                true,
+                false,
+                false
+            ),
+            "apply"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Archived,
+                true,
+                true,
+                true
+            ),
+            "apply_combination_archive_edit"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Superseded,
+                true,
+                false,
+                true
+            ),
+            "skip"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Tombstoned,
+                LifecycleState::Active,
+                true,
+                false,
+                true
+            ),
+            "refuse_tombstone_wins"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Archived,
+                true,
+                false,
+                true
+            ),
+            "refuse_stale_restore"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Superseded,
+                LifecycleState::Superseded,
+                false,
+                false,
+                true
+            ),
+            "conflict_two_replacements"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Archived,
+                true,
+                false,
+                true
+            ),
+            "conflict_restore_archive"
+        );
+        assert_eq!(
+            classify_merge_parity_tag(
+                LifecycleState::Active,
+                LifecycleState::Active,
+                true,
+                true,
+                true
+            ),
+            "conflict_incompatible_edits"
+        );
+    }
+
     /// End-to-end: a tombstone always wins and a retired id never resurrects —
     /// the resurrection candidate is refused and reported, never stomped.
     #[tokio::test]
@@ -6124,7 +6417,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "original")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("tombstone-e2e").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -6140,7 +6434,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "tombstoned", None, "original")).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6155,7 +6450,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "zombie")).unwrap(),
-        ).await;
+        )
+        .await;
         let third = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6191,7 +6487,8 @@ mod tests {
                 "original",
             ))
             .unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("supersede-edit-e2e").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -6209,7 +6506,8 @@ mod tests {
             &id.to_string(),
             &serde_json::to_string(&record_with_state(id, "active", None, "edited content"))
                 .unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6314,20 +6612,20 @@ mod tests {
 
         let store = fresh_store("dirb-proc").await;
         store.init(&namespace).await.unwrap();
-        let disposition = preserve_superseded_edit(
-            &root,
-            &mesh_id,
-            &id.to_string(),
-            &namespace,
-            LifecycleState::Active,
-            &local_payload,
-            &cand,
-            store.clone(),
-            emb(),
-            Trust::Untrusted,
-            "unsigned",
-            &SignatureDisposition::Unsigned,
-        )
+        let disposition = preserve_superseded_edit(PreserveSupersededEditParams {
+            root: &root,
+            mesh_id: &mesh_id,
+            id: &id.to_string(),
+            namespace: &namespace,
+            local_state: LifecycleState::Active,
+            local_payload: &local_payload,
+            cand: &cand,
+            store: store.clone(),
+            emb: emb(),
+            import_trust: Trust::Untrusted,
+            head_signature: "unsigned",
+            signature_disposition: &SignatureDisposition::Unsigned,
+        })
         .await;
         assert!(
             matches!(disposition, Disposition::Applied),
@@ -6365,17 +6663,17 @@ mod tests {
 
         // The typed relationships carry the row's own references link forward
         // AND append the spec's references -> original_id link.
-        let rebuilt = preserved_edit_record(
-            &namespace,
-            &id.to_string(),
-            local_content_value(&local_payload),
-            local_payload.memory_type.clone(),
-            local_origin(&local_payload),
-            local_relationships(&local_payload),
-            local_payload.metadata.clone(),
-            Trust::Untrusted,
-            cand.origin_mesh_epoch,
-        );
+        let rebuilt = preserved_edit_record(PreservedEditRecordParams {
+            namespace: &namespace,
+            original_id: &id.to_string(),
+            content: local_content_value(&local_payload),
+            memory_type: local_payload.memory_type.clone(),
+            created_by: local_origin(&local_payload),
+            source_rels: local_relationships(&local_payload),
+            source_metadata: local_payload.metadata.clone(),
+            import_trust: Trust::Untrusted,
+            origin_mesh_epoch: cand.origin_mesh_epoch,
+        });
         assert!(
             rebuilt.relationships.contains(&Relationship {
                 kind: "references".to_string(),
@@ -6451,20 +6749,20 @@ mod tests {
 
         let store = fresh_store("dirb-meta").await;
         store.init(&namespace).await.unwrap();
-        let disposition = preserve_superseded_edit(
-            &root,
-            &mesh_id,
-            &id.to_string(),
-            &namespace,
-            LifecycleState::Active,
-            &local_payload,
-            &cand,
-            store.clone(),
-            emb(),
-            Trust::Untrusted,
-            "unsigned",
-            &SignatureDisposition::Unsigned,
-        )
+        let disposition = preserve_superseded_edit(PreserveSupersededEditParams {
+            root: &root,
+            mesh_id: &mesh_id,
+            id: &id.to_string(),
+            namespace: &namespace,
+            local_state: LifecycleState::Active,
+            local_payload: &local_payload,
+            cand: &cand,
+            store: store.clone(),
+            emb: emb(),
+            import_trust: Trust::Untrusted,
+            head_signature: "unsigned",
+            signature_disposition: &SignatureDisposition::Unsigned,
+        })
         .await;
         assert!(
             matches!(disposition, Disposition::Applied),
@@ -6559,20 +6857,20 @@ mod tests {
 
         let store = fresh_store("dirb-trusted").await;
         store.init(&namespace).await.unwrap();
-        let disposition = preserve_superseded_edit(
-            &root,
-            &mesh_id,
-            &id.to_string(),
-            &namespace,
-            LifecycleState::Active,
-            &local_payload,
-            &cand,
-            store.clone(),
-            emb(),
-            Trust::Trusted,
-            "unsigned",
-            &SignatureDisposition::Unsigned,
-        )
+        let disposition = preserve_superseded_edit(PreserveSupersededEditParams {
+            root: &root,
+            mesh_id: &mesh_id,
+            id: &id.to_string(),
+            namespace: &namespace,
+            local_state: LifecycleState::Active,
+            local_payload: &local_payload,
+            cand: &cand,
+            store: store.clone(),
+            emb: emb(),
+            import_trust: Trust::Trusted,
+            head_signature: "unsigned",
+            signature_disposition: &SignatureDisposition::Unsigned,
+        })
         .await;
         assert!(
             matches!(disposition, Disposition::Applied),
@@ -6618,7 +6916,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "original")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("conflict-nodrop").await;
         assert_eq!(
             apply_changed(&mesh, &served, store.clone(), emb())
@@ -6636,7 +6935,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "their edit")).unwrap(),
-        ).await;
+        )
+        .await;
         let second = apply_changed(&mesh, &served, store.clone(), emb())
             .await
             .unwrap();
@@ -6711,7 +7011,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
 
         let store = fresh_store("topology").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -6755,7 +7056,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
 
         let store = fresh_store("domainunion").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
@@ -6789,7 +7091,10 @@ mod tests {
     /// Rewrite the on-disk manifest's imported-procedures policy, commit,
     /// and reopen so the cached manifest reflects it (mirrors
     /// `reopen_with_epoch`).
-    async fn reopen_with_policy(mesh: &MeshStorage, trust: super::super::manifest::Trust) -> MeshStorage {
+    async fn reopen_with_policy(
+        mesh: &MeshStorage,
+        trust: super::super::manifest::Trust,
+    ) -> MeshStorage {
         let mut manifest = mesh.manifest().clone();
         manifest.policy.imported_procedures_trust = trust;
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -6798,7 +7103,9 @@ mod tests {
             format!("{json}\n"),
         )
         .unwrap();
-        mesh.commit_all("policy change", "node-import-test").await.unwrap();
+        mesh.commit_all("policy change", "node-import-test")
+            .await
+            .unwrap();
         MeshStorage::open(mesh.root()).unwrap()
     }
 
@@ -6863,7 +7170,8 @@ mod tests {
             "procedures",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("forged").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -6907,7 +7215,8 @@ mod tests {
             "procedures",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("pol-trusted").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -6937,7 +7246,8 @@ mod tests {
             "procedures",
             &id2.to_string(),
             &serde_json::to_string(&value2).unwrap(),
-        ).await;
+        )
+        .await;
         let store2 = fresh_store("pol-none").await;
         let report2 = apply_changed(&mesh2, &["probe".to_string()], store2.clone(), emb())
             .await
@@ -6971,7 +7281,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("secret").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -6983,7 +7294,11 @@ mod tests {
             "the refusal names the scan: {:?}",
             report.ignored
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// Program Task 3 (fix round, M-1): the scanner builds its location
@@ -7001,10 +7316,7 @@ mod tests {
         let mut metadata = serde_json::Map::new();
         metadata.insert("eligibility".to_string(), json!("shareable"));
         metadata.insert("trust".to_string(), json!("untrusted"));
-        metadata.insert(
-            evil_key.clone(),
-            json!({ "nested": secret_value.clone() }),
-        );
+        metadata.insert(evil_key.clone(), json!({ "nested": secret_value.clone() }));
         value["metadata"] = Value::Object(metadata);
         commit_record_json(
             &mesh,
@@ -7012,7 +7324,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&value).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("secret-key").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -7036,7 +7349,11 @@ mod tests {
             !entry.contains(&secret_value),
             "the report must not echo the secret value: {entry}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// J3 (provenance leg): the row keeps the sender's claimed author for
@@ -7053,7 +7370,8 @@ mod tests {
             "memories",
             &id.to_string(),
             &serde_json::to_string(&simple_rule(id, "always use podman")).unwrap(),
-        ).await;
+        )
+        .await;
         let store = fresh_store("createdby").await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
@@ -7076,7 +7394,12 @@ mod tests {
         );
     }
 
-    async fn seed_row(store: &std::sync::Arc<dyn VectorStore>, id: &str, memory_type: &str, metadata: Value) {
+    async fn seed_row(
+        store: &std::sync::Arc<dyn VectorStore>,
+        id: &str,
+        memory_type: &str,
+        metadata: Value,
+    ) {
         store
             .upsert(
                 "probe",
@@ -7097,11 +7420,7 @@ mod tests {
     }
 
     async fn trust_stamp_of(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
-        let (_, payload) = store
-            .get("probe", id)
-            .await
-            .unwrap()
-            .expect("row present");
+        let (_, payload) = store.get("probe", id).await.unwrap().expect("row present");
         payload
             .metadata
             .get("trust")
@@ -7117,7 +7436,13 @@ mod tests {
     async fn backfill_stamps_by_provenance() {
         let store = fresh_store("backfill").await;
         store.init("probe").await.unwrap();
-        seed_row(&store, "proc-local", "procedure", json!({"trigger": "session-start"})).await;
+        seed_row(
+            &store,
+            "proc-local",
+            "procedure",
+            json!({"trigger": "session-start"}),
+        )
+        .await;
         seed_row(
             &store,
             "proc-imported",
@@ -7128,13 +7453,22 @@ mod tests {
             }),
         )
         .await;
-        seed_row(&store, "proc-promoted", "procedure", json!({"trust": "promoted"})).await;
+        seed_row(
+            &store,
+            "proc-promoted",
+            "procedure",
+            json!({"trust": "promoted"}),
+        )
+        .await;
         seed_row(&store, "rule-plain", "rule", json!({})).await;
 
         let (local, imported) = backfill_imported_procedure_trust(&store).await;
         assert_eq!((local, imported), (1, 1), "one of each class stamped");
         assert_eq!(trust_stamp_of(&store, "proc-local").await, json!("local"));
-        assert_eq!(trust_stamp_of(&store, "proc-imported").await, json!("untrusted"));
+        assert_eq!(
+            trust_stamp_of(&store, "proc-imported").await,
+            json!("untrusted")
+        );
         assert_eq!(
             trust_stamp_of(&store, "proc-promoted").await,
             json!("promoted"),
@@ -7147,6 +7481,10 @@ mod tests {
         );
 
         let (local2, imported2) = backfill_imported_procedure_trust(&store).await;
-        assert_eq!((local2, imported2), (0, 0), "idempotent: nothing left to classify");
+        assert_eq!(
+            (local2, imported2),
+            (0, 0),
+            "idempotent: nothing left to classify"
+        );
     }
 }

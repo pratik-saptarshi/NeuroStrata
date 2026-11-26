@@ -9,8 +9,9 @@
 mod memories_for_file;
 
 use memories_for_file::{
-    freshness_priority, memory_type_priority, rank_hits, GraphMatchKind, MemoryHit,
-    DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES, MAX_LIMIT,
+    fan_out_bucket, freshness_priority, memory_type_priority, query_failure_response, rank_hits,
+    recommended_next_actions, GraphMatchKind, MemoryHit, DEFAULT_LIMIT, DEFAULT_MEMORY_TYPES,
+    MAX_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -29,22 +30,115 @@ fn hit(
         access_count,
         explanation: String::new(),
         metadata,
+        conceptual_bridges: Vec::new(),
+        linked_files: 0,
     }
+}
+
+/// A hit with the fan-out count `set_linked_files` would have measured.
+fn hit_with_fan_out(
+    id: &str,
+    kind: GraphMatchKind,
+    memory_type: &str,
+    metadata: Value,
+    linked_files: usize,
+) -> MemoryHit {
+    let mut h = hit(id, kind, memory_type, 0, metadata);
+    h.linked_files = linked_files;
+    h
+}
+
+#[test]
+fn rank_hits_orders_enforced_rule_before_narrow_advisory() {
+    // Same match kind: a broad ENFORCED rule (4 linked files, fan-out bucket
+    // 1) must outrank a one-file PARTIAL advisory rule (bucket 0). Before
+    // #208 the fan-out segment sat above the type segment, so the advisory won.
+    let mut hits = vec![
+        hit_with_fan_out(
+            "narrow-advisory",
+            GraphMatchKind::ExactFile,
+            "rule",
+            json!({ "enforcement": "PARTIAL" }),
+            1,
+        ),
+        hit_with_fan_out(
+            "broad-enforced",
+            GraphMatchKind::ExactFile,
+            "rule",
+            json!({ "enforcement": "ENFORCED" }),
+            4,
+        ),
+    ];
+    assert_eq!(
+        fan_out_bucket(1),
+        fan_out_bucket(4) - 1,
+        "buckets must differ"
+    );
+    rank_hits(&mut hits);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["broad-enforced", "narrow-advisory"]);
+}
+
+#[test]
+fn enforced_rule_survives_top_five_truncation() {
+    // The default page is five hits. Five narrow advisory rules must not push
+    // the one ENFORCED rule off the page.
+    let mut hits = vec![hit_with_fan_out(
+        "enforced-broad",
+        GraphMatchKind::ExactFile,
+        "rule",
+        json!({ "enforcement": "ENFORCED" }),
+        4,
+    )];
+    for i in 0..5 {
+        hits.push(hit_with_fan_out(
+            &format!("advisory-{i}"),
+            GraphMatchKind::ExactFile,
+            "rule",
+            json!({ "enforcement": "PARTIAL" }),
+            1,
+        ));
+    }
+    rank_hits(&mut hits);
+    hits.truncate(DEFAULT_LIMIT);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert!(ids.contains(&"enforced-broad"), "page was {ids:?}");
+    assert_eq!(hits.len(), DEFAULT_LIMIT);
+}
+
+#[test]
+fn fan_out_still_breaks_ties_within_one_enforcement_class() {
+    // Both PARTIAL rules share a type priority, so fan-out is still the
+    // tiebreaker: the one-file rule says more about the file than the four-file
+    // rule.
+    let narrow = json!({ "enforcement": "PARTIAL" });
+    let broad = json!({ "enforcement": "PARTIAL" });
+    assert_eq!(
+        memory_type_priority("rule", &narrow),
+        memory_type_priority("rule", &broad)
+    );
+    let mut hits = vec![
+        hit_with_fan_out("broad-partial", GraphMatchKind::ExactFile, "rule", broad, 4),
+        hit_with_fan_out(
+            "narrow-partial",
+            GraphMatchKind::ExactFile,
+            "rule",
+            narrow,
+            1,
+        ),
+    ];
+    rank_hits(&mut hits);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["narrow-partial", "broad-partial"]);
 }
 
 #[test]
 fn match_kind_priority_orders_best_first() {
-    assert!(
-        GraphMatchKind::ExactSymbol.priority() < GraphMatchKind::ExactFile.priority()
-    );
+    assert!(GraphMatchKind::ExactSymbol.priority() < GraphMatchKind::ExactFile.priority());
     assert!(GraphMatchKind::ExactFile.priority() < GraphMatchKind::SymbolTwoHop.priority());
     assert!(GraphMatchKind::SymbolTwoHop.priority() < GraphMatchKind::AncestorDirectory.priority());
-    assert!(
-        GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority()
-    );
-    assert!(
-        GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority()
-    );
+    assert!(GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority());
+    assert!(GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority());
 }
 
 #[test]
@@ -53,19 +147,13 @@ fn memory_type_priority_ranks_enforced_rules_first() {
     let partial = json!({ "enforcement": "PARTIAL" });
     let shaped_fact = json!({ "topology": {} });
     let plain_fact = json!({});
+    assert!(memory_type_priority("rule", &enforced) < memory_type_priority("rule", &partial));
+    assert!(memory_type_priority("rule", &partial) < memory_type_priority("fact", &shaped_fact));
     assert!(
-        memory_type_priority("rule", &enforced) < memory_type_priority("rule", &partial)
+        memory_type_priority("fact", &shaped_fact) < memory_type_priority("procedure", &json!({}))
     );
     assert!(
-        memory_type_priority("rule", &partial) < memory_type_priority("fact", &shaped_fact)
-    );
-    assert!(
-        memory_type_priority("fact", &shaped_fact)
-            < memory_type_priority("procedure", &json!({}))
-    );
-    assert!(
-        memory_type_priority("procedure", &json!({}))
-            < memory_type_priority("fact", &plain_fact)
+        memory_type_priority("procedure", &json!({})) < memory_type_priority("fact", &plain_fact)
     );
 }
 
@@ -91,7 +179,13 @@ fn rank_hits_orders_by_kind_then_type_then_access_count() {
             100,
             json!({ "enforcement": "ENFORCED" }),
         ),
-        hit("exact-fact", GraphMatchKind::ExactFile, "fact", 100, json!({})),
+        hit(
+            "exact-fact",
+            GraphMatchKind::ExactFile,
+            "fact",
+            100,
+            json!({}),
+        ),
         hit(
             "exact-rule",
             GraphMatchKind::ExactFile,
@@ -106,18 +200,18 @@ fn rank_hits_orders_by_kind_then_type_then_access_count() {
 }
 
 #[test]
-fn rank_hits_breaks_ties_by_access_count_descending() {
+fn rank_hits_breaks_related_ties_by_access_count_descending() {
     let mut hits = vec![
         hit(
             "a",
-            GraphMatchKind::ExactFile,
+            GraphMatchKind::Related,
             "rule",
             1,
             json!({ "enforcement": "ENFORCED" }),
         ),
         hit(
             "b",
-            GraphMatchKind::ExactFile,
+            GraphMatchKind::Related,
             "rule",
             99,
             json!({ "enforcement": "ENFORCED" }),
@@ -129,8 +223,175 @@ fn rank_hits_breaks_ties_by_access_count_descending() {
 }
 
 #[test]
+fn rank_hits_puts_the_newest_direct_match_first() {
+    let mut hits = vec![
+        hit(
+            "older",
+            GraphMatchKind::ExactFile,
+            "rule",
+            99,
+            json!({ "valid_from": 1_700_000_000 }),
+        ),
+        hit(
+            "newer",
+            GraphMatchKind::ExactFile,
+            "rule",
+            0,
+            json!({ "valid_from": 1_800_000_000 }),
+        ),
+    ];
+    rank_hits(&mut hits);
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["newer", "older"]);
+}
+
+#[test]
 fn constants_match_the_spec_defaults() {
     assert_eq!(DEFAULT_LIMIT, 5);
     assert_eq!(MAX_LIMIT, 20);
     assert_eq!(DEFAULT_MEMORY_TYPES, ["rule", "fact", "procedure"]);
+}
+
+// --- Task 4: conditional escalation from memories_for_file -----------------
+
+#[test]
+fn high_blast_radius_escalates_to_two_hop() {
+    // blast_radius_count >= 15 -> T_HIGH_BLAST -> neurostrata_related(max_hops:2).
+    let resp = recommended_next_actions(16, &[], 0, false, "NeuroStrata", Some("sym::foo"));
+    assert_eq!(resp["status"], "success");
+    let actions = resp["next_actions"].as_array().expect("next_actions array");
+    assert!(!actions.is_empty(), "expected an escalation action");
+    assert_eq!(actions[0]["trigger_id"], "T_HIGH_BLAST");
+    assert_eq!(actions[0]["tool"], "neurostrata_related");
+    assert_eq!(actions[0]["args"]["max_hops"], 2);
+    assert_eq!(actions[0]["args"]["id"], "sym::foo");
+    assert_eq!(actions[0]["args"]["namespace"], "NeuroStrata");
+}
+
+#[test]
+fn empty_lookup_routes_to_locate() {
+    // An empty lookup is T_AMBIGUOUS -> neurostrata_locate. Empty is NOT
+    // "no governance": no response field may claim governance absence.
+    let resp = recommended_next_actions(0, &[], 0, true, "NeuroStrata", Some("src/foo.rs"));
+    assert_eq!(resp["status"], "empty");
+    let actions = resp["next_actions"].as_array().expect("next_actions array");
+    assert_eq!(actions[0]["trigger_id"], "T_AMBIGUOUS");
+    assert_eq!(actions[0]["tool"], "neurostrata_locate");
+    assert_eq!(actions[0]["args"]["namespace"], "NeuroStrata");
+    assert_eq!(actions[0]["args"]["query"], "src/foo.rs");
+    let lowered = resp.to_string().to_ascii_lowercase();
+    for forbidden in ["no governance", "no rules", "governance absence"] {
+        assert!(
+            !lowered.contains(forbidden),
+            "field claims absence: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn empty_lookup_without_usable_seed_abstains() {
+    // P2: an empty lookup with no seed cannot form a schema-valid `query`;
+    // it must abstain with a suppressed_reason, not emit a locate with "".
+    let resp = recommended_next_actions(0, &[], 0, true, "NeuroStrata", None);
+    assert_eq!(resp["status"], "empty");
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+    let reason = resp["suppressed_reason"].as_str().expect("suppressed_reason");
+    assert!(
+        reason.contains("no usable") && reason.contains("narrow"),
+        "reason was {reason:?}"
+    );
+    let blank = recommended_next_actions(0, &[], 0, true, "NeuroStrata", Some("   "));
+    assert_eq!(blank["next_actions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn ordinary_single_file_edit_does_not_escalate() {
+    // blast radius 3, no bridges -> no escalation; one-hop data is already
+    // present in the response. suppressed_reason explains the abstention.
+    let resp = recommended_next_actions(3, &[], 0, false, "NeuroStrata", Some("sym::x"));
+    assert_eq!(resp["status"], "success");
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+    let reason = resp["suppressed_reason"]
+        .as_str()
+        .expect("suppressed_reason");
+    assert!(reason.contains("1-hop"), "reason was {reason:?}");
+}
+
+#[test]
+fn conceptual_bridge_suggests_object_view() {
+    let resp = recommended_next_actions(
+        3,
+        &["target-rule".to_string()],
+        0,
+        false,
+        "NeuroStrata",
+        Some("sym::seed"),
+    );
+    let actions = resp["next_actions"].as_array().unwrap();
+    assert_eq!(actions[0]["trigger_id"], "T_SEED_EDGE");
+    assert_eq!(actions[0]["tool"], "neurostrata_object_view");
+    assert_eq!(actions[0]["args"]["id"], "target-rule");
+    assert_eq!(actions[0]["args"]["namespace"], "NeuroStrata");
+}
+
+#[test]
+fn staged_diff_scope_emits_schema_valid_args_only() {
+    // diff_tour declares no `git_ref` argument: emit only {namespace, diff_text}.
+    let resp = recommended_next_actions(3, &[], 3, false, "NeuroStrata", Some("sym::x"));
+    let actions = resp["next_actions"].as_array().unwrap();
+    assert_eq!(actions[0]["trigger_id"], "T_DIFF");
+    assert_eq!(actions[0]["tool"], "neurostrata_diff_tour");
+    let args = actions[0]["args"].as_object().unwrap();
+    let mut keys: Vec<&str> = args.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["diff_text", "namespace"]);
+    assert!(
+        !args.contains_key("git_ref"),
+        "diff_tour has no git_ref arg"
+    );
+}
+
+#[test]
+fn high_blast_without_seed_emits_no_related_action() {
+    // A high blast radius with no usable seed must NOT emit a schema-invalid
+    // related action with args.id == "".
+    let resp = recommended_next_actions(16, &[], 0, false, "NeuroStrata", None);
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+    let reason = resp["suppressed_reason"].as_str().unwrap();
+    assert!(reason.contains("usable seed"), "reason was {reason:?}");
+
+    // Whitespace-only seed is equally unusable.
+    let resp = recommended_next_actions(16, &[], 0, false, "NeuroStrata", Some("   "));
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn next_actions_are_capped_at_three() {
+    let bridges: Vec<String> = (0..5).map(|i| format!("bridge-{i}")).collect();
+    let resp = recommended_next_actions(16, &bridges, 3, false, "NeuroStrata", Some("sym::x"));
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn query_failure_response_keeps_legacy_fields_and_adds_receipt_fields() {
+    // Finding 1: a failed lookup carries the additive §5 receipt fields so it
+    // is never misread as "no governance". Legacy fields keep exact values.
+    let resp = query_failure_response("src/server.rs", "boom: query failed");
+    assert_eq!(resp["memories"], json!([]));
+    assert_eq!(resp["unsupported"], json!(false));
+    assert_eq!(resp["path"], json!("src/server.rs"));
+    assert_eq!(resp["error"], json!("boom: query failed"));
+    assert_eq!(resp["status"], "failed");
+    assert_eq!(resp["next_actions"], json!([]));
+    let reason = resp["suppressed_reason"]
+        .as_str()
+        .expect("suppressed_reason present when no actions fired");
+    assert!(
+        !reason.trim().is_empty(),
+        "abstention must say why no actions fired"
+    );
+    let lowered = resp.to_string().to_ascii_lowercase();
+    for forbidden in ["no governance", "no rules", "governance absence"] {
+        assert!(!lowered.contains(forbidden), "field claims absence: {forbidden}");
+    }
 }
