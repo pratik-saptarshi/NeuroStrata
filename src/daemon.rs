@@ -956,8 +956,6 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
 
     let mesh_dir = match MeshStorage::read_pointer(project_root) {
         Ok(Some((_mesh_id, dir, _remote))) => dir,
-        _ => return,
-        Ok(None) => return,
         Err(e) => {
             tracing::warn!(
                 "mesh pointer read failed for {}: {e}",
@@ -965,6 +963,7 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
             );
             return;
         }
+        _ => return,
     };
     let node_id = resolve_node_id();
     let mesh = match MeshStorage::open(&mesh_dir) {
@@ -2516,6 +2515,84 @@ mod tests {
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
+
+    /// A `MakeWriter` that appends formatted tracing output to a shared
+    /// buffer, so a test can assert that a log event actually fired.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log capture lock").clone())
+                .expect("captured log output is utf-8")
+        }
+    }
+
+    #[test]
+    fn drain_mesh_once_logs_a_pointer_read_failure() {
+        // Regression test for a shadowed warn arm: the doc on
+        // `drain_mesh_once` promises every failure is a logged no-op. A
+        // guard-free `_` arm sat above the `Err(e)` warn arm, so a
+        // pointer-read failure was silently swallowed.
+        use crate::guard::testkit::MockStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-drain-mesh-once-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pointer_dir = dir.join(".NeuroStrata");
+        std::fs::create_dir_all(&pointer_dir).unwrap();
+        // A malformed pointer (not three tab-separated fields) makes
+        // `MeshStorage::read_pointer` return Err, which is the path whose
+        // warn arm was shadowed. The store is never reached on that path.
+        std::fs::write(pointer_dir.join("synaptic-mesh-ref"), "not-a-pointer").unwrap();
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .finish();
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The current-thread runtime runs the drain on this thread, so the
+        // thread-local default subscriber applies for the whole call.
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(drain_mesh_once(&dir, &store));
+        });
+        let logs = capture.text();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            logs.contains("mesh pointer read failed"),
+            "expected the warn log for a pointer-read failure, captured: {logs:?}"
+        );
+    }
 
     #[test]
     fn daemon_token_tests_never_touch_real_home_config() {
