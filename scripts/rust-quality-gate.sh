@@ -443,7 +443,11 @@ else
         if [ -n "$found" ]; then
             OWNING_MANIFESTS="${OWNING_MANIFESTS}${found}
 "
-        else
+        elif [ -f "$f" ]; then
+            # Only LIVE files can be uncovered: a file this push
+            # deleted has nothing left to lint (see the deletion
+            # distinction below), so it must not be reported as
+            # NOT verified.
             UNCOVERED_RS="${UNCOVERED_RS}${f}
 "
         fi
@@ -470,7 +474,36 @@ else
         esac
     done <<< "$CHANGED_MANIFEST"
     OWNING_MANIFESTS="$(printf '%s' "$OWNING_MANIFESTS" | sort -u)"
-    if [ -z "$OWNING_MANIFESTS" ]; then
+    # Deletion distinction: OWNING_MANIFESTS can be empty BECAUSE
+    # every owning manifest was itself deleted by this push — the
+    # [ -f ] existence guards above drop deleted paths, so a push
+    # whose only change deletes the last nested crate resolves to
+    # an empty set even though nothing is left to check. That is
+    # NOT the "no manifest found for a live source file" case: a
+    # deleted crate has nothing to lint, and the workspace fallback
+    # below would fail closed on the missing root manifest
+    # ("could not find Cargo.toml"), blocking a valid push. So:
+    # when the empty set is fully explained by manifests this push
+    # deleted (present at $BASE, absent on disk) and no LIVE source
+    # file is uncovered, skip the fallback for the deleted crates.
+    # Any live uncovered file keeps the existing fail-closed
+    # fallback exactly as before.
+    DELETED_OWNING=""
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$p" in
+            */Cargo.toml|Cargo.toml) cand="$p" ;;
+            */Cargo.lock|Cargo.lock) cand="${p%Cargo.lock}Cargo.toml" ;;
+            *) continue ;;
+        esac
+        if [ ! -f "$cand" ] && git cat-file -e "$BASE:$cand" 2>/dev/null; then
+            DELETED_OWNING="${DELETED_OWNING}${cand}
+"
+        fi
+    done <<< "$CHANGED_MANIFEST"
+    if [ -z "$OWNING_MANIFESTS" ] && [ -n "$DELETED_OWNING" ] && [ -z "$UNCOVERED_RS" ]; then
+        echo "$GATE: note: all affected Rust crates were deleted in this push — clippy skipped for the deleted crates" >&2
+    elif [ -z "$OWNING_MANIFESTS" ]; then
         CLIPPY_OUT="$(cargo clippy --locked --workspace --all-targets --all-features --message-format=short --color never 2>&1)"
         clippy_leg "$CLIPPY_OUT" "$?" "workspace" ""
     else

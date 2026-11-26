@@ -1032,4 +1032,53 @@ if [ "$st35" -eq 0 ] || ! grep -q 'needs formatting on added lines' <<< "$out35"
     exit 1
 fi
 
+# Leg 36 (regression, Codex P2 — deleted crates): a deletion-only
+# push that removes the last (only) nested crate. The changed
+# manifests/sources no longer exist on disk, so pre-fix the
+# owning-manifest set came out empty and §2's empty-set fallback
+# ran `cargo clippy --workspace` in a manifest-less directory,
+# blocking a valid push with "could not find Cargo.toml".
+# Post-fix the gate recognizes the manifests were deleted by this
+# very push and passes (the deleted crate has nothing to lint).
+del_only="$TMP/del-only"
+new_nested_repo "$del_only"
+git -C "$del_only" rm -qr native
+git -C "$del_only" commit -q -m 'delete the nested crate'
+set +e
+out36=$(run_gate "$del_only" "$PATH")
+st36=$?
+set -e
+if [ "$st36" -ne 0 ] || ! grep -q 'pass' <<< "$out36" \
+    || grep -q 'could not find' <<< "$out36"; then
+    printf 'FAIL: a deletion-only push removing the last nested crate must pass the gate, not block on the missing root manifest\n%s\n' "$out36" >&2
+    exit 1
+fi
+
+# Leg 37 (converse, same P2 — live uncovered file keeps the
+# fail-closed fallback): a push with NO manifest anywhere that
+# adds a live .rs file (no crate deleted — nothing was ever
+# owned). The empty owning-manifest set is NOT explained by
+# deletions, so the existing workspace fallback must still run
+# and fail closed exactly as before.
+uncovered_live="$TMP/uncovered-live"
+mkdir -p "$uncovered_live/src"
+git -C "$uncovered_live" init -q
+git -C "$uncovered_live" config user.email test@example.com
+git -C "$uncovered_live" config user.name test
+printf '# docs only baseline\n' > "$uncovered_live/README.md"
+git -C "$uncovered_live" add README.md
+git -C "$uncovered_live" commit -q -m 'non-Rust baseline'
+git -C "$uncovered_live" update-ref refs/remotes/origin/develop HEAD
+printf 'pub fn orphan() -> i32 {\n    1\n}\n' > "$uncovered_live/src/lib.rs"
+git -C "$uncovered_live" add src/lib.rs
+git -C "$uncovered_live" commit -q -m 'orphan rust file, no manifest anywhere'
+set +e
+out37=$(run_gate "$uncovered_live" "$PATH")
+st37=$?
+set -e
+if [ "$st37" -eq 0 ] || ! grep -q 'does not build' <<< "$out37"; then
+    printf 'FAIL: a live .rs file with no owning manifest anywhere (and no deleted crate) must keep the fail-closed workspace fallback\n%s\n' "$out37" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'

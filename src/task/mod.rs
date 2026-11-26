@@ -6317,6 +6317,11 @@ mod tests {
             "the guard must resolve the rustfmt edition per source file from its owning package (nearest Cargo.toml ancestor), so a bootstrapped nested-only crate on edition 2024 is not formatted as the root default 2021 — rustfmt errors on edition-2024 syntax, the fmt leg warns-and-skips, and misformatted added lines pass"
         );
         assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("all affected Rust crates were deleted in this push"),
+            "the guard must distinguish an empty owning-manifest set caused by this push deleting the affected crates themselves (nothing left to lint — skip the workspace clippy fallback) from no manifest found for a live source file (existing fail-closed fallback), so a deletion-only push removing the last nested crate is not blocked on the missing root Cargo.toml"
+        );
+        assert!(
             SCAFFOLDED_RUST_QUALITY_GATE.contains("export CARGO_TERM_COLOR=never"),
             "the guard must force cargo color off so a user-set CARGO_TERM_COLOR=always cannot inject ANSI escapes into the clippy diagnostics and audit report the guard parses (an escaped severity silently empties the diagnostic set and the gate passes unverified code)"
         );
