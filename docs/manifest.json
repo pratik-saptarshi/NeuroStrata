@@ -5,7 +5,8 @@
     "manifest.json",
     "agent-routing-strategy.md",
     "pitch-astrum.md",
-    "remediation_plan.md"
+    "remediation_plan.md",
+    "SECDEVOPS-CHECKLIST.md"
   ],
   "tiers": {
     "vision": {
