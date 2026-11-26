@@ -2052,7 +2052,10 @@ fn extract_public_surface_signatures(
             pending_command.push(attribute);
         }
         let indent = line.len() - line.trim_start().len();
-        if fn_body_indent.map(|i| indent <= i).unwrap_or(false) {
+        // Blank lines carry indent 0 but are not body content: they
+        // must not end fn-body tracking, or a tail expression after
+        // a blank line inside a fn is read as an enum member.
+        if !line.trim().is_empty() && fn_body_indent.map(|i| indent <= i).unwrap_or(false) {
             fn_body_indent = None;
         }
         // A closing brace at column 0 ends the enclosing container.
@@ -3765,6 +3768,57 @@ pub struct AfterAll {}
             "pub fn build() -> Result<Foo> {\n    Ok(embeddings)\n}",
         );
         assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn body_expression_after_blank_line_in_top_level_fn_is_not_an_enum_member() {
+        // Wave-3 review probe: a blank line inside a free fn has
+        // indent 0, which must not end fn-body tracking — otherwise
+        // the tail expression after the blank line is extracted as
+        // an enum member (the W1 false-positive class).
+        let before = extract_public_surface_signatures(
+            "pub fn f() -> Result<Foo> {\n\n    Ok(Path::UNIT)\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub fn f() -> Result<Foo> {\n\n    Ok(Path::OTHER)\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            !before.keys().any(|k| k.contains("Ok")),
+            "body expression extracted as a member: {before:?}"
+        );
+    }
+
+    #[test]
+    fn blank_line_inside_enum_does_not_disturb_variant_extraction() {
+        let with_blank =
+            extract_public_surface_signatures("pub enum E {\n    Ok(u64),\n\n    Plain,\n}");
+        let without_blank =
+            extract_public_surface_signatures("pub enum E {\n    Ok(u64),\n    Plain,\n}");
+        assert_eq!(with_blank, without_blank, "with_blank={with_blank:?}");
+        let changed =
+            extract_public_surface_signatures("pub enum E {\n    Ok(u64),\n\n    Other,\n}");
+        assert_ne!(with_blank, changed, "with_blank={with_blank:?}");
+    }
+
+    #[test]
+    fn variant_shaped_line_after_fn_closing_brace_still_registers() {
+        // Fn-body tracking ends at the fn's closing brace: a bare
+        // member-shaped line after the fn, at body indent, is
+        // extracted exactly as it was before body tracking existed
+        // (member lines are only recognized when indented, so the
+        // post-fn line sits at the body's indent level).
+        let before = extract_public_surface_signatures(
+            "pub fn f() -> Result<Foo> {\n\n    Ok(Path::UNIT)\n}\n    Bare(u64),",
+        );
+        let after = extract_public_surface_signatures(
+            "pub fn f() -> Result<Foo> {\n\n    Ok(Path::UNIT)\n}\n    Bare(String),",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.keys().any(|k| k.contains("Bare")),
+            "post-fn member line not extracted: {before:?}"
+        );
     }
 
     #[test]
