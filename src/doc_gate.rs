@@ -2558,9 +2558,25 @@ fn extract_public_surface_signatures(
                         Some(kind) => kind == "enum",
                     });
             if variant_allowed {
-                let key = match &enclosing_at_line_start {
-                    Some(owner) => match key.split_once(':') {
-                        Some((prefix, rest)) => format!("{prefix}:{owner}.{rest}"),
+                // The owner path composes like the clap-arg owner
+                // path below: when a struct-variant scope is active
+                // at line start, the variant segment sits between the
+                // enum and the member, so a field shared by sibling
+                // variants (`target_param` in three
+                // `ActionEffectTemplate` variants) no longer cancels
+                // a removal from just one of them. The variant's own
+                // header line is unaffected: the scope is cleared at
+                // the top of the loop for a line at the header's
+                // indent, so its key stays `member:<Enum>.<Variant>`.
+                let owner_path = match (&enclosing_at_line_start, &variant_at_line_start) {
+                    (Some(owner), Some(variant)) => Some(format!("{owner}.{variant}")),
+                    (Some(owner), None) => Some(owner.clone()),
+                    (None, Some(variant)) => Some(variant.clone()),
+                    (None, None) => None,
+                };
+                let key = match &owner_path {
+                    Some(owner_path) => match key.split_once(':') {
+                        Some((prefix, rest)) => format!("{prefix}:{owner_path}.{rest}"),
                         None => key,
                     },
                     None => key,
@@ -5936,6 +5952,100 @@ pub struct AfterAll {}
         assert_ne!(before, after, "before={before:?} after={after:?}");
         assert!(before.contains_key("mcp-schema:tool_a:mode"), "{before:?}");
         assert!(before.contains_key("mcp-schema:tool_b:mode"), "{before:?}");
+    }
+
+    #[test]
+    fn enum_variant_field_removal_from_one_sibling_differs_real_shape() {
+        // W5-2 probe (Codex PR #162): `target_param: String` occurs
+        // in THREE `ActionEffectTemplate` variants in the real
+        // src/rdf/action.rs; removing it from `SupersedeMemory`
+        // produced identical maps because all three fields shared
+        // the key `member:ActionEffectTemplate.target_param`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/rdf/action.rs")).unwrap();
+        let needle = "    SupersedeMemory {\n        target_param: String,\n";
+        assert!(real.contains(needle), "real shape missing");
+        let mutated = real.replacen(needle, "    SupersedeMemory {\n", 1);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_ne!(before, after, "removal from one sibling must register");
+        assert!(
+            before.contains_key("member:ActionEffectTemplate.SupersedeMemory.target_param"),
+            "{:?}",
+            before
+                .keys()
+                .filter(|k| k.contains("target_param"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !after.contains_key("member:ActionEffectTemplate.SupersedeMemory.target_param"),
+            "removed field's variant-qualified key must be gone"
+        );
+        // The sibling variants' fields survive under their own keys.
+        assert!(
+            after.contains_key("member:ActionEffectTemplate.LinkEdge.target_param"),
+            "{:?}",
+            after
+                .keys()
+                .filter(|k| k.contains("target_param"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            after.contains_key("member:ActionEffectTemplate.TransitionTask.target_param"),
+            "{:?}",
+            after
+                .keys()
+                .filter(|k| k.contains("target_param"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enum_variant_header_key_unchanged_by_variant_scope() {
+        // The variant's OWN header line keeps `member:<Enum>.<Variant>`:
+        // the variant scope is cleared for a line at the header's
+        // indent, so the header is not qualified by itself.
+        let sigs = extract_public_surface_signatures(
+            "pub enum ActionEffectTemplate {\n    SupersedeMemory {\n        target_param: String,\n    },\n}",
+        );
+        assert!(
+            sigs.contains_key("member:ActionEffectTemplate.SupersedeMemory"),
+            "{sigs:?}"
+        );
+        assert!(
+            !sigs.contains_key("member:ActionEffectTemplate.SupersedeMemory.SupersedeMemory"),
+            "{sigs:?}"
+        );
+    }
+
+    #[test]
+    fn struct_fields_keep_owner_only_key() {
+        // Non-enum containers have no variant scope: their fields
+        // keep the `<Owner>.<name>` composition.
+        let sigs = extract_public_surface_signatures(
+            "pub struct Args {\n    pub profile: bool,\n    pub force: bool,\n}",
+        );
+        assert!(sigs.contains_key("field:Args.profile"), "{sigs:?}");
+        assert!(sigs.contains_key("field:Args.force"), "{sigs:?}");
+    }
+
+    #[test]
+    fn enum_variant_unique_field_add_remove_differs() {
+        let before = extract_public_surface_signatures(
+            "pub enum Shape {\n    Circle {\n        radius: f64,\n    },\n    Square {\n        side: f64,\n    },\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub enum Shape {\n    Circle {\n    },\n    Square {\n        side: f64,\n    },\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("member:Shape.Circle.radius"),
+            "{before:?}"
+        );
+        assert!(
+            before.contains_key("member:Shape.Square.side"),
+            "{before:?}"
+        );
     }
 
     #[test]
