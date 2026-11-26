@@ -230,7 +230,33 @@ else
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         [ -f "$f" ] || continue
-        FORMATTED="$(rustfmt --edition "$EDITION" --emit stdout < "$f" 2>/dev/null || true)"
+        # stdin mode has no file path, so rustfmt would search for
+        # configuration from the CWD (the repo root) and miss a
+        # file-local rustfmt.toml beside the source (e.g.
+        # src/rustfmt.toml with hard_tabs = true) — formatting valid
+        # tab-indented lines as violations and vice versa. Find the
+        # nearest rustfmt.toml/.rustfmt.toml in the file's directory
+        # or any ancestor up to the repo root (rustfmt's own
+        # file-mode search order) and pass its directory as
+        # --config-path. Only pass it when a config was actually
+        # found: --config-path ERRORS (empty output, which would
+        # read as "could not format" for every file) when no config
+        # exists under the given path.
+        FMT_CFG_DIR=""
+        fd="$(dirname "$f")"
+        while :; do
+            if [ -f "$fd/rustfmt.toml" ] || [ -f "$fd/.rustfmt.toml" ]; then
+                FMT_CFG_DIR="$fd"
+                break
+            fi
+            [ "$fd" = "." ] && break
+            fd="$(dirname "$fd")"
+        done
+        if [ -n "$FMT_CFG_DIR" ]; then
+            FORMATTED="$(rustfmt --edition "$EDITION" --config-path "$FMT_CFG_DIR" --emit stdout < "$f" 2>/dev/null || true)"
+        else
+            FORMATTED="$(rustfmt --edition "$EDITION" --emit stdout < "$f" 2>/dev/null || true)"
+        fi
         if [ -z "$FORMATTED" ]; then
             echo "$GATE: warning: rustfmt could not format $f (syntax?) — fmt NOT verified for this file (clippy/build remain backstop)" >&2
             continue

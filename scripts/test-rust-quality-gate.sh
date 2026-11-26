@@ -881,4 +881,50 @@ if [ "$st30" -ne 0 ] || ! grep -q 'pass' <<< "$out30"; then
     exit 1
 fi
 
+# Leg 31 (regression, Codex P2 — file-local rustfmt config): a
+# src/rustfmt.toml with hard_tabs = true makes TAB-indented added
+# lines correctly formatted (cargo fmt -- --check passes on this
+# fixture). Pre-fix the gate formatted stdin from the repo root,
+# ignoring the local config, and blocked the push demanding spaces.
+local_fmt_clean="$TMP/local-fmt-clean"
+new_repo "$local_fmt_clean"
+printf 'hard_tabs = true\n' > "$local_fmt_clean/src/rustfmt.toml"
+printf 'pub fn clean() -> i32 {\n\t1\n}\n' > "$local_fmt_clean/src/lib.rs"
+git -C "$local_fmt_clean" add src/rustfmt.toml src/lib.rs
+git -C "$local_fmt_clean" commit -q -m 'hard-tabs baseline'
+git -C "$local_fmt_clean" update-ref refs/remotes/origin/develop HEAD
+printf '\npub fn tabbed() -> i32 {\n\t7\n}\n' >> "$local_fmt_clean/src/lib.rs"
+git -C "$local_fmt_clean" add src/lib.rs
+git -C "$local_fmt_clean" commit -q -m 'tabbed addition'
+set +e
+out31=$(run_gate "$local_fmt_clean" "$PATH")
+st31=$?
+set -e
+if [ "$st31" -ne 0 ] || ! grep -q 'pass' <<< "$out31"; then
+    printf 'FAIL: tab-indented added lines valid under a file-local rustfmt.toml (hard_tabs) must pass the gate\n%s\n' "$out31" >&2
+    exit 1
+fi
+
+# Leg 32 (converse): SPACE-indented added lines under the same
+# hard_tabs config are misformatted and must still BLOCK — the
+# config must actually drive the check, not disable it.
+local_fmt_dirty="$TMP/local-fmt-dirty"
+new_repo "$local_fmt_dirty"
+printf 'hard_tabs = true\n' > "$local_fmt_dirty/src/rustfmt.toml"
+printf 'pub fn clean() -> i32 {\n\t1\n}\n' > "$local_fmt_dirty/src/lib.rs"
+git -C "$local_fmt_dirty" add src/rustfmt.toml src/lib.rs
+git -C "$local_fmt_dirty" commit -q -m 'hard-tabs baseline'
+git -C "$local_fmt_dirty" update-ref refs/remotes/origin/develop HEAD
+printf '\npub fn spaced() -> i32 {\n    7\n}\n' >> "$local_fmt_dirty/src/lib.rs"
+git -C "$local_fmt_dirty" add src/lib.rs
+git -C "$local_fmt_dirty" commit -q -m 'space-indented addition'
+set +e
+out32=$(run_gate "$local_fmt_dirty" "$PATH")
+st32=$?
+set -e
+if [ "$st32" -eq 0 ] || ! grep -q 'needs formatting on added lines' <<< "$out32"; then
+    printf 'FAIL: space-indented added lines under a file-local hard_tabs rustfmt.toml must block the gate\n%s\n' "$out32" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
