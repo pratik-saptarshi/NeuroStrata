@@ -1081,4 +1081,104 @@ if [ "$st37" -eq 0 ] || ! grep -q 'does not build' <<< "$out37"; then
     exit 1
 fi
 
+# Leg 38 (regression, Codex P2 — lockfile relocation): the baseline
+# commit has a crate at old/ whose Cargo.lock carries a high
+# advisory; the push's ONLY change relocates the crate to new/ with
+# IDENTICAL lockfile content (Git reports R100 renames). Pre-fix,
+# the lockfile's new path is absent at $BASE, so the verified-absent
+# branch treated its advisory baseline as empty and the gate
+# blocked on the INHERITED advisory as if newly introduced.
+# Post-fix, lineage resolution (rename detection / content match)
+# finds the baseline at old/Cargo.lock and the push passes.
+new_movable_repo() {
+    # $1 = repo, $2 = 1 if the baseline lockfile carries the advisory
+    local repo="$1" marker="$2"
+    mkdir -p "$repo/old/src"
+    git -C "$repo" init -q
+    git -C "$repo" config user.email test@example.com
+    git -C "$repo" config user.name test
+    cat > "$repo/old/Cargo.toml" <<'EOF'
+[package]
+name = "movable-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+EOF
+    printf 'pub fn clean() -> i32 {\n    1\n}\n' > "$repo/old/src/lib.rs"
+    (cd "$repo/old" && cargo generate-lockfile >/dev/null 2>&1)
+    if [ "$marker" = "1" ]; then
+        printf '# audit-vuln-marker\n' >> "$repo/old/Cargo.lock"
+    fi
+    git -C "$repo" add old
+    git -C "$repo" commit -q -m 'crate at old/ baseline'
+    git -C "$repo" update-ref refs/remotes/origin/develop HEAD
+}
+relocated="$TMP/relocated"
+new_movable_repo "$relocated" 1
+git -C "$relocated" mv old new
+git -C "$relocated" commit -q -m 'relocate crate old to new, lockfile unchanged'
+set +e
+out38=$(run_gate "$relocated" "$AUDIT_PATH")
+st38=$?
+set -e
+if [ "$st38" -ne 0 ] || grep -q 'new high/critical advisory' <<< "$out38"; then
+    printf 'FAIL: relocating a crate with an identical advisory lockfile must not block on the inherited advisory (baseline follows the move)\n%s\n' "$out38" >&2
+    exit 1
+fi
+
+# Leg 38b (control, same P2): a genuinely NEW lockfile at a new path
+# introducing an advisory that exists NOWHERE at $BASE must still
+# block — lineage resolution must not whitewash new lockfiles.
+brand_new_lock="$TMP/brand-new-lock"
+new_nonrust_repo "$brand_new_lock"
+mkdir -p "$brand_new_lock/new/src"
+cat > "$brand_new_lock/new/Cargo.toml" <<'EOF'
+[package]
+name = "brand-new-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+EOF
+printf 'pub fn clean() -> i32 {\n    1\n}\n' > "$brand_new_lock/new/src/lib.rs"
+(cd "$brand_new_lock/new" && cargo generate-lockfile >/dev/null 2>&1)
+printf '# audit-vuln-marker\n' >> "$brand_new_lock/new/Cargo.lock"
+git -C "$brand_new_lock" add new
+git -C "$brand_new_lock" commit -q -m 'add brand-new crate with advisory lockfile'
+set +e
+out38b=$(run_gate "$brand_new_lock" "$AUDIT_PATH")
+st38b=$?
+set -e
+if [ "$st38b" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out38b"; then
+    printf 'FAIL: a genuinely new lockfile introducing a new advisory must still block the gate\n%s\n' "$out38b" >&2
+    exit 1
+fi
+
+# Leg 38c (control, same P2): a relocation whose lockfile content
+# CHANGED during the move to ADD a new advisory must still block on
+# that advisory — the lineage baseline (the old lockfile, audited on
+# its own merits) must not whitewash advisories introduced by the
+# move itself.
+relocated_dirty="$TMP/relocated-dirty"
+new_movable_repo "$relocated_dirty" 0
+git -C "$relocated_dirty" mv old new
+printf '# audit-vuln-marker\n' >> "$relocated_dirty/new/Cargo.lock"
+git -C "$relocated_dirty" add new/Cargo.lock
+git -C "$relocated_dirty" commit -q -m 'relocate crate and add advisory'
+set +e
+out38c=$(run_gate "$relocated_dirty" "$AUDIT_PATH")
+st38c=$?
+set -e
+if [ "$st38c" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced by this push: RUSTSEC-9999-0001' <<< "$out38c"; then
+    printf 'FAIL: an advisory added to a lockfile during its relocation must still block the gate\n%s\n' "$out38c" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'

@@ -6294,6 +6294,11 @@ mod tests {
             "the guard must treat a baseline commit that positively has no lockfile at the audited path (verified via git cat-file against the existing baseline commit, not a failed git show) as a verified-empty advisory baseline, so advisories in a newly added lockfile block instead of warning and passing"
         );
         assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE
+                .contains("resolve renamed lockfiles to their original baseline paths"),
+            "the guard must resolve a relocated lockfile to its original baseline path (rename detection over the push range, then an exact content match against the baseline's lockfiles) before treating its new path as verified-absent, so a crate relocation is not blocked on advisories inherited from the lockfile's old location"
+        );
+        assert!(
             SCAFFOLDED_RUST_QUALITY_GATE.contains("':(glob)**/Cargo.toml'"),
             "the guard must detect Cargo.toml/Cargo.lock changes tree-wide (glob pathspecs matching the root and any nested directory), so a manifest/lockfile-only push in a nested crate (e.g. native/) engages the gate instead of exiting as 'no Rust sources or manifests changed'"
         );

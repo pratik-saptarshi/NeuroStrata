@@ -690,6 +690,7 @@ audit_leg() {
     local lock="$1"
     local audit_text audit_rc parsed parse_rc new_ids
     local base_sev base_ok tmpbase base_text base_rc aid
+    local base_lock lineage_stat lineage_old lineage_new cur_blob cand_lock
     if [ "$lock" = "Cargo.lock" ]; then
         # (no `set -e` in this script, so a failing substitution is safe
         # to inspect via $? on the next line)
@@ -727,6 +728,44 @@ audit_leg() {
     fi
     base_sev=""
     base_ok=0
+    # Lockfile lineage: resolve renamed lockfiles to their original baseline paths
+    # before treating an absent path as dependency-free.
+    # A push that RELOCATES an existing crate
+    # leaves the lockfile's new path absent at $BASE, so the
+    # verified-absent branch below would treat its advisory
+    # baseline as empty and block on vulnerabilities the push
+    # inherited rather than introduced. Two lineage proofs, in
+    # order: (1) rename detection over the push range names the
+    # lockfile's original path (this also covers a relocation
+    # whose lockfile content changed during the move — the
+    # baseline found this way is audited on its own merits, so a
+    # genuinely new advisory added during the move still blocks);
+    # (2) an exact content match — the current lockfile's blob is
+    # byte-identical to a lockfile at $BASE under another path.
+    # Only when NEITHER proof finds a baseline lockfile may the
+    # verified-absent branch below conclude the baseline is empty.
+    base_lock=""
+    if git cat-file -e "$BASE:$lock" 2>/dev/null; then
+        base_lock="$lock"
+    else
+        while IFS="$(printf '\t')" read -r lineage_stat lineage_old lineage_new; do
+            case "$lineage_stat" in
+                R*) [ "$lineage_new" = "$lock" ] && base_lock="$lineage_old" ;;
+            esac
+        done <<< "$(git -c core.quotePath=false diff --name-status -M --no-color --no-ext-diff --no-textconv --text "$BASE" -- ':(glob)**/Cargo.lock' 2>/dev/null || true)"
+        if [ -z "$base_lock" ] && [ -f "$lock" ]; then
+            cur_blob="$(git hash-object "$lock" 2>/dev/null || true)"
+            if [ -n "$cur_blob" ]; then
+                while IFS= read -r cand_lock; do
+                    [ -n "$cand_lock" ] || continue
+                    if [ "$(git rev-parse "$BASE:$cand_lock" 2>/dev/null || true)" = "$cur_blob" ]; then
+                        base_lock="$cand_lock"
+                        break
+                    fi
+                done <<< "$(git ls-tree -r --name-only "$BASE" 2>/dev/null | grep -E '(^|/)Cargo\.lock$' || true)"
+            fi
+        fi
+    fi
     if [ "$BASE" = "4b825dc642cb6eb9a060e54bf8d69288fbee4904" ]; then
         # Empty-tree baseline (first push, root commit):
         # there is no baseline lockfile — that is verified
@@ -736,13 +775,15 @@ audit_leg() {
         # the baseline advisory set is empty and every
         # high/critical advisory in the push counts as new.
         base_ok=1
-    elif git cat-file -e "$BASE:$lock" 2>/dev/null; then
-        # The baseline HAS a lockfile at this path: audit it. (A failed
-        # `git show` below, or a failed audit/parse of what it shows,
-        # leaves base_ok=0 — an existing-but-unverifiable baseline
-        # keeps the warn-only NOT-verified posture, never a pass.)
+    elif [ -n "$base_lock" ]; then
+        # The baseline HAS this lockfile — at this path, or at its
+        # original path when this push relocated it (lineage above):
+        # audit it. (A failed `git show` below, or a failed
+        # audit/parse of what it shows, leaves base_ok=0 — an
+        # existing-but-unverifiable baseline keeps the warn-only
+        # NOT-verified posture, never a pass.)
         tmpbase="$(mktemp -t rustgate-base-lock.XXXXXX)"
-        if git show "$BASE:$lock" > "$tmpbase" 2>/dev/null; then
+        if git show "$BASE:$base_lock" > "$tmpbase" 2>/dev/null; then
             base_text="$(cargo audit --file "$tmpbase" --color never 2>/dev/null)"
             base_rc=$?
             if [ "$base_rc" -eq 0 ]; then
