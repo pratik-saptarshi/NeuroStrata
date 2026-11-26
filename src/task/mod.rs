@@ -6313,6 +6313,10 @@ mod tests {
             "the guard must resolve the owning manifest for each changed .rs file when no root Cargo.toml exists, so a bootstrapped repo whose crate lives under a subdirectory (e.g. native/) is linted instead of blocked on the missing root manifest"
         );
         assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("FILE_EDITION"),
+            "the guard must resolve the rustfmt edition per source file from its owning package (nearest Cargo.toml ancestor), so a bootstrapped nested-only crate on edition 2024 is not formatted as the root default 2021 — rustfmt errors on edition-2024 syntax, the fmt leg warns-and-skips, and misformatted added lines pass"
+        );
+        assert!(
             SCAFFOLDED_RUST_QUALITY_GATE.contains("export CARGO_TERM_COLOR=never"),
             "the guard must force cargo color off so a user-set CARGO_TERM_COLOR=always cannot inject ANSI escapes into the clippy diagnostics and audit report the guard parses (an escaped severity silently empties the diagnostic set and the gate passes unverified code)"
         );

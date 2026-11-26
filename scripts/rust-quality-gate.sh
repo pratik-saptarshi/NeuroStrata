@@ -269,10 +269,33 @@ else
             [ "$fd" = "." ] && break
             fd="$(dirname "$fd")"
         done
+        # The edition is per FILE, resolved from its owning package:
+        # the nearest Cargo.toml in the file's directory or any
+        # ancestor up to the repo root (the same owning-manifest
+        # walk §2 uses). Reading the edition only from a ROOT
+        # Cargo.toml (the $EDITION fallback below) misformats a
+        # bootstrapped layout whose crate lives only in a nested
+        # directory: a native/ crate on edition 2024 formatted as
+        # 2021 makes rustfmt error on edition-2024 syntax
+        # (let-chains), the leg warns-and-skips, and misformatted
+        # added lines pass unchecked. When a root Cargo.toml exists
+        # and owns the file, the walk finds it first, so root-crate
+        # behaviour is unchanged.
+        FILE_EDITION=""
+        ed_d="$(dirname "$f")"
+        while :; do
+            if [ -f "$ed_d/Cargo.toml" ]; then
+                FILE_EDITION="$(grep -m1 '^edition[[:space:]]*=' "$ed_d/Cargo.toml" 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' || true)"
+                break
+            fi
+            [ "$ed_d" = "." ] && break
+            ed_d="$(dirname "$ed_d")"
+        done
+        [ -n "$FILE_EDITION" ] || FILE_EDITION="$EDITION"
         if [ -n "$FMT_CFG_DIR" ]; then
-            FORMATTED="$(rustfmt --edition "$EDITION" --config-path "$FMT_CFG_DIR" --emit stdout < "$f" 2>/dev/null || true)"
+            FORMATTED="$(rustfmt --edition "$FILE_EDITION" --config-path "$FMT_CFG_DIR" --emit stdout < "$f" 2>/dev/null || true)"
         else
-            FORMATTED="$(rustfmt --edition "$EDITION" --emit stdout < "$f" 2>/dev/null || true)"
+            FORMATTED="$(rustfmt --edition "$FILE_EDITION" --emit stdout < "$f" 2>/dev/null || true)"
         fi
         if [ -z "$FORMATTED" ]; then
             echo "$GATE: warning: rustfmt could not format $f (syntax?) — fmt NOT verified for this file (clippy/build remain backstop)" >&2

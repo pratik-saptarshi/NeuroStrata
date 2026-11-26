@@ -990,4 +990,46 @@ if [ "$st34" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: src/cafÃ
     exit 1
 fi
 
+# Leg 35 (regression, Codex P2 â€” per-file edition): a bootstrapped
+# repo whose ONLY crate lives under native/ on edition = "2024"
+# (no root Cargo.toml). The added line uses a let-chain and is
+# misformatted per rustfmt edition 2024. Pre-fix the fmt leg read
+# the edition only from a root Cargo.toml (default 2021), rustfmt
+# errored on the let-chain, the leg warned-and-skipped, and the
+# gate passed. Post-fix the edition comes from the owning
+# manifest (native/Cargo.toml) and the gate blocks on fmt.
+nested_ed2024="$TMP/nested-ed2024"
+mkdir -p "$nested_ed2024/native/src"
+git -C "$nested_ed2024" init -q
+git -C "$nested_ed2024" config user.email test@example.com
+git -C "$nested_ed2024" config user.name test
+cat > "$nested_ed2024/native/Cargo.toml" <<'EOF'
+[package]
+name = "nested-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+EOF
+printf 'pub fn clean() -> i32 {\n    1\n}\n' > "$nested_ed2024/native/src/lib.rs"
+(cd "$nested_ed2024/native" && cargo generate-lockfile >/dev/null 2>&1)
+git -C "$nested_ed2024" add native
+git -C "$nested_ed2024" commit -q -m 'nested edition-2024 baseline'
+git -C "$nested_ed2024" update-ref refs/remotes/origin/develop HEAD
+if [ -e "$nested_ed2024/Cargo.toml" ]; then
+    echo 'FAIL: edition fixture must have no root Cargo.toml' >&2; exit 1
+fi
+printf '\npub fn check(a: Option<i32>, b: Option<i32>) -> bool { if let Some(x) = a && let Some(y) = b { x == y } else { false } }\n' >> "$nested_ed2024/native/src/lib.rs"
+git -C "$nested_ed2024" add native/src/lib.rs
+git -C "$nested_ed2024" commit -q -m 'misformatted let-chain addition'
+set +e
+out35=$(run_gate "$nested_ed2024" "$PATH")
+st35=$?
+set -e
+if [ "$st35" -eq 0 ] || ! grep -q 'needs formatting on added lines' <<< "$out35"; then
+    printf 'FAIL: misformatted let-chain added lines in a nested-only edition-2024 crate must block the gate (per-file edition)\n%s\n' "$out35" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'
