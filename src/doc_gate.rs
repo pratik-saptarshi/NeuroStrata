@@ -1719,11 +1719,21 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
     // (its signatures are taken from the corresponding original line,
     // which blanking's line-structure preservation keeps aligned).
     let mut test_scope = TestScopeTracker::new();
+    // The enclosing container kind, tracked only so a multiline
+    // variant header can be recognized in an enum context (as in the
+    // signatures extractor).
+    let mut enclosing_kind: Option<String> = None;
     for (line, original_line) in cleaned.lines().zip(text.lines()) {
         // Test-only scopes extract nothing (see TestScopeTracker).
         let indent = line.len() - line.trim_start().len();
         if test_scope.suppresses(indent, line) {
             continue;
+        }
+        if !line.starts_with([' ', '\t']) && line.trim_start().starts_with('}') {
+            enclosing_kind = None;
+        }
+        if let Some((_name, kind)) = parse_any_container_header(line) {
+            enclosing_kind = Some(kind);
         }
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             for (name, _signature) in pairs {
@@ -1740,7 +1750,14 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
         {
             decls.insert(name);
         }
-        if let Some((name, _key, _signature)) = parse_member_declaration(line) {
+        let member = parse_member_declaration(line).or_else(|| {
+            if enclosing_kind.as_deref() == Some("enum") {
+                parse_multiline_variant_header(line)
+            } else {
+                None
+            }
+        });
+        if let Some((name, _key, _signature)) = member {
             decls.insert(name);
         }
     }
@@ -2435,7 +2452,21 @@ fn extract_public_surface_signatures(
             enclosing = Some(name);
             enclosing_kind = Some(kind);
         }
-        if let Some((member_name, key, signature)) = parse_member_declaration(line) {
+        let member = parse_member_declaration(line).or_else(|| {
+            // A multiline variant header (payload opening unclosed
+            // on its line) extracts nothing from the member parser;
+            // recognize it in an enum context only, so the same
+            // shape inside a fn body or a struct literal stays a
+            // body/literal fragment (the W1 class).
+            if enclosing_kind_at_line_start.as_deref() == Some("enum")
+                && !in_fn_body_at_line_start
+            {
+                parse_multiline_variant_header(line)
+            } else {
+                None
+            }
+        });
+        if let Some((member_name, key, signature)) = member {
             if key.starts_with("fn:") {
                 line_is_fn = true;
             }
@@ -5563,6 +5594,56 @@ pub struct AfterAll {}
             before.contains_key("clap-arg:Commands.Daemon.profile"),
             "{before:?}"
         );
+    }
+
+    #[test]
+    fn multiline_struct_variant_rename_differs() {
+        // X4 probe (Codex PR #162): replacing `Daemon {` with
+        // `DaemonV2 {` in src/main.rs produced identical maps — a
+        // multiline struct variant without an explicit
+        // #[command(name = ...)] was invisible, because the member
+        // parser requires the payload to close on the header line,
+        // so the derived CLI name change registered nothing.
+        let before = extract_public_surface_signatures(
+            "enum Commands {\n    Daemon {\n        profile: bool,\n    },\n    Namespaces,\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "enum Commands {\n    DaemonV2 {\n        profile: bool,\n    },\n    Namespaces,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("member:Commands.Daemon"), "{before:?}");
+        let decls = extract_public_surface_declarations(
+            "enum Commands {\n    Daemon {\n        profile: bool,\n    },\n    Namespaces,\n}",
+        );
+        assert!(decls.contains("Daemon"), "{decls:?}");
+    }
+
+    #[test]
+    fn multiline_tuple_variant_rename_differs() {
+        // The tuple-payload sibling: the payload opens on the
+        // header line and closes on a later line.
+        let before = extract_public_surface_signatures(
+            "pub enum Message {\n    Load(\n        u64,\n    ),\n    Quit,\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub enum Message {\n    LoadV2(\n        u64,\n    ),\n    Quit,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("member:Message.Load"), "{before:?}");
+    }
+
+    #[test]
+    fn multiline_literal_header_in_fn_body_is_not_a_variant() {
+        // Control (the W1 false-positive class): a multiline
+        // struct-literal header inside a fn body has the same shape
+        // but is not an enum variant and must not register.
+        let before = extract_public_surface_signatures(
+            "pub fn build() -> Thing {\n    Foo {\n        x: 1,\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub fn build() -> Thing {\n    Bar {\n        x: 1,\n    }\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
     }
 
     #[test]
