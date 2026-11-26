@@ -58,6 +58,44 @@ if [ -n "$_ns_remote_url" ]; then
 fi
 unset _ns_remote_name _ns_remote_url _ns_path
 
+# ── Pushed refs (best-effort) ────────────────────────────────────────────
+# git invokes pre-push as: pre-push <remote-name> <remote-url> with one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per updated
+# ref on stdin. Capture them for guards that need the exact push range
+# (e.g. the Rust gate validates pushed refs, not just the checkout).
+# /dev/null or empty stdin yields empty immediately; a TTY is never read
+# (it would hang waiting for input).
+HOOK_PUSH_REFS=""
+if [ ! -t 0 ]; then
+    HOOK_PUSH_REFS="$(cat 2>/dev/null || true)"
+fi
+export HOOK_PUSH_REFS
+
+# ── Project guards (run before the task gate, independently of it) ───────
+# These run BEFORE Guard 2 below on purpose: NEUROSTRATA_SKIP_GATE=1
+# exits 0 at the top of Guard 2, so project guards placed after it would
+# be skipped along with the task gate; running them first makes them
+# skip-proof.
+# A guard that belongs here does NOT need a CI workflow to be real.
+PROJECT_GATES=(
+    # Rust quality gate: fmt/clippy deltas + audit delta on pushes that
+    # touch Rust sources or manifests. Never blocks on legacy backlog
+    # (the quality-baseline file owns that); see
+    # docs/SECDEVOPS-CHECKLIST.md. Bypass: RUST_QUALITY_SKIP=1.
+    ./scripts/rust-quality-gate.sh
+    # Task-coverage gate: blocks pushes when changed docs contain work-item
+    # language without a NeuroStrata task ID citation.
+    ./scripts/task-coverage-gate.sh
+    # ./scripts/rules-gate.sh
+)
+
+if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
+    for g in "${PROJECT_GATES[@]}"; do
+        [ -f "$g" ] || { echo "project guard $g missing — skipping" >&2; continue; }
+        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
+    done
+fi
+
 command -v neurostrata-mcp >/dev/null 2>&1 || { echo "error: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 1; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
@@ -89,22 +127,5 @@ for GATE_NAMESPACE in "${GATE_NAMESPACES[@]}"; do
     fi
 done
 
-# ── project guards (add yours here) ────────────────────────────────────────
-# Add the path of each local guard; it runs before every push on every host.
-# A guard that belongs here does NOT need a CI workflow to be real.
-PROJECT_GATES=(
-    # Task-coverage gate: blocks pushes when changed docs contain work-item
-    # language without a NeuroStrata task ID citation.
-    ./scripts/task-coverage-gate.sh
-    # ./scripts/rules-gate.sh
-)
-
-if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
-    for g in "${PROJECT_GATES[@]}"; do
-        [ -f "$g" ] || { echo "task-coverage-gate: guard $g missing — skipping" >&2; continue; }
-        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
-    done
-fi
-
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 484be5817cac70a65f860f0f79654f0c243f97e9113bd09e3cdf43e7dd3ac05a
+# neurostrata-hook-sha256: 171b4ce9eab330bbcc44cf25be0d941346ad9e53638092ce5bb0c606f22c2bf8
