@@ -2064,6 +2064,78 @@ impl TestScopeTracker {
     }
 }
 
+/// Parses one line as a container header of any visibility — a bare
+/// `pub` item, a restricted-visibility item, or a private item
+/// (`enum Commands {`, `mod tests {`) — returning its (name, kind)
+/// when the kind is a container kind. Scope tracking needs private
+/// containers too: a clap command enum is typically not `pub`, but
+/// its variants and fields are still CLI surface, and member
+/// qualification must know the enum encloses them. Extraction of the
+/// container itself stays visibility-gated by the declaration
+/// parsers; this parser only names the scope.
+fn parse_any_container_header(line: &str) -> Option<(String, String)> {
+    const CONTAINER_KINDS: [&str; 5] = ["struct", "enum", "trait", "union", "mod"];
+    for parsed in [
+        parse_public_surface_declaration(line),
+        parse_restricted_surface_declaration(line),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (name, kind) = parsed;
+        if CONTAINER_KINDS.contains(&kind.as_str()) {
+            return Some((name, kind));
+        }
+    }
+    let trimmed = line.trim();
+    let mut tokens = trimmed.split_whitespace();
+    let kind = tokens.next()?;
+    if !CONTAINER_KINDS.contains(&kind) {
+        return None;
+    }
+    let name_token = tokens.next()?;
+    let (name, _len) = leading_identifier(name_token)?;
+    Some((name, kind.to_string()))
+}
+
+/// Parses one indented line as a multiline enum variant header: an
+/// uppercase variant name followed by a `{` (struct variant) or `(`
+/// (tuple variant) payload that does NOT close on the same line. The
+/// member parser's variant pattern requires the payload group to end
+/// at its close on the header line, so these headers extract nothing
+/// there; this parser recognizes the header alone, returning
+/// (name, key, signature) in the member parser's shape.
+fn parse_multiline_variant_header(line: &str) -> Option<(String, String, String)> {
+    if line == line.trim_start() {
+        return None;
+    }
+    let trimmed = line.trim();
+    let (name, len) = leading_identifier(trimmed)?;
+    let plain = name.strip_prefix("r#").unwrap_or(&name);
+    if RUST_KEYWORDS.contains(&plain)
+        || !plain
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let rest = trimmed[len..].trim_start();
+    let (open, close) = if rest.starts_with('{') {
+        ('{', '}')
+    } else if rest.starts_with('(') {
+        ('(', ')')
+    } else {
+        return None;
+    };
+    if rest.matches(open).count() <= rest.matches(close).count() {
+        return None;
+    }
+    let signature = normalized_line(trimmed);
+    Some((name.clone(), format!("member:{name}"), signature))
+}
+
 /// Extracts the public surface as a map from declaration key to the set
 /// of normalized signatures seen for that key. SS7 identifiers enter as
 /// key = signature = identifier, so a changed line carrying one still
@@ -2194,6 +2266,14 @@ fn extract_public_surface_signatures(
     // member (stacked attribute lines and blank lines keep it
     // pending; any other code line drops it).
     let mut pending_command: Vec<String> = Vec::new();
+    // Clap argument attributes awaiting their field, with the same
+    // placement rule: a `#[arg(...)]` line contributes only when it
+    // directly precedes the field it annotates. On attachment the
+    // attribute is recorded under a key qualified by the owning
+    // command and field (`clap-arg:<Owner>.<field>`), because the
+    // unconditional shared `clap-arg` key alone cancels a change
+    // whenever both spellings occur on other options in the file.
+    let mut pending_clap_args: Vec<String> = Vec::new();
     // The enclosing container (struct / enum / trait / union / mod,
     // an `impl` target type, or a TypeScript class / interface /
     // enum / namespace) most recently declared in the text. Member
@@ -2215,6 +2295,13 @@ fn extract_public_surface_signatures(
     // struct / trait / union / mod / impl block is a body or literal
     // fragment, never a variant.
     let mut enclosing_kind: Option<String> = None;
+    // The struct-variant scope inside the enclosing enum: a variant
+    // header (`Daemon {`) whose payload opens unclosed on its line
+    // puts the following, deeper lines inside the variant, so their
+    // owners are the variant as well as the enum (the daemon
+    // `profile` option's owner is `Commands.Daemon`). A line at or
+    // shallower than the header ends the variant scope.
+    let mut variant_scope: Option<(String, usize)> = None;
     // The indentation of a `fn` header whose body opened on its line
     // and has not closed yet. Lines deeper than the header are fn
     // body lines: their bare tokens are body expressions (`Ok(out)`
@@ -2239,6 +2326,19 @@ fn extract_public_surface_signatures(
         if let Some(attribute) = parse_command_attribute(preserved_line) {
             pending_command.push(attribute);
         }
+        if let Some(attribute) = parse_clap_arg_attribute(original_line) {
+            pending_clap_args.push(attribute);
+        }
+        // A non-blank line at or shallower than a variant header
+        // ends the variant scope.
+        if !line.trim().is_empty()
+            && variant_scope
+                .as_ref()
+                .map(|(_, open_indent)| indent <= *open_indent)
+                .unwrap_or(false)
+        {
+            variant_scope = None;
+        }
         // Blank lines carry indent 0 but are not body content: they
         // must not end fn-body tracking, or a tail expression after
         // a blank line inside a fn is read as an enum member.
@@ -2249,6 +2349,7 @@ fn extract_public_surface_signatures(
         if !line.starts_with([' ', '\t']) && line.trim_start().starts_with('}') {
             enclosing = None;
             enclosing_kind = None;
+            variant_scope = None;
         }
         // The owner in scope at the START of this line: a line that is
         // both a declaration and a member (a `pub fn` method in an
@@ -2257,9 +2358,11 @@ fn extract_public_surface_signatures(
         // declared on this same line.
         let enclosing_at_line_start = enclosing.clone();
         let enclosing_kind_at_line_start = enclosing_kind.clone();
+        let variant_at_line_start = variant_scope.as_ref().map(|(name, _)| name.clone());
         let in_fn_body_at_line_start = fn_body_indent.is_some();
         let mut line_is_fn = false;
         let mut attach_keys: Vec<String> = Vec::new();
+        let mut attach_names: Vec<String> = Vec::new();
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             if let Some((name, _)) = pairs.first() {
                 let container_kind = line
@@ -2302,6 +2405,7 @@ fn extract_public_surface_signatures(
                 enclosing_kind = Some(kind.clone());
             }
             attach_keys.push(name.clone());
+            attach_names.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
             .filter(|(name, _kind)| reexported.contains(name))
@@ -2317,12 +2421,21 @@ fn extract_public_surface_signatures(
                 enclosing_kind = Some(kind.clone());
             }
             attach_keys.push(name.clone());
+            attach_names.push(name.clone());
             signatures.entry(name).or_default().insert(signature);
         } else if let Some(owner) = parse_impl_enclosing(line) {
             enclosing = Some(owner);
             enclosing_kind = Some("impl".to_string());
+        } else if let Some((name, kind)) = parse_any_container_header(line) {
+            // A private container (a clap command enum, a test
+            // module) is not itself extracted, but it encloses the
+            // members that follow, and they must be qualified with
+            // it — the declaration branches above only see bare
+            // `pub` containers.
+            enclosing = Some(name);
+            enclosing_kind = Some(kind);
         }
-        if let Some((_name, key, signature)) = parse_member_declaration(line) {
+        if let Some((member_name, key, signature)) = parse_member_declaration(line) {
             if key.starts_with("fn:") {
                 line_is_fn = true;
             }
@@ -2352,7 +2465,21 @@ fn extract_public_surface_signatures(
                     None => key,
                 };
                 attach_keys.push(key.clone());
+                attach_names.push(member_name.clone());
                 signatures.entry(key).or_default().insert(signature);
+            }
+        }
+        // A multiline struct-variant header opens the variant scope
+        // for the fields that follow (a tuple variant's payload is
+        // types, not fields, so only `{` opens a scope).
+        if enclosing_kind_at_line_start.as_deref() == Some("enum") {
+            if let Some((variant_name, _key, _signature)) =
+                parse_multiline_variant_header(line)
+            {
+                let trimmed = line.trim();
+                if trimmed[variant_name.len()..].trim_start().starts_with('{') {
+                    variant_scope = Some((variant_name, indent));
+                }
             }
         }
         // A fn header whose body brace opens unclosed on its line
@@ -2397,11 +2524,45 @@ fn extract_public_surface_signatures(
                 }
             }
             pending_command.clear();
+            // The pending clap-arg contents enter the annotated
+            // field's signature set (as an `arg(...)` signature) and
+            // a key qualified by the owning command and field: the
+            // shared `clap-arg` key (populated unconditionally in the
+            // schema scan above) cannot distinguish two options whose
+            // spellings both occur elsewhere in the file.
+            for key in &attach_keys {
+                for attribute in &pending_clap_args {
+                    signatures
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(format!("arg({attribute})"));
+                }
+            }
+            if !pending_clap_args.is_empty() {
+                let owner_path = match (&enclosing_at_line_start, &variant_at_line_start) {
+                    (Some(owner), Some(variant)) => Some(format!("{owner}.{variant}")),
+                    (Some(owner), None) => Some(owner.clone()),
+                    (None, Some(variant)) => Some(variant.clone()),
+                    (None, None) => None,
+                };
+                if let Some(owner_path) = owner_path {
+                    for name in &attach_names {
+                        for attribute in &pending_clap_args {
+                            signatures
+                                .entry(format!("clap-arg:{owner_path}.{name}"))
+                                .or_default()
+                                .insert(attribute.clone());
+                        }
+                    }
+                }
+            }
+            pending_clap_args.clear();
         } else {
             let preserved_trimmed = preserved_line.trim();
             if !preserved_trimmed.is_empty() && !preserved_trimmed.starts_with("#[") {
                 pending_serde.clear();
                 pending_command.clear();
+                pending_clap_args.clear();
             }
         }
     }
@@ -5382,6 +5543,41 @@ pub struct AfterAll {}
         let before = extract_public_surface_signatures("        #[arg(long)]");
         let after = extract_public_surface_signatures("        #[arg(short)]");
         assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn clap_arg_change_on_one_variant_field_differs() {
+        // X3 probe (Codex PR #162): changing the daemon `profile`
+        // option in src/main.rs from #[arg(long)] to
+        // #[arg(short, long)] produced identical maps, because every
+        // #[arg(...)] aggregated under the shared `clap-arg` key and
+        // both spellings occur on other options.
+        let before = extract_public_surface_signatures(
+            "enum Commands {\n    Daemon {\n        #[arg(long)]\n        profile: bool,\n    },\n    Other {\n        #[arg(short, long)]\n        verbose: bool,\n        #[arg(long)]\n        force: bool,\n    },\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "enum Commands {\n    Daemon {\n        #[arg(short, long)]\n        profile: bool,\n    },\n    Other {\n        #[arg(short, long)]\n        verbose: bool,\n        #[arg(long)]\n        force: bool,\n    },\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("clap-arg:Commands.Daemon.profile"),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn clap_arg_change_on_one_struct_field_differs() {
+        // Same shared-key cancellation between two Args structs:
+        // the attribute must be qualified by its owning struct and
+        // field.
+        let before = extract_public_surface_signatures(
+            "pub struct Args {\n    #[arg(long)]\n    pub profile: bool,\n}\npub struct Other {\n    #[arg(short, long)]\n    pub profile: bool,\n    #[arg(long)]\n    pub force: bool,\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub struct Args {\n    #[arg(short, long)]\n    pub profile: bool,\n}\npub struct Other {\n    #[arg(short, long)]\n    pub profile: bool,\n    #[arg(long)]\n    pub force: bool,\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("clap-arg:Args.profile"), "{before:?}");
     }
 
     #[test]
