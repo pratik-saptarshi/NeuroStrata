@@ -14409,6 +14409,11 @@ impl VectorStore for LadybugStore {
                 // just-promoted row would make the by-path slot ambiguous
                 // and strand the declarations this replay heals (M1,
                 // decoy-holder probe). See `KnownIds::unscoped`.
+                // Exact declarations are matched against the full,
+                // pre-filter id set instead: they name a row verbatim,
+                // scoped rows included.
+                let known_id_set: std::collections::HashSet<&str> =
+                    known_ids.iter().map(String::as_str).collect();
                 let known = KnownIds::unscoped(known_ids.iter().map(String::as_str));
                 let active_gen = active_generation_of(conn, &namespace);
                 let mut wanted: std::collections::HashMap<
@@ -14419,6 +14424,16 @@ impl VectorStore for LadybugStore {
                     if is_retired(metadata) {
                         continue;
                     }
+                    // A declarer carrying `exact_edge_targets` names its
+                    // targets verbatim: bind the named row if this
+                    // namespace holds it, defer the pair if it does not,
+                    // and never resolve or remap the declaration onto a
+                    // different row — the same verbatim-or-defer rule
+                    // `relink_edges` applies to exact declarations.
+                    let exact_edge_targets = metadata
+                        .get("exact_edge_targets")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     for edge in edge_specs(metadata) {
                         // F7 (fork issue #85): same superseded-generation
                         // remap as relink — a declaration persisted as an
@@ -14429,16 +14444,27 @@ impl VectorStore for LadybugStore {
                         // pointer, so pointer state must not gate the
                         // remap (M1, Arm A). `active_gen` is still read
                         // above for the created edges' generation stamp.
-                        let target = known
-                            .resolve(&edge.target_id)
-                            .or_else(|| {
-                                remap_superseded_scoped_target_at_publication(
-                                    &known,
-                                    &namespace,
-                                    &edge.target_id,
-                                )
-                            })
-                            .unwrap_or_else(|| edge.target_id.clone());
+                        let target = if exact_edge_targets {
+                            match crate::parser::ingest::exact_target_match(
+                                &namespace,
+                                &edge.target_id,
+                                |candidate| known_id_set.contains(candidate),
+                            ) {
+                                Some(found) => found.to_string(),
+                                None => continue,
+                            }
+                        } else {
+                            known
+                                .resolve(&edge.target_id)
+                                .or_else(|| {
+                                    remap_superseded_scoped_target_at_publication(
+                                        &known,
+                                        &namespace,
+                                        &edge.target_id,
+                                    )
+                                })
+                                .unwrap_or_else(|| edge.target_id.clone())
+                        };
                         let pair = if edge.points_at_target {
                             (id.clone(), target)
                         } else {
@@ -40047,6 +40073,99 @@ eurostrata\src\daemon.rs",
             .unwrap();
         let created = f7_publish_staged_tree(&store).await;
         f7_assert_publication_healed(&store, created).await;
+    }
+
+    /// Exact declarations at publication replay: a declarer carrying
+    /// `exact_edge_targets` names a retained generation-scoped row
+    /// verbatim (`probe::1::src/lib.rs`); the replay must bind that
+    /// retained row, not resolve/remap the declaration onto the
+    /// promoted row holding the same logical path — the same
+    /// verbatim-or-defer behaviour `relink_edges` already honours.
+    #[tokio::test]
+    async fn f7_publish_ingested_exact_declaration_binds_retained_row() {
+        let store = retired_test_store().await;
+        // 1. Declarer first, while the named row does not exist yet:
+        // no edge can exist.
+        store
+            .upsert(
+                "probe",
+                "rule-exact",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "owner",
+                    json!({
+                        "governs": ["probe::1::src/lib.rs"],
+                        "exact_edge_targets": true
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            f7_outgoing_targets(&store, "GOVERNS", "rule-exact")
+                .await
+                .is_empty(),
+            "precondition: no GOVERNS edge before the retained row exists"
+        );
+        // 2. The retained row the declaration names exactly.
+        let retained_id =
+            crate::parser::ingest::generation_scoped_id("probe", 1, "src/lib.rs");
+        let mut retained =
+            retired_test_payload("file", "owner", json!({ "marker": ["retained"] }));
+        retained.location = "src/lib.rs".to_string();
+        store
+            .upsert("probe", &retained_id, vec![0.0; 4], retained)
+            .await
+            .unwrap();
+        // 3. Publish a staged tree promoting the same logical path.
+        let _created = f7_publish_staged_tree(&store).await;
+        let post = f7_outgoing_targets(&store, "GOVERNS", "rule-exact").await;
+        assert_eq!(
+            post,
+            vec![retained_id.clone()],
+            "exact declaration must bind the retained row it names"
+        );
+    }
+
+    /// Deferred shape of the exact-declaration rule: the named retained
+    /// scoped row is never created, so at publication the exact target
+    /// is absent. The replay must create no GOVERNS edge at all — in
+    /// particular none to the promoted row (mirrors relink's
+    /// verbatim-or-defer).
+    #[tokio::test]
+    async fn f7_publish_ingested_exact_declaration_absent_target_defers() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "rule-exact-absent",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "owner",
+                    json!({
+                        "governs": ["probe::1::src/lib.rs"],
+                        "exact_edge_targets": true
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            f7_outgoing_targets(&store, "GOVERNS", "rule-exact-absent")
+                .await
+                .is_empty(),
+            "precondition: no GOVERNS edge before publication"
+        );
+        // Publish a staged tree promoting the same logical path, while
+        // the exactly-named retained row never exists.
+        let _created = f7_publish_staged_tree(&store).await;
+        let post = f7_outgoing_targets(&store, "GOVERNS", "rule-exact-absent").await;
+        assert!(
+            post.is_empty(),
+            "exact declaration with an absent target must defer, not bind the promoted row; got {post:?}"
+        );
     }
 }
 
