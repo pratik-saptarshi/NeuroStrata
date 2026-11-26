@@ -1787,13 +1787,18 @@ fn declaration_signature(kind: &str, line: &str) -> String {
 }
 
 /// Parses one line as a fragment of an MCP tool `inputSchema`, returning
-/// its (key, signature) pair. Three shapes, all matched on the original
-/// line (schema keys and values live inside string literals that the
-/// blanking pipeline erases): a single-line property carrying its type
-/// (`"query": { "type": "string", ... }`, keyed by property name, with
-/// the description deliberately excluded so a description-only edit does
-/// not fire); a standalone `"type": "<t>"` line (a property whose value
-/// object opened on a previous line, or the schema's own type); and a
+/// its (leaf, signature) pair. The leaf is the entry's own name — a
+/// property name, `required`, or `type` — which the caller qualifies
+/// with the owning tool and the nested property path (see
+/// `mcp_schema_key`): entries used to aggregate under shared leaves, so
+/// a change in one tool cancelled against the identical entry in
+/// another. Three shapes, all matched on the original line (schema keys
+/// and values live inside string literals that the blanking pipeline
+/// erases): a single-line property carrying its type
+/// (`"query": { "type": "string", ... }`, with the description
+/// deliberately excluded so a description-only edit does not fire); a
+/// standalone `"type": "<t>"` line (a property whose value object
+/// opened on a previous line, or the schema's own type); and a
 /// `"required": [...]` line, whose array contents are the signature.
 /// Property lines without a same-line type and non-schema JSON lines
 /// (`"name":`, `"description":`, `"properties": {`) extract nothing.
@@ -1807,18 +1812,12 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
     let after = after.trim_start().strip_prefix(':')?.trim_start();
     if key == "required" {
         let end = after.find(']')?;
-        return Some((
-            "mcp-schema:required".to_string(),
-            normalized_line(&after[..=end]),
-        ));
+        return Some(("required".to_string(), normalized_line(&after[..=end])));
     }
     if key == "type" {
         let value = after.strip_prefix('"')?;
         let end = value.find('"')?;
-        return Some((
-            "mcp-schema:type".to_string(),
-            value[..end].to_string(),
-        ));
+        return Some(("type".to_string(), value[..end].to_string()));
     }
     if after.starts_with('{') {
         let type_idx = after.find("\"type\":")?;
@@ -1826,12 +1825,40 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
             .trim_start()
             .strip_prefix('"')?;
         let end = value.find('"')?;
-        return Some((
-            format!("mcp-schema:{key}"),
-            format!("{key}:{}", &value[..end]),
-        ));
+        return Some((key.to_string(), format!("{key}:{}", &value[..end])));
     }
     None
+}
+
+/// Composes the signature-map key for one MCP schema entry from its
+/// owning tool, its nested property path (the property names enclosing
+/// it, outermost first, with the structural `inputSchema` /
+/// `properties` levels dropped), and its leaf. A contextless entry
+/// (a lone schema line, the common -U0 diff shape) keeps the legacy
+/// bare key `mcp-schema:<leaf>`.
+fn mcp_schema_key(tool: Option<&str>, path: &[String], leaf: &str) -> String {
+    let mut key = "mcp-schema:".to_string();
+    if let Some(tool) = tool {
+        key.push_str(tool);
+        key.push(':');
+    }
+    if !path.is_empty() {
+        key.push_str(&path.join("."));
+        key.push('.');
+    }
+    key.push_str(leaf);
+    key
+}
+
+/// The `"key"` opening a JSON-ish line (`"name": ...`), if any: the
+/// first quoted token, when a colon follows it.
+fn json_line_key(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix('"')?;
+    let (key, after) = rest.split_once('"')?;
+    if key.is_empty() || !after.trim_start().starts_with(':') {
+        return None;
+    }
+    Some(key.to_string())
 }
 
 /// Parses one line as a clap argument attribute (`#[arg(...)]`),
@@ -2057,8 +2084,45 @@ fn extract_public_surface_signatures(
     // and required set are user-facing API surface, so a schema-only
     // change to an existing tool must register even though the tool
     // name line itself is unchanged.
-    for line in text.lines() {
-        if let Some((key, signature)) = parse_mcp_schema_line(line) {
+    // The blanked text is computed here (and reused below) because
+    // the schema scan tracks object nesting by counting braces, and
+    // braces inside string literals (a description quoting a JSON
+    // example) must not move the nesting.
+    let cleaned = blank_comments_and_strings(text);
+    // The tool whose schema is being scanned (`"name": "<tool>"` most
+    // recently seen), and the stack of (indent, key) objects enclosing
+    // the current line. Schema keys are qualified with both, so an
+    // entry shared by two tools — or by two properties of one tool —
+    // no longer cancels a change to just one of them.
+    let mut mcp_tool: Option<String> = None;
+    let mut mcp_stack: Vec<(usize, String)> = Vec::new();
+    for (line, blanked) in text.lines().zip(cleaned.lines()) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"name\": \"") {
+            if let Some(end) = rest.find('"') {
+                if end > 0 {
+                    mcp_tool = Some(rest[..end].to_string());
+                    mcp_stack.clear();
+                }
+            }
+        }
+        let indent = line.len() - line.trim_start().len();
+        if !trimmed.is_empty() {
+            while mcp_stack
+                .last()
+                .map(|(open_indent, _)| *open_indent >= indent)
+                .unwrap_or(false)
+            {
+                mcp_stack.pop();
+            }
+        }
+        if let Some((leaf, signature)) = parse_mcp_schema_line(line) {
+            let path: Vec<String> = mcp_stack
+                .iter()
+                .map(|(_, key)| key.clone())
+                .filter(|key| !key.is_empty() && key != "properties" && key != "inputSchema")
+                .collect();
+            let key = mcp_schema_key(mcp_tool.as_deref(), &path, &leaf);
             signatures.entry(key).or_default().insert(signature);
         }
         if let Some(attribute) = parse_clap_arg_attribute(line) {
@@ -2066,6 +2130,11 @@ fn extract_public_surface_signatures(
                 .entry("clap-arg".to_string())
                 .or_default()
                 .insert(attribute);
+        }
+        let opens = blanked.matches('{').count() as i32;
+        let closes = blanked.matches('}').count() as i32;
+        if opens > closes {
+            mcp_stack.push((indent, json_line_key(line).unwrap_or_default()));
         }
     }
     // Pipeline step 2, as in `extract_public_surface_declarations`:
@@ -2090,7 +2159,6 @@ fn extract_public_surface_signatures(
                 .insert(attribute);
         }
     }
-    let cleaned = blank_comments_and_strings(text);
     // Same re-export transitivity as in
     // `extract_public_surface_declarations`: a restricted item behind
     // a bare `pub use` in the same text contributes its declaration
@@ -5221,6 +5289,92 @@ pub struct AfterAll {}
             "#[cfg(test)]\npub fn test_helper(x: String) {}",
         );
         assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn mcp_schema_required_change_in_one_tool_differs() {
+        // X2 probe (Codex PR #162): dropping "namespace" from
+        // neurostrata_get_memory's required array in src/server.rs
+        // produced identical maps, because the same array occurs in
+        // other tools and every entry aggregated under the shared
+        // `mcp-schema:required` key.
+        let tool = |name: &str, required: &str| {
+            format!(
+                "{{\n    \"name\": \"{name}\",\n    \"inputSchema\": {{\n        \"type\": \"object\",\n        \"properties\": {{\n            \"id\": {{ \"type\": \"string\" }},\n            \"namespace\": {{ \"type\": \"string\" }}\n        }},\n        \"required\": {required}\n    }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&format!(
+            "{},\n{}",
+            tool("neurostrata_get_memory", "[\"id\", \"namespace\"]"),
+            tool("neurostrata_other_tool", "[\"id\", \"namespace\"]")
+        ));
+        let after = extract_public_surface_signatures(&format!(
+            "{},\n{}",
+            tool("neurostrata_get_memory", "[\"id\"]"),
+            tool("neurostrata_other_tool", "[\"id\", \"namespace\"]")
+        ));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("mcp-schema:neurostrata_get_memory:required"),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_type_change_in_one_tool_differs() {
+        // The standalone `"type":` lines of two tools likewise
+        // aggregated under the shared `mcp-schema:type` key: changing
+        // one property's type to a value another property already
+        // used cancelled out.
+        let tool = |name: &str, id_type: &str| {
+            format!(
+                "{{\n    \"name\": \"{name}\",\n    \"inputSchema\": {{\n        \"properties\": {{\n            \"id\": {{\n                \"type\": \"{id_type}\"\n            }},\n            \"count\": {{\n                \"type\": \"integer\"\n            }}\n        }}\n    }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&format!(
+            "{},\n{}",
+            tool("neurostrata_get_memory", "string"),
+            tool("neurostrata_other_tool", "string")
+        ));
+        let after = extract_public_surface_signatures(&format!(
+            "{},\n{}",
+            tool("neurostrata_get_memory", "integer"),
+            tool("neurostrata_other_tool", "string")
+        ));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("mcp-schema:neurostrata_get_memory:id.type"),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_nested_required_is_qualified_by_property_path() {
+        // A `required` array nested inside a property's items must
+        // be qualified by the property path as well as the tool, or
+        // it cancels against the same nested shape in another tool.
+        let tool = |name: &str, required: &str| {
+            format!(
+                "{{\n    \"name\": \"{name}\",\n    \"inputSchema\": {{\n        \"properties\": {{\n            \"candidates\": {{\n                \"type\": \"array\",\n                \"items\": {{\n                    \"properties\": {{\n                        \"title\": {{ \"type\": \"string\" }}\n                    }},\n                    \"required\": {required}\n                }}\n            }}\n        }}\n    }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&format!(
+            "{},\n{}",
+            tool("neurostrata_task_create", "[\"title\"]"),
+            tool("neurostrata_other_tool", "[\"title\"]")
+        ));
+        let after = extract_public_surface_signatures(&format!(
+            "{},\n{}",
+            tool("neurostrata_task_create", "[]"),
+            tool("neurostrata_other_tool", "[\"title\"]")
+        ));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key(
+                "mcp-schema:neurostrata_task_create:candidates.items.required"
+            ),
+            "{before:?}"
+        );
     }
 
     #[test]
