@@ -1771,6 +1771,39 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
 /// value / aliased type / path is the surface of those kinds; a balanced
 /// one-line item keeps the whole line, while a multiline item keeps only
 /// the header before the first `{`.
+/// Whether a trait-method header line opens a default body: it
+/// carries a `{` and does not end in the `;` of a bodyless
+/// declaration. (A const-generic argument can put a `{...}` group
+/// inside a bodyless signature, so the trailing semicolon rules a
+/// line out.)
+fn trait_fn_line_opens_body(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    !trimmed.ends_with(';') && trimmed.contains('{')
+}
+
+/// Records default-implementation presence in a trait method's
+/// signature (W7-1): `declaration_signature` cuts a `fn` at its body
+/// brace and strips a trailing `;`, so a defaulted trait method and
+/// the same method as a bodyless declaration recorded identically —
+/// yet stripping a default body is a breaking change to the
+/// implementer contract. A trait method whose header line opens a
+/// body gets a `[default impl]` marker appended; the body contents
+/// themselves stay ignored, exactly as for any other fn. Scoped to
+/// trait declarations: inherent-impl and trait-impl methods always
+/// have bodies, so their signatures are untouched.
+fn with_default_impl_marker(
+    kind: &str,
+    signature: String,
+    enclosing_kind: Option<&str>,
+    line: &str,
+) -> String {
+    if kind == "fn" && enclosing_kind == Some("trait") && trait_fn_line_opens_body(line) {
+        format!("{signature} [default impl]")
+    } else {
+        signature
+    }
+}
+
 fn declaration_signature(kind: &str, line: &str) -> String {
     let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let strip_trailing_semicolon = |text: &str| {
@@ -2516,7 +2549,12 @@ fn extract_public_surface_signatures(
                     .insert(full_path);
             }
         } else if let Some((name, kind)) = parse_public_surface_declaration(line) {
-            let signature = signature_line(&kind, line, preserved_line);
+            let signature = with_default_impl_marker(
+                &kind,
+                signature_line(&kind, line, preserved_line),
+                enclosing_kind_at_line_start.as_deref(),
+                line,
+            );
             if kind == "fn" {
                 line_is_fn = true;
             }
@@ -2534,7 +2572,12 @@ fn extract_public_surface_signatures(
         } else if let Some((name, kind)) = parse_restricted_surface_declaration(line)
             .filter(|(name, _kind)| reexported.contains(name))
         {
-            let signature = signature_line(&kind, line, preserved_line);
+            let signature = with_default_impl_marker(
+                &kind,
+                signature_line(&kind, line, preserved_line),
+                enclosing_kind_at_line_start.as_deref(),
+                line,
+            );
             if kind == "fn" {
                 line_is_fn = true;
             }
@@ -2577,6 +2620,16 @@ fn extract_public_surface_signatures(
             if key.starts_with("fn:") {
                 line_is_fn = true;
             }
+            let signature = if key.starts_with("fn:") {
+                with_default_impl_marker(
+                    "fn",
+                    signature,
+                    enclosing_kind_at_line_start.as_deref(),
+                    line,
+                )
+            } else {
+                signature
+            };
             // The variant / bare-member pattern is the one whose key
             // repeats its whole signature (`member:<content>`): it
             // may fire only in an enum context — an enclosing enum,
@@ -6322,6 +6375,99 @@ pub struct AfterAll {}
         let after = extract_public_surface_signatures(&decl_after_literal("u64"));
         assert_ne!(before, after, "before={before:?} after={after:?}");
         assert!(before.contains_key("member:Local.field"), "{before:?}");
+    }
+
+    #[test]
+    fn trait_method_default_impl_removal_differs() {
+        // W7-1 probe (Codex PR #162): stripping a trait method's
+        // default body — turning a defaulted method into a required
+        // one — is a breaking change to the implementer contract,
+        // but the recorded signature was the bare declaration head
+        // either way (`declaration_signature` cuts a `fn` at its
+        // body brace and strips a trailing `;`), so the two maps
+        // came out identical and the gate saw nothing.
+        let before = extract_public_surface_signatures(
+            "pub trait Embedder {\n    async fn embed_batch(&self) -> Result<Vec<Vec<f32>>> {\n        Ok(out)\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub trait Embedder {\n    async fn embed_batch(&self) -> Result<Vec<Vec<f32>>>;\n}",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert_ne!(
+            before.get("fn:Embedder.embed_batch"),
+            after.get("fn:Embedder.embed_batch"),
+            "before={before:?} after={after:?}"
+        );
+        // The reverse direction (required gaining a default) is the
+        // same map difference.
+        let before_required = extract_public_surface_signatures(
+            "pub trait Embedder {\n    fn dimensions(&self) -> usize;\n}",
+        );
+        let after_default = extract_public_surface_signatures(
+            "pub trait Embedder {\n    fn dimensions(&self) -> usize {\n        0\n    }\n}",
+        );
+        assert_ne!(
+            before_required, after_default,
+            "before={before_required:?} after={after_default:?}"
+        );
+    }
+
+    #[test]
+    fn trait_method_default_body_edit_is_identical() {
+        // Pin (W7-1): the marker records default-implementation
+        // PRESENCE only — changing the contents of a default body
+        // must stay signature-identical, exactly as a body-only edit
+        // to any other fn already is.
+        let before = extract_public_surface_signatures(
+            "pub trait Embedder {\n    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {\n        let mut out = Vec::with_capacity(texts.len());\n        Ok(out)\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "pub trait Embedder {\n    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {\n        let mut out = Vec::new();\n        out.extend(texts.iter().map(|_| Vec::new()));\n        Ok(out)\n    }\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn trait_method_default_impl_removal_differs_real_shape() {
+        // W7-1 probe on the real file shape: the extractor over the
+        // real src/traits.rs vs the same text with `embed_batch`'s
+        // default body stripped (the finding's compiled probe,
+        // replayed at extractor level like the W6-1 real-shape
+        // test above).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/traits.rs")).unwrap();
+        let defaulted = "    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {\n        let mut out = Vec::with_capacity(texts.len());\n        for text in texts {\n            out.push(self.embed(text).await?);\n        }\n        Ok(out)\n    }";
+        assert!(real.contains(defaulted));
+        let stripped = real.replacen(
+            defaulted,
+            "    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;",
+            1,
+        );
+        assert_ne!(real, stripped);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&stripped);
+        assert_ne!(before, after, "default-body strip must register");
+        assert_ne!(
+            before.get("fn:Embedder.embed_batch"),
+            after.get("fn:Embedder.embed_batch")
+        );
+    }
+
+    #[test]
+    fn impl_method_signature_records_no_default_marker() {
+        // Scope pin (W7-1): the default-implementation marker is a
+        // trait-declaration concept. An inherent-impl method always
+        // has a body, so its recorded signature stays the bare
+        // declaration head it has always been.
+        let sigs = extract_public_surface_signatures(
+            "impl Foo {\n    fn build(&self) -> Result<Foo> {\n        Ok(foo)\n    }\n}",
+        );
+        let expected: std::collections::BTreeSet<String> =
+            ["fn build(&self) -> Result<Foo>"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        assert_eq!(sigs.get("fn:Foo.build"), Some(&expected), "{sigs:?}");
     }
 
     #[test]
