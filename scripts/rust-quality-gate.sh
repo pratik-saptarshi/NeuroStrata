@@ -375,6 +375,44 @@ fi
 # be prefixed back to repo-root form before matching ADDED_FILE).
 # Same fail-closed rule everywhere: no diagnostics plus a nonzero
 # exit means quality cannot be verified.
+# Normalize a diagnostic path before matching it against the
+# added-line set (whose paths come from Git and are already
+# normalized): a module loaded via #[path = "sub/../logic.rs"] makes
+# cargo report the file as `src/sub/../logic.rs`, while Git
+# attributes its added lines to `src/logic.rs`, so the raw
+# diagnostic path never matches and an added violation passes
+# unchecked. LEXICAL ONLY: resolve `.`/`..` components textually,
+# with NO symlink resolution or realpath canonicalization — the
+# file may not exist on disk, and symlinks must never merge two
+# distinct files into one path. A `..` that would climb above the
+# path's own root is kept verbatim, so a diagnostic for a file
+# outside the attributed tree can never be normalized INTO a
+# match. Shared by clippy_leg and the duplicated src-tauri parser
+# in §2b — both normalize through this one helper, identically.
+normalize_diag_path() {
+    local p="$1" prefix="" part joined=""
+    case "$p" in
+        /*) prefix="/" ;;
+    esac
+    local -a parts=() stack=()
+    IFS='/' read -ra parts <<< "$p"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ""|.) ;;
+            ..)
+                if [ "${#stack[@]}" -gt 0 ] && [ "${stack[$((${#stack[@]} - 1))]}" != ".." ]; then
+                    unset "stack[$((${#stack[@]} - 1))]"
+                elif [ -z "$prefix" ]; then
+                    stack+=("..")
+                fi
+                ;;
+            *) stack+=("$part") ;;
+        esac
+    done
+    local IFS='/'
+    joined="${stack[*]}"
+    printf '%s%s' "$prefix" "$joined"
+}
 clippy_leg() {
     local out="$1" code="$2" subject="$3" prefix="$4"
     local diags diag dpath dline
@@ -403,6 +441,7 @@ clippy_leg() {
         # pattern silently discards every such diagnostic.
         dpath="$(printf '%s' "$diag" | sed -E 's/^(.*\.rs):[0-9]+:[0-9]+: (warning|error).*/\1/' || true)"
         dline="$(printf '%s' "$diag" | sed -E 's/^.*\.rs:([0-9]+):[0-9]+: (warning|error).*/\1/' || true)"
+        dpath="$(normalize_diag_path "$dpath")"
         if [ -n "$dpath" ] && [ -n "$dline" ] \
             && grep -qxF "$dpath:$dline" "$ADDED_FILE" 2>/dev/null; then
             echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2
@@ -645,8 +684,12 @@ if [ -n "$TAURI_CHANGED" ] || [ -n "$TAURI_MANIFEST_CHANGED" ]; then
             [ -n "$diag" ] || continue
             # Same greedy suffix parse as clippy_leg: paths with
             # spaces (#[path = "has space.rs"]) must not be dropped.
+            # Same normalize_diag_path call as clippy_leg: a Tauri
+            # module loaded via #[path = "sub/../logic.rs"] carries
+            # the `..` components in its diagnostic path too.
             dpath="$(printf '%s' "$diag" | sed -E 's/^(.*\.rs):[0-9]+:[0-9]+: (warning|error).*/\1/' || true)"
             dline="$(printf '%s' "$diag" | sed -E 's/^.*\.rs:([0-9]+):[0-9]+: (warning|error).*/\1/' || true)"
+            dpath="$(normalize_diag_path "$dpath")"
             if [ -n "$dpath" ] && [ -n "$dline" ] \
                 && grep -qxF "$dpath:$dline" "$ADDED_FILE" 2>/dev/null; then
                 echo "$GATE: FAIL: new clippy diagnostic on added line: $diag" >&2

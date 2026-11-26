@@ -1181,4 +1181,86 @@ if [ "$st38c" -eq 0 ] || ! grep -q 'FAIL: new high/critical advisory introduced 
     exit 1
 fi
 
+# Leg 39 (regression, Codex P2 — diagnostic path normalization): a
+# module loaded via #[path = "sub/../logic.rs"] makes clippy report
+# the file as `src/sub/../logic.rs:6:5: warning: ...`, while Git
+# attributes the added lines to the normalized `src/logic.rs`.
+# Pre-fix the raw diagnostic path never matched the added-line set
+# and the gate PASSED an added needless_return (fail-open).
+# Post-fix the diagnostic path is normalized lexically before
+# matching and the same push BLOCKS.
+pathmod_dirty="$TMP/pathmod-dirty"
+mkdir -p "$pathmod_dirty/src/sub"
+git -C "$pathmod_dirty" init -q
+git -C "$pathmod_dirty" config user.email test@example.com
+git -C "$pathmod_dirty" config user.name test
+cat > "$pathmod_dirty/Cargo.toml" <<'EOF'
+[package]
+name = "gate-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+printf '#[path = "sub/../logic.rs"]\npub mod logic;\n\npub fn clean() -> i32 {\n    1\n}\n' > "$pathmod_dirty/src/lib.rs"
+printf 'pub fn lclean() -> i32 {\n    1\n}\n' > "$pathmod_dirty/src/logic.rs"
+printf 'placeholder so src/sub exists for path traversal\n' > "$pathmod_dirty/src/sub/keep.txt"
+(cd "$pathmod_dirty" && cargo generate-lockfile >/dev/null 2>&1)
+git -C "$pathmod_dirty" add Cargo.toml Cargo.lock src
+git -C "$pathmod_dirty" commit -q -m baseline
+git -C "$pathmod_dirty" update-ref refs/remotes/origin/develop HEAD
+printf '\npub fn bad() -> String {\n    return "x".to_string();\n}\n' >> "$pathmod_dirty/src/logic.rs"
+git -C "$pathmod_dirty" add src/logic.rs
+git -C "$pathmod_dirty" commit -q -m 'dirty path-module addition'
+set +e
+out39=$(run_gate "$pathmod_dirty" "$PATH")
+st39=$?
+set -e
+if [ "$st39" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: src/sub/../logic.rs' <<< "$out39"; then
+    printf 'FAIL: clippy warning on an added line in a module loaded via #[path = "sub/../logic.rs"] must block the gate (diagnostic path normalized before matching)\n%s\n' "$out39" >&2
+    exit 1
+fi
+
+# Leg 39b (no-false-match control, same P2): a PRE-EXISTING
+# violation in root-level x.rs, loaded via #[path = "../other/../x.rs"]
+# so its diagnostic reads `src/../other/../x.rs:5:5: ...` — which
+# lexically resolves to `x.rs`, a DIFFERENT file from the one this
+# push touches. The push adds a CLEAN line to src/x.rs landing on
+# the same line number (5). Normalization must NOT manufacture a
+# match: the gate passes, exactly as pre-fix.
+pathmod_other="$TMP/pathmod-other"
+mkdir -p "$pathmod_other/src" "$pathmod_other/other"
+git -C "$pathmod_other" init -q
+git -C "$pathmod_other" config user.email test@example.com
+git -C "$pathmod_other" config user.name test
+cat > "$pathmod_other/Cargo.toml" <<'EOF'
+[package]
+name = "gate-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+printf '#[path = "../other/../x.rs"]\npub mod rootx;\n\npub fn clean() -> i32 {\n    1\n}\n' > "$pathmod_other/src/lib.rs"
+printf 'pub fn old() -> String {\n    let a = "x".to_string();\n    let b = a;\n    let c = b;\n    return c;\n}\n' > "$pathmod_other/x.rs"
+printf 'placeholder so other/ exists for path traversal\n' > "$pathmod_other/other/keep.txt"
+printf 'pub fn xclean() -> i32 {\n    1\n}\n' > "$pathmod_other/src/x.rs"
+(cd "$pathmod_other" && cargo generate-lockfile >/dev/null 2>&1)
+git -C "$pathmod_other" add Cargo.toml Cargo.lock src x.rs other
+git -C "$pathmod_other" commit -q -m baseline
+git -C "$pathmod_other" update-ref refs/remotes/origin/develop HEAD
+printf '\npub fn xmore() -> i32 {\n    5\n}\n' >> "$pathmod_other/src/x.rs"
+git -C "$pathmod_other" add src/x.rs
+git -C "$pathmod_other" commit -q -m 'clean addition to src/x.rs'
+set +e
+out39b=$(run_gate "$pathmod_other" "$PATH")
+st39b=$?
+set -e
+if [ "$st39b" -ne 0 ] || ! grep -q 'pass' <<< "$out39b"; then
+    printf 'FAIL: a diagnostic whose .. path lexically resolves to a different file (x.rs) than the changed file (src/x.rs) must not match, even on a coinciding line number\n%s\n' "$out39b" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'

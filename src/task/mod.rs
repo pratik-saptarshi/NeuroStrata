@@ -6330,6 +6330,10 @@ mod tests {
             SCAFFOLDED_RUST_QUALITY_GATE.contains("export CARGO_TERM_COLOR=never"),
             "the guard must force cargo color off so a user-set CARGO_TERM_COLOR=always cannot inject ANSI escapes into the clippy diagnostics and audit report the guard parses (an escaped severity silently empties the diagnostic set and the gate passes unverified code)"
         );
+        assert!(
+            SCAFFOLDED_RUST_QUALITY_GATE.contains("normalize_diag_path"),
+            "the guard must normalize diagnostic paths lexically (resolving ./.. components, no symlink resolution) before matching them against the Git-attributed added-line set, in both the main clippy parser and the duplicated src-tauri parser — a module loaded via #[path = \"sub/../logic.rs\"] is reported by clippy as src/sub/../logic.rs while Git attributes its lines to src/logic.rs, so the unnormalized diagnostic never matches and an added violation passes unchecked"
+        );
         let path =
             std::env::temp_dir().join(format!("ns-rust-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_RUST_QUALITY_GATE).unwrap();
