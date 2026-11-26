@@ -1809,7 +1809,9 @@ fn declaration_signature(kind: &str, line: &str) -> String {
 /// with the owning tool and the nested property path (see
 /// `mcp_schema_key`): entries used to aggregate under shared leaves, so
 /// a change in one tool cancelled against the identical entry in
-/// another. Three shapes, all matched on the original line (schema keys
+/// another. A `type` value may be a quoted scalar or an array of
+/// quoted scalars (`["string", "array"]`); both forms are captured
+/// (see `schema_type_signature`). Three shapes, all matched on the original line (schema keys
 /// and values live inside string literals that the blanking pipeline
 /// erases): a single-line property carrying its type
 /// (`"query": { "type": "string", ... }`, with the description
@@ -1839,6 +1841,24 @@ fn schema_enum_signature(segment: &str) -> Option<String> {
     }
     let end = rest.find(']')?;
     Some(normalized_line(&rest[..=end]))
+}
+
+/// The type material at the start of `after` (the text following a
+/// `"type":` colon): a quoted scalar (`"string"` — the legacy form,
+/// returned without its quotes), or an array of quoted scalars
+/// (`["string", "array"]`, returned as the whole normalized bracket
+/// group). JSON Schema types are commonly array-valued (a nullable
+/// or multi-type property), and requiring a leading quote made the
+/// whole property extract nothing.
+fn schema_type_signature(after: &str) -> Option<String> {
+    let after = after.trim_start();
+    if let Some(rest) = after.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return Some(normalized_line(&after[..=end + 1]));
+    }
+    let value = after.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(value[..end].to_string())
 }
 
 /// The normalized scalar value at the start of `after` (the text
@@ -1885,17 +1905,12 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
         return schema_default_signature(after).map(|value| ("default".to_string(), value));
     }
     if key == "type" {
-        let value = after.strip_prefix('"')?;
-        let end = value.find('"')?;
-        return Some(("type".to_string(), value[..end].to_string()));
+        return schema_type_signature(after).map(|value| ("type".to_string(), value));
     }
     if after.starts_with('{') {
         let type_idx = after.find("\"type\":")?;
-        let value = after[type_idx + "\"type\":".len()..]
-            .trim_start()
-            .strip_prefix('"')?;
-        let end = value.find('"')?;
-        let mut signature = format!("{key}:{}", &value[..end]);
+        let type_value = schema_type_signature(&after[type_idx + "\"type\":".len()..])?;
+        let mut signature = format!("{key}:{type_value}");
         // Same-line constraint material, searched only in the part
         // of the line before `"description":` so constraint-shaped
         // text inside a description string is not captured.
@@ -5952,6 +5967,108 @@ pub struct AfterAll {}
         assert_ne!(before, after, "before={before:?} after={after:?}");
         assert!(before.contains_key("mcp-schema:tool_a:mode"), "{before:?}");
         assert!(before.contains_key("mcp-schema:tool_b:mode"), "{before:?}");
+    }
+
+    #[test]
+    fn mcp_schema_array_type_change_differs_real_shape() {
+        // W6-2 probe (Codex PR #162): changing the first
+        // `"type": ["string", "array"]` in the real src/server.rs
+        // to `["array"]` produced identical maps — the `type`
+        // capture required a leading quote, so an array-valued
+        // type extracted nothing and the whole property was missed.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/server.rs")).unwrap();
+        assert!(real.contains("\"type\": [\"string\", \"array\"]"));
+        let mutated = real.replacen("\"type\": [\"string\", \"array\"]", "[\"array\"]", 1);
+        assert_ne!(real, mutated);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_ne!(before, after, "array type change must register");
+        assert!(
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .any(|k| k.contains("domain")),
+            "differing key must name the domain property: {:?}",
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mcp_schema_array_type_single_line_property_registers() {
+        // Synthetic single-line shape, independent of the real
+        // file: the array is the property's type material.
+        let before = extract_public_surface_signatures(
+            "\"domain\": { \"type\": [\"string\", \"array\"], \"description\": \"Slug(s).\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"domain\": { \"type\": [\"array\"], \"description\": \"Slug(s).\" },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before["mcp-schema:domain"]
+                .iter()
+                .any(|s| s == "domain:[\"string\", \"array\"]"),
+            "{before:?}"
+        );
+        // A description-only edit on an array-typed property stays
+        // invisible, exactly as for scalar types.
+        let reworded = extract_public_surface_signatures(
+            "\"domain\": { \"type\": [\"string\", \"array\"], \"description\": \"Other wording.\" },",
+        );
+        assert_eq!(before, reworded, "before={before:?} after={reworded:?}");
+        // The scalar form keeps its exact legacy signature.
+        let scalar = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"description\": \"Track.\" },",
+        );
+        assert!(
+            scalar["mcp-schema:mode"].iter().any(|s| s == "mode:string"),
+            "{scalar:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_array_type_standalone_line_registers_under_qualified_key() {
+        let schema = |type_line: &str| {
+            format!(
+                "\"name\": \"tool_a\",\n\"inputSchema\": {{\n  \"properties\": {{\n    \"domain\": {{\n      {type_line}\n    }}\n  }}\n}}"
+            )
+        };
+        let before =
+            extract_public_surface_signatures(&schema("\"type\": [\"string\", \"array\"]"));
+        let after = extract_public_surface_signatures(&schema("\"type\": [\"array\"]"));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("mcp-schema:tool_a:domain.type"),
+            "{before:?}"
+        );
+        assert!(
+            before["mcp-schema:tool_a:domain.type"]
+                .iter()
+                .any(|s| s == "[\"string\", \"array\"]"),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_array_type_keeps_constraint_leaves() {
+        // The W5-1 segment rule stays intact on an array-typed
+        // property: a same-line enum change still registers, and
+        // constraint-shaped text inside the description does not.
+        let before = extract_public_surface_signatures(
+            "\"mode\": { \"type\": [\"string\", \"array\"], \"enum\": [\"a\", \"b\"], \"description\": \"Track.\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"mode\": { \"type\": [\"string\", \"array\"], \"enum\": [\"a\"], \"description\": \"Track.\" },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        let reworded = extract_public_surface_signatures(
+            "\"mode\": { \"type\": [\"string\", \"array\"], \"enum\": [\"a\", \"b\"], \"description\": \"see \\\"enum\\\": [\\\"z\\\"] here\" },",
+        );
+        assert_eq!(before, reworded, "before={before:?} after={reworded:?}");
     }
 
     #[test]
