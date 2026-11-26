@@ -39637,16 +39637,16 @@ eurostrata\src\daemon.rs",
 
     async fn f7_hit_kinds(store: &LadybugStore, rule: &str) -> Vec<String> {
         let hits = store
-            .memories_for_file(
-                "probe",
-                Some(PROBE_SOURCE),
-                "src/lib.rs",
-                None,
-                false,
-                &["rule".to_string()],
-                &[],
-                5,
-            )
+            .memories_for_file(crate::traits::MemoriesForFileParams {
+                namespace: "probe",
+                source: Some(PROBE_SOURCE),
+                path: "src/lib.rs",
+                symbol: None,
+                include_ancestors: false,
+                memory_types: &["rule".to_string()],
+                exclude_ids: &[],
+                limit: 5,
+            })
             .await
             .unwrap();
         hits.iter()
