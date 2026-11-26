@@ -1817,8 +1817,51 @@ fn declaration_signature(kind: &str, line: &str) -> String {
 /// standalone `"type": "<t>"` line (a property whose value object
 /// opened on a previous line, or the schema's own type); and a
 /// `"required": [...]` line, whose array contents are the signature.
+/// Constraint leaves are surface too: a standalone `"enum": [...]`
+/// line (same-line `]` required, mirroring `required`) and a
+/// standalone `"default": <value>` line extract under their own
+/// leaves, and a single-line property's signature appends any
+/// same-line `enum` / `default` material found BEFORE the
+/// `"description":` entry — so a constraint-only edit registers,
+/// while an `"enum":` quoted inside a description string (which
+/// follows the description key in the observed shapes) and a
+/// description-only edit do not.
 /// Property lines without a same-line type and non-schema JSON lines
 /// (`"name":`, `"description":`, `"properties": {`) extract nothing.
+
+/// The normalized `[...]` array following `"enum":` in `segment`,
+/// when the array closes on the same segment.
+fn schema_enum_signature(segment: &str) -> Option<String> {
+    let idx = segment.find("\"enum\":")?;
+    let rest = segment[idx + "\"enum\":".len()..].trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let end = rest.find(']')?;
+    Some(normalized_line(&rest[..=end]))
+}
+
+/// The normalized scalar value at the start of `after` (the text
+/// following a `"default":` colon): a quoted string through its
+/// closing quote, or a bare token up to the entry's closing `,`/`}`.
+fn schema_default_signature(after: &str) -> Option<String> {
+    let after = after.trim_start();
+    if after.is_empty() {
+        return None;
+    }
+    if let Some(string_value) = after.strip_prefix('"') {
+        let end = string_value.find('"')?;
+        return Some(normalized_line(&after[..=end + 1]));
+    }
+    let end = after.find([',', '}']).unwrap_or(after.len());
+    let value = after[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(normalized_line(value))
+    }
+}
+
 fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix('"')?;
@@ -1831,6 +1874,16 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
         let end = after.find(']')?;
         return Some(("required".to_string(), normalized_line(&after[..=end])));
     }
+    if key == "enum" {
+        let end = after.find(']')?;
+        if !after.starts_with('[') {
+            return None;
+        }
+        return Some(("enum".to_string(), normalized_line(&after[..=end])));
+    }
+    if key == "default" {
+        return schema_default_signature(after).map(|value| ("default".to_string(), value));
+    }
     if key == "type" {
         let value = after.strip_prefix('"')?;
         let end = value.find('"')?;
@@ -1842,7 +1895,24 @@ fn parse_mcp_schema_line(line: &str) -> Option<(String, String)> {
             .trim_start()
             .strip_prefix('"')?;
         let end = value.find('"')?;
-        return Some((key.to_string(), format!("{key}:{}", &value[..end])));
+        let mut signature = format!("{key}:{}", &value[..end]);
+        // Same-line constraint material, searched only in the part
+        // of the line before `"description":` so constraint-shaped
+        // text inside a description string is not captured.
+        let constraint_segment = match after.find("\"description\":") {
+            Some(idx) => &after[..idx],
+            None => after,
+        };
+        if let Some(enum_signature) = schema_enum_signature(constraint_segment) {
+            signature.push_str(&format!("|enum={enum_signature}"));
+        }
+        if let Some(default_idx) = constraint_segment.find("\"default\":") {
+            let default_after = &constraint_segment[default_idx + "\"default\":".len()..];
+            if let Some(default_signature) = schema_default_signature(default_after) {
+                signature.push_str(&format!("|default={default_signature}"));
+            }
+        }
+        return Some((key.to_string(), signature));
     }
     None
 }
@@ -5754,6 +5824,118 @@ pub struct AfterAll {}
         assert!(!decls.contains("internal_op"), "{decls:?}");
         let sigs = extract_public_surface_signatures("pub(crate) fn internal_op(x: u32) {}");
         assert!(!sigs.contains_key("internal_op"), "{sigs:?}");
+    }
+
+    #[test]
+    fn mcp_schema_single_line_enum_change_differs_real_shape() {
+        // W5-1 probe (Codex PR #162): removing `"lexical-inhouse"`
+        // from the search tool's single-line `mode` enum in the real
+        // src/server.rs produced identical maps — only `required`
+        // and `type` leaves were captured.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/server.rs")).unwrap();
+        assert!(real.contains("\"lexical\", \"lexical-inhouse\"]"));
+        let mutated = real.replacen("\"lexical\", \"lexical-inhouse\"]", "\"lexical\"]", 1);
+        assert_ne!(real, mutated);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_ne!(before, after, "enum removal must register");
+        assert!(
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .any(|k| k.contains("mode")),
+            "differing key must name the mode property: {:?}",
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .collect::<Vec<_>>()
+        );
+        // Synthetic single-line shape, independent of the real file.
+        let before = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"enum\": [\"hybrid\", \"vector\"], \"description\": \"Search track.\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"enum\": [\"hybrid\"], \"description\": \"Search track.\" },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn mcp_schema_standalone_enum_line_registers_under_qualified_key() {
+        let schema = |enum_line: &str| {
+            format!(
+                "\"name\": \"tool_a\",\n\"inputSchema\": {{\n  \"type\": \"object\",\n  \"properties\": {{\n    \"mode\": {{\n      \"type\": \"string\",\n      {enum_line}\n    }}\n  }}\n}}"
+            )
+        };
+        let before =
+            extract_public_surface_signatures(&schema("\"enum\": [\"hybrid\", \"vector\"]"));
+        let after = extract_public_surface_signatures(&schema("\"enum\": [\"hybrid\"]"));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("mcp-schema:tool_a:mode.enum"),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_default_change_differs_both_shapes() {
+        // Single-line property shape.
+        let before = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"default\": \"hybrid\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"default\": \"vector\" },",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        // Standalone line in a multiline property object.
+        let schema = |default_line: &str| {
+            format!(
+                "\"name\": \"tool_a\",\n\"inputSchema\": {{\n  \"properties\": {{\n    \"mode\": {{\n      \"type\": \"string\",\n      {default_line}\n    }}\n  }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&schema("\"default\": \"hybrid\""));
+        let after = extract_public_surface_signatures(&schema("\"default\": \"vector\""));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(
+            before.contains_key("mcp-schema:tool_a:mode.default"),
+            "{before:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_description_only_edit_is_identical() {
+        let before = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"enum\": [\"hybrid\"], \"description\": \"First wording.\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"enum\": [\"hybrid\"], \"description\": \"Second wording.\" },",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        // An `"enum":` quoted inside the description string is not a
+        // constraint: constraint material is searched only before
+        // the `"description":` key.
+        let before = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"description\": \"see \\\"enum\\\": [\\\"a\\\"] here\" },",
+        );
+        let after = extract_public_surface_signatures(
+            "\"mode\": { \"type\": \"string\", \"description\": \"see \\\"enum\\\": [\\\"b\\\"] here\" },",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn mcp_schema_same_enum_in_two_tools_does_not_cancel() {
+        let schema = |tool_b_enum: &str| {
+            format!(
+                "\"name\": \"tool_a\",\n\"inputSchema\": {{\n  \"properties\": {{\n    \"mode\": {{ \"type\": \"string\", \"enum\": [\"hybrid\", \"vector\"] }}\n  }}\n}},\n\"name\": \"tool_b\",\n\"inputSchema\": {{\n  \"properties\": {{\n    \"mode\": {{ \"type\": \"string\", \"enum\": {tool_b_enum} }}\n  }}\n}}"
+            )
+        };
+        let before = extract_public_surface_signatures(&schema("[\"hybrid\", \"vector\"]"));
+        let after = extract_public_surface_signatures(&schema("[\"hybrid\"]"));
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("mcp-schema:tool_a:mode"), "{before:?}");
+        assert!(before.contains_key("mcp-schema:tool_b:mode"), "{before:?}");
     }
 
     #[test]
