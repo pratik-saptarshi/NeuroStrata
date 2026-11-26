@@ -1718,7 +1718,13 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
     // The TypeScript export branch runs here too, on the blanked line
     // (its signatures are taken from the corresponding original line,
     // which blanking's line-structure preservation keeps aligned).
+    let mut test_scope = TestScopeTracker::new();
     for (line, original_line) in cleaned.lines().zip(text.lines()) {
+        // Test-only scopes extract nothing (see TestScopeTracker).
+        let indent = line.len() - line.trim_start().len();
+        if test_scope.suppresses(indent, line) {
+            continue;
+        }
         if let Some(pairs) = parse_typescript_exports(line, original_line) {
             for (name, _signature) in pairs {
                 decls.insert(name);
@@ -1925,6 +1931,112 @@ fn parse_impl_enclosing(line: &str) -> Option<String> {
     Some(name)
 }
 
+/// Whether a trimmed line is a `#[cfg(test)]` attribute (a compound
+/// `#[cfg(test, ...)]` included).
+fn is_cfg_test_attribute(trimmed: &str) -> bool {
+    match trimmed.strip_prefix("#[cfg(test") {
+        Some(rest) => rest.starts_with(')') || rest.starts_with(','),
+        None => false,
+    }
+}
+
+/// Whether a trimmed line is a test-function attribute: `#[test]`, or
+/// a path-qualified spelling whose final segment is `test`
+/// (`#[tokio::test]`, `#[actix_rt::test]`, ...).
+fn is_test_fn_attribute(trimmed: &str) -> bool {
+    let Some(inner) = trimmed.strip_prefix("#[") else {
+        return false;
+    };
+    let path = inner.split(['(', ']']).next().unwrap_or_default().trim();
+    path.rsplit("::").next().unwrap_or_default().trim() == "test"
+}
+
+/// Whether a trimmed line opens a conventional test module without a
+/// bare-`pub` qualifier (`mod tests {` / `mod test {`): such a module
+/// is private, so its contents are test-only even when no
+/// `#[cfg(test)]` precedes it.
+fn is_test_module_header(trimmed: &str) -> bool {
+    let rest = trimmed
+        .strip_prefix("pub(crate) ")
+        .or_else(|| trimmed.strip_prefix("pub(super) "))
+        .unwrap_or(trimmed);
+    ["mod tests", "mod test"].iter().any(|prefix| {
+        rest.strip_prefix(prefix)
+            .map(|after| {
+                after.starts_with(|c: char| c.is_whitespace() || c == '{' || c == ';')
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Tracks test-only scopes while scanning a file top to bottom, so
+/// member/declaration extraction can skip them: the member parser
+/// accepts any indented `fn` line, so without this a test function
+/// (or a helper inside a test module) entered the public surface and
+/// a test-only rename demanded a documentation update. A scope opens
+/// at a `#[cfg(test)]` item, a `#[test]` function, or a private
+/// `mod tests` header, and ends at the first non-blank line at or
+/// above the opening line's indentation. Legitimate member shapes
+/// outside test scopes — trait methods, inherent-impl helpers,
+/// trait-impl methods — are untouched: suppression is keyed to the
+/// test markers, never to visibility alone.
+struct TestScopeTracker {
+    pending_cfg_test: bool,
+    pending_test_fn: bool,
+    scope_indent: Option<usize>,
+}
+
+impl TestScopeTracker {
+    fn new() -> Self {
+        TestScopeTracker {
+            pending_cfg_test: false,
+            pending_test_fn: false,
+            scope_indent: None,
+        }
+    }
+
+    /// Feeds one blanked line (with its indentation); returns true
+    /// when the line is test-only and must extract nothing.
+    fn suppresses(&mut self, indent: usize, line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Some(scope) = self.scope_indent {
+            if indent > scope {
+                return true;
+            }
+            self.scope_indent = None;
+        }
+        if is_cfg_test_attribute(trimmed) {
+            self.pending_cfg_test = true;
+            return false;
+        }
+        if is_test_fn_attribute(trimmed) {
+            self.pending_test_fn = true;
+            return false;
+        }
+        if trimmed.starts_with("#[") {
+            // Another attribute stacked between the test marker and
+            // its item: the marker stays pending.
+            return false;
+        }
+        let opens_block = line.matches('{').count() > line.matches('}').count();
+        if self.pending_cfg_test || self.pending_test_fn {
+            self.pending_cfg_test = false;
+            self.pending_test_fn = false;
+            if opens_block {
+                self.scope_indent = Some(indent);
+            }
+            return true;
+        }
+        if is_test_module_header(trimmed) && opens_block {
+            self.scope_indent = Some(indent);
+        }
+        false
+    }
+}
+
 /// Extracts the public surface as a map from declaration key to the set
 /// of normalized signatures seen for that key. SS7 identifiers enter as
 /// key = signature = identifier, so a changed line carrying one still
@@ -2042,16 +2154,23 @@ fn extract_public_surface_signatures(
     // variant pattern must not fire for them either. A line at or
     // shallower than the header ends the body.
     let mut fn_body_indent: Option<usize> = None;
+    let mut test_scope = TestScopeTracker::new();
     for ((line, original_line), preserved_line) in
         cleaned.lines().zip(text.lines()).zip(route_text.lines())
     {
+        let indent = line.len() - line.trim_start().len();
+        // Test-only scopes extract nothing (see TestScopeTracker):
+        // a test fn rename or a test helper's signature change must
+        // not register as public surface.
+        if test_scope.suppresses(indent, line) {
+            continue;
+        }
         if let Some(attribute) = parse_serde_attribute(preserved_line) {
             pending_serde.push(attribute);
         }
         if let Some(attribute) = parse_command_attribute(preserved_line) {
             pending_command.push(attribute);
         }
-        let indent = line.len() - line.trim_start().len();
         // Blank lines carry indent 0 but are not body content: they
         // must not end fn-body tracking, or a tail expression after
         // a blank line inside a fn is read as an enum member.
@@ -5048,6 +5167,60 @@ pub struct AfterAll {}
                 || !before["helper"].iter().any(|s| s.starts_with("command(")),
             "attribute attached to a non-declaration: {before:?}"
         );
+    }
+
+    #[test]
+    fn test_fn_rename_in_cfg_test_mod_is_identical() {
+        // X1 probe (Codex PR #162): renaming ONLY a test function in
+        // src/traits.rs changed the signature map, so a test-only
+        // change demanded a documentation update. Test functions are
+        // not public surface.
+        let before = extract_public_surface_signatures(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn memory_vocabulary_declares_task() {\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn memory_vocabulary_declares_renamed() {\n    }\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        let decls = extract_public_surface_declarations(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn memory_vocabulary_declares_task() {\n    }\n}",
+        );
+        assert!(
+            !decls.contains("memory_vocabulary_declares_task"),
+            "{decls:?}"
+        );
+    }
+
+    #[test]
+    fn test_helper_in_cfg_test_mod_signature_change_is_identical() {
+        // A helper fn inside a #[cfg(test)] module carries no
+        // #[test] attribute of its own; the enclosing test scope
+        // still makes it test-only.
+        let before = extract_public_surface_signatures(
+            "#[cfg(test)]\nmod tests {\n    fn helper(value: u32) -> u32 {\n        value\n    }\n}",
+        );
+        let after = extract_public_surface_signatures(
+            "#[cfg(test)]\nmod tests {\n    fn helper(value: String) -> u32 {\n        0\n    }\n}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn test_attribute_fn_outside_a_module_is_identical() {
+        // A #[test] fn at file scope (no enclosing test module) is
+        // test-only too, as is a #[cfg(test)] helper item.
+        let before =
+            extract_public_surface_signatures("#[test]\nfn it_works() {\n}");
+        let after =
+            extract_public_surface_signatures("#[test]\nfn it_passes() {\n}");
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        let before = extract_public_surface_signatures(
+            "#[cfg(test)]\npub fn test_helper(x: u32) {}",
+        );
+        let after = extract_public_surface_signatures(
+            "#[cfg(test)]\npub fn test_helper(x: String) {}",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
     }
 
     #[test]
