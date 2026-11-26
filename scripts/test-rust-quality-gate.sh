@@ -824,4 +824,61 @@ if [ "$st28" -ne 0 ] || ! grep -q 'audit NOT verified' <<< "$out28" \
     exit 1
 fi
 
+# Leg 29 (regression, Codex P2 — source-owning crates with a root
+# manifest): a root workspace plus a standalone native/ crate (its own
+# [workspace], so the root workspace run never builds it). A
+# source-only push adding a needless_return warning in native/ must
+# BLOCK via the owning manifest — pre-fix no leg ran that crate.
+new_root_plus_native_repo() {
+    local repo="$1"
+    new_repo "$repo"
+    mkdir -p "$repo/native/src"
+    cat > "$repo/native/Cargo.toml" <<'EOF'
+[package]
+name = "native-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+EOF
+    printf 'pub fn nclean() -> i32 {\n    1\n}\n' > "$repo/native/src/lib.rs"
+    (cd "$repo/native" && cargo generate-lockfile >/dev/null 2>&1)
+    git -C "$repo" add native
+    git -C "$repo" commit -q -m 'standalone native crate baseline'
+    git -C "$repo" update-ref refs/remotes/origin/develop HEAD
+}
+root_native_dirty="$TMP/root-native-dirty"
+new_root_plus_native_repo "$root_native_dirty"
+printf '\npub fn bad() -> String {\n    return "x".to_string();\n}\n' >> "$root_native_dirty/native/src/lib.rs"
+git -C "$root_native_dirty" add native/src/lib.rs
+git -C "$root_native_dirty" commit -q -m 'dirty standalone native addition'
+set +e
+out29=$(run_gate "$root_native_dirty" "$PATH")
+st29=$?
+set -e
+if [ "$st29" -eq 0 ] || ! grep -q 'new clippy diagnostic on added line: native/src/lib.rs' <<< "$out29"; then
+    printf 'FAIL: clippy warning on an added line in a standalone crate beside a root workspace must block the gate\n%s\n' "$out29" >&2
+    exit 1
+fi
+
+# Leg 30 (converse): a CLEAN source-only push in the same standalone
+# crate passes on the merits — the source-owning run must not
+# false-block (e.g. on path-prefix misattribution).
+root_native_clean="$TMP/root-native-clean"
+new_root_plus_native_repo "$root_native_clean"
+printf '\npub fn also_clean() -> i32 {\n    2\n}\n' >> "$root_native_clean/native/src/lib.rs"
+git -C "$root_native_clean" add native/src/lib.rs
+git -C "$root_native_clean" commit -q -m 'clean standalone native addition'
+set +e
+out30=$(run_gate "$root_native_clean" "$PATH")
+st30=$?
+set -e
+if [ "$st30" -ne 0 ] || ! grep -q 'pass' <<< "$out30"; then
+    printf 'FAIL: clean push in a standalone crate beside a root workspace must pass the gate\n%s\n' "$out30" >&2
+    exit 1
+fi
+
 echo 'rust-quality-gate tests passed'

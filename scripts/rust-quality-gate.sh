@@ -456,6 +456,53 @@ if [ -f Cargo.toml ]; then
     done <<< "$CHANGED_OWNING"
 fi
 
+# ── 2d. clippy (source-owning crates, root workspace present) ──────────
+# §2's workspace run covers workspace members only: a standalone crate
+# the root workspace excludes (e.g. a bootstrapped native/ next to a
+# root crate) is never built by it, §2c keys off changed MANIFESTS
+# only, and §2b special-cases src-tauri — so a source-only push in
+# such a crate passed with warnings nobody ran. Resolve the owning
+# manifest for every changed .rs file (the nearest Cargo.toml in the
+# file's directory or any ancestor up to the repo root — the same
+# walk §2 uses when no root manifest exists) and run clippy once per
+# distinct owning manifest that is neither the root manifest (§2 owns
+# it) nor src-tauri's (§2b owns it) nor already run by §2c (a manifest
+# this push changed). Diagnostics are attributed exactly like §2's
+# nested runs (manifest dir prefixed back to repo-root form).
+if [ -f Cargo.toml ]; then
+    SRC_OWNING=""
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        d="$(dirname "$f")"
+        found=""
+        while :; do
+            if [ -f "$d/Cargo.toml" ]; then
+                found="$d/Cargo.toml"
+                break
+            fi
+            [ "$d" = "." ] && break
+            d="$(dirname "$d")"
+        done
+        case "$found" in
+            ""|Cargo.toml|src-tauri/Cargo.toml) ;;
+            *) SRC_OWNING="${SRC_OWNING}${found}
+" ;;
+        esac
+    done <<< "$CHANGED_RS"
+    SRC_OWNING="$(printf '%s' "$SRC_OWNING" | sort -u)"
+    while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        # §2c already ran every owning manifest derived from the
+        # changed manifests; do not run those a second time.
+        if printf '%s\n' "$CHANGED_OWNING" | grep -qxF "$m"; then
+            continue
+        fi
+        mdir="$(dirname "$m")"
+        M_OUT="$(cargo clippy --locked --manifest-path "$m" --all-targets --all-features --message-format=short --color never 2>&1)"
+        clippy_leg "$M_OUT" "$?" "crate at $m" "$mdir/"
+    done <<< "$SRC_OWNING"
+fi
+
 # ── 2b. clippy (src-tauri): the excluded standalone crate ────────────────
 # The root workspace EXCLUDES src-tauri (standalone package, own
 # lockfile), so the --workspace run above never checks it: a push
