@@ -1763,12 +1763,18 @@ fn multiline_typescript_const_signatures(
         // before the declaration's `=` are not the initializer, so
         // the first bare `=` resets the depth — an annotation's
         // own balanced `[…]` (`string[]`, a tuple type) otherwise
-        // ends the scan on the declaration line.
+        // ends the scan on the declaration line. A declaration
+        // whose line terminates before any bare `=` appears has no
+        // initializer at all (W9-3: an ambient `export declare
+        // const NAME: <annotation>;` in a `.d.ts`): the scan bails
+        // to the legacy first-line behaviour instead of running
+        // away into subsequent declarations and swallowing theirs.
         let mut state = ScanState::Normal;
         let mut template_stack: Vec<i32> = Vec::new();
         let mut depth: i32 = 0;
         let mut seen_open = false;
         let mut initializer = false;
+        let mut no_initializer = false;
         let mut arrow = false;
         let mut end_line: Option<usize> = None;
         let mut cur_line = idx;
@@ -1776,6 +1782,13 @@ fn multiline_typescript_const_signatures(
         while pos < bytes.len() {
             let b = bytes[pos];
             if b == b'\n' {
+                // W9-3: the declaration line ended before any bare
+                // `=` set the initializer flag — there is no
+                // initializer to capture (see above).
+                if cur_line == idx && !initializer {
+                    no_initializer = true;
+                    break;
+                }
                 // An unterminated single/double-quoted string
                 // resyncs at the end of its line.
                 if matches!(state, ScanState::Single | ScanState::Double) {
@@ -1801,6 +1814,20 @@ fn multiline_typescript_const_signatures(
                             initializer = true;
                             depth = 0;
                             seen_open = false;
+                        }
+                        b';' if cur_line == idx && !initializer && depth == 0 => {
+                            // W9-3: a depth-0 `;` in Normal state
+                            // terminates the declaration before any
+                            // bare `=` — no initializer (see the
+                            // scan comment above). A `;` inside a
+                            // string literal never reaches this arm
+                            // (the string states consume it), and
+                            // one inside annotation brackets sits
+                            // at depth > 0, so an initialized const
+                            // with an object annotation still
+                            // captures in full.
+                            no_initializer = true;
+                            break;
                         }
                         b'(' | b'[' | b'{' => {
                             depth += 1;
@@ -1844,6 +1871,9 @@ fn multiline_typescript_const_signatures(
                 }
             }
             pos += 1;
+        }
+        if no_initializer {
+            continue;
         }
         let Some(end) = end_line else {
             continue;
@@ -7697,5 +7727,138 @@ pub struct AfterAll {}
             "export const HANDLERS = [\n  () => 'a',\n  () => 'c'\n]\n",
         );
         assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn typescript_ambient_declare_consts_keep_legacy_signatures_real_shape() {
+        // W9-3: the checked-in plugins/core/dist/index.d.ts carries
+        // initializer-less ambient declarations (`export declare
+        // const NAME: <annotation>;`). They contain no bare `=`, so
+        // the W9-1/W9-2 initializer scan never terminated at the
+        // declaration: it ran away into subsequent declarations —
+        // MARKERS recorded a signature spanning ~180 lines — and a
+        // single unrelated value change diffed 10 keys. Ambient
+        // declarations must keep their legacy first-line signatures.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("plugins/core/dist/index.d.ts")).unwrap();
+        assert!(real.contains("export declare const MARKERS: readonly [string, string][];"));
+        assert!(real.contains("export declare const REQUIRED_TOOLS: string[];"));
+        assert!(real.contains("export declare const PREFETCH_LRU_CAP = 128;"));
+        let sigs = extract_public_surface_signatures(&real);
+        for (key, decl) in [
+            (
+                "ts:MARKERS",
+                "export declare const MARKERS: readonly [string, string][];",
+            ),
+            (
+                "ts:REQUIRED_TOOLS",
+                "export declare const REQUIRED_TOOLS: string[];",
+            ),
+        ] {
+            let legacy = extract_public_surface_signatures(decl);
+            assert_eq!(
+                sigs.get(key),
+                legacy.get(key),
+                "{key} must record its legacy first-line signature: {:?}",
+                sigs.get(key)
+            );
+        }
+        // A single value change elsewhere in the file diffs exactly
+        // the changed key — not the ambient declarations whose
+        // runaway scans used to swallow the changed line.
+        let mutated = real.replacen(
+            "export declare const PREFETCH_LRU_CAP = 128;",
+            "export declare const PREFETCH_LRU_CAP = 256;",
+            1,
+        );
+        assert_ne!(real, mutated);
+        let after = extract_public_surface_signatures(&mutated);
+        let differing: Vec<&str> = sigs
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| sigs.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(
+            differing,
+            vec!["ts:PREFETCH_LRU_CAP"],
+            "exactly the changed key must differ"
+        );
+    }
+
+    #[test]
+    fn typescript_ambient_declare_const_before_multiline_const_keeps_legacy_signature() {
+        // W9-3: an initializer-less ambient declaration in front of
+        // a multiline exported const: the ambient scan ran away
+        // into the following const's initializer, so the ambient
+        // key recorded the following const's lines and an edit
+        // there diffed both keys.
+        let text = "export declare const AMBIENT: string[];\nexport const FOLLOWING = [\n  'alpha',\n  'beta'\n]\n";
+        let before = extract_public_surface_signatures(text);
+        let legacy = extract_public_surface_signatures("export declare const AMBIENT: string[];");
+        assert_eq!(
+            before.get("ts:AMBIENT"),
+            legacy.get("ts:AMBIENT"),
+            "AMBIENT must record its legacy first-line signature: {:?}",
+            before.get("ts:AMBIENT")
+        );
+        let after = extract_public_surface_signatures(
+            "export declare const AMBIENT: string[];\nexport const FOLLOWING = [\n  'alpha',\n  'gamma'\n]\n",
+        );
+        let differing: Vec<&str> = before
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(
+            differing,
+            vec!["ts:FOLLOWING"],
+            "only the edited const's key must differ"
+        );
+    }
+
+    #[test]
+    fn typescript_ambient_declare_const_without_brackets_keeps_legacy_signature() {
+        // W9-3: the same runaway with no brackets anywhere in the
+        // ambient annotation (`export declare const W: string;`) —
+        // nothing on the declaration line opens a bracket, yet the
+        // scan still ran into the following const's initializer.
+        let text = "export declare const W: string;\nexport const AFTER = [\n  'alpha',\n  'beta'\n]\n";
+        let before = extract_public_surface_signatures(text);
+        let legacy = extract_public_surface_signatures("export declare const W: string;");
+        assert_eq!(
+            before.get("ts:W"),
+            legacy.get("ts:W"),
+            "W must record its legacy first-line signature: {:?}",
+            before.get("ts:W")
+        );
+        let after = extract_public_surface_signatures(
+            "export declare const W: string;\nexport const AFTER = [\n  'alpha',\n  'gamma'\n]\n",
+        );
+        let differing: Vec<&str> = before
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(
+            differing,
+            vec!["ts:AFTER"],
+            "only the edited const's key must differ"
+        );
+    }
+
+    #[test]
+    fn typescript_semicolon_in_string_annotation_does_not_bail_multiline_capture() {
+        // W9-3 pin: the no-initializer bail must stay string-aware —
+        // a `;` inside a string literal in the annotation is not a
+        // declaration terminator, and an annotated const WITH a
+        // multiline initializer still captures in full.
+        let before = extract_public_surface_signatures(
+            "export const MODE: 'x;y' = [\n  'alpha',\n  'beta'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const MODE: 'x;y' = [\n  'alpha',\n  'gamma'\n]\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(after.contains_key("ts:MODE"), "{after:?}");
     }
 }
