@@ -945,12 +945,183 @@ fn variant_payload_passes(group: &str) -> bool {
             .all(|part| variant_payload_part_passes(part))
 }
 
+/// Finds the byte index of a TypeScript parameter-default
+/// separator in `text` (a type expression optionally followed by
+/// `= <default>`): a single `=` at bracket depth 0 that is not half
+/// of `==`, `=>`, `<=`, `>=` or `!=`, and not a generic argument
+/// default (`Foo<T = string>` sits at depth > 0). With
+/// `skip_strings`, string / template literal contents are skipped,
+/// so an `=` or bracket inside a literal counts for nothing; on a
+/// blanked line those contents are already erased, so the flag is
+/// only needed for original text.
+fn typescript_default_separator(text: &str, skip_strings: bool) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if skip_strings {
+            if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if matches!(b, b'"' | b'\'' | b'`') {
+                quote = Some(b);
+                i += 1;
+                continue;
+            }
+        }
+        match b {
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            // An arrow `=>` in a function type is not a default
+            // separator, and its `>` must not close a bracket.
+            b'=' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'(' | b'{' | b'<' => depth += 1,
+            b']' | b')' | b'}' | b'>' => depth -= 1,
+            b'=' if depth == 0
+                && bytes.get(i + 1) != Some(&b'=')
+                && (i == 0 || !matches!(bytes[i - 1], b'=' | b'!' | b'<' | b'>')) =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Normalizes a TypeScript default value for a recorded signature:
+/// whitespace outside string / template literals is dropped (so a
+/// whitespace-only reformatting of the default is
+/// signature-identical), literal contents are preserved verbatim
+/// (a string default's content is surface, as an exported const's
+/// value is), a trailing comment ends the value, and a trailing
+/// parameter separator (`,` / `;`) is stripped.
+fn normalize_typescript_default(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '/' if matches!(chars.peek(), Some('/') | Some('*')) => break,
+            c if c.is_whitespace() => {}
+            _ => out.push(c),
+        }
+    }
+    out.trim_end_matches(&[',', ';'][..]).to_string()
+}
+
+/// Builds the recorded signature for a defaulted TypeScript typed
+/// member / parameter (`<name>[?]: <Type> = <default>`) from the
+/// ORIGINAL line, so a string default's content — erased from the
+/// blanked line the recognition ran on — still registers. Returns
+/// `None` when the original line does not carry the same shape
+/// (the caller then falls back to the blanked line's parts).
+fn typescript_defaulted_signature(
+    original_line: &str,
+    name: &str,
+    optional: bool,
+) -> Option<String> {
+    let trimmed = original_line.trim();
+    let (orig_name, len) = leading_identifier(trimmed)?;
+    if orig_name != name {
+        return None;
+    }
+    let after = &trimmed[len..];
+    let after = after.strip_prefix('?').unwrap_or(after);
+    let rest = after.strip_prefix(':')?;
+    let sep = typescript_default_separator(rest, true)?;
+    let type_part = normalized_line(rest[..sep].trim());
+    if type_part.is_empty() {
+        return None;
+    }
+    let default = normalize_typescript_default(&rest[sep + 1..]);
+    if default.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{name}{}: {type_part} = {default}",
+        if optional { "?" } else { "" }
+    ))
+}
+
+/// Finds the byte index of a `function` signature's body brace in
+/// a normalized line: the first `{` at parenthesis depth 0, scanned
+/// string-aware. A `{` inside the parameter list — an object
+/// default, an object type — is part of the signature, not the
+/// body, so the cut must not land on it.
+fn function_body_brace_index(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut paren_depth = 0i32;
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => quote = Some(b),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            b'{' if paren_depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parses one indented line as a member of an enclosing public
 /// declaration (method, named field, parameter / typed member, or
 /// variant / bare member token), returning (name, key, signature).
 /// Indentation is the enclosing-declaration signal: top-level items
 /// sit at column 0, interior lines are indented.
-fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
+fn parse_member_declaration(
+    line: &str,
+    original_line: &str,
+) -> Option<(String, String, String)> {
     if line == line.trim_start() {
         return None;
     }
@@ -1049,12 +1220,38 @@ fn parse_member_declaration(line: &str) -> Option<(String, String, String)> {
         if !["let", "return", "if", "for", "while", "match", "use"].contains(&first_token) {
             if let Some((name, len)) = leading_identifier(trimmed) {
                 let after_name = &trimmed[len..];
+                let optional = after_name.starts_with('?');
                 let after_name = after_name.strip_prefix('?').unwrap_or(after_name);
                 if let Some(type_part) = after_name.strip_prefix(':') {
                     let type_part = strip_trailing_comma(type_part.trim())
                         .trim_end_matches(';')
                         .trim();
-                    if !type_part.contains('=') && typescript_type_passes(type_part) {
+                    // W8-2: a defaulted parameter / member
+                    // (`<name>: <Type> = <default>`) — the default
+                    // separator split off, the type must pass on its
+                    // own, and the signature records the normalized
+                    // default, so a change to the default's content
+                    // registers. Without this the `=` rejected the
+                    // whole line and the parameter extracted nothing.
+                    if let Some(sep) = typescript_default_separator(type_part, false) {
+                        let type_only = type_part[..sep].trim();
+                        if typescript_type_passes(type_only) {
+                            let signature = typescript_defaulted_signature(
+                                original_line,
+                                &name,
+                                optional,
+                            )
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{name}{}: {} = {}",
+                                    if optional { "?" } else { "" },
+                                    normalized_line(type_only),
+                                    normalize_typescript_default(&type_part[sep + 1..])
+                                )
+                            });
+                            return Some((name.clone(), format!("member:{name}"), signature));
+                        }
+                    } else if typescript_type_passes(type_part) {
                         let signature = strip_trailing_comma(&normalized).to_string();
                         return Some((name.clone(), format!("member:{name}"), signature));
                     }
@@ -1450,7 +1647,10 @@ fn typescript_signature(kind: &str, line: &str) -> String {
     };
     match kind {
         "function" => {
-            let head = match normalized.find('{') {
+            // The body-brace cut is parenthesis-aware (W8-2): a
+            // `{` inside the parameter list — an object default —
+            // is signature, not the body opening.
+            let head = match function_body_brace_index(&normalized) {
                 Some(idx) => &normalized[..idx],
                 None => &normalized[..],
             };
@@ -1750,7 +1950,7 @@ pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTre
         {
             decls.insert(name);
         }
-        let member = parse_member_declaration(line).or_else(|| {
+        let member = parse_member_declaration(line, original_line).or_else(|| {
             if enclosing_kind.as_deref() == Some("enum") {
                 parse_multiline_variant_header(line)
             } else {
@@ -2832,7 +3032,7 @@ fn extract_public_surface_signatures(
             enclosing = Some(name);
             enclosing_kind = Some(kind);
         }
-        let member = parse_member_declaration(line).or_else(|| {
+        let member = parse_member_declaration(line, original_line).or_else(|| {
             // A multiline variant header (payload opening unclosed
             // on its line) extracts nothing from the member parser;
             // recognize it in an enum context only, so the same
@@ -6118,6 +6318,172 @@ pub struct AfterAll {}
         let before = extract_public_surface_signatures("  strictMode: boolean");
         let after = extract_public_surface_signatures("  strictMode: string");
         assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn typescript_defaulted_parameter_change_differs_real_shape() {
+        // W8-2 probe (Codex PR #162): a faithful excerpt of
+        // resolveConfig's signature in plugins/core/index.ts.
+        // Changing the pluginConfig default's CONTENT produced
+        // identical maps — the parameter line extracted nothing
+        // because its type part is followed by `= {}`.
+        let before = extract_public_surface_signatures(
+            "export function resolveConfig(\n  pluginConfig: unknown = {},\n  cwd = process.cwd()\n): PluginConfig {\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export function resolveConfig(\n  pluginConfig: unknown = { strictMode: false },\n  cwd = process.cwd()\n): PluginConfig {\n",
+        );
+        assert_ne!(
+            before, after,
+            "default content change must register: before={before:?} after={after:?}"
+        );
+        assert!(
+            after.contains_key("member:pluginConfig"),
+            "defaulted parameter must be recorded: {after:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_defaulted_parameter_scalar_default_change_differs() {
+        // W8-2: a scalar default change on a multiline parameter.
+        let before = extract_public_surface_signatures(
+            "export function configure(\n  limit: number = 3,\n): void {\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export function configure(\n  limit: number = 5,\n): void {\n",
+        );
+        assert_ne!(
+            before, after,
+            "scalar default change must register: before={before:?} after={after:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_defaulted_parameter_string_default_change_differs() {
+        // W8-2: a string default containing `=` and a comma — the
+        // `=` inside the literal is not the default separator, the
+        // comma inside it does not split the parameter list, and a
+        // change to the literal's content registers.
+        let before = extract_public_surface_signatures(
+            "export function configure(\n  mode: string = \"a=b,c\",\n  next: number\n): void {\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export function configure(\n  mode: string = \"a=d,c\",\n  next: number\n): void {\n",
+        );
+        assert_ne!(
+            before, after,
+            "string default change must register: before={before:?} after={after:?}"
+        );
+        assert!(
+            before.contains_key("member:next"),
+            "parameter after a string default must still record: {before:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_defaulted_parameter_object_and_array_defaults_differ() {
+        // W8-2: commas inside an object / array default belong to
+        // the default, not the parameter list — a change past the
+        // first inner comma must register.
+        let before = extract_public_surface_signatures(
+            "export function configure(\n  options: PluginConfig = { strictMode: false, retries: 3 },\n  tags: number[] = [1, 2],\n): void {\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export function configure(\n  options: PluginConfig = { strictMode: false, retries: 5 },\n  tags: number[] = [1, 9],\n): void {\n",
+        );
+        assert_ne!(
+            before, after,
+            "object/array default change must register: before={before:?} after={after:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_defaulted_parameter_before_required_parameter() {
+        // W8-2: a defaulted parameter followed by a non-defaulted
+        // one — the default must record without swallowing the
+        // parameter that follows it.
+        let before = extract_public_surface_signatures(
+            "export function configure(\n  limit: number = 3,\n  label: string\n): void {\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export function configure(\n  limit: number = 7,\n  label: string\n): void {\n",
+        );
+        assert_ne!(
+            before, after,
+            "default change must register: before={before:?} after={after:?}"
+        );
+        assert!(
+            before.contains_key("member:label"),
+            "following parameter must still record: {before:?}"
+        );
+        assert_eq!(
+            before.get("member:label"),
+            after.get("member:label"),
+            "following parameter must record identically: {before:?} vs {after:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_single_line_function_object_default_change_differs() {
+        // W8-2: on a one-line function signature the body-brace cut
+        // must not land on the opening brace of an object default —
+        // the default's content is part of the signature.
+        let before = extract_public_surface_signatures(
+            "export function f(cfg: PluginConfig = { strictMode: false }): void {}",
+        );
+        let after = extract_public_surface_signatures(
+            "export function f(cfg: PluginConfig = { strictMode: true }): void {}",
+        );
+        assert_ne!(
+            before.get("ts:f"),
+            after.get("ts:f"),
+            "single-line object default change must register: {before:?} vs {after:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_non_defaulted_parameter_records_as_before() {
+        // W8-2 pin (passes before and after the fix): a
+        // non-defaulted typed parameter / member records exactly
+        // the whole normalized line, as it always has.
+        let sigs = extract_public_surface_signatures("  label: string");
+        let expected: std::collections::BTreeSet<String> =
+            ["label: string"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(sigs.get("member:label"), Some(&expected), "{sigs:?}");
+    }
+
+    #[test]
+    fn typescript_defaulted_parameter_whitespace_reformat_is_identical() {
+        // W8-2 pin: a whitespace-only reformatting of a default
+        // normalizes away — the recorded signatures are identical.
+        let before = extract_public_surface_signatures(
+            "export function resolveConfig(\n  pluginConfig: unknown = { strictMode: false },\n): PluginConfig {\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export function resolveConfig(\n  pluginConfig: unknown = {strictMode:false},\n): PluginConfig {\n",
+        );
+        assert_eq!(
+            before, after,
+            "whitespace-only default reformat must be identical: {before:?} vs {after:?}"
+        );
+    }
+
+    #[test]
+    fn rust_signatures_unaffected_by_typescript_default_handling() {
+        // W8-2 pin (passes before and after the fix): Rust
+        // extraction is untouched — a field type change differs, a
+        // body-only edit does not.
+        let before = extract_public_surface_signatures(
+            "pub struct S {\n    pub count: u64,\n}\npub fn run(x: u32) -> u32 { x }\n",
+        );
+        let type_changed = extract_public_surface_signatures(
+            "pub struct S {\n    pub count: String,\n}\npub fn run(x: u32) -> u32 { x }\n",
+        );
+        let body_changed = extract_public_surface_signatures(
+            "pub struct S {\n    pub count: u64,\n}\npub fn run(x: u32) -> u32 { x + 1 }\n",
+        );
+        assert_ne!(before, type_changed, "before={before:?} after={type_changed:?}");
+        assert_eq!(before, body_changed, "before={before:?} after={body_changed:?}");
     }
 
     #[test]
