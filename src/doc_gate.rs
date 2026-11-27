@@ -142,6 +142,17 @@ fn collect_doc_markdown_files(root: &Path) -> Vec<std::path::PathBuf> {
 pub fn extract_public_surface_identifiers(text: &str) -> Vec<String> {
     let mut idents = std::collections::BTreeSet::new();
     for line in text.lines() {
+        collect_ss7_identifiers(line, &mut idents);
+    }
+    idents.into_iter().collect()
+}
+
+/// Collects the SS7 identifiers carried by ONE original-text line
+/// into `idents` (the per-line body of
+/// `extract_public_surface_identifiers`, split out so the extractors
+/// can run it line by line behind a `TestScopeTracker`).
+fn collect_ss7_identifiers(line: &str, idents: &mut std::collections::BTreeSet<String>) {
+    {
         let trimmed = line.trim();
         if let Some(idx) = trimmed.find("#[command(name = \"") {
             let rest = &trimmed[idx + "#[command(name = \"".len()..];
@@ -172,7 +183,6 @@ pub fn extract_public_surface_identifiers(text: &str) -> Vec<String> {
             }
         }
     }
-    idents.into_iter().collect()
 }
 
 fn rename_source(root: &Path, range: &str, rel_path: &str) -> Option<String> {
@@ -490,7 +500,15 @@ fn parse_restricted_surface_declaration(line: &str) -> Option<(String, String)> 
 /// be named from the use line.
 fn reexported_source_names(text: &str) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
+    // A `pub use` inside a test-only scope must not promote the
+    // restricted item it names to public surface (W9-2): gate on a
+    // tracker fed this (already blanked) text, as in the main pass.
+    let mut test_scope = TestScopeTracker::new();
     for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if test_scope.suppresses(indent, line) {
+            continue;
+        }
         if let Some(pairs) = parse_use_declarations(line) {
             for (_declared, full_path) in pairs {
                 let source_path = full_path.split(" as ").next().unwrap_or(&full_path);
@@ -2094,26 +2112,78 @@ fn parse_http_route_registration(line: &str) -> Option<(String, String)> {
 /// declaration-shaped text inside a comment or string extracts nothing;
 /// the SS7 identifiers are taken from the original text first, because
 /// SS7 reads identifiers out of string contents.
+/// SS7 identifiers from the original text, skipping test-only
+/// scopes (W9-2). Every collection pass in the two extractors gates
+/// on a FRESH `TestScopeTracker` fed the fully blanked lines — the
+/// same lines, in the same order, that the main pass feeds its own
+/// tracker. The tracker is a deterministic function of that line
+/// sequence, so a fresh instance per pass reproduces the main
+/// pass's scope decisions exactly and cannot drift from them,
+/// while sharing one instance across passes would couple the
+/// passes' iteration order and leave later passes with whatever
+/// state earlier passes happened to end in.
+fn test_scope_gated_identifiers(
+    text: &str,
+    cleaned: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut idents = std::collections::BTreeSet::new();
+    let mut test_scope = TestScopeTracker::new();
+    for (line, blanked) in text.lines().zip(cleaned.lines()) {
+        if test_scope_line_suppressed(&mut test_scope, blanked) {
+            continue;
+        }
+        collect_ss7_identifiers(line, &mut idents);
+    }
+    idents
+}
+
+/// Feeds one blanked line to a collection pass's tracker and
+/// reports whether the aligned original line must be skipped. The
+/// pre-passes read the ORIGINAL (or strings-preserved) line, whose
+/// content may live entirely inside a string literal — a schema
+/// block, an SS7 identifier — so its blanked form is empty, and
+/// `suppresses` alone never suppresses an empty line (it merely
+/// leaves the scope open). A blanked-empty line seen while the
+/// tracker is inside a test scope is string content of that scope
+/// and is suppressed too.
+fn test_scope_line_suppressed(test_scope: &mut TestScopeTracker, blanked: &str) -> bool {
+    let indent = blanked.len() - blanked.trim_start().len();
+    test_scope.suppresses(indent, blanked)
+        || (blanked.trim().is_empty() && test_scope.scope_indent.is_some())
+}
+
 pub fn extract_public_surface_declarations(text: &str) -> std::collections::BTreeSet<String> {
+    // The blanked intermediates are computed up front (they are
+    // pure functions of the text): every pass below, including the
+    // pre-passes, gates test-only scopes on a tracker fed the fully
+    // blanked lines, whose line structure all intermediates share.
+    let cleaned = blank_comments_and_strings(text);
+    let route_text = blank_comments_only(text);
     // Pipeline step 1: SS7 identifiers, from the ORIGINAL text (SS7
-    // extracts identifiers from string contents, which step 3 erases).
-    let mut decls: std::collections::BTreeSet<String> = extract_public_surface_identifiers(text)
-        .into_iter()
-        .collect();
+    // extracts identifiers from string contents, which step 3
+    // erases) — skipping test-only scopes (W9-2).
+    let mut decls: std::collections::BTreeSet<String> =
+        test_scope_gated_identifiers(text, &cleaned);
     // Pipeline step 2: pre-blanking extraction point. Route
     // registrations are extracted here, from the
     // comments-blanked-but-strings-preserved intermediate produced by
     // `blank_comments_only`, because a route's identity is a string
     // literal that step 3 erases. Nothing else may use this slot
-    // without a design note.
-    let route_text = blank_comments_only(text);
-    for line in route_text.lines() {
-        if let Some((key, _signature)) = parse_http_route_registration(line) {
-            decls.insert(key);
+    // without a design note. Test-only scopes are skipped (W9-2):
+    // a route registered only inside a test is not public surface.
+    {
+        let mut test_scope = TestScopeTracker::new();
+        for (line, blanked) in route_text.lines().zip(cleaned.lines()) {
+            if test_scope_line_suppressed(&mut test_scope, blanked) {
+                continue;
+            }
+            if let Some((key, _signature)) = parse_http_route_registration(line) {
+                decls.insert(key);
+            }
         }
     }
-    // Pipeline step 3: blank comments and string literals.
-    let cleaned = blank_comments_and_strings(text);
+    // Pipeline step 3: blank comments and string literals (the
+    // `cleaned` intermediate computed above).
     // A restricted-visibility item re-exported by a bare `pub use` in
     // the same text is public surface transitively: the use line is
     // extracted, so the definition behind it must be too, or its own
@@ -2917,8 +2987,14 @@ fn extract_public_surface_signatures(
         std::collections::BTreeMap::new();
     // Same pipeline as `extract_public_surface_declarations`: SS7
     // identifiers from the original text, then all declaration parsing
-    // on the comment/string-blanked text.
-    for ident in extract_public_surface_identifiers(text) {
+    // on the comment/string-blanked text. The blanked text is
+    // computed first (and reused below) because the schema scan
+    // tracks object nesting by counting braces, and braces inside
+    // string literals (a description quoting a JSON example) must
+    // not move the nesting — and because every pre-pass gates
+    // test-only scopes on a tracker fed its lines (W9-2).
+    let cleaned = blank_comments_and_strings(text);
+    for ident in test_scope_gated_identifiers(text, &cleaned) {
         signatures.entry(ident.clone()).or_default().insert(ident);
     }
     // MCP input schemas, from the original text alongside SS7 (their
@@ -2926,11 +3002,6 @@ fn extract_public_surface_signatures(
     // and required set are user-facing API surface, so a schema-only
     // change to an existing tool must register even though the tool
     // name line itself is unchanged.
-    // The blanked text is computed here (and reused below) because
-    // the schema scan tracks object nesting by counting braces, and
-    // braces inside string literals (a description quoting a JSON
-    // example) must not move the nesting.
-    let cleaned = blank_comments_and_strings(text);
     // The tool whose schema is being scanned (`"name": "<tool>"` most
     // recently seen), and the stack of (indent, key) objects enclosing
     // the current line. Schema keys are qualified with both, so an
@@ -2938,7 +3009,16 @@ fn extract_public_surface_signatures(
     // no longer cancels a change to just one of them.
     let mut mcp_tool: Option<String> = None;
     let mut mcp_stack: Vec<(usize, String)> = Vec::new();
+    // Test-only scopes register no schema or clap-arg surface
+    // (W9-2): a suppressed line is skipped whole — it neither sets
+    // the current tool nor moves the nesting stack (a test scope's
+    // braces balance inside the scope, so the stack stays correct
+    // for the production lines after it).
+    let mut mcp_test_scope = TestScopeTracker::new();
     for (line, blanked) in text.lines().zip(cleaned.lines()) {
+        if test_scope_line_suppressed(&mut mcp_test_scope, blanked) {
+            continue;
+        }
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("\"name\": \"") {
             if let Some(end) = rest.find('"') {
@@ -2984,7 +3064,13 @@ fn extract_public_surface_signatures(
     // preserved intermediate, keyed `route:<path>` with the signature
     // carrying the sorted method set.
     let route_text = blank_comments_only(text);
-    for line in route_text.lines() {
+    // Test-only scopes are skipped (W9-2), for the command
+    // attributes collected in this same loop as well as the routes.
+    let mut route_test_scope = TestScopeTracker::new();
+    for (line, blanked) in route_text.lines().zip(cleaned.lines()) {
+        if test_scope_line_suppressed(&mut route_test_scope, blanked) {
+            continue;
+        }
         if let Some((key, signature)) = parse_http_route_registration(line) {
             signatures.entry(key).or_default().insert(signature);
         }
@@ -3099,7 +3185,13 @@ fn extract_public_surface_signatures(
     // TypeScript constants (W9-1), keyed by line index: the
     // per-line pass below records only the declaration line of
     // such a constant, so a change to a later initializer line
-    // registered nothing.
+    // registered nothing. Test-scope adjudication (W9-2): this
+    // pre-pass registers nothing on its own — an entry is consumed
+    // only when the main loop reaches its declaration line, and
+    // the main loop's tracker suppression skips that line first,
+    // so a constant declared inside a test scope contributes
+    // nothing (pinned by
+    // `w9_2_multiline_const_inside_test_scope_registers_nothing`).
     let multiline_const_signatures = multiline_typescript_const_signatures(&cleaned, &route_text);
     for (line_idx, ((line, original_line), preserved_line)) in cleaned
         .lines()
@@ -4762,6 +4854,147 @@ pub struct AfterAll {}
         assert!(!decls.contains("route:/health"), "{decls:?}");
         let sigs = extract_public_surface_signatures(text);
         assert!(!sigs.contains_key("route:/health"), "{sigs:?}");
+    }
+
+    #[test]
+    fn w9_2_routes_inside_test_scopes_register_nothing() {
+        // W9-2 census (Codex PR #162): the route pre-pass ran with
+        // no TestScopeTracker, so a route registered only inside a
+        // #[cfg(test)] module or a #[test] fn entered the surface.
+        // Production routes in the same file must still register.
+        let text = "pub fn build_router() {\n    Router::new()\n        .route(\"/health\", get(handle_health))\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn dummy_router() {\n        let app = Router::new()\n            .route(\"/test-only\", get(handle_test_only));\n    }\n    #[tokio::test]\n    async fn guarded() {\n        let app = Router::new()\n            .route(\"/test-fn-only\", post(handle_test_fn_only));\n    }\n}\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.contains("route:/health"), "{decls:?}");
+        assert!(!decls.contains("route:/test-only"), "{decls:?}");
+        assert!(!decls.contains("route:/test-fn-only"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(
+            sigs.get("route:/health")
+                .is_some_and(|s| s.contains("route:/health:get")),
+            "{sigs:?}"
+        );
+        assert!(!sigs.contains_key("route:/test-only"), "{sigs:?}");
+        assert!(!sigs.contains_key("route:/test-fn-only"), "{sigs:?}");
+    }
+
+    #[test]
+    fn w9_2_daemon_test_only_route_rename_is_invisible_real_shape() {
+        // W9-2 probe (Codex PR #162): renaming both `/dummy`
+        // occurrences inside the test
+        // `auth_middleware_guards_only_authenticated_non_mcp_routes`
+        // in the real src/daemon.rs changed the surface map exactly
+        // at `route:/dummy` -> `route:/dummy-v2`. `/dummy` exists
+        // only in that test, so the rename must be invisible and no
+        // extractor may contain the test-only route at all.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("src/daemon.rs")).unwrap();
+        assert_eq!(real.matches("\"/dummy\"").count(), 2, "probe shape drifted");
+        let renamed = real.replace("\"/dummy\"", "\"/dummy-v2\"");
+        assert_ne!(real, renamed);
+        let before_decls = extract_public_surface_declarations(&real);
+        let after_decls = extract_public_surface_declarations(&renamed);
+        assert_eq!(before_decls, after_decls);
+        assert!(!before_decls.contains("route:/dummy"), "{before_decls:?}");
+        assert!(!before_decls.contains("route:/dummy-v2"), "{before_decls:?}");
+        let before_sigs = extract_public_surface_signatures(&real);
+        let after_sigs = extract_public_surface_signatures(&renamed);
+        assert_eq!(before_sigs, after_sigs);
+        assert!(!before_sigs.contains_key("route:/dummy"), "{before_sigs:?}");
+        assert!(!before_sigs.contains_key("route:/dummy-v2"), "{before_sigs:?}");
+        // Pin: the production routes of the same file still register.
+        assert!(before_decls.contains("route:/health"), "{before_decls:?}");
+        assert!(before_sigs.contains_key("route:/health"), "{before_sigs:?}");
+    }
+
+    #[test]
+    fn w9_2_command_attribute_inside_test_scope_registers_nothing() {
+        // Census, signatures step 2: `#[command(...)]` lines entered
+        // the shared `command` key unconditionally, with no tracker.
+        let text = "#[command(name = \"prod\", about = \"production command\")]\npub enum Cli {}\n#[cfg(test)]\nmod tests {\n    #[command(name = \"testonly\", about = \"test only command\")]\n    enum FakeCli {}\n}\n";
+        let sigs = extract_public_surface_signatures(text);
+        let command = sigs.get("command").cloned().unwrap_or_default();
+        assert!(
+            command.iter().any(|s| s.contains("production command")),
+            "{sigs:?}"
+        );
+        assert!(
+            !command.iter().any(|s| s.contains("test only command")),
+            "{sigs:?}"
+        );
+    }
+
+    #[test]
+    fn w9_2_ss7_identifiers_inside_test_scope_register_nothing() {
+        // Census, declarations step 1 / signatures SS7: identifiers
+        // were read from the original text with no tracker, so a
+        // test-only `#[command(name = ...)]`, MCP tool name, or
+        // `pub trait` inside a test scope entered the surface.
+        let text = "#[command(name = \"prodcmd\")]\npub enum Cli {}\n#[cfg(test)]\nmod tests {\n    #[command(name = \"testonlycmd\")]\n    enum FakeCli {}\n    pub trait TestOnlyTrait {}\n    const TOOL: &str = \"\\\"name\\\": \\\"neurostrata_testonly_tool\\\"\";\n}\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(decls.contains("prodcmd"), "{decls:?}");
+        assert!(!decls.contains("testonlycmd"), "{decls:?}");
+        assert!(!decls.contains("TestOnlyTrait"), "{decls:?}");
+        assert!(!decls.contains("neurostrata_testonly_tool"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(sigs.contains_key("prodcmd"), "{sigs:?}");
+        assert!(!sigs.contains_key("testonlycmd"), "{sigs:?}");
+        assert!(!sigs.contains_key("TestOnlyTrait"), "{sigs:?}");
+        assert!(!sigs.contains_key("neurostrata_testonly_tool"), "{sigs:?}");
+    }
+
+    #[test]
+    fn w9_2_mcp_schema_and_clap_arg_prepass_skip_test_scopes() {
+        // Census, signatures step 1: the MCP schema / clap-arg
+        // pre-pass over the original text had no tracker, so schema
+        // entries and `#[arg(...)]` lines inside a test scope
+        // registered under the mcp-schema / clap-arg keys.
+        let text = "pub struct Args {\n    #[arg(long)]\n    pub prod_flag: bool,\n}\nconst PROD_SCHEMA: &str = r#\"{\n    \"name\": \"neurostrata_prod_tool\",\n    \"inputSchema\": {\n        \"properties\": {\n            \"prodquery\": { \"type\": \"string\" }\n        }\n    }\n}\"#;\n#[cfg(test)]\nmod tests {\n    struct FakeArgs {\n        #[arg(short)]\n        test_flag: bool,\n    }\n    const TEST_SCHEMA: &str = r#\"{\n        \"name\": \"neurostrata_test_tool\",\n        \"inputSchema\": {\n            \"properties\": {\n                \"testquery\": { \"type\": \"integer\" }\n            }\n        }\n    }\"#;\n}\n";
+        let sigs = extract_public_surface_signatures(text);
+        assert!(
+            sigs.keys().any(|k| k.contains("prodquery")),
+            "{sigs:?}"
+        );
+        assert!(
+            !sigs.keys().any(|k| k.contains("testquery")),
+            "{sigs:?}"
+        );
+        let clap_arg = sigs.get("clap-arg").cloned().unwrap_or_default();
+        assert!(clap_arg.iter().any(|s| s.contains("long")), "{sigs:?}");
+        assert!(!clap_arg.iter().any(|s| s.contains("short")), "{sigs:?}");
+    }
+
+    #[test]
+    fn w9_2_test_only_reexport_does_not_promote_restricted_item() {
+        // Census, re-export pre-pass: `reexported_source_names` ran
+        // with no tracker, so a `pub use` appearing only inside a
+        // test scope promoted a restricted production item to
+        // public surface.
+        let text = "pub(crate) fn internal_op(x: u32) {}\n#[cfg(test)]\nmod tests {\n    pub use crate::m::internal_op;\n}\n";
+        let decls = extract_public_surface_declarations(text);
+        assert!(!decls.contains("internal_op"), "{decls:?}");
+        let sigs = extract_public_surface_signatures(text);
+        assert!(!sigs.contains_key("internal_op"), "{sigs:?}");
+        // Pin: a production re-export still promotes it.
+        let prod = "pub(crate) fn internal_op(x: u32) {}\npub use crate::m::internal_op;\n";
+        assert!(
+            extract_public_surface_declarations(prod).contains("internal_op")
+        );
+        assert!(extract_public_surface_signatures(prod).contains_key("internal_op"));
+    }
+
+    #[test]
+    fn w9_2_multiline_const_inside_test_scope_registers_nothing() {
+        // Census, W9-1 multiline-const pre-pass: its entries are
+        // consumed only at the declaration line inside the gated
+        // main pass, so a multiline exported const whose
+        // declaration line sits in a test scope must register
+        // nothing, while the production one keeps its
+        // full-initializer signature.
+        let text = "#[cfg(test)]\nmod tests {\n    export const TEST_ONLY: string[] = [\n        'alpha',\n    ];\n}\nexport const PROD: string[] = [\n    'beta',\n];\n";
+        let sigs = extract_public_surface_signatures(text);
+        assert!(!sigs.contains_key("ts:TEST_ONLY"), "{sigs:?}");
+        let prod = sigs.get("ts:PROD").cloned().unwrap_or_default();
+        assert!(prod.iter().any(|s| s.contains("beta")), "{sigs:?}");
     }
 
     fn setup_git_daemon_repo(root: &Path, initial_source: &str) {
