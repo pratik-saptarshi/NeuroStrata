@@ -1682,6 +1682,168 @@ fn typescript_signature(kind: &str, line: &str) -> String {
     }
 }
 
+/// Full-initializer signatures for exported TypeScript `const` /
+/// `let` / `var` declarations whose initializer brackets do not
+/// balance on the declaration line (W9-1), keyed by the
+/// declaration's line index within the text. Recognition mirrors
+/// `parse_typescript_exports` (an `export` line whose kind token,
+/// after any modifiers, is const / let / var and which yields
+/// exactly one pair). The initializer's extent is found by a
+/// string-aware scan of the comments-blanked-but-strings-preserved
+/// intermediate, in the spirit of `SchemaFragParser`: brackets
+/// inside single-quoted, double-quoted, and template literals do
+/// not move the depth (the shared blanker only erases double-quoted
+/// strings and Rust char literals, so it cannot be trusted with
+/// TypeScript single-quoted strings), `${ … }` template
+/// expressions nest, and the signature is built from that same
+/// intermediate, so string elements are recorded while
+/// comment-only edits stay invisible, exactly as for the Rust
+/// `const` / `static` signatures in the caller. An initializer
+/// that never balances, or that contains an arrow anywhere, fails
+/// soft to the legacy first-line behaviour: an arrow's body is not
+/// value surface (see `typescript_signature`), and there is no
+/// reliable line-local way to tell its body braces from
+/// initializer braces.
+fn multiline_typescript_const_signatures(
+    blanked_text: &str,
+    preserved_text: &str,
+) -> std::collections::BTreeMap<usize, String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ScanState {
+        Normal,
+        Single,
+        Double,
+        Template,
+    }
+    let blanked_lines: Vec<&str> = blanked_text.lines().collect();
+    let preserved_lines: Vec<&str> = preserved_text.lines().collect();
+    // Byte offset of each preserved line's first byte.
+    let mut line_starts: Vec<usize> = Vec::with_capacity(preserved_lines.len());
+    let mut offset = 0;
+    for line in &preserved_lines {
+        line_starts.push(offset);
+        offset += line.len() + 1;
+    }
+    let bytes = preserved_text.as_bytes();
+    let mut out = std::collections::BTreeMap::new();
+    for (idx, blanked_line) in blanked_lines.iter().enumerate() {
+        let trimmed = blanked_line.trim();
+        let Some(rest) = trimmed.strip_prefix("export") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut kind_idx = 1;
+        while kind_idx < tokens.len()
+            && ["default", "declare", "abstract", "async"].contains(&tokens[kind_idx])
+        {
+            kind_idx += 1;
+        }
+        let Some(kind) = tokens.get(kind_idx).copied() else {
+            continue;
+        };
+        if !["const", "let", "var"].contains(&kind) {
+            continue;
+        }
+        let Some(preserved_line) = preserved_lines.get(idx) else {
+            continue;
+        };
+        if parse_typescript_exports(blanked_line, preserved_line)
+            .map(|pairs| pairs.len())
+            != Some(1)
+        {
+            continue;
+        }
+        // String-aware bracket scan from the declaration line: the
+        // initializer ends on the line where the depth first
+        // returns to zero in Normal state.
+        let mut state = ScanState::Normal;
+        let mut template_stack: Vec<i32> = Vec::new();
+        let mut depth: i32 = 0;
+        let mut seen_open = false;
+        let mut arrow = false;
+        let mut end_line: Option<usize> = None;
+        let mut cur_line = idx;
+        let mut pos = line_starts[idx];
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            if b == b'\n' {
+                // An unterminated single/double-quoted string
+                // resyncs at the end of its line.
+                if matches!(state, ScanState::Single | ScanState::Double) {
+                    state = ScanState::Normal;
+                }
+                cur_line += 1;
+                pos += 1;
+                continue;
+            }
+            match state {
+                ScanState::Normal => {
+                    match b {
+                        b'\'' => state = ScanState::Single,
+                        b'"' => state = ScanState::Double,
+                        b'`' => state = ScanState::Template,
+                        b'=' if bytes.get(pos + 1) == Some(&b'>') => {
+                            arrow = true;
+                            pos += 1;
+                        }
+                        b'(' | b'[' | b'{' => {
+                            depth += 1;
+                            seen_open = true;
+                        }
+                        b')' | b']' | b'}' => {
+                            depth -= 1;
+                            if b == b'}' && template_stack.last() == Some(&depth) {
+                                // This `}` closes a `${ … }` and
+                                // returns to the template literal.
+                                template_stack.pop();
+                                state = ScanState::Template;
+                            } else if seen_open && depth == 0 {
+                                end_line = Some(cur_line);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                ScanState::Single | ScanState::Double => {
+                    let quote = if state == ScanState::Single { b'\'' } else { b'"' };
+                    if b == b'\\' && bytes.get(pos + 1).map(|n| *n != b'\n').unwrap_or(false) {
+                        pos += 1;
+                    } else if b == quote {
+                        state = ScanState::Normal;
+                    }
+                }
+                ScanState::Template => {
+                    if b == b'\\' && bytes.get(pos + 1).map(|n| *n != b'\n').unwrap_or(false) {
+                        pos += 1;
+                    } else if b == b'`' {
+                        state = ScanState::Normal;
+                    } else if b == b'$' && bytes.get(pos + 1) == Some(&b'{') {
+                        template_stack.push(depth);
+                        depth += 1;
+                        seen_open = true;
+                        state = ScanState::Normal;
+                        pos += 1;
+                    }
+                }
+            }
+            pos += 1;
+        }
+        let Some(end) = end_line else {
+            continue;
+        };
+        if end == idx || arrow {
+            continue;
+        }
+        let joined = preserved_lines[idx..=end].join("\n");
+        out.insert(idx, typescript_signature(kind, &joined));
+    }
+    out
+}
+
 /// Parses one line as a TypeScript `export` declaration, returning
 /// its (declared name, signature) pairs, or `None` when the line
 /// does not begin an export. Recognition runs on the blanked line
@@ -2890,8 +3052,17 @@ fn extract_public_surface_signatures(
     // header ends the literal scope, as with the fn body.
     let mut literal_scope_indent: Option<usize> = None;
     let mut test_scope = TestScopeTracker::new();
-    for ((line, original_line), preserved_line) in
-        cleaned.lines().zip(text.lines()).zip(route_text.lines())
+    // Full-initializer signatures for multiline exported
+    // TypeScript constants (W9-1), keyed by line index: the
+    // per-line pass below records only the declaration line of
+    // such a constant, so a change to a later initializer line
+    // registered nothing.
+    let multiline_const_signatures = multiline_typescript_const_signatures(&cleaned, &route_text);
+    for (line_idx, ((line, original_line), preserved_line)) in cleaned
+        .lines()
+        .zip(text.lines())
+        .zip(route_text.lines())
+        .enumerate()
     {
         let indent = line.len() - line.trim_start().len();
         // Test-only scopes extract nothing (see TestScopeTracker):
@@ -2964,6 +3135,13 @@ fn extract_public_surface_signatures(
                 enclosing_kind = container_kind;
             }
             for (name, signature) in pairs {
+                // A multiline exported constant's signature is the
+                // full initializer (see the pre-pass above); every
+                // other export keeps its per-line signature.
+                let signature = multiline_const_signatures
+                    .get(&line_idx)
+                    .cloned()
+                    .unwrap_or(signature);
                 signatures
                     .entry(format!("ts:{name}"))
                     .or_default()
@@ -7256,5 +7434,167 @@ pub struct AfterAll {}
         );
         assert_eq!(report.checked_tiers, 3);
         assert!(report.checked_rules >= 8);
+    }
+
+    #[test]
+    fn typescript_multiline_exported_const_element_removal_differs_real_shape() {
+        // W9-1 probe (Codex PR #162): removing
+        // 'neurostrata_guard_validate', from the multiline exported
+        // REQUIRED_TOOLS list in the real plugins/core/index.ts
+        // produced identical maps — only the first line
+        // (`export const REQUIRED_TOOLS = [`) was recorded.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("plugins/core/index.ts")).unwrap();
+        assert!(real.contains("'neurostrata_guard_validate',"));
+        let mutated = real.replacen("  'neurostrata_guard_validate',\n", "", 1);
+        assert_ne!(real, mutated);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_ne!(
+            before, after,
+            "removing a middle element of a multiline exported const must register"
+        );
+        assert!(
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .any(|k| k.contains("REQUIRED_TOOLS")),
+            "differing key must name REQUIRED_TOOLS: {:?}",
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typescript_multiline_exported_const_array_later_line_change_differs() {
+        // W9-1: a change to a later line of a multiline exported
+        // array constant registers.
+        let before = extract_public_surface_signatures(
+            "export const TOOLS = [\n  'alpha',\n  'beta'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const TOOLS = [\n  'alpha',\n  'gamma'\n]\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(after.contains_key("ts:TOOLS"), "{after:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_exported_const_object_later_line_change_differs() {
+        // W9-1: a change to a later line of a multiline exported
+        // object constant registers.
+        let before = extract_public_surface_signatures(
+            "export const CONFIG = {\n  endpoint: 'http://a',\n  retries: 3\n}\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const CONFIG = {\n  endpoint: 'http://a',\n  retries: 5\n}\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(after.contains_key("ts:CONFIG"), "{after:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_exported_const_nested_later_line_change_differs() {
+        // W9-1: bracket-depth tracking must not stop at the first
+        // inner close — a change inside a nested group on a later
+        // line registers.
+        let before = extract_public_surface_signatures(
+            "export const MATRIX = [\n  [1, 2],\n  [3, 4]\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const MATRIX = [\n  [1, 2],\n  [3, 9]\n]\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_exported_const_bracket_in_string_change_differs() {
+        // W9-1: a bracket inside a string element must not close
+        // the initializer early — the element after it still
+        // registers when changed.
+        let before = extract_public_surface_signatures(
+            "export const PATTERNS = [\n  'a]b',\n  'c'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const PATTERNS = [\n  'a]b',\n  'd'\n]\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn typescript_single_line_exported_const_signature_unchanged() {
+        // W9-1 pin: a single-line exported constant keeps its exact
+        // legacy signature, byte-for-byte.
+        let sigs = extract_public_surface_signatures(
+            "export const DEFAULT_ENDPOINT = 'http://127.0.0.1:34343/mcp'",
+        );
+        let expected: std::collections::BTreeSet<String> =
+            ["export const DEFAULT_ENDPOINT = 'http://127.0.0.1:34343/mcp'"]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            sigs.get("ts:DEFAULT_ENDPOINT"),
+            Some(&expected),
+            "{sigs:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_non_exported_multiline_const_change_is_identical() {
+        // W9-1 pin: a non-exported multiline constant is not public
+        // surface today and stays unrecorded.
+        let before = extract_public_surface_signatures(
+            "const LOCAL_TOOLS = [\n  'alpha',\n  'beta'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "const LOCAL_TOOLS = [\n  'alpha',\n  'gamma'\n]\n",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        assert!(!before.contains_key("ts:LOCAL_TOOLS"), "{before:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_exported_arrow_body_edit_is_identical() {
+        // W9-1 pin: an exported arrow-function value keeps the
+        // legacy body-cut behaviour — a body-only edit on a later
+        // line does not register.
+        let before = extract_public_surface_signatures(
+            "export const handler = () => {\n  return 'a'\n}\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const handler = () => {\n  return 'b'\n}\n",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_exported_const_comment_edit_is_identical() {
+        // W9-1 pin: a comment-only edit inside a multiline exported
+        // constant does not register (the signature text comes from
+        // the comments-blanked intermediate, as for Rust constants).
+        let before = extract_public_surface_signatures(
+            "export const TOOLS = [\n  // the alpha tool\n  'alpha'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const TOOLS = [\n  // the first tool\n  'alpha'\n]\n",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+    }
+
+    #[test]
+    fn typescript_unbalanced_exported_const_fails_soft_to_first_line() {
+        // W9-1 pin: an initializer whose brackets never balance
+        // (truncated text) fails soft to the legacy first-line
+        // behaviour — the entry is kept, later lines unrecorded,
+        // and nothing panics.
+        let before =
+            extract_public_surface_signatures("export const BROKEN = [\n  'alpha',\n");
+        let after =
+            extract_public_surface_signatures("export const BROKEN = [\n  'gamma',\n");
+        assert_eq!(before, after, "before={before:?} after={after:?}");
+        assert!(before.contains_key("ts:BROKEN"), "{before:?}");
     }
 }
