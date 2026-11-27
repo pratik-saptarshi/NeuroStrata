@@ -1758,11 +1758,17 @@ fn multiline_typescript_const_signatures(
         }
         // String-aware bracket scan from the declaration line: the
         // initializer ends on the line where the depth first
-        // returns to zero in Normal state.
+        // returns to zero in Normal state. The depth is scoped to
+        // the initializer (W9-2): brackets in a type annotation
+        // before the declaration's `=` are not the initializer, so
+        // the first bare `=` resets the depth — an annotation's
+        // own balanced `[…]` (`string[]`, a tuple type) otherwise
+        // ends the scan on the declaration line.
         let mut state = ScanState::Normal;
         let mut template_stack: Vec<i32> = Vec::new();
         let mut depth: i32 = 0;
         let mut seen_open = false;
+        let mut initializer = false;
         let mut arrow = false;
         let mut end_line: Option<usize> = None;
         let mut cur_line = idx;
@@ -1789,6 +1795,13 @@ fn multiline_typescript_const_signatures(
                             arrow = true;
                             pos += 1;
                         }
+                        b'=' if !initializer => {
+                            // The declaration's assignment: the
+                            // scan is scoped to what follows it.
+                            initializer = true;
+                            depth = 0;
+                            seen_open = false;
+                        }
                         b'(' | b'[' | b'{' => {
                             depth += 1;
                             seen_open = true;
@@ -1800,7 +1813,7 @@ fn multiline_typescript_const_signatures(
                                 // returns to the template literal.
                                 template_stack.pop();
                                 state = ScanState::Template;
-                            } else if seen_open && depth == 0 {
+                            } else if initializer && seen_open && depth == 0 {
                                 end_line = Some(cur_line);
                                 break;
                             }
@@ -7596,5 +7609,93 @@ pub struct AfterAll {}
             extract_public_surface_signatures("export const BROKEN = [\n  'gamma',\n");
         assert_eq!(before, after, "before={before:?} after={after:?}");
         assert!(before.contains_key("ts:BROKEN"), "{before:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_annotated_const_element_change_differs_real_shape() {
+        // W9-2: the bracket-typed annotation on the real MARKERS
+        // declaration line (`readonly [string, string][]`) balances
+        // on that line, so the W9-1 bracket scan ended there and
+        // only the first line was recorded — an element edit
+        // registered nothing.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real = std::fs::read_to_string(root.join("plugins/core/index.ts")).unwrap();
+        assert!(real.contains("['defer ', 'defer'],"));
+        let mutated = real.replacen("['defer ', 'defer'],", "['deferX ', 'defer'],", 1);
+        assert_ne!(real, mutated);
+        let before = extract_public_surface_signatures(&real);
+        let after = extract_public_surface_signatures(&mutated);
+        assert_ne!(
+            before, after,
+            "editing a MARKERS element must register"
+        );
+        assert!(
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .any(|k| k.contains("MARKERS")),
+            "differing key must name MARKERS: {:?}",
+            before
+                .keys()
+                .filter(|k| before.get(*k) != after.get(*k))
+                .collect::<Vec<_>>()
+        );
+        // The recorded signature covers the full initializer, down
+        // to its last element.
+        let markers = before.get("ts:MARKERS").expect("ts:MARKERS recorded");
+        assert!(
+            markers.iter().any(|s| s.contains("['deferred ', 'deferred']")),
+            "ts:MARKERS signature must cover the full initializer: {markers:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_multiline_string_array_annotated_const_later_line_change_differs() {
+        // W9-2: a `string[]` annotation's brackets balance on the
+        // declaration line; a later-line element change of the
+        // annotated multiline const must still register.
+        let before = extract_public_surface_signatures(
+            "export const NAMES: string[] = [\n  'alpha',\n  'beta'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const NAMES: string[] = [\n  'alpha',\n  'gamma'\n]\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(after.contains_key("ts:NAMES"), "{after:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_tuple_annotated_const_later_line_change_differs() {
+        // W9-2: a tuple annotation (`readonly [string, number][]`)
+        // carries two bracket pairs on the declaration line; a
+        // later-line element change must still register.
+        let before = extract_public_surface_signatures(
+            "export const PAIRS: readonly [string, number][] = [\n  ['a', 1],\n  ['b', 2]\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const PAIRS: readonly [string, number][] = [\n  ['a', 1],\n  ['b', 3]\n]\n",
+        );
+        assert_ne!(before, after, "before={before:?} after={after:?}");
+        assert!(after.contains_key("ts:PAIRS"), "{after:?}");
+    }
+
+    #[test]
+    fn typescript_multiline_exported_arrow_list_body_edit_is_identical() {
+        // W9-2 pin (strengthens the W9-1 arrow pin): an exported
+        // array of expression-bodied arrow functions. Without the
+        // pre-pass arrow guard, the full initializer would be
+        // captured and — `typescript_signature`'s own arrow cut
+        // finding no `{` after the first `=>` — the whole joined
+        // text, bodies included, would become the signature, so a
+        // body-only edit on a later line would register. With the
+        // guard, the declaration fails soft to the legacy
+        // first-line behaviour and the edit stays invisible.
+        let before = extract_public_surface_signatures(
+            "export const HANDLERS = [\n  () => 'a',\n  () => 'b'\n]\n",
+        );
+        let after = extract_public_surface_signatures(
+            "export const HANDLERS = [\n  () => 'a',\n  () => 'c'\n]\n",
+        );
+        assert_eq!(before, after, "before={before:?} after={after:?}");
     }
 }
